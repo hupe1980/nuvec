@@ -23,6 +23,10 @@ bessemer-kernels = { path = "crates/bessemer-kernels" }
 bessemer-lm = { path = "crates/bessemer-lm" }
 bessemer-nn = { path = "crates/bessemer-nn" }
 
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+half = { version = "2.7", features = ["bytemuck"] }
+smallvec = { version = "1", features = ["union", "const_generics"] }
+
 [workspace.lints.rust]
 missing_docs = "warn"
 unreachable_pub = "warn"

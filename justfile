@@ -63,11 +63,10 @@ layering:
     #!/usr/bin/env bash
     set -euo pipefail
     allowed='
+    bessemer-core -> bessemer-cpu
     bessemer-compile -> bessemer-core
-    bessemer-cpu -> bessemer-core
     bessemer-io -> bessemer-core
     bessemer-distributed -> bessemer-core
-    bessemer-gpu -> bessemer-core
     bessemer-gpu -> bessemer-kernels
     bessemer -> bessemer-core
     bessemer -> bessemer-compile

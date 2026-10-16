@@ -50,6 +50,12 @@ executables = "deny"
 allow-build-scripts = [
     # Compiles the crate's own .metal sources with Apple's system toolchain (xcrun).
     { crate = "bessemer-kernels" },
+    # Compiler version/cfg probes only, no native code (via `half`'s dependency tree).
+    { crate = "proc-macro2" },
+    { crate = "quote" },
+    { crate = "zerocopy" },
+    # Generates its unrolling macros as Rust source, no native code (via `half`, some targets).
+    { crate = "crunchy" },
 ]
 
 [sources]

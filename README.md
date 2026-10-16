@@ -5,8 +5,8 @@ A pure-Rust array framework for Apple Silicon in the spirit of
 transforms (`grad`, `vjp`, `jvp`, `vmap`, `compile`) and Metal kernels. It is written in
 Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 
-> **Status: pre-alpha.** The workspace, build pipeline and quality gates are in place.
-> There is no functional array API yet.
+> **Status: pre-alpha.** Lazy arrays with 14 dtypes and element-wise `add`/`multiply`
+> evaluate on the CPU. Broadcasting, more operations, Metal and transforms are next.
 
 ## Platforms
 
