@@ -22,6 +22,10 @@ const INSTALL_HINT: &str = "install it with `xcodebuild -downloadComponent Metal
 /// Deployment floor: macOS 15 (Metal 3.2).
 const METAL_STD: &str = "-std=metal3.2";
 const MACOS_MIN: &str = "-mmacosx-version-min=15.0";
+/// IEEE-conformant math, as MLX compiles its kernels.
+const PRECISE: &str = "-fno-fast-math";
+/// No implicit fused multiply-add: element-wise results round like the CPU backend.
+const NO_CONTRACT: &str = "-ffp-contract=off";
 
 fn main() {
     println!(
@@ -97,7 +101,7 @@ fn precompile(files: &[PathBuf], out_dir: &Path) -> Vec<String> {
         let air = out_dir
             .join(src.file_stem().expect("shader file has a name"))
             .with_extension("air");
-        let mut args = vec![METAL_STD, MACOS_MIN];
+        let mut args = vec![METAL_STD, MACOS_MIN, PRECISE, NO_CONTRACT];
         if debug {
             args.extend(["-gline-tables-only", "-frecord-sources"]);
         }

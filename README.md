@@ -6,8 +6,10 @@ transforms (`grad`, `vjp`, `jvp`, `vmap`, `compile`) and Metal kernels. It is wr
 Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 
 > **Status: pre-alpha.** Lazy arrays with 14 dtypes, MLX type promotion, broadcasting,
-> zero-copy views, element-wise operations, reductions and matmul evaluate on the CPU.
-> The Metal backend and function transforms are next.
+> zero-copy views, element-wise operations, reductions and matmul, evaluated on the CPU or on
+> the GPU (Metal kernels on unified memory, selected with
+> `set_default_stream(Stream::default_for(Device::gpu(0)))`). Function transforms and tuned
+> GPU kernels are next.
 
 ## Platforms
 

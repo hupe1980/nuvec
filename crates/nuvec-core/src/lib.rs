@@ -22,7 +22,23 @@
 //! Reductions (`sum`, `mean`, `max`, `argmax`, …) work over any axes and layouts;
 //! `matmul` broadcasts batch dimensions and uses a SIMD GEMM on the CPU.
 //!
-//! **Status:** pre-alpha. Evaluated on the CPU.
+//! Arrays live in unified memory. Operations on the GPU stream run as Metal kernels; anything
+//! without a GPU kernel (for example float64) runs on the CPU over the same memory:
+//!
+//! ```
+//! use nuvec_core::{Array, Device, Stream, set_default_stream};
+//!
+//! # fn main() -> nuvec_core::Result<()> {
+//! set_default_stream(Stream::default_for(Device::gpu(0)));
+//! let x = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3])?;
+//! let y = &x * &x; // a Metal kernel on a Mac; an `UnsupportedDevice` error elsewhere
+//! # if y.eval().is_ok() { assert_eq!(y.to_vec::<f32>()?, vec![1.0, 4.0, 9.0]); }
+//! # set_default_stream(Stream::default_for(Device::cpu()));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! **Status:** pre-alpha. The default stream is the CPU.
 
 #![forbid(unsafe_code)]
 
@@ -33,6 +49,7 @@ mod device;
 mod dtype;
 mod error;
 mod eval;
+mod gpu;
 mod kernels;
 mod ops;
 mod primitive;

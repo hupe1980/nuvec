@@ -42,6 +42,8 @@ pub enum Error {
     },
     /// Memory for this many bytes could not be allocated (or exceeds the memory limit).
     OutOfMemory(usize),
+    /// The GPU backend failed (for example, a command buffer error).
+    Backend(String),
     /// The device has no backend yet.
     UnsupportedDevice(Device),
     /// An argument is invalid for another reason.
@@ -68,6 +70,7 @@ impl fmt::Display for Error {
             }
             Self::UnsupportedDType { op, dtype } => write!(f, "{op}: not supported for {dtype}"),
             Self::OutOfMemory(n) => write!(f, "out of memory: cannot allocate {n} bytes"),
+            Self::Backend(msg) => write!(f, "GPU backend error: {msg}"),
             Self::UnsupportedDevice(device) => write!(f, "no backend for device {device} yet"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
         }

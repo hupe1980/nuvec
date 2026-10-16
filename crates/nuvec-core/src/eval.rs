@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::array::{Data, Node, State};
+use crate::gpu::GpuEval;
 use crate::kernels::{self, Operand};
 use crate::primitive::Primitive;
 use crate::{Array, DeviceKind, Error, Result, view};
@@ -11,21 +12,25 @@ use crate::{Array, DeviceKind, Error, Result, view};
 /// Evaluates `arrays` and everything they depend on. Each node runs at most once, even
 /// across threads.
 ///
-/// Returns the first error among `arrays`. Errors are sticky: a failed array, and anything
-/// computed from it, fails with the same error on every later evaluation or readback.
+/// Nodes on the GPU stream run as Metal kernels where one exists, and on the CPU (over the
+/// same unified memory) otherwise. Returns the first error among `arrays`. Errors are
+/// sticky: a failed array, and anything computed from it, fails with the same error on
+/// every later evaluation or readback.
 pub fn eval(arrays: &[Array]) -> Result<()> {
+    let mut gpu = GpuEval::new();
     for node in topological_order(arrays) {
-        evaluate(&node);
+        evaluate(&node, &mut gpu);
         // `node` is released here, so intermediates are freed as soon as their last
-        // consumer has run.
+        // consumer has run (or, on the GPU, once their command buffer completes).
     }
-    match arrays
-        .iter()
-        .find_map(|a| a.out().slot.get().and_then(|r| r.as_ref().err()))
-    {
-        Some(err) => Err(err.clone()),
-        None => Ok(()),
+    // GPU errors are published to the nodes they affect; reported through the slots below.
+    let _ = gpu.flush();
+    for array in arrays {
+        if let Err(err) = array.out().slot.wait() {
+            return Err(err.clone());
+        }
     }
+    Ok(())
 }
 
 /// Unevaluated nodes reachable from `arrays`, inputs before consumers. Iterative, so graph
@@ -58,16 +63,18 @@ fn topological_order(arrays: &[Array]) -> Vec<Arc<Node>> {
     order
 }
 
-/// Runs one node whose inputs are all evaluated, stores its outputs, and detaches it.
-fn evaluate(node: &Node) {
+/// Runs one node whose inputs are all evaluated, stores (or, for GPU work, defers) its
+/// outputs, and detaches it.
+fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
     let mut state = node.lock();
     let State::Pending { primitive, inputs } = std::mem::replace(&mut *state, State::Done) else {
         return; // evaluated meanwhile by another thread
     };
     #[cfg(test)]
     counter::inc();
-    match run(node, &primitive, &inputs) {
-        Ok(outputs) => {
+    match compute(node, &primitive, &inputs, gpu) {
+        Ok((outputs, true)) => gpu.defer(node.clone(), outputs),
+        Ok((outputs, false)) => {
             for (output, data) in node.outputs.iter().zip(outputs) {
                 let _ = output.slot.set(Ok(data));
             }
@@ -82,37 +89,63 @@ fn evaluate(node: &Node) {
     drop(inputs); // detach: release the inputs outside the lock
 }
 
-fn run(node: &Node, primitive: &Primitive, inputs: &[Array]) -> Result<Vec<Data>> {
-    let mut operands: Vec<Operand<'_>> = Vec::with_capacity(inputs.len());
+/// Computes a node's outputs. The flag is true if they depend on GPU work that has not
+/// completed yet (and must be deferred until it has).
+fn compute(
+    node: &Node,
+    primitive: &Primitive,
+    inputs: &[Array],
+    gpu: &mut GpuEval,
+) -> Result<(Vec<Data>, bool)> {
+    let mut data = Vec::with_capacity(inputs.len());
+    let mut pending = false;
     for input in inputs {
-        match input
-            .out()
-            .slot
-            .get()
-            .expect("inputs are evaluated before consumers")
-        {
-            Ok(data) => operands.push((input.out(), data)),
-            Err(err) => return Err(err.clone()),
+        if let Some(d) = gpu.lookup(&input.node, input.output) {
+            pending = true;
+            data.push(d);
+        } else if let Some(result) = input.out().slot.get() {
+            data.push(result.clone()?);
+        } else {
+            // Produced by another thread's evaluation: finish our own GPU work first, so two
+            // evaluations never wait on each other.
+            gpu.flush()?;
+            data.push(input.out().slot.wait().clone()?);
         }
     }
-    if node.stream.device.kind != DeviceKind::Cpu {
-        return Err(Error::UnsupportedDevice(node.stream.device));
+    let operands: Vec<Operand<'_>> = inputs
+        .iter()
+        .zip(&data)
+        .map(|(a, d)| (a.out(), d))
+        .collect();
+    if let Some(views) = view_outputs(primitive, &operands)? {
+        return Ok((views, pending));
     }
-    let new = |buffer| Ok(vec![Data::new(buffer)]);
+    let device = node.stream.device;
+    if device.kind != DeviceKind::Cpu {
+        if !gpu.available(device) {
+            return Err(Error::UnsupportedDevice(device));
+        }
+        if gpu.supports(primitive, &operands, &node.outputs) {
+            return Ok((gpu.run(primitive, &operands, &node.outputs)?, true));
+        }
+    }
+    // The CPU reads inputs in place: wait for the GPU work that produces them.
+    if pending {
+        gpu.flush()?;
+    }
+    Ok((cpu(primitive, &operands)?, false))
+}
+
+/// Outputs of view primitives, which share their input's buffer (on every device), or
+/// `None` for primitives that compute.
+fn view_outputs(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Option<Vec<Data>>> {
     let share = |offset| {
-        Ok(vec![Data {
+        Some(vec![Data {
             buffer: operands[0].1.buffer.clone(),
             offset,
         }])
     };
-    match primitive {
-        Primitive::Unary(op) => new(kernels::unary(*op, operands[0])?),
-        Primitive::Binary(op) => new(kernels::binary(*op, operands[0], operands[1])?),
-        Primitive::Select => new(kernels::select(operands[0], operands[1], operands[2])?),
-        Primitive::AsType(dtype) => new(kernels::cast(operands[0], *dtype)?),
-        Primitive::Reduce { op, axes } => new(kernels::reduce(*op, operands[0], axes)?),
-        Primitive::ArgReduce { op, axis } => new(kernels::arg_reduce(*op, operands[0], *axis)?),
-        Primitive::Matmul => new(kernels::matmul(operands[0], operands[1])?),
+    Ok(match primitive {
         Primitive::Transpose(_) | Primitive::Broadcast(_) => share(operands[0].1.offset),
         Primitive::Slice { .. } => {
             let (meta, data) = operands[0];
@@ -122,11 +155,27 @@ fn run(node: &Node, primitive: &Primitive, inputs: &[Array]) -> Result<Vec<Data>
         }
         Primitive::Reshape(shape) => {
             let (meta, data) = operands[0];
-            if view::nocopy_reshape(&meta.shape, &meta.strides, shape).is_some() {
-                share(data.offset)
-            } else {
-                new(kernels::contiguous(meta, data)?)
-            }
+            view::nocopy_reshape(&meta.shape, &meta.strides, shape).and_then(|_| share(data.offset))
+        }
+        _ => None,
+    })
+}
+
+/// Computing primitives on the CPU.
+fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
+    let new = |buffer| Ok(vec![Data::new(buffer)]);
+    match primitive {
+        Primitive::Unary(op) => new(kernels::unary(*op, operands[0])?),
+        Primitive::Binary(op) => new(kernels::binary(*op, operands[0], operands[1])?),
+        Primitive::Select => new(kernels::select(operands[0], operands[1], operands[2])?),
+        Primitive::AsType(dtype) => new(kernels::cast(operands[0], *dtype)?),
+        Primitive::Reduce { op, axes } => new(kernels::reduce(*op, operands[0], axes)?),
+        Primitive::ArgReduce { op, axis } => new(kernels::arg_reduce(*op, operands[0], *axis)?),
+        Primitive::Matmul => new(kernels::matmul(operands[0], operands[1])?),
+        // A reshape that `view_outputs` could not express as a view copies.
+        Primitive::Reshape(_) => new(kernels::contiguous(operands[0].0, operands[0].1)?),
+        Primitive::Transpose(_) | Primitive::Broadcast(_) | Primitive::Slice { .. } => {
+            unreachable!("views are handled by view_outputs")
         }
         #[cfg(test)]
         Primitive::AddMultiply => {

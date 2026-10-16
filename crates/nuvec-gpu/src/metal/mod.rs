@@ -56,7 +56,9 @@ impl Device {
             max_threads_per_threadgroup: device.maxThreadsPerThreadgroup().width,
         };
         let ram = objc2_foundation::NSProcessInfo::processInfo().physicalMemory();
-        let pool = Arc::new(Pool::new(info.recommended_working_set, ram));
+        let options = objc2_metal::MTLResourceOptions::StorageModeShared;
+        let placeholder = device.newBufferWithLength_options(16, options);
+        let pool = Arc::new(Pool::new(info.recommended_working_set, ram, placeholder));
         Some(Device {
             inner: Arc::new(Inner {
                 device,
@@ -182,8 +184,11 @@ fn load_library(device: &ProtocolObject<dyn MTLDevice>) -> Result<Library> {
         }
         MetallibMode::RuntimeSource => {
             let source = inline_sources(nuvec_kernels::sources());
+            // IEEE-conformant math, matching the precompiled library's `-fno-fast-math`.
+            let options = objc2_metal::MTLCompileOptions::new();
+            options.setMathMode(objc2_metal::MTLMathMode::Safe);
             device
-                .newLibraryWithSource_options_error(&NSString::from_str(&source), None)
+                .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
                 .map_err(error)
         }
         _ => Err(GpuError::NoKernels),

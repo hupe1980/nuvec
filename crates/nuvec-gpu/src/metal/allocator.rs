@@ -28,6 +28,9 @@ struct Cached(Raw);
 // SAFETY: retaining and releasing Metal buffer objects is thread-safe; a cached buffer's
 // memory is not touched until it is handed out again, under the pool's lock.
 unsafe impl Send for Cached {}
+// SAFETY: shared access only retains or binds the buffer (the placeholder); its memory is
+// never read or written through a shared reference.
+unsafe impl Sync for Cached {}
 
 /// Memory use and limits of a device's allocator, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +60,9 @@ pub(crate) fn rounded(len: usize) -> usize {
 
 pub(crate) struct Pool {
     state: Mutex<State>,
+    /// A tiny buffer bound in place of empty buffers (Metal requires a binding for every
+    /// kernel argument; kernels never touch it, as empty buffers have no elements).
+    placeholder: Option<Cached>,
 }
 
 struct State {
@@ -152,7 +158,7 @@ impl State {
 
 impl Pool {
     /// A pool with MLX's default limits for a GPU with the given working set and RAM.
-    pub(crate) fn new(working_set: u64, ram: u64) -> Self {
+    pub(crate) fn new(working_set: u64, ram: u64, placeholder: Option<Raw>) -> Self {
         let memory_limit = (1.5 * working_set as f64).min(0.95 * ram as f64) as usize;
         Pool {
             state: Mutex::new(State {
@@ -167,7 +173,13 @@ impl Pool {
                 working_set: working_set as usize,
                 system_allocations: 0,
             }),
+            placeholder: placeholder.map(Cached),
         }
+    }
+
+    /// The buffer bound for empty buffers.
+    pub(crate) fn placeholder(&self) -> Option<&Raw> {
+        self.placeholder.as_ref().map(|Cached(raw)| raw)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -279,7 +291,7 @@ mod tests {
 
     #[test]
     fn default_limits_follow_mlx() {
-        let pool = Pool::new(40_000_000_000, 48_000_000_000);
+        let pool = Pool::new(40_000_000_000, 48_000_000_000, None);
         let stats = pool.stats();
         assert_eq!(stats.memory_limit, 45_600_000_000); // min(1.5 * 40e9, 0.95 * 48e9)
         assert_eq!(stats.cache_limit, stats.memory_limit);

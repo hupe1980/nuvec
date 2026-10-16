@@ -105,6 +105,24 @@ impl Buffer {
         }
     }
 
+    /// The Metal buffer holding the bytes, if they live in unified GPU memory.
+    #[cfg(all(target_os = "macos", not(miri)))]
+    pub(crate) fn metal(&self) -> Option<&nuvec_gpu::Buffer> {
+        match &self.storage {
+            Storage::Metal(buffer) => Some(buffer),
+            Storage::Host(_) => None,
+        }
+    }
+
+    /// The Metal buffer holding the bytes, mutably, if they live in unified GPU memory.
+    #[cfg(all(target_os = "macos", not(miri)))]
+    pub(crate) fn metal_mut(&mut self) -> Option<&mut nuvec_gpu::Buffer> {
+        match &mut self.storage {
+            Storage::Metal(buffer) => Some(buffer),
+            Storage::Host(_) => None,
+        }
+    }
+
     /// Whether the bytes live in GPU-visible unified memory.
     #[cfg_attr(not(all(test, target_os = "macos", not(miri))), allow(dead_code))]
     pub(crate) fn is_metal(&self) -> bool {

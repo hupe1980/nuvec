@@ -158,15 +158,16 @@ fn misuse_readback_type() {
 
 #[test]
 fn misuse_unsupported_device() {
+    // GPU 0 is a real device on a Mac; no machine has an eighth GPU.
     let a = Array::scalar(1.0f32);
-    set_default_stream(Stream::default_for(Device::gpu(0)));
+    set_default_stream(Stream::default_for(Device::gpu(7)));
     let c = &a + &a;
     set_default_stream(Stream::default_for(Device::cpu()));
-    assert_eq!(c.device(), Device::gpu(0));
-    assert_eq!(c.eval(), Err(Error::UnsupportedDevice(Device::gpu(0))));
+    assert_eq!(c.device(), Device::gpu(7));
+    assert_eq!(c.eval(), Err(Error::UnsupportedDevice(Device::gpu(7))));
     assert_eq!(
         c.eval(),
-        Err(Error::UnsupportedDevice(Device::gpu(0))),
+        Err(Error::UnsupportedDevice(Device::gpu(7))),
         "sticky"
     );
 }

@@ -38,8 +38,8 @@ def bench(reps: int, run) -> float:
     return median_us(samples)
 
 
-def mlx_results() -> dict[str, float]:
-    mx.set_default_device(mx.cpu)
+def mlx_results(device=mx.cpu, prefix: str = "") -> dict[str, float]:
+    mx.set_default_device(device)
     out: dict[str, float] = {}
     one = mx.array(1.0, dtype=mx.float32)
 
@@ -49,20 +49,20 @@ def mlx_results() -> dict[str, float]:
             x = x + one
         mx.eval(x)
 
-    out["dispatch_10k"] = bench(20, dispatch)
+    out[prefix + "dispatch_10k"] = bench(20 if not prefix else 10, dispatch)
     a = mx.arange(0, 1e6, 1, dtype=mx.float32)
     b = mx.ones((1_000_000,), dtype=mx.float32)
     mx.eval(a, b)
-    out["add_1m"] = bench(50, lambda: mx.eval(a + b))
-    out["sum_1m"] = bench(50, lambda: mx.eval(mx.sum(a)))
+    out[prefix + "add_1m"] = bench(50, lambda: mx.eval(a + b))
+    out[prefix + "sum_1m"] = bench(50, lambda: mx.eval(mx.sum(a)))
     m, n = a.reshape(1000, 1000), b.reshape(1000, 1000)
     mx.eval(m, n)
-    out["add_strided_1m"] = bench(50, lambda: mx.eval(m.T + n))
-    out["sum_axis_1k"] = bench(50, lambda: mx.eval(mx.sum(m, axis=1)))
+    out[prefix + "add_strided_1m"] = bench(50, lambda: mx.eval(m.T + n))
+    out[prefix + "sum_axis_1k"] = bench(50, lambda: mx.eval(mx.sum(m, axis=1)))
     for size in (256, 1024):
         x, y = mx.ones((size, size)), mx.ones((size, size))
         mx.eval(x, y)
-        out[f"matmul_{size}"] = bench(10 if size > 512 else 50, lambda: mx.eval(x @ y))
+        out[f"{prefix}matmul_{size}"] = bench(20 if prefix else (10 if size > 512 else 50), lambda: mx.eval(x @ y))
     return out
 
 
@@ -90,10 +90,11 @@ def machine() -> str:
 
 def main() -> None:
     theirs = mlx_results()
+    theirs.update(mlx_results(mx.gpu, "gpu_"))
     ours = nuvec_results()
     print(f"Machine: {machine()}")
-    print(f"MLX {mx.__version__} on device=cpu; nuvec release build, single-threaded CPU.")
-    print("Medians over repeated runs; MLX timings include Python call overhead.\n")
+    print(f"MLX {mx.__version__}; rows without a prefix use the CPU device, `gpu_` rows the GPU.")
+    print("nuvec release build. Medians over repeated runs; MLX timings include Python overhead.\n")
     print("| workload | nuvec (µs) | MLX (µs) | nuvec / MLX |")
     print("|---|---:|---:|---:|")
     for name, mlx_us in theirs.items():

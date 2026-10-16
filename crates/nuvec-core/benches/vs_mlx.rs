@@ -5,7 +5,9 @@
 
 use std::time::Instant;
 
-use nuvec_core::{Array, DType, Result, arange, matmul, ones, sum};
+use nuvec_core::{
+    Array, DType, Device, Result, Stream, arange, matmul, ones, set_default_stream, sum,
+};
 
 fn median_us(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(f64::total_cmp);
@@ -56,6 +58,28 @@ fn main() -> Result<()> {
         let y = evaluated(ones(&[size, size], DType::F32)?)?;
         let reps = if size > 512 { 10 } else { 50 };
         bench(&format!("matmul_{size}"), reps, || matmul(&x, &y)?.eval())?;
+    }
+
+    // The same workloads on the GPU stream (skipped without Metal).
+    set_default_stream(Stream::default_for(Device::gpu(0)));
+    if (&one + &one).eval().is_err() {
+        return Ok(());
+    }
+    bench("gpu_dispatch_10k", 10, || {
+        let mut x = Array::scalar(0.0f32);
+        for _ in 0..10_000 {
+            x = &x + &one;
+        }
+        x.eval()
+    })?;
+    bench("gpu_add_1m", 50, || (&a + &b).eval())?;
+    bench("gpu_sum_1m", 50, || sum(&a, &[], false)?.eval())?;
+    bench("gpu_add_strided_1m", 50, || (&m.t()? + &n).eval())?;
+    bench("gpu_sum_axis_1k", 50, || sum(&m, &[1], false)?.eval())?;
+    for size in [256usize, 1024] {
+        let x = evaluated(ones(&[size, size], DType::F32)?)?;
+        let y = evaluated(ones(&[size, size], DType::F32)?)?;
+        bench(&format!("gpu_matmul_{size}"), 20, || matmul(&x, &y)?.eval())?;
     }
     Ok(())
 }

@@ -90,17 +90,60 @@ impl Device {
 
 impl CommandBuffer {
     /// Encodes `pipeline` over `threads` threads (a 1-D grid) with `args` bound to slots
-    /// `0..args.len()`.
+    /// `0..args.len()`. The threadgroup size is derived from the pipeline's limits.
     pub fn dispatch(
         &mut self,
         pipeline: &Pipeline,
         args: &[Arg<'_>],
         threads: usize,
     ) -> Result<()> {
-        validate(args)?;
         if threads == 0 {
-            return Ok(());
+            return validate(args);
         }
+        let width = pipeline.execution_width().max(1);
+        let mut group = pipeline.max_threads_per_threadgroup().min(threads).max(1);
+        if group > width {
+            group -= group % width;
+        }
+        self.encode(pipeline, args, |encoder| {
+            encoder
+                .dispatchThreads_threadsPerThreadgroup(size([threads, 1, 1]), size([group, 1, 1]));
+        })
+    }
+
+    /// Encodes `pipeline` over a grid of `groups` threadgroups of `threads` threads each, for
+    /// kernels that cooperate within a threadgroup (reductions, tiled matrix products).
+    pub fn dispatch_groups(
+        &mut self,
+        pipeline: &Pipeline,
+        args: &[Arg<'_>],
+        groups: [usize; 3],
+        threads: [usize; 3],
+    ) -> Result<()> {
+        let per_group: usize = threads.iter().product();
+        if per_group > pipeline.max_threads_per_threadgroup() {
+            return Err(GpuError::InvalidArgument(format!(
+                "{per_group} threads per threadgroup; `{}` allows {}",
+                pipeline.name(),
+                pipeline.max_threads_per_threadgroup()
+            )));
+        }
+        if groups.contains(&0) || per_group == 0 {
+            return validate(args);
+        }
+        self.encode(pipeline, args, |encoder| {
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(threads));
+        })
+    }
+
+    /// Validates and binds `args`, inserts a barrier if needed, then lets `dispatch` encode.
+    fn encode(
+        &mut self,
+        pipeline: &Pipeline,
+        args: &[Arg<'_>],
+        dispatch: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
+    ) -> Result<()> {
+        validate(args)?;
         if self.conflicts(args) {
             self.encoder()?
                 .memoryBarrierWithScope(MTLBarrierScope::Buffers);
@@ -142,17 +185,7 @@ impl CommandBuffer {
             self.guards.push(guard);
             self.retained.extend(buffer.retained());
         }
-        let width = pipeline.execution_width().max(1);
-        let mut group = pipeline.max_threads_per_threadgroup().min(threads).max(1);
-        if group > width {
-            group -= group % width;
-        }
-        let size = |width| MTLSize {
-            width,
-            height: 1,
-            depth: 1,
-        };
-        encoder.dispatchThreads_threadsPerThreadgroup(size(threads), size(group));
+        dispatch(&encoder);
         Ok(())
     }
 
@@ -205,6 +238,14 @@ impl Drop for CommandBuffer {
         for guard in self.guards.drain(..) {
             guard.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+}
+
+fn size([width, height, depth]: [usize; 3]) -> MTLSize {
+    MTLSize {
+        width,
+        height,
+        depth,
     }
 }
 

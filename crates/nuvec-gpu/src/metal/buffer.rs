@@ -114,12 +114,17 @@ impl Buffer {
         Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) })
     }
 
+    /// The Metal buffer to bind: the device's placeholder for empty buffers.
     pub(crate) fn raw(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
-        self.raw.as_deref()
+        self.raw
+            .as_deref()
+            .or_else(|| self.pool.placeholder().map(|r| &**r))
     }
 
     pub(crate) fn retained(&self) -> Option<Raw> {
-        self.raw.clone()
+        self.raw
+            .clone()
+            .or_else(|| self.pool.placeholder().cloned())
     }
 
     pub(crate) fn guard(&self) -> Arc<AtomicUsize> {
