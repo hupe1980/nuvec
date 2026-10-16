@@ -1,0 +1,240 @@
+//! The Metal runtime on `objc2-metal` (macOS only).
+
+mod buffer;
+mod command;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+pub use buffer::Buffer;
+pub use command::{Arg, CommandBuffer, Submitted};
+use nuvec_kernels::MetallibMode;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+};
+
+use crate::info::parse_architecture;
+use crate::{DeviceInfo, GpuError, Result};
+
+type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
+
+/// A Metal GPU with its command queue, kernel library and pipeline cache. Cheap to clone.
+#[derive(Clone)]
+pub struct Device {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    info: DeviceInfo,
+    library: OnceLock<Result<Library>>,
+    pipelines: Mutex<HashMap<String, Pipeline>>,
+}
+
+impl Device {
+    /// The system's default Metal device, or `None` if there is none (for example in some
+    /// virtual machines).
+    pub fn system_default() -> Option<Device> {
+        let device = MTLCreateSystemDefaultDevice()?;
+        let queue = device.newCommandQueue()?;
+        let architecture = device.architecture().name().to_string();
+        let (generation, class) = parse_architecture(&architecture);
+        let info = DeviceInfo {
+            name: device.name().to_string(),
+            architecture,
+            generation,
+            class,
+            recommended_working_set: device.recommendedMaxWorkingSetSize(),
+            max_threads_per_threadgroup: device.maxThreadsPerThreadgroup().width,
+        };
+        Some(Device {
+            inner: Arc::new(Inner {
+                device,
+                queue,
+                info,
+                library: OnceLock::new(),
+                pipelines: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    /// What this GPU is and can do.
+    pub fn info(&self) -> &DeviceInfo {
+        &self.inner.info
+    }
+
+    /// The compute pipeline for the kernel `name` from nuvec's kernel library, compiled on
+    /// first use and cached.
+    pub fn pipeline(&self, name: &str) -> Result<Pipeline> {
+        let mut cache = self
+            .inner
+            .pipelines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(p) = cache.get(name) {
+            return Ok(p.clone());
+        }
+        let function = self
+            .library()?
+            .newFunctionWithName(&NSString::from_str(name))
+            .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))?;
+        let state = self
+            .inner
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|e| GpuError::Pipeline {
+                name: name.to_owned(),
+                message: e.localizedDescription().to_string(),
+            })?;
+        let pipeline = Pipeline {
+            state,
+            name: name.into(),
+        };
+        cache.insert(name.to_owned(), pipeline.clone());
+        Ok(pipeline)
+    }
+
+    /// nuvec's kernel library, loaded once.
+    fn library(&self) -> Result<&Library> {
+        self.inner
+            .library
+            .get_or_init(|| load_library(&self.inner.device))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
+        &self.inner.device
+    }
+
+    pub(crate) fn queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
+        &self.inner.queue
+    }
+}
+
+impl std::fmt::Debug for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Device")
+            .field("info", &self.inner.info)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Loads the precompiled library, or compiles the embedded sources (with their headers
+/// inlined, as the runtime compiler has no include path for them).
+fn load_library(device: &ProtocolObject<dyn MTLDevice>) -> Result<Library> {
+    let error = |e: Retained<objc2_foundation::NSError>| {
+        GpuError::LibraryLoad(e.localizedDescription().to_string())
+    };
+    match nuvec_kernels::MODE {
+        MetallibMode::Precompiled => {
+            let bytes = nuvec_kernels::metallib().ok_or(GpuError::NoKernels)?;
+            device
+                .newLibraryWithData_error(&dispatch2::DispatchData::from_static_bytes(bytes))
+                .map_err(error)
+        }
+        MetallibMode::RuntimeSource => {
+            let source = inline_sources(nuvec_kernels::sources());
+            device
+                .newLibraryWithSource_options_error(&NSString::from_str(&source), None)
+                .map_err(error)
+        }
+        _ => Err(GpuError::NoKernels),
+    }
+}
+
+/// All `.metal` sources as one translation unit, each `#include "header.h"` of an embedded
+/// header replaced by the header's text on first use.
+fn inline_sources(sources: &[(&str, &str)]) -> String {
+    let headers: HashMap<&str, &str> = sources
+        .iter()
+        .copied()
+        .filter(|(p, _)| p.ends_with(".h"))
+        .collect();
+    let mut included = HashSet::new();
+    let mut out = String::new();
+    for (_, source) in sources.iter().filter(|(p, _)| p.ends_with(".metal")) {
+        for line in source.lines() {
+            let header = line
+                .trim()
+                .strip_prefix("#include \"")
+                .and_then(|r| r.strip_suffix('"'));
+            match header.and_then(|h| headers.get(h).map(|text| (h, text))) {
+                Some((h, text)) => {
+                    if included.insert(h) {
+                        out.push_str(text);
+                        out.push('\n');
+                    }
+                }
+                None => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A compiled compute kernel. Cheap to clone.
+#[derive(Clone)]
+pub struct Pipeline {
+    state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    name: Arc<str>,
+}
+
+impl Pipeline {
+    /// The kernel's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The most threads one threadgroup of this kernel may have.
+    pub fn max_threads_per_threadgroup(&self) -> usize {
+        self.state.maxTotalThreadsPerThreadgroup()
+    }
+
+    /// The SIMD-group width (threads that execute in lockstep).
+    pub fn execution_width(&self) -> usize {
+        self.state.threadExecutionWidth()
+    }
+
+    /// Whether two handles refer to the same compiled pipeline.
+    pub fn same_as(&self, other: &Pipeline) -> bool {
+        Retained::as_ptr(&self.state) == Retained::as_ptr(&other.state)
+    }
+
+    pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
+        &self.state
+    }
+}
+
+impl std::fmt::Debug for Pipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pipeline")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inline_sources;
+
+    #[test]
+    fn inlines_each_header_once() {
+        let sources = [
+            ("a.metal", "#include \"h.h\"\nkernel A;"),
+            ("b.metal", "  #include \"h.h\"\nkernel B;"),
+            ("h.h", "#pragma once\ninline int f();"),
+        ];
+        let out = inline_sources(&sources);
+        assert_eq!(out.matches("inline int f();").count(), 1);
+        assert!(out.contains("kernel A;") && out.contains("kernel B;"));
+        assert!(!out.contains("#include \"h.h\""));
+    }
+}

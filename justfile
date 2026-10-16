@@ -1,4 +1,4 @@
-# nuvect — development task runner (https://just.systems). `just ci` mirrors CI.
+# nuvec — development task runner (https://just.systems). `just ci` mirrors CI.
 
 default:
     @just --list --unsorted
@@ -29,17 +29,21 @@ test-stable:
 
 # Undefined-behaviour check of the core graph logic (`rustup +nightly component add miri`).
 miri:
-    cargo +nightly miri test -p nuvect-core
+    cargo +nightly miri test -p nuvec-core
 
 # ── Metal kernels ─────────────────────────────────────────────────────────────
 
 # Build the kernel library (precompiled when the Metal toolchain is installed).
 metallib:
-    cargo build -p nuvect-kernels
+    cargo build -p nuvec-kernels
 
 # Fail unless the kernel library is precompiled and contains the expected kernels.
 metallib-check:
-    NUVECT_REQUIRE_METALLIB=1 cargo test -p nuvect-kernels
+    NUVEC_REQUIRE_METALLIB=1 cargo test -p nuvec-kernels
+
+# GPU runtime tests with Metal API validation (skip without a Metal device).
+metal-check:
+    MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu
 
 # ── MLX reference (needs uv; never part of `ci`) ──────────────────────────────
 
@@ -47,7 +51,7 @@ metallib-check:
 fixtures:
     uv run scripts/mlx_fixtures.py
 
-# Same-machine benchmark table: nuvect vs MLX (CPU device).
+# Same-machine benchmark table: nuvec vs MLX (CPU device).
 bench-mlx:
     uv run scripts/bench_vs_mlx.py
 
@@ -73,24 +77,24 @@ layering:
     #!/usr/bin/env bash
     set -euo pipefail
     allowed='
-    nuvect-core -> nuvect-cpu
-    nuvect-compile -> nuvect-core
-    nuvect-io -> nuvect-core
-    nuvect-distributed -> nuvect-core
-    nuvect-gpu -> nuvect-kernels
-    nuvect -> nuvect-core
-    nuvect -> nuvect-compile
-    nuvect -> nuvect-cpu
-    nuvect -> nuvect-gpu
-    nuvect -> nuvect-io
-    nuvect -> nuvect-distributed
-    nuvect-nn -> nuvect
-    nuvect-lm -> nuvect
-    nuvect-lm -> nuvect-nn
+    nuvec-core -> nuvec-cpu
+    nuvec-compile -> nuvec-core
+    nuvec-io -> nuvec-core
+    nuvec-distributed -> nuvec-core
+    nuvec-gpu -> nuvec-kernels
+    nuvec -> nuvec-core
+    nuvec -> nuvec-compile
+    nuvec -> nuvec-cpu
+    nuvec -> nuvec-gpu
+    nuvec -> nuvec-io
+    nuvec -> nuvec-distributed
+    nuvec-nn -> nuvec
+    nuvec-lm -> nuvec
+    nuvec-lm -> nuvec-nn
     '
     edges=$(cargo metadata --format-version 1 --no-deps | jq -r '
         .packages[] | .name as $from | .dependencies[]
-        | select(.name | startswith("nuvect")) | select(.kind == null)
+        | select(.name | startswith("nuvec")) | select(.kind == null)
         | "\($from) -> \(.name)"')
     bad=0
     while IFS= read -r edge; do
@@ -105,4 +109,4 @@ layering:
 
 # ── Everything ────────────────────────────────────────────────────────────────
 
-ci: fmt-check lint test doc miri deny metallib-check internal-paths layering
+ci: fmt-check lint test doc miri deny metallib-check metal-check internal-paths layering

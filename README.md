@@ -1,4 +1,4 @@
-# nuvect
+# nuvec
 
 A pure-Rust array framework for Apple Silicon in the spirit of
 [MLX](https://github.com/ml-explore/mlx): lazy arrays on unified memory, composable function
@@ -26,7 +26,7 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 | jq | `brew install jq` |
 
 Without the Metal toolchain the build still succeeds. It prints one warning and embeds the
-shader sources for runtime compilation. Set `NUVECT_METALLIB=off` to choose this mode
+shader sources for runtime compilation. Set `NUVEC_METALLIB=off` to choose this mode
 explicitly.
 
 ## Quick start
@@ -42,26 +42,26 @@ repository-hygiene checks.
 
 ## Testing against MLX
 
-The test suite replays outputs recorded from real MLX (`crates/nuvect-core/tests/fixtures/mlx.bin`).
+The test suite replays outputs recorded from real MLX (`crates/nuvec-core/tests/fixtures/mlx.bin`).
 Python is not needed to build or test. With [uv](https://docs.astral.sh/uv/) installed:
 
 - `just fixtures`: re-records the fixtures with the pinned MLX version on its CPU device
-- `just bench-mlx`: prints a same-machine benchmark table, nuvect vs MLX
+- `just bench-mlx`: prints a same-machine benchmark table, nuvec vs MLX
 
 ## Crates
 
 | Crate | Responsibility |
 |---|---|
-| `nuvect` | Public facade: re-exports the layers below |
-| `nuvect-core` | Lazy array graph, primitives, dtypes, streams and evaluation |
-| `nuvect-compile` | Tracing, graph simplification, fusion and buffer planning |
-| `nuvect-gpu` | Metal backend: device, command encoding, memory, dispatch |
-| `nuvect-kernels` | Metal kernel sources and the precompiled `nuvect.metallib` |
-| `nuvect-cpu` | Pure-Rust CPU backend |
-| `nuvect-io` | Zero-copy safetensors, GGUF and npy loading |
-| `nuvect-distributed` | Collectives over TCP rings and Thunderbolt RDMA |
-| `nuvect-nn` | Neural-network modules, layers and optimizers |
-| `nuvect-lm` | LLM runtime: model loading, KV caches, sampling |
+| `nuvec` | Public facade: re-exports the layers below |
+| `nuvec-core` | Lazy array graph, primitives, dtypes, streams and evaluation |
+| `nuvec-compile` | Tracing, graph simplification, fusion and buffer planning |
+| `nuvec-gpu` | Metal runtime: device, kernel pipelines, shared buffers, command encoding with minimal barriers |
+| `nuvec-kernels` | Metal kernel sources and the precompiled `nuvec.metallib` |
+| `nuvec-cpu` | Pure-Rust CPU backend |
+| `nuvec-io` | Zero-copy safetensors, GGUF and npy loading |
+| `nuvec-distributed` | Collectives over TCP rings and Thunderbolt RDMA |
+| `nuvec-nn` | Neural-network modules, layers and optimizers |
+| `nuvec-lm` | LLM runtime: model loading, KV caches, sampling |
 
 ## License
 

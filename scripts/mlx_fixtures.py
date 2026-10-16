@@ -2,11 +2,11 @@
 # requires-python = ">=3.11"
 # dependencies = ["mlx==0.32.4", "numpy==2.5.4"]
 # ///
-"""Records MLX outputs as test fixtures for nuvect.
+"""Records MLX outputs as test fixtures for nuvec.
 
 Runs MLX on its CPU device with fixed seeds and writes every case to one binary file
 (format "BSMXFIX1", documented at the bottom of this file). The Rust test
-`crates/nuvect-core/tests/mlx.rs` replays the cases without Python.
+`crates/nuvec-core/tests/mlx.rs` replays the cases without Python.
 
 Usage: `just fixtures` (or `uv run scripts/mlx_fixtures.py`).
 """
@@ -19,12 +19,12 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-mx.set_default_device(mx.cpu)  # deterministic, and the device nuvect is compared with
+mx.set_default_device(mx.cpu)  # deterministic, and the device nuvec is compared with
 
 SEED = 20261016
-OUT = Path(__file__).resolve().parent.parent / "crates/nuvect-core/tests/fixtures/mlx.bin"
+OUT = Path(__file__).resolve().parent.parent / "crates/nuvec-core/tests/fixtures/mlx.bin"
 
-# nuvect DType order -> (code, MLX dtype)
+# nuvec DType order -> (code, MLX dtype)
 DTYPES = [
     ("bool", mx.bool_), ("uint8", mx.uint8), ("uint16", mx.uint16), ("uint32", mx.uint32),
     ("uint64", mx.uint64), ("int8", mx.int8), ("int16", mx.int16), ("int32", mx.int32),
@@ -196,7 +196,7 @@ case("where-broadcast", "where", [make("bool", (3, 1)), make("float32", (3, 4)),
 case("where-int-cond", "where", [ints("int32", (2, 3), -1, 2), make("float16", (2, 3)), make("float16", ())])
 
 # astype: edge values to every dtype. Values stay inside every target's range: MLX's
-# out-of-range float->int casts are C++ undefined behaviour (nuvect saturates, D-021).
+# out-of-range float->int casts are C++ undefined behaviour (nuvec saturates, D-021).
 EDGE_F32 = mx.array(np.array([0.0, -0.0, 1.5, -1.5, 2.5, 100.25, -100.75, 127.0], dtype=np.float32))
 for dt in ALL:
     case(f"astype-float32-{dt}", "astype", [EDGE_F32], dtype=CODE[dt])
@@ -225,7 +225,7 @@ case("squeeze-axis", "squeeze", [make("float32", (1, 3, 1))], axes="0")
 # Creation.
 case("arange-int", "arange", [], start=0, stop=10, step=3, dtype=CODE["int32"])
 case("arange-neg", "arange", [], start=1, stop=0, step=-0.25, dtype=CODE["float32"])
-# Exact steps only: MLX accumulates `start += step` in the target type, nuvect computes
+# Exact steps only: MLX accumulates `start += step` in the target type, nuvec computes
 # `start + i*step` once (D-021), so inexact steps differ in the last bits.
 case("arange-f16", "arange", [], start=-2, stop=2, step=0.25, dtype=CODE["float16"])
 case("arange-empty", "arange", [], start=5, stop=1, step=1, dtype=CODE["float32"])

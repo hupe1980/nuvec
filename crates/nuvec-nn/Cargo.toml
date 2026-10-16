@@ -1,0 +1,16 @@
+[package]
+name = "nuvec-nn"
+description = "Neural-network modules, layers and optimizers for nuvec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+nuvec.workspace = true
+
+[lints]
+workspace = true

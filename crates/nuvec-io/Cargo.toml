@@ -1,0 +1,16 @@
+[package]
+name = "nuvec-io"
+description = "Zero-copy safetensors, GGUF and npy loading for nuvec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+nuvec-core.workspace = true
+
+[lints]
+workspace = true

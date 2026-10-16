@@ -2,11 +2,11 @@
 # requires-python = ">=3.11"
 # dependencies = ["mlx==0.32.4", "numpy==2.5.4"]
 # ///
-"""Compares nuvect and MLX on the same machine.
+"""Compares nuvec and MLX on the same machine.
 
 Times identical workloads in MLX (CPU device, pinned version), runs
-`cargo bench -p nuvect-core --bench vs_mlx`, and prints a markdown table with median
-times and the nuvect/MLX ratio (lower is better for nuvect).
+`cargo bench -p nuvec-core --bench vs_mlx`, and prints a markdown table with median
+times and the nuvec/MLX ratio (lower is better for nuvec).
 
 Usage: `just bench-mlx` (or `uv run scripts/bench_vs_mlx.py`).
 """
@@ -66,9 +66,9 @@ def mlx_results() -> dict[str, float]:
     return out
 
 
-def nuvect_results() -> dict[str, float]:
+def nuvec_results() -> dict[str, float]:
     proc = subprocess.run(
-        ["cargo", "bench", "-q", "-p", "nuvect-core", "--bench", "vs_mlx"],
+        ["cargo", "bench", "-q", "-p", "nuvec-core", "--bench", "vs_mlx"],
         cwd=ROOT, capture_output=True, text=True, check=True,
     )
     results = {}
@@ -90,11 +90,11 @@ def machine() -> str:
 
 def main() -> None:
     theirs = mlx_results()
-    ours = nuvect_results()
+    ours = nuvec_results()
     print(f"Machine: {machine()}")
-    print(f"MLX {mx.__version__} on device=cpu; nuvect release build, single-threaded CPU.")
+    print(f"MLX {mx.__version__} on device=cpu; nuvec release build, single-threaded CPU.")
     print("Medians over repeated runs; MLX timings include Python call overhead.\n")
-    print("| workload | nuvect (µs) | MLX (µs) | nuvect / MLX |")
+    print("| workload | nuvec (µs) | MLX (µs) | nuvec / MLX |")
     print("|---|---:|---:|---:|")
     for name, mlx_us in theirs.items():
         ours_us = ours.get(name)

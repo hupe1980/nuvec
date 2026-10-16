@@ -14,7 +14,7 @@ ignore = [
 
 [licenses]
 version = 2
-# Compatible with distributing nuvect under MIT OR Apache-2.0.
+# Compatible with distributing nuvec under MIT OR Apache-2.0.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -53,7 +53,7 @@ include-workspace = true
 executables = "deny"
 allow-build-scripts = [
     # Compiles the crate's own .metal sources with Apple's system toolchain (xcrun).
-    { crate = "nuvect-kernels" },
+    { crate = "nuvec-kernels" },
     # Compiler version/cfg probes only, no native code (via `half`'s dependency tree).
     { crate = "proc-macro2" },
     { crate = "quote" },
@@ -75,6 +75,8 @@ allow-build-scripts = [
     { crate = "crossbeam-deque" },
     { crate = "crossbeam-epoch" },
     { crate = "crossbeam-utils" },
+    # Metal access (D-002): Apple-target cfg probe only, no native code.
+    { crate = "objc2" },
 ]
 
 [sources]

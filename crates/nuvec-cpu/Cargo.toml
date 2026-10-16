@@ -1,0 +1,17 @@
+[package]
+name = "nuvec-cpu"
+description = "Pure-Rust CPU backend for nuvec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+gemm.workspace = true
+half.workspace = true
+
+[lints]
+workspace = true

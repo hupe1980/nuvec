@@ -12,19 +12,37 @@ authors = ["hupe1980"]
 publish = false
 
 [workspace.dependencies]
-nuvect = { path = "crates/nuvect" }
-nuvect-core = { path = "crates/nuvect-core" }
-nuvect-compile = { path = "crates/nuvect-compile" }
-nuvect-cpu = { path = "crates/nuvect-cpu" }
-nuvect-distributed = { path = "crates/nuvect-distributed" }
-nuvect-gpu = { path = "crates/nuvect-gpu" }
-nuvect-io = { path = "crates/nuvect-io" }
-nuvect-kernels = { path = "crates/nuvect-kernels" }
-nuvect-lm = { path = "crates/nuvect-lm" }
-nuvect-nn = { path = "crates/nuvect-nn" }
+nuvec = { path = "crates/nuvec" }
+nuvec-core = { path = "crates/nuvec-core" }
+nuvec-compile = { path = "crates/nuvec-compile" }
+nuvec-cpu = { path = "crates/nuvec-cpu" }
+nuvec-distributed = { path = "crates/nuvec-distributed" }
+nuvec-gpu = { path = "crates/nuvec-gpu" }
+nuvec-io = { path = "crates/nuvec-io" }
+nuvec-kernels = { path = "crates/nuvec-kernels" }
+nuvec-lm = { path = "crates/nuvec-lm" }
+nuvec-nn = { path = "crates/nuvec-nn" }
 
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2", "block2"] }
 gemm = { version = "0.19", default-features = false, features = ["std", "f16", "rayon"] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "dispatch2",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTypes",
+] }
 half = { version = "2.7", features = ["bytemuck"] }
 smallvec = { version = "1", features = ["union", "const_generics"] }
 

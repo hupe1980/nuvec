@@ -1,0 +1,21 @@
+[package]
+name = "nuvec"
+description = "Pure-Rust array framework for Apple Silicon in the spirit of MLX: lazy arrays, unified memory, composable transforms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+nuvec-core.workspace = true
+nuvec-compile.workspace = true
+nuvec-cpu.workspace = true
+nuvec-gpu.workspace = true
+nuvec-io.workspace = true
+nuvec-distributed.workspace = true
+
+[lints]
+workspace = true

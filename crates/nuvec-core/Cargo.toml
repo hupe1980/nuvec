@@ -1,0 +1,23 @@
+[package]
+name = "nuvec-core"
+description = "Lazy array graph, primitives, dtypes and evaluation for nuvec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+nuvec-cpu.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+smallvec.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "vs_mlx"
+harness = false
