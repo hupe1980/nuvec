@@ -126,7 +126,7 @@ impl CommandBuffer {
                     // SAFETY: `validate` checked `index < 31` and `offset <= buffer.len()`, so
                     // the binding stays within the buffer; the buffer is retained by this
                     // command buffer until the GPU has finished.
-                    unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.raw()), offset, index) };
+                    unsafe { encoder.setBuffer_offset_atIndex(buffer.raw(), offset, index) };
                 }
             }
         }
@@ -140,7 +140,7 @@ impl CommandBuffer {
             let guard = buffer.guard();
             guard.fetch_add(1, Ordering::AcqRel);
             self.guards.push(guard);
-            self.retained.push(buffer.retained());
+            self.retained.extend(buffer.retained());
         }
         let width = pipeline.execution_width().max(1);
         let mut group = pipeline.max_threads_per_threadgroup().min(threads).max(1);

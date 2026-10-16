@@ -306,8 +306,10 @@ fn edge_half() {
     assert_eq!((&x * &x).item::<bf16>().unwrap(), bf16::from_f32(2.25));
 }
 
+/// Timing bounds are only meaningful in optimised builds (as for the other `perf_*` checks);
+/// run with `cargo test --release`.
 #[test]
-#[cfg_attr(miri, ignore = "timing bound is meaningless under Miri")]
+#[cfg(not(debug_assertions))]
 fn many_small_ops_sanity() {
     let start = std::time::Instant::now();
     let one = Array::scalar(1.0f32);

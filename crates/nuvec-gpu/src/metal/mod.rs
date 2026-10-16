@@ -1,11 +1,14 @@
 //! The Metal runtime on `objc2-metal` (macOS only).
 
+mod allocator;
 mod buffer;
 mod command;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+pub use allocator::MemoryStats;
+use allocator::Pool;
 pub use buffer::Buffer;
 pub use command::{Arg, CommandBuffer, Submitted};
 use nuvec_kernels::MetallibMode;
@@ -33,6 +36,7 @@ struct Inner {
     info: DeviceInfo,
     library: OnceLock<Result<Library>>,
     pipelines: Mutex<HashMap<String, Pipeline>>,
+    pool: Arc<Pool>,
 }
 
 impl Device {
@@ -51,6 +55,8 @@ impl Device {
             recommended_working_set: device.recommendedMaxWorkingSetSize(),
             max_threads_per_threadgroup: device.maxThreadsPerThreadgroup().width,
         };
+        let ram = objc2_foundation::NSProcessInfo::processInfo().physicalMemory();
+        let pool = Arc::new(Pool::new(info.recommended_working_set, ram));
         Some(Device {
             inner: Arc::new(Inner {
                 device,
@@ -58,8 +64,45 @@ impl Device {
                 info,
                 library: OnceLock::new(),
                 pipelines: Mutex::new(HashMap::new()),
+                pool,
             }),
         })
+    }
+
+    /// The process-wide default device, created on first use: one allocator, kernel cache
+    /// and queue shared by everything that uses the GPU.
+    pub fn shared() -> Option<&'static Device> {
+        static SHARED: OnceLock<Option<Device>> = OnceLock::new();
+        SHARED.get_or_init(Device::system_default).as_ref()
+    }
+
+    /// Memory use and limits of this device's allocator.
+    pub fn memory(&self) -> MemoryStats {
+        self.inner.pool.stats()
+    }
+
+    /// Sets the memory limit (allocations beyond it fail) and returns the previous one.
+    pub fn set_memory_limit(&self, bytes: usize) -> usize {
+        self.inner.pool.set_memory_limit(bytes)
+    }
+
+    /// Sets the cache limit, trimming the cache to it, and returns the previous one.
+    pub fn set_cache_limit(&self, bytes: usize) -> usize {
+        self.inner.pool.set_cache_limit(bytes)
+    }
+
+    /// Releases every cached buffer.
+    pub fn clear_cache(&self) {
+        self.inner.pool.clear_cache();
+    }
+
+    /// Resets the peak to the current active memory.
+    pub fn reset_peak(&self) {
+        self.inner.pool.reset_peak();
+    }
+
+    pub(crate) fn pool(&self) -> &Arc<Pool> {
+        &self.inner.pool
     }
 
     /// What this GPU is and can do.

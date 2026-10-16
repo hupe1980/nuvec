@@ -555,7 +555,7 @@ pub fn arange(start: f64, stop: f64, step: f64, dtype: DType) -> Result<Array> {
 
 /// An array whose element `i` (row-major) is `value(i)` converted to `dtype`.
 fn filled(shape: &[usize], dtype: DType, value: impl Fn(usize) -> Canon) -> Result<Array> {
-    let mut buffer = Buffer::try_zeroed(shape::checked_nbytes(shape, dtype.size())?)?;
+    let mut buffer = Buffer::try_alloc(shape::checked_nbytes(shape, dtype.size())?)?;
     with_type!(dtype, T => {
         for (i, x) in buffer.typed_mut::<T>().iter_mut().enumerate() {
             *x = T::from_canon(value(i));

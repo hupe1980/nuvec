@@ -113,7 +113,7 @@ impl Array {
                 actual: data.len(),
             });
         }
-        let mut buffer = Buffer::try_zeroed(shape::checked_nbytes(shape, T::DTYPE.size())?)?;
+        let mut buffer = Buffer::try_alloc(shape::checked_nbytes(shape, T::DTYPE.size())?)?;
         T::write_bytes(data, buffer.bytes_mut());
         Self::leaf(Ok(Data::new(buffer)), T::DTYPE, shape.into())
     }
@@ -121,7 +121,7 @@ impl Array {
     /// An array of the given `shape` with every element set to `value`.
     pub fn full<T: Element>(shape: &[usize], value: T) -> Result<Self> {
         let itemsize = T::DTYPE.size();
-        let mut buffer = Buffer::try_zeroed(shape::checked_nbytes(shape, itemsize)?)?;
+        let mut buffer = Buffer::try_alloc(shape::checked_nbytes(shape, itemsize)?)?;
         let mut element = vec![0u8; itemsize];
         T::write_bytes(&[value], &mut element);
         for chunk in buffer.bytes_mut().chunks_exact_mut(itemsize) {

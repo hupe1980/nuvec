@@ -26,7 +26,7 @@ fn view<'a, T: Pod>((meta, data): Operand<'a>) -> View<'a, T> {
 }
 
 fn output<T: Pod>(size: usize) -> Result<Buffer> {
-    Buffer::try_zeroed(size * size_of::<T>())
+    Buffer::try_alloc(size * size_of::<T>())
 }
 
 /// The operand's elements, gathered into a row-contiguous buffer.

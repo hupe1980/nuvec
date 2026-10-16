@@ -33,7 +33,7 @@ pub use info::DeviceInfo;
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(target_os = "macos")]
-pub use metal::{Arg, Buffer, CommandBuffer, Device, Pipeline, Submitted};
+pub use metal::{Arg, Buffer, CommandBuffer, Device, MemoryStats, Pipeline, Submitted};
 
 #[cfg(not(target_os = "macos"))]
 mod stub;

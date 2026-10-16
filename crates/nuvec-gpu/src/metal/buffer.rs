@@ -1,23 +1,32 @@
 //! Shared-memory buffers.
 
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+use objc2_metal::MTLBuffer;
 
 use super::Device;
+use super::allocator::{Pool, Raw};
 use crate::{GpuError, Result};
 
 /// GPU memory in unified (shared) storage: the CPU reads and writes it in place.
 ///
-/// Hazard tracking is disabled at the Metal level (as in MLX); nuvec orders accesses itself.
-/// CPU access is refused while submitted GPU work uses the buffer, and GPU writes require
+/// Buffers come from the device's caching allocator and return to it when dropped. Hazard
+/// tracking is disabled at the Metal level (as in MLX); nuvec orders accesses itself. CPU
+/// access is refused while submitted GPU work uses the buffer, and GPU writes require
 /// `&mut Buffer`, so the CPU and the GPU never race on it.
 pub struct Buffer {
-    raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// `None` for zero-length buffers, which own no Metal memory.
+    raw: Option<Raw>,
+    /// `raw.contents()`, fixed for the buffer's lifetime (cached: each lookup is an
+    /// Objective-C message).
+    ptr: NonNull<u8>,
     len: usize,
+    /// Accounted (rounded) size in the pool.
+    size: usize,
+    pool: Arc<Pool>,
     /// Number of submitted-but-unwaited command buffers that use this buffer.
     in_flight: Arc<AtomicUsize>,
 }
@@ -31,18 +40,24 @@ unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
 
 impl Device {
-    /// A zero-initialised buffer of `len` bytes.
+    /// A buffer of `len` bytes from the caching allocator. Its contents are unspecified
+    /// (a reused buffer holds stale bytes); fails with [`GpuError::OutOfMemory`] beyond the
+    /// memory limit.
     pub fn new_buffer(&self, len: usize) -> Result<Buffer> {
-        let options =
-            MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
-        // Metal rejects zero-length buffers; allocate one byte and expose zero.
-        let raw = self
-            .raw()
-            .newBufferWithLength_options(len.max(1), options)
-            .ok_or(GpuError::OutOfMemory(len))?;
+        let pool = self.pool().clone();
+        let (raw, size) = match pool.alloc(self.raw(), len)? {
+            Some((raw, size)) => (Some(raw), size),
+            None => (None, 0),
+        };
+        let ptr = raw
+            .as_ref()
+            .map_or(NonNull::dangling(), |r| r.contents().cast());
         Ok(Buffer {
             raw,
+            ptr,
             len,
+            size,
+            pool,
             in_flight: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -76,13 +91,14 @@ impl Buffer {
         if self.in_use() {
             return Err(GpuError::BufferInUse);
         }
-        // SAFETY: `contents()` points to at least `len` bytes of CPU-visible shared storage
-        // that lives as long as `self.raw`, which this borrow keeps alive. No GPU work uses
-        // the buffer (checked above), and new GPU writes need `&mut self`, which this shared
-        // borrow excludes.
-        Ok(unsafe {
-            std::slice::from_raw_parts(self.raw.contents().as_ptr().cast::<u8>(), self.len)
-        })
+        if self.raw.is_none() {
+            return Ok(&[]);
+        }
+        // SAFETY: `ptr` is `raw.contents()`, at least `len` bytes (the allocation is at least the
+        // rounded size) of CPU-visible shared storage that lives as long as `raw`, which this
+        // borrow keeps alive. No GPU work uses the buffer (checked above), and new GPU writes
+        // need `&mut self`, which this shared borrow excludes.
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) })
     }
 
     /// The bytes, mutably, if no submitted GPU work uses the buffer.
@@ -90,18 +106,19 @@ impl Buffer {
         if self.in_use() {
             return Err(GpuError::BufferInUse);
         }
+        if self.raw.is_none() {
+            return Ok(&mut []);
+        }
         // SAFETY: as in `contents`; additionally `&mut self` is exclusive, and `Buffer` is not
         // `Clone`, so no other CPU reference to these bytes exists.
-        Ok(unsafe {
-            std::slice::from_raw_parts_mut(self.raw.contents().as_ptr().cast::<u8>(), self.len)
-        })
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) })
     }
 
-    pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        &self.raw
+    pub(crate) fn raw(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
+        self.raw.as_deref()
     }
 
-    pub(crate) fn retained(&self) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+    pub(crate) fn retained(&self) -> Option<Raw> {
         self.raw.clone()
     }
 
@@ -109,9 +126,20 @@ impl Buffer {
         self.in_flight.clone()
     }
 
-    /// Identity for hazard tracking.
+    /// Identity for hazard tracking (unique per live buffer, including empty ones).
     pub(crate) fn id(&self) -> usize {
-        Retained::as_ptr(&self.raw).cast::<()>() as usize
+        Arc::as_ptr(&self.in_flight) as usize
+    }
+}
+
+impl Drop for Buffer {
+    /// Returns the memory to the allocator's cache, unless GPU work still uses it (then it
+    /// is released when the GPU finishes, never reused early).
+    fn drop(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            let reusable = !self.in_use();
+            self.pool.free(raw, self.size, reusable);
+        }
     }
 }
 

@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 nuvec-cpu.workspace = true
+nuvec-gpu.workspace = true
 bytemuck.workspace = true
 half.workspace = true
 smallvec.workspace = true

@@ -78,6 +78,7 @@ layering:
     set -euo pipefail
     allowed='
     nuvec-core -> nuvec-cpu
+    nuvec-core -> nuvec-gpu
     nuvec-compile -> nuvec-core
     nuvec-io -> nuvec-core
     nuvec-distributed -> nuvec-core

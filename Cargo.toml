@@ -27,7 +27,7 @@ bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2", "block2"] }
 gemm = { version = "0.19", default-features = false, features = ["std", "f16", "rayon"] }
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError", "NSProcessInfo"] }
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
     "dispatch2",
