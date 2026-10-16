@@ -1,4 +1,4 @@
-# bessemer — development task runner (https://just.systems). `just ci` mirrors CI.
+# nuvect — development task runner (https://just.systems). `just ci` mirrors CI.
 
 default:
     @just --list --unsorted
@@ -29,17 +29,27 @@ test-stable:
 
 # Undefined-behaviour check of the core graph logic (`rustup +nightly component add miri`).
 miri:
-    cargo +nightly miri test -p bessemer-core
+    cargo +nightly miri test -p nuvect-core
 
 # ── Metal kernels ─────────────────────────────────────────────────────────────
 
 # Build the kernel library (precompiled when the Metal toolchain is installed).
 metallib:
-    cargo build -p bessemer-kernels
+    cargo build -p nuvect-kernels
 
 # Fail unless the kernel library is precompiled and contains the expected kernels.
 metallib-check:
-    BESSEMER_REQUIRE_METALLIB=1 cargo test -p bessemer-kernels
+    NUVECT_REQUIRE_METALLIB=1 cargo test -p nuvect-kernels
+
+# ── MLX reference (needs uv; never part of `ci`) ──────────────────────────────
+
+# Re-record the MLX fixtures replayed by `tests/mlx.rs` (pinned MLX, CPU device).
+fixtures:
+    uv run scripts/mlx_fixtures.py
+
+# Same-machine benchmark table: nuvect vs MLX (CPU device).
+bench-mlx:
+    uv run scripts/bench_vs_mlx.py
 
 # ── Constitution gates ────────────────────────────────────────────────────────
 
@@ -63,24 +73,24 @@ layering:
     #!/usr/bin/env bash
     set -euo pipefail
     allowed='
-    bessemer-core -> bessemer-cpu
-    bessemer-compile -> bessemer-core
-    bessemer-io -> bessemer-core
-    bessemer-distributed -> bessemer-core
-    bessemer-gpu -> bessemer-kernels
-    bessemer -> bessemer-core
-    bessemer -> bessemer-compile
-    bessemer -> bessemer-cpu
-    bessemer -> bessemer-gpu
-    bessemer -> bessemer-io
-    bessemer -> bessemer-distributed
-    bessemer-nn -> bessemer
-    bessemer-lm -> bessemer
-    bessemer-lm -> bessemer-nn
+    nuvect-core -> nuvect-cpu
+    nuvect-compile -> nuvect-core
+    nuvect-io -> nuvect-core
+    nuvect-distributed -> nuvect-core
+    nuvect-gpu -> nuvect-kernels
+    nuvect -> nuvect-core
+    nuvect -> nuvect-compile
+    nuvect -> nuvect-cpu
+    nuvect -> nuvect-gpu
+    nuvect -> nuvect-io
+    nuvect -> nuvect-distributed
+    nuvect-nn -> nuvect
+    nuvect-lm -> nuvect
+    nuvect-lm -> nuvect-nn
     '
     edges=$(cargo metadata --format-version 1 --no-deps | jq -r '
         .packages[] | .name as $from | .dependencies[]
-        | select(.name | startswith("bessemer")) | select(.kind == null)
+        | select(.name | startswith("nuvect")) | select(.kind == null)
         | "\($from) -> \(.name)"')
     bad=0
     while IFS= read -r edge; do

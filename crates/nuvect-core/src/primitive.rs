@@ -1,0 +1,461 @@
+//! What a graph node computes.
+//!
+//! Primitives form a closed enum (D-015): equality and hashing — the basis for
+//! common-subexpression elimination — are derived, and every per-primitive rule (output
+//! inference here; gradient, batching and fusion rules later) is an exhaustive `match`.
+//!
+//! Primitives require operands of equal shape and dtype. Promotion and broadcasting happen
+//! in the ops layer, which inserts `AsType` and `Broadcast` nodes (D-019).
+
+use smallvec::{SmallVec, smallvec};
+
+use crate::shape::{Shape, Strides};
+use crate::view::{self, DimSlice};
+use crate::{Array, DType, Error, Result};
+
+/// An element-wise function of one operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum UnaryOp {
+    /// `-x`.
+    Negative,
+    /// `|x|`; the magnitude for complex numbers.
+    Abs,
+    /// `e^x`.
+    Exp,
+    /// Natural logarithm.
+    Log,
+    /// Square root.
+    Sqrt,
+    /// Sine.
+    Sin,
+    /// Cosine.
+    Cos,
+    /// Hyperbolic tangent.
+    Tanh,
+    /// `1 / (1 + e^-x)`.
+    Sigmoid,
+}
+
+impl UnaryOp {
+    /// Whether the function computes in floating point (integer inputs are promoted).
+    pub(crate) fn is_transcendental(self) -> bool {
+        !matches!(self, Self::Negative | Self::Abs)
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Negative => "negative",
+            Self::Abs => "abs",
+            Self::Exp => "exp",
+            Self::Log => "log",
+            Self::Sqrt => "sqrt",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Tanh => "tanh",
+            Self::Sigmoid => "sigmoid",
+        }
+    }
+}
+
+/// An element-wise function of two operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BinaryOp {
+    /// `a + b`.
+    Add,
+    /// `a - b`.
+    Subtract,
+    /// `a * b`.
+    Multiply,
+    /// `a / b` (true division).
+    Divide,
+    /// The larger operand; NaN propagates.
+    Maximum,
+    /// The smaller operand; NaN propagates.
+    Minimum,
+    /// `a == b`.
+    Equal,
+    /// `a != b`.
+    NotEqual,
+    /// `a < b`.
+    Less,
+    /// `a <= b`.
+    LessEqual,
+    /// `a > b`.
+    Greater,
+    /// `a >= b`.
+    GreaterEqual,
+}
+
+impl BinaryOp {
+    /// Whether the result is boolean.
+    pub(crate) fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            Self::Equal
+                | Self::NotEqual
+                | Self::Less
+                | Self::LessEqual
+                | Self::Greater
+                | Self::GreaterEqual
+        )
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Subtract => "subtract",
+            Self::Multiply => "multiply",
+            Self::Divide => "divide",
+            Self::Maximum => "maximum",
+            Self::Minimum => "minimum",
+            Self::Equal => "equal",
+            Self::NotEqual => "not_equal",
+            Self::Less => "less",
+            Self::LessEqual => "less_equal",
+            Self::Greater => "greater",
+            Self::GreaterEqual => "greater_equal",
+        }
+    }
+}
+
+/// A reduction over a set of axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ReduceOp {
+    /// Sum (identity 0).
+    Sum,
+    /// Product (identity 1).
+    Prod,
+    /// Maximum; NaN propagates. No identity.
+    Max,
+    /// Minimum; NaN propagates. No identity.
+    Min,
+    /// Logical AND of bools (identity true).
+    And,
+    /// Logical OR of bools (identity false).
+    Or,
+}
+
+impl ReduceOp {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Prod => "prod",
+            Self::Max => "max",
+            Self::Min => "min",
+            Self::And => "all",
+            Self::Or => "any",
+        }
+    }
+}
+
+/// The position of an extreme value along one axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ArgReduceOp {
+    /// Index of the maximum (first occurrence; first NaN wins).
+    Max,
+    /// Index of the minimum (first occurrence; first NaN wins).
+    Min,
+}
+
+impl ArgReduceOp {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Max => "argmax",
+            Self::Min => "argmin",
+        }
+    }
+}
+
+/// An operation recorded in the graph, with its parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Primitive {
+    /// Element-wise function of one operand.
+    Unary(UnaryOp),
+    /// Element-wise function of two operands of equal shape and dtype.
+    Binary(BinaryOp),
+    /// `where(condition, a, b)`: a boolean condition selects from `a` or `b`.
+    Select,
+    /// Conversion to another element type.
+    AsType(DType),
+    /// The same elements in another shape. A view when the layout permits, else a copy.
+    Reshape(Vec<usize>),
+    /// Axes reordered: output axis `i` is input axis `axes[i]`. A view.
+    Transpose(Vec<usize>),
+    /// A normalised slice per dimension. A view.
+    Slice {
+        /// First index per dimension.
+        start: Vec<usize>,
+        /// Step per dimension (non-zero, may be negative).
+        step: Vec<isize>,
+        /// Number of selected indices per dimension (the output shape).
+        len: Vec<usize>,
+    },
+    /// Presented as a larger shape with zero strides. A view.
+    Broadcast(Vec<usize>),
+    /// Reduction over sorted, unique `axes`; reduced dimensions become size 1.
+    Reduce {
+        /// The reduction.
+        op: ReduceOp,
+        /// Reduced axes, sorted and unique.
+        axes: Vec<usize>,
+    },
+    /// Index of an extreme value along `axis` (uint32); the axis becomes size 1.
+    ArgReduce {
+        /// Maximum or minimum.
+        op: ArgReduceOp,
+        /// The reduced axis.
+        axis: usize,
+    },
+    /// Batched matrix product of `[B..., M, K]` and `[B..., K, N]` with equal batch
+    /// dimensions.
+    Matmul,
+    /// Test-only two-output primitive: `(a + b, a * b)`.
+    #[cfg(test)]
+    AddMultiply,
+}
+
+/// The dtype, shape and (for views) strides of one output of a primitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputSpec {
+    pub(crate) dtype: DType,
+    pub(crate) shape: Shape,
+    /// `None` means row-contiguous.
+    pub(crate) strides: Option<Strides>,
+}
+
+impl Primitive {
+    /// The operation's name, as used in error messages.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Unary(op) => op.name(),
+            Self::Binary(op) => op.name(),
+            Self::Select => "where",
+            Self::AsType(_) => "astype",
+            Self::Reshape(_) => "reshape",
+            Self::Transpose(_) => "transpose",
+            Self::Slice { .. } => "slice",
+            Self::Broadcast(_) => "broadcast_to",
+            Self::Reduce { op, .. } => op.name(),
+            Self::ArgReduce { op, .. } => op.name(),
+            Self::Matmul => "matmul",
+            #[cfg(test)]
+            Self::AddMultiply => "add_multiply",
+        }
+    }
+
+    /// Validates the inputs and infers the outputs, without computing anything.
+    pub(crate) fn output_specs(&self, inputs: &[Array]) -> Result<SmallVec<[OutputSpec; 1]>> {
+        let computed = |dtype: DType, shape: &[usize]| OutputSpec {
+            dtype,
+            shape: shape.into(),
+            strides: None,
+        };
+        let spec = match self {
+            Self::Unary(op) => {
+                let [a] = self.arity::<1>(inputs)?;
+                let dtype = match (op, a.dtype()) {
+                    (UnaryOp::Abs, DType::Complex64) => DType::F32,
+                    (_, d) => d,
+                };
+                computed(dtype, a.shape())
+            }
+            Self::Binary(op) => {
+                let [a, b] = self.arity::<2>(inputs)?;
+                self.same_shape_and_dtype(a, b)?;
+                computed(
+                    if op.is_comparison() {
+                        DType::Bool
+                    } else {
+                        a.dtype()
+                    },
+                    a.shape(),
+                )
+            }
+            Self::Select => {
+                let [c, a, b] = self.arity::<3>(inputs)?;
+                self.same_shape_and_dtype(a, b)?;
+                if c.dtype() != DType::Bool || c.shape() != a.shape() {
+                    return Err(Error::InvalidArgument(
+                        "where: condition must be a bool array of the same shape".into(),
+                    ));
+                }
+                computed(a.dtype(), a.shape())
+            }
+            Self::AsType(dtype) => {
+                let [a] = self.arity::<1>(inputs)?;
+                computed(*dtype, a.shape())
+            }
+            Self::Reshape(shape) => {
+                let [a] = self.arity::<1>(inputs)?;
+                OutputSpec {
+                    dtype: a.dtype(),
+                    shape: shape.as_slice().into(),
+                    strides: view::nocopy_reshape(a.shape(), a.strides(), shape),
+                }
+            }
+            Self::Transpose(axes) => {
+                let [a] = self.arity::<1>(inputs)?;
+                let (shape, strides) = view::permute(a.shape(), a.strides(), axes)?;
+                OutputSpec {
+                    dtype: a.dtype(),
+                    shape,
+                    strides: Some(strides),
+                }
+            }
+            Self::Slice { len, .. } => {
+                let [a] = self.arity::<1>(inputs)?;
+                let (strides, _) = view::slice_geometry(a.strides(), &self.dim_slices(a.ndim())?);
+                OutputSpec {
+                    dtype: a.dtype(),
+                    shape: len.as_slice().into(),
+                    strides: Some(strides),
+                }
+            }
+            Self::Broadcast(shape) => {
+                let [a] = self.arity::<1>(inputs)?;
+                let strides = view::broadcast_strides(a.shape(), a.strides(), shape)?;
+                OutputSpec {
+                    dtype: a.dtype(),
+                    shape: shape.as_slice().into(),
+                    strides: Some(strides),
+                }
+            }
+            Self::Reduce { axes, .. } => {
+                let [a] = self.arity::<1>(inputs)?;
+                computed(a.dtype(), &self.reduced_shape(a.shape(), axes)?)
+            }
+            Self::ArgReduce { axis, .. } => {
+                let [a] = self.arity::<1>(inputs)?;
+                computed(DType::U32, &self.reduced_shape(a.shape(), &[*axis])?)
+            }
+            Self::Matmul => {
+                let [a, b] = self.arity::<2>(inputs)?;
+                let (sa, sb) = (a.shape(), b.shape());
+                let n = sa.len();
+                let valid =
+                    n >= 2 && sb.len() == n && sa[..n - 2] == sb[..n - 2] && sa[n - 1] == sb[n - 2];
+                if !valid {
+                    return Err(Error::ShapeMismatch {
+                        op: "matmul",
+                        lhs: sa.to_vec(),
+                        rhs: sb.to_vec(),
+                    });
+                }
+                if a.dtype() != b.dtype() {
+                    return Err(Error::DTypeMismatch {
+                        op: "matmul",
+                        lhs: a.dtype(),
+                        rhs: b.dtype(),
+                    });
+                }
+                let mut shape: Shape = sa.into();
+                shape[n - 1] = sb[n - 1];
+                computed(a.dtype(), &shape)
+            }
+            #[cfg(test)]
+            Self::AddMultiply => {
+                let [a, b] = self.arity::<2>(inputs)?;
+                self.same_shape_and_dtype(a, b)?;
+                let spec = computed(a.dtype(), a.shape());
+                return Ok(smallvec![spec.clone(), spec]);
+            }
+        };
+        Ok(smallvec![spec])
+    }
+
+    /// The per-dimension slices of a `Slice` primitive over `ndim` dimensions.
+    pub(crate) fn dim_slices(&self, ndim: usize) -> Result<Vec<DimSlice>> {
+        match self {
+            Self::Slice { start, step, len }
+                if start.len() == ndim && step.len() == ndim && len.len() == ndim =>
+            {
+                Ok((0..ndim)
+                    .map(|i| DimSlice {
+                        start: start[i],
+                        step: step[i],
+                        len: len[i],
+                    })
+                    .collect())
+            }
+            _ => Err(Error::InvalidArgument(
+                "slice: one start, step and length per dimension".into(),
+            )),
+        }
+    }
+
+    /// `shape` with `axes` set to 1, after validating the axes.
+    fn reduced_shape(&self, shape: &[usize], axes: &[usize]) -> Result<Shape> {
+        let mut out: Shape = shape.into();
+        for &axis in axes {
+            *out.get_mut(axis).ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "{}: axis {axis} out of range for shape {shape:?}",
+                    self.name()
+                ))
+            })? = 1;
+        }
+        Ok(out)
+    }
+
+    fn arity<'a, const N: usize>(&self, inputs: &'a [Array]) -> Result<&'a [Array; N]> {
+        inputs.try_into().map_err(|_| {
+            Error::InvalidArgument(format!(
+                "{} takes {N} inputs, got {}",
+                self.name(),
+                inputs.len()
+            ))
+        })
+    }
+
+    fn same_shape_and_dtype(&self, a: &Array, b: &Array) -> Result<()> {
+        if a.shape() != b.shape() {
+            return Err(Error::ShapeMismatch {
+                op: self.name(),
+                lhs: a.shape().to_vec(),
+                rhs: b.shape().to_vec(),
+            });
+        }
+        if a.dtype() != b.dtype() {
+            return Err(Error::DTypeMismatch {
+                op: self.name(),
+                lhs: a.dtype(),
+                rhs: b.dtype(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    use super::*;
+
+    fn hash(p: &Primitive) -> u64 {
+        let mut h = DefaultHasher::new();
+        p.hash(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn equal_primitives_compare_and_hash_equal() {
+        let add = Primitive::Binary(BinaryOp::Add);
+        assert_eq!(add, Primitive::Binary(BinaryOp::Add));
+        assert_eq!(hash(&add), hash(&Primitive::Binary(BinaryOp::Add)));
+        assert_ne!(add, Primitive::Binary(BinaryOp::Multiply));
+        let s = |start: Vec<usize>| Primitive::Slice {
+            start,
+            step: vec![1],
+            len: vec![2],
+        };
+        assert_eq!(s(vec![1]), s(vec![1]));
+        assert_ne!(s(vec![1]), s(vec![2]));
+    }
+}

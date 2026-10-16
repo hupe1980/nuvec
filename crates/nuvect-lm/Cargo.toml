@@ -1,0 +1,17 @@
+[package]
+name = "nuvect-lm"
+description = "LLM runtime for nuvect: model loading, KV caches and sampling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+nuvect.workspace = true
+nuvect-nn.workspace = true
+
+[lints]
+workspace = true

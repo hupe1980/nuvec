@@ -12,18 +12,19 @@ authors = ["hupe1980"]
 publish = false
 
 [workspace.dependencies]
-bessemer = { path = "crates/bessemer" }
-bessemer-core = { path = "crates/bessemer-core" }
-bessemer-compile = { path = "crates/bessemer-compile" }
-bessemer-cpu = { path = "crates/bessemer-cpu" }
-bessemer-distributed = { path = "crates/bessemer-distributed" }
-bessemer-gpu = { path = "crates/bessemer-gpu" }
-bessemer-io = { path = "crates/bessemer-io" }
-bessemer-kernels = { path = "crates/bessemer-kernels" }
-bessemer-lm = { path = "crates/bessemer-lm" }
-bessemer-nn = { path = "crates/bessemer-nn" }
+nuvect = { path = "crates/nuvect" }
+nuvect-core = { path = "crates/nuvect-core" }
+nuvect-compile = { path = "crates/nuvect-compile" }
+nuvect-cpu = { path = "crates/nuvect-cpu" }
+nuvect-distributed = { path = "crates/nuvect-distributed" }
+nuvect-gpu = { path = "crates/nuvect-gpu" }
+nuvect-io = { path = "crates/nuvect-io" }
+nuvect-kernels = { path = "crates/nuvect-kernels" }
+nuvect-lm = { path = "crates/nuvect-lm" }
+nuvect-nn = { path = "crates/nuvect-nn" }
 
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+gemm = { version = "0.19", default-features = false, features = ["std", "f16", "rayon"] }
 half = { version = "2.7", features = ["bytemuck"] }
 smallvec = { version = "1", features = ["union", "const_generics"] }
 

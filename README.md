@@ -1,12 +1,13 @@
-# bessemer
+# nuvect
 
 A pure-Rust array framework for Apple Silicon in the spirit of
 [MLX](https://github.com/ml-explore/mlx): lazy arrays on unified memory, composable function
 transforms (`grad`, `vjp`, `jvp`, `vmap`, `compile`) and Metal kernels. It is written in
 Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 
-> **Status: pre-alpha.** Lazy arrays with 14 dtypes and element-wise `add`/`multiply`
-> evaluate on the CPU. Broadcasting, more operations, Metal and transforms are next.
+> **Status: pre-alpha.** Lazy arrays with 14 dtypes, MLX type promotion, broadcasting,
+> zero-copy views, element-wise operations, reductions and matmul evaluate on the CPU.
+> The Metal backend and function transforms are next.
 
 ## Platforms
 
@@ -25,7 +26,7 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 | jq | `brew install jq` |
 
 Without the Metal toolchain the build still succeeds. It prints one warning and embeds the
-shader sources for runtime compilation. Set `BESSEMER_METALLIB=off` to choose this mode
+shader sources for runtime compilation. Set `NUVECT_METALLIB=off` to choose this mode
 explicitly.
 
 ## Quick start
@@ -39,20 +40,28 @@ just ci
 docs, Miri, cargo-deny, the Metal kernel library check, and the crate-layering and
 repository-hygiene checks.
 
+## Testing against MLX
+
+The test suite replays outputs recorded from real MLX (`crates/nuvect-core/tests/fixtures/mlx.bin`).
+Python is not needed to build or test. With [uv](https://docs.astral.sh/uv/) installed:
+
+- `just fixtures`: re-records the fixtures with the pinned MLX version on its CPU device
+- `just bench-mlx`: prints a same-machine benchmark table, nuvect vs MLX
+
 ## Crates
 
 | Crate | Responsibility |
 |---|---|
-| `bessemer` | Public facade: re-exports the layers below |
-| `bessemer-core` | Lazy array graph, primitives, dtypes, streams and evaluation |
-| `bessemer-compile` | Tracing, graph simplification, fusion and buffer planning |
-| `bessemer-gpu` | Metal backend: device, command encoding, memory, dispatch |
-| `bessemer-kernels` | Metal kernel sources and the precompiled `bessemer.metallib` |
-| `bessemer-cpu` | Pure-Rust CPU backend |
-| `bessemer-io` | Zero-copy safetensors, GGUF and npy loading |
-| `bessemer-distributed` | Collectives over TCP rings and Thunderbolt RDMA |
-| `bessemer-nn` | Neural-network modules, layers and optimizers |
-| `bessemer-lm` | LLM runtime: model loading, KV caches, sampling |
+| `nuvect` | Public facade: re-exports the layers below |
+| `nuvect-core` | Lazy array graph, primitives, dtypes, streams and evaluation |
+| `nuvect-compile` | Tracing, graph simplification, fusion and buffer planning |
+| `nuvect-gpu` | Metal backend: device, command encoding, memory, dispatch |
+| `nuvect-kernels` | Metal kernel sources and the precompiled `nuvect.metallib` |
+| `nuvect-cpu` | Pure-Rust CPU backend |
+| `nuvect-io` | Zero-copy safetensors, GGUF and npy loading |
+| `nuvect-distributed` | Collectives over TCP rings and Thunderbolt RDMA |
+| `nuvect-nn` | Neural-network modules, layers and optimizers |
+| `nuvect-lm` | LLM runtime: model loading, KV caches, sampling |
 
 ## License
 

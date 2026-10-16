@@ -6,11 +6,15 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # `paste` (a proc-macro used inside `gemm`) is archived, not vulnerable. Revisit when
+    # `gemm` drops it.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro inside gemm; no vulnerability" },
+]
 
 [licenses]
 version = 2
-# Compatible with distributing bessemer under MIT OR Apache-2.0.
+# Compatible with distributing nuvect under MIT OR Apache-2.0.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -49,13 +53,28 @@ include-workspace = true
 executables = "deny"
 allow-build-scripts = [
     # Compiles the crate's own .metal sources with Apple's system toolchain (xcrun).
-    { crate = "bessemer-kernels" },
+    { crate = "nuvect-kernels" },
     # Compiler version/cfg probes only, no native code (via `half`'s dependency tree).
     { crate = "proc-macro2" },
     { crate = "quote" },
     { crate = "zerocopy" },
     # Generates its unrolling macros as Rust source, no native code (via `half`, some targets).
     { crate = "crunchy" },
+    # Via `gemm` (pure-Rust SIMD GEMM): compiler version/cfg probes and generated Rust
+    # source only, no native code.
+    { crate = "num-traits" },
+    { crate = "libm" },
+    { crate = "paste" },
+    { crate = "pulp" },
+    # Via `gemm-common` -> `sysctl` (CPU feature detection on macOS). `libc` is FFI to the
+    # OS's own C library (system API, as allowed by D-001); both scripts are compiler probes.
+    { crate = "libc" },
+    { crate = "thiserror" },
+    # Via `gemm`'s `rayon` feature (multithreaded GEMM): compiler version/cfg probes only.
+    { crate = "rayon-core" },
+    { crate = "crossbeam-deque" },
+    { crate = "crossbeam-epoch" },
+    { crate = "crossbeam-utils" },
 ]
 
 [sources]
