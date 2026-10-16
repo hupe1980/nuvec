@@ -7,7 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 nuvec-core.workspace = true
@@ -16,6 +19,10 @@ nuvec-cpu.workspace = true
 nuvec-gpu.workspace = true
 nuvec-io.workspace = true
 nuvec-distributed.workspace = true
+
+# Document the Metal API, which only exists on Apple targets.
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
 
 [lints]
 workspace = true

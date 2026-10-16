@@ -32,7 +32,7 @@ explicitly.
 ## Quick start
 
 ```sh
-git clone https://github.com/hupe1980/rusty-metal && cd rusty-metal
+git clone https://github.com/hupe1980/nuvec && cd nuvec
 just ci
 ```
 
