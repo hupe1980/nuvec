@@ -1,0 +1,58 @@
+# cargo-deny policy (https://embarkstudios.github.io/cargo-deny/). Run with `just deny`.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Compatible with distributing bessemer under MIT OR Apache-2.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+# The allow-list is policy, not inventory: entries may be unused today.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+# Constitution I (pure Rust, no bindings): crates that compile or link
+# third-party C/C++ code are not allowed anywhere in the graph.
+deny = [
+    { crate = "cc", reason = "compiles C/C++ (constitution I)" },
+    { crate = "cmake", reason = "drives a C/C++ build (constitution I)" },
+    { crate = "bindgen", reason = "generates bindings to C/C++ headers (constitution I)" },
+    { crate = "pkg-config", reason = "links native system libraries (constitution I)" },
+    { crate = "vcpkg", reason = "links native libraries (constitution I)" },
+    { crate = "openssl-sys", reason = "links OpenSSL (constitution I)" },
+    { crate = "libz-sys", reason = "builds or links zlib (constitution I)" },
+]
+
+# Every crate with a build script must be reviewed and listed here, with a
+# justification. This catches native builds that the deny list misses.
+[bans.build]
+include-workspace = true
+executables = "deny"
+allow-build-scripts = [
+    # Compiles the crate's own .metal sources with Apple's system toolchain (xcrun).
+    { crate = "bessemer-kernels" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

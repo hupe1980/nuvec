@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hupe1980/rusty-metal"
+authors = ["hupe1980"]
+publish = false
+
+[workspace.dependencies]
+bessemer = { path = "crates/bessemer" }
+bessemer-core = { path = "crates/bessemer-core" }
+bessemer-compile = { path = "crates/bessemer-compile" }
+bessemer-cpu = { path = "crates/bessemer-cpu" }
+bessemer-distributed = { path = "crates/bessemer-distributed" }
+bessemer-gpu = { path = "crates/bessemer-gpu" }
+bessemer-io = { path = "crates/bessemer-io" }
+bessemer-kernels = { path = "crates/bessemer-kernels" }
+bessemer-lm = { path = "crates/bessemer-lm" }
+bessemer-nn = { path = "crates/bessemer-nn" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+# Constitution I: every `unsafe` block carries a `// SAFETY:` justification.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"

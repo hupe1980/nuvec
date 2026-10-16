@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+
+# Each gate runs the same command as its `just` recipe, so a green `just ci` predicts
+# a green run here. Gates run on Apple Silicon (`macos-latest` is arm64); `portable`
+# proves the non-GPU crates still build off macOS.
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install # from rust-toolchain.toml
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy + docs
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install # from rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc --workspace --no-deps --all-features
+
+  # rust-toolchain.toml pins the MSRV; RUSTUP_TOOLCHAIN overrides it for the stable leg.
+  test:
+    name: Test (${{ matrix.rust }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.99.0", stable]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust }}
+      - run: cargo test --workspace --all-targets --all-features
+
+  miri:
+    name: Miri (bessemer-core)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just miri
+
+  deny:
+    name: cargo-deny
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install # from rust-toolchain.toml
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,just
+      - run: just deny
+
+  # The Metal toolchain ships separately from Xcode; install it if the image lacks it.
+  # BESSEMER_REQUIRE_METALLIB turns the runtime-source fallback into a hard error.
+  metallib:
+    name: Metal kernel library
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install # from rust-toolchain.toml
+      - name: Metal toolchain
+        run: |
+          xcodebuild -version
+          xcrun -sdk macosx -f metal || xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@v2
+      - run: just metallib-check
+
+  hygiene:
+    name: Layering + internal paths
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install # from rust-toolchain.toml
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just layering internal-paths
+
+  portable:
+    name: Portable crates (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install # from rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p bessemer-core -p bessemer-cpu -p bessemer-kernels -p bessemer-gpu

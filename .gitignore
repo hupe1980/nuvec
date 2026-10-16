@@ -22,3 +22,28 @@ rustc-ice-*.txt
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# macOS
+.DS_Store
+
+# Compiled Metal artifacts
+*.air
+*.metallib
+
+# Internal architecture notes (see concepts/README.md).
+#
+# Anchored to the repository root. These are working documents: research
+# reports on MLX, Candle, Burn and the arXiv literature, the target
+# architecture, the roadmap and the decision log. They are not a claim this
+# crate makes to its users, and nothing in the build reads them.
+/concepts/
+
+# Local Spec Kit planning, matching billing and sepa: one `specs/NNN-slug/` per
+# roadmap item, `.specify/` (constitution, templates, scripts) and the
+# `/speckit-*` skills. Agent guidance in CLAUDE.md points into these, so it
+# stays local too.
+/specs/
+/.specify/
+/.claude/
+/.github/skills/speckit-*/
+/CLAUDE.md

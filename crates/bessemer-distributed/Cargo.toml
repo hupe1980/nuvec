@@ -1,0 +1,16 @@
+[package]
+name = "bessemer-distributed"
+description = "Collectives over TCP rings and Thunderbolt RDMA for bessemer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bessemer-core.workspace = true
+
+[lints]
+workspace = true
