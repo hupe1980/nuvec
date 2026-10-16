@@ -90,6 +90,15 @@ def parse_slice(spec: str) -> tuple[slice, ...]:
     return tuple(out)
 
 
+def scalar(spec: str) -> bool | int | float | complex:
+    """A Python scalar written as `<kind>:<value>` (complex values as `re,im`)."""
+    kind, value = spec.split(":", 1)
+    if kind == "complex":
+        re, im = value.split(",")
+        return complex(float(re), float(im))
+    return {"bool": lambda v: v == "True", "int": int, "float": float}[kind](value)
+
+
 def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
     if xs:
         xs = [pre_view(xs[0], p.get("pre"))] + xs[1:]
@@ -107,6 +116,9 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         "sum": mx.sum, "prod": mx.prod, "max": mx.max, "min": mx.min, "mean": mx.mean,
         "all": mx.all, "any": mx.any,
     }
+    if op in binary and "scalar" in p:
+        v = scalar(p["scalar"])
+        return binary[op](v, xs[0]) if p.get("side") == "left" else binary[op](xs[0], v)
     if op in binary:
         return binary[op](xs[0], xs[1])
     if op in unary:
@@ -267,6 +279,32 @@ case("matmul-bf16", "matmul", [make("bfloat16", (3, 8)), make("bfloat16", (8, 2)
 case("matmul-c64", "matmul", [make("complex64", (2, 3)), make("complex64", (3, 2))])
 case("matmul-mixed", "matmul", [make("int32", (2, 3)), make("float32", (3, 2))])
 
+# Python scalars are weak: they adapt to the array operand (on either side).
+SCALAR_CASES = [
+    ("multiply", "float16", "float:2.5", "right"),
+    ("add", "bfloat16", "int:1", "right"),
+    ("subtract", "float32", "float:1.0", "left"),
+    ("divide", "int32", "int:1", "left"),
+    ("divide", "float16", "int:3", "right"),
+    ("add", "int8", "int:100", "right"),
+    ("add", "int16", "int:-32768", "right"),
+    ("multiply", "uint8", "int:3", "left"),
+    ("subtract", "uint64", "int:4000000000", "left"),
+    ("subtract", "int64", f"int:{1 << 40}", "right"),
+    ("add", "bool", "int:1", "right"),
+    ("add", "bool", "bool:True", "right"),
+    ("multiply", "int32", "float:0.5", "right"),
+    ("add", "float64", "float:0.1", "right"),
+    ("multiply", "float32", "complex:0.0,1.0", "right"),
+    ("maximum", "float16", "float:0.0", "right"),
+    ("minimum", "float32", "float:1.0", "left"),
+    ("greater", "int32", "int:0", "right"),
+    ("less_equal", "uint16", "int:7", "left"),
+    ("equal", "float32", "float:2.0", "right"),
+    ("not_equal", "bool", "bool:False", "left"),
+]
+for op, dt, sc, side in SCALAR_CASES:
+    case(f"{op}-{dt}-scalar-{side}", op, [make(dt, (2, 3), edge=dt in FLOATS)], scalar=sc, side=side)
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

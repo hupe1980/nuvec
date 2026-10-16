@@ -301,6 +301,21 @@ fn slice_args(spec: &str) -> Vec<SliceArg> {
         .collect()
 }
 
+/// A Python scalar recorded as `<kind>:<value>` (`complex` values are `re,im`).
+fn parse_scalar(spec: &str) -> Option<Scalar> {
+    let (kind, value) = spec.split_once(':')?;
+    Some(match kind {
+        "bool" => Scalar::Bool(value == "True"),
+        "int" => Scalar::Int(value.parse().unwrap()),
+        "float" => Scalar::Float(value.parse().unwrap()),
+        "complex" => {
+            let (re, im) = value.split_once(',').unwrap();
+            Scalar::Complex(Complex64::new(re.parse().unwrap(), im.parse().unwrap()))
+        }
+        other => panic!("unknown scalar kind {other}"),
+    })
+}
+
 /// A reduction operation: `(array, axes, keepdims)`.
 type Reduction = fn(&Array, &[isize], bool) -> Result<Array>;
 
@@ -321,7 +336,11 @@ pub fn run(case: &Case) -> Result<Array> {
     }
     let dtype = || DTYPES[p("dtype").parse::<usize>().unwrap()];
     let keep = p("keepdims") == "1";
-    let binary: Option<fn(&Array, &Array) -> Result<Array>> = match case.op.as_str() {
+    if case.op == "matmul" {
+        return matmul(&xs[0], &xs[1]);
+    }
+    type S = ScalarOrArray;
+    let binary: Option<fn(S, S) -> Result<Array>> = match case.op.as_str() {
         "add" => Some(add),
         "subtract" => Some(subtract),
         "multiply" => Some(multiply),
@@ -334,11 +353,15 @@ pub fn run(case: &Case) -> Result<Array> {
         "less_equal" => Some(less_equal),
         "greater" => Some(greater),
         "greater_equal" => Some(greater_equal),
-        "matmul" => Some(matmul),
         _ => None,
     };
     if let Some(f) = binary {
-        return f(&xs[0], &xs[1]);
+        let array = S::from(&xs[0]);
+        return match (parse_scalar(p("scalar")), p("side")) {
+            (None, _) => f(array, S::from(&xs[1])),
+            (Some(s), "left") => f(s.into(), array),
+            (Some(s), _) => f(array, s.into()),
+        };
     }
     let unary: Option<fn(&Array) -> Result<Array>> = match case.op.as_str() {
         "negative" => Some(negative),

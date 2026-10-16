@@ -10,9 +10,12 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use crate::buffer::Buffer;
 use crate::cast::{Canon, Scalar, with_type};
 use crate::primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, UnaryOp};
+use crate::scalar::{ScalarOperand, ScalarOrArray, resolve};
 use crate::shape::{self, Shape};
 use crate::view::{self, SliceArg};
-use crate::{Array, Category, DType, Error, Result, at_least_float, promote_types};
+use crate::{
+    Array, Category, Complex64, DType, Error, Result, at_least_float, bf16, f16, promote_types,
+};
 
 fn single(primitive: Primitive, inputs: Vec<Array>) -> Result<Array> {
     let mut outputs = Array::from_op(primitive, inputs)?;
@@ -60,12 +63,15 @@ fn binary(op: BinaryOp, a: &Array, b: &Array) -> Result<Array> {
 macro_rules! binary_fn {
     ($($(#[$doc:meta])* $name:ident => $op:ident;)*) => {$(
         $(#[$doc])*
-        pub fn $name(a: &Array, b: &Array) -> Result<Array> {
-            binary(BinaryOp::$op, a, b)
+        pub fn $name(a: impl Into<ScalarOrArray>, b: impl Into<ScalarOrArray>) -> Result<Array> {
+            let (a, b) = resolve(a.into(), b.into())?;
+            binary(BinaryOp::$op, &a, &b)
         }
     )*};
 }
 
+// Every binary function accepts arrays or Rust numbers for either operand; numbers are weak
+// and adapt to the array operand (see [`ScalarOrArray`]).
 binary_fn! {
     /// Element-wise `a + b`, with promotion and broadcasting. Integers wrap; for booleans
     /// this is logical OR.
@@ -152,8 +158,16 @@ unary_fn! {
 /// Element-wise selection: `a` where `condition` is true, otherwise `b`.
 ///
 /// `condition` is converted to bool (non-zero is true); `a` and `b` are promoted to a
-/// common type; all three are broadcast together.
-pub fn where_(condition: &Array, a: &Array, b: &Array) -> Result<Array> {
+/// common type; all three are broadcast together. Numbers are accepted for any operand
+/// (weak, as in [`ScalarOrArray`]).
+pub fn where_(
+    condition: impl Into<ScalarOrArray>,
+    a: impl Into<ScalarOrArray>,
+    b: impl Into<ScalarOrArray>,
+) -> Result<Array> {
+    let (a, b) = resolve(a.into(), b.into())?;
+    let condition = condition.into().into_array(None)?;
+    let (condition, a, b) = (&condition, &a, &b);
     check_inputs(&[condition, a, b])?;
     let dtype = promote_types(a.dtype(), b.dtype());
     let shape = view::broadcast_shapes("where", condition.shape(), a.shape())?;
@@ -554,7 +568,11 @@ pub fn arange(start: f64, stop: f64, step: f64, dtype: DType) -> Result<Array> {
 }
 
 /// An array whose element `i` (row-major) is `value(i)` converted to `dtype`.
-fn filled(shape: &[usize], dtype: DType, value: impl Fn(usize) -> Canon) -> Result<Array> {
+pub(crate) fn filled(
+    shape: &[usize],
+    dtype: DType,
+    value: impl Fn(usize) -> Canon,
+) -> Result<Array> {
     let mut buffer = Buffer::try_alloc(shape::checked_nbytes(shape, dtype.size())?)?;
     with_type!(dtype, T => {
         for (i, x) in buffer.typed_mut::<T>().iter_mut().enumerate() {
@@ -625,6 +643,63 @@ operator!(Add, add, add);
 operator!(Sub, sub, subtract);
 operator!(Mul, mul, multiply);
 operator!(Div, div, divide);
+
+/// Operators with a weak Rust number on the right: `&x * 2.0`.
+macro_rules! scalar_rhs_operator {
+    ($trait:ident, $method:ident, $op:ident) => {
+        impl<S: ScalarOperand> $trait<S> for &Array {
+            type Output = Array;
+            fn $method(self, rhs: S) -> Array {
+                or_failed($op(self, rhs.into()), self)
+            }
+        }
+        impl<S: ScalarOperand> $trait<S> for Array {
+            type Output = Array;
+            fn $method(self, rhs: S) -> Array {
+                or_failed($op(&self, rhs.into()), &self)
+            }
+        }
+    };
+}
+
+scalar_rhs_operator!(Add, add, add);
+scalar_rhs_operator!(Sub, sub, subtract);
+scalar_rhs_operator!(Mul, mul, multiply);
+scalar_rhs_operator!(Div, div, divide);
+
+/// Operators with a weak Rust number on the left: `1.0 - &x`.
+///
+/// These impls cannot be generic (orphan rule), so there is one per literal kind: integer
+/// literals resolve to `i32` and float literals to `f64` only while no other integer or
+/// float impl competes. Other number types go on the right or through the functions
+/// (`subtract(x_f32, &a)`); since numbers are weak, the result is the same.
+macro_rules! scalar_lhs_operator {
+    ($trait:ident, $method:ident, $op:ident; $($t:ty),*) => {$(
+        impl $trait<&Array> for $t {
+            type Output = Array;
+            fn $method(self, rhs: &Array) -> Array {
+                or_failed($op(self, rhs), rhs)
+            }
+        }
+        impl $trait<Array> for $t {
+            type Output = Array;
+            fn $method(self, rhs: Array) -> Array {
+                or_failed($op(self, &rhs), &rhs)
+            }
+        }
+    )*};
+}
+
+macro_rules! scalar_lhs_operators {
+    ($($t:ty),*) => {
+        scalar_lhs_operator!(Add, add, add; $($t),*);
+        scalar_lhs_operator!(Sub, sub, subtract; $($t),*);
+        scalar_lhs_operator!(Mul, mul, multiply; $($t),*);
+        scalar_lhs_operator!(Div, div, divide; $($t),*);
+    };
+}
+
+scalar_lhs_operators!(bool, i32, f64, f16, bf16, Complex64);
 
 impl Neg for &Array {
     type Output = Array;

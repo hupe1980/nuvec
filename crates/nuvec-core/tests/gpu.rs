@@ -162,7 +162,7 @@ fn reductions_and_matmul_match_cpu() {
         same_on_both::<f32>("min f32", || min(&fa, &[axis], false));
         same_on_both::<u32>("argmax", || argmax(&fa, Some(axis), false));
         same_on_both::<bool>("any", || {
-            any(&greater(&fa, &Array::scalar(0.5f32))?, &[axis], false)
+            any(&greater(&fa, Array::scalar(0.5f32))?, &[axis], false)
         });
         // Float sums: the GPU accumulates in f32, the CPU in f64.
         let c = on(Device::cpu(), || sum(&fa, &[axis], false))

@@ -46,7 +46,7 @@ fn broadcast_scalar_and_zero_size() {
     let e = zeros(&[3, 0], DType::U8).unwrap();
     assert_eq!((&e * &s).shape(), &[3, 0]);
     assert_eq!(
-        multiply(&s, &ones(&[2, 2], DType::U8).unwrap())
+        multiply(&s, ones(&[2, 2], DType::U8).unwrap())
             .unwrap()
             .to_vec::<u8>()
             .unwrap(),
@@ -54,8 +54,8 @@ fn broadcast_scalar_and_zero_size() {
     );
     assert!(
         add(
-            &zeros(&[2], DType::U8).unwrap(),
-            &zeros(&[0], DType::U8).unwrap()
+            zeros(&[2], DType::U8).unwrap(),
+            zeros(&[0], DType::U8).unwrap()
         )
         .is_err()
     );
@@ -64,8 +64,8 @@ fn broadcast_scalar_and_zero_size() {
 #[test]
 fn broadcast_mismatch_names_shapes() {
     let err = add(
-        &zeros(&[2, 3], DType::F32).unwrap(),
-        &zeros(&[4], DType::F32).unwrap(),
+        zeros(&[2, 3], DType::F32).unwrap(),
+        zeros(&[4], DType::F32).unwrap(),
     )
     .unwrap_err();
     assert_eq!(
@@ -89,7 +89,7 @@ fn promotion_all_pairs() {
     };
     for &a in &all {
         for &b in &all {
-            let out = add(&ones(&[2], a).unwrap(), &ones(&[2], b).unwrap()).unwrap();
+            let out = add(ones(&[2], a).unwrap(), ones(&[2], b).unwrap()).unwrap();
             assert_eq!(out.dtype(), promote_types(a, b), "{a} + {b}");
             let expected = if out.dtype() == Bool { 1.0 } else { 2.0 };
             assert_eq!(
@@ -104,13 +104,13 @@ fn promotion_all_pairs() {
 #[test]
 fn divide_promotes_integers_to_float() {
     let q = divide(
-        &Array::from_slice(&[7i32, -7], &[2]).unwrap(),
-        &Array::scalar(2i32),
+        Array::from_slice(&[7i32, -7], &[2]).unwrap(),
+        Array::scalar(2i32),
     )
     .unwrap();
     assert_eq!(q.dtype(), DType::F32);
     assert_eq!(q.to_vec::<f32>().unwrap(), vec![3.5, -3.5]);
-    let half = divide(&Array::scalar(1i64), &Array::scalar(bf16::from_f32(4.0))).unwrap();
+    let half = divide(Array::scalar(1i64), Array::scalar(bf16::from_f32(4.0))).unwrap();
     assert_eq!(half.dtype(), DType::BF16);
 }
 
@@ -614,7 +614,7 @@ fn errors_are_typed_and_deferred() {
         Err(Error::ShapeMismatch { op: "divide", .. })
     ));
     assert!(matches!(
-        where_(&Array::scalar(true), &a, &b),
+        where_(Array::scalar(true), &a, &b),
         Err(Error::ShapeMismatch { op: "where", .. })
     ));
     assert!(matches!(reshape(&a, &[-2]), Err(Error::InvalidArgument(_))));

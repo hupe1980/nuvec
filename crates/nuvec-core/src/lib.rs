@@ -53,6 +53,7 @@ mod gpu;
 mod kernels;
 mod ops;
 mod primitive;
+mod scalar;
 mod shape;
 mod view;
 
@@ -68,6 +69,7 @@ pub use ops::{
     squeeze, subtract, sum, tanh, transpose, where_, zeros,
 };
 pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, UnaryOp};
+pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
 pub use shape::Flags;
 pub use view::SliceArg;
 
