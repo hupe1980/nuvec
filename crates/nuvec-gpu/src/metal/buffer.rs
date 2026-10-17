@@ -27,14 +27,15 @@ pub struct Buffer {
     /// Accounted (rounded) size in the pool.
     size: usize,
     pool: Arc<Pool>,
-    /// Number of submitted-but-unwaited command buffers that use this buffer.
-    in_flight: Arc<AtomicUsize>,
+    /// Submitted-but-unfinished GPU uses of this buffer.
+    in_flight: Arc<Guard>,
 }
 
 // SAFETY: Metal buffer objects may be retained, released and bound from any thread. The only
 // non-thread-safe part is the memory behind `contents()`, and access to it is synchronised by
 // Rust borrows (`contents_mut` needs `&mut self`; GPU writes need `&mut Buffer`) plus the
-// `in_flight` guard, which refuses CPU access while GPU work is pending.
+// `in_flight` guard, which refuses CPU reads while GPU writes are pending and CPU writes while
+// any GPU use is pending.
 unsafe impl Send for Buffer {}
 // SAFETY: as above; `&Buffer` only allows shared reads of memory no GPU work is writing.
 unsafe impl Sync for Buffer {}
@@ -58,7 +59,7 @@ impl Device {
             len,
             size,
             pool,
-            in_flight: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::default(),
         })
     }
 
@@ -81,14 +82,14 @@ impl Buffer {
         self.len == 0
     }
 
-    /// Whether submitted GPU work still uses the buffer.
+    /// Whether submitted GPU work still uses (reads or writes) the buffer.
     pub fn in_use(&self) -> bool {
-        self.in_flight.load(Ordering::Acquire) != 0
+        self.in_flight.users.load(Ordering::Acquire) != 0
     }
 
-    /// The bytes, if no submitted GPU work uses the buffer.
+    /// The bytes, if no submitted GPU work writes the buffer (concurrent GPU reads are fine).
     pub fn contents(&self) -> Result<&[u8]> {
-        if self.in_use() {
+        if self.in_flight.writers.load(Ordering::Acquire) != 0 {
             return Err(GpuError::BufferInUse);
         }
         if self.raw.is_none() {
@@ -96,12 +97,13 @@ impl Buffer {
         }
         // SAFETY: `ptr` is `raw.contents()`, at least `len` bytes (the allocation is at least the
         // rounded size) of CPU-visible shared storage that lives as long as `raw`, which this
-        // borrow keeps alive. No GPU work uses the buffer (checked above), and new GPU writes
-        // need `&mut self`, which this shared borrow excludes.
+        // borrow keeps alive. No submitted GPU work writes the buffer (checked above), so any
+        // concurrent GPU access only reads; new GPU writes need `&mut self`, which this shared
+        // borrow excludes.
         Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) })
     }
 
-    /// The bytes, mutably, if no submitted GPU work uses the buffer.
+    /// The bytes, mutably, if no submitted GPU work uses (reads or writes) the buffer.
     pub fn contents_mut(&mut self) -> Result<&mut [u8]> {
         if self.in_use() {
             return Err(GpuError::BufferInUse);
@@ -127,13 +129,36 @@ impl Buffer {
             .or_else(|| self.pool.placeholder().cloned())
     }
 
-    pub(crate) fn guard(&self) -> Arc<AtomicUsize> {
+    pub(crate) fn guard(&self) -> Arc<Guard> {
         self.in_flight.clone()
     }
 
     /// Identity for hazard tracking (unique per live buffer, including empty ones).
     pub(crate) fn id(&self) -> usize {
         Arc::as_ptr(&self.in_flight) as usize
+    }
+}
+
+/// Counts submitted GPU uses of a buffer: all uses, and the writing ones.
+#[derive(Debug, Default)]
+pub(crate) struct Guard {
+    users: AtomicUsize,
+    writers: AtomicUsize,
+}
+
+impl Guard {
+    pub(crate) fn acquire(&self, write: bool) {
+        self.users.fetch_add(1, Ordering::AcqRel);
+        if write {
+            self.writers.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    pub(crate) fn release(&self, write: bool) {
+        if write {
+            self.writers.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.users.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

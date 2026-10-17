@@ -140,12 +140,20 @@ fn compute(
 ) -> Result<(Vec<Data>, bool)> {
     let mut data = Vec::with_capacity(inputs.len());
     let mut pending = false;
+    // Inputs read from another evaluation's in-flight GPU work.
+    let mut foreign = Vec::new();
     for input in inputs {
         if let Some(d) = gpu.lookup(&input.node, input.output) {
             pending = true;
             data.push(d);
         } else if let Some(result) = input.out().slot.get() {
             data.push(result.clone()?);
+        } else if let Some(d) = input.out().inflight.get() {
+            // Committed by another evaluation on the device timeline: GPU work encoded now
+            // runs after it, so it may read the data at once.
+            pending = true;
+            foreign.push(input);
+            data.push(d.clone());
         } else {
             // Produced by another evaluation (another thread, or an earlier `async_eval`):
             // submit our own GPU work first, so two evaluations never wait on each other.
@@ -158,7 +166,18 @@ fn compute(
         .zip(&data)
         .map(|(a, d)| (a.out(), d))
         .collect();
+    // Waits until foreign in-flight inputs are complete (for work that does not run on the
+    // device timeline).
+    let await_foreign = || -> Result<()> {
+        for input in &foreign {
+            input.out().slot.wait().clone()?;
+        }
+        Ok(())
+    };
     if let Some(views) = view_outputs(primitive, &operands)? {
+        // Views do no work: they are published with this evaluation's GPU work (which runs
+        // after any foreign producer) or, without GPU work, once the producers complete.
+        gpu.depend_on(&foreign);
         return Ok((views, pending));
     }
     let device = node.stream.device;
@@ -171,6 +190,7 @@ fn compute(
         }
     }
     // The CPU reads inputs in place: wait for the GPU work that produces them.
+    await_foreign()?;
     if pending {
         gpu.flush()?;
     }
@@ -221,6 +241,13 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
         Primitive::Reduce { op, axes } => new(kernels::reduce(*op, operands[0], axes)?),
         Primitive::ArgReduce { op, axis } => new(kernels::arg_reduce(*op, operands[0], *axis)?),
         Primitive::Matmul => new(kernels::matmul(operands[0], operands[1])?),
+        Primitive::RandomBits { shape, .. } => {
+            let n: usize = shape.iter().product();
+            new(kernels::random_bits(
+                operands[0],
+                n * primitive_width(primitive),
+            )?)
+        }
         Primitive::SliceUpdate { .. } => new(kernels::slice_update(
             operands[0],
             operands[1],
@@ -247,6 +274,13 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
                 )?),
             ])
         }
+    }
+}
+
+fn primitive_width(primitive: &Primitive) -> usize {
+    match primitive {
+        Primitive::RandomBits { width, .. } => usize::from(*width),
+        _ => unreachable!(),
     }
 }
 

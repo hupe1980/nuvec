@@ -136,6 +136,11 @@ impl Primitive {
                 UnaryOp::Tanh => multiply(v, subtract(1, multiply(out, out)?)?)?,
                 UnaryOp::Sigmoid => multiply(v, multiply(out, subtract(1, out)?)?)?,
                 UnaryOp::Conjugate => conjugate(v)?,
+                // d/dx erfinv(x) = √π/2 · exp(erfinv(x)²)
+                UnaryOp::ErfInv => multiply(
+                    multiply(v, std::f64::consts::PI.sqrt() / 2.0)?,
+                    ops::exp(&multiply(out, out)?)?,
+                )?,
             },
             Self::Binary(op) => {
                 let (a, b) = (&inputs[0], &inputs[1]);
@@ -236,7 +241,7 @@ impl Primitive {
                 Ok(vec![base, update])
             }
             Self::Broadcast(_) => one(sum_to(g, x.shape())),
-            Self::StopGradient | Self::ArgReduce { .. } => Ok(vec![None]),
+            Self::StopGradient | Self::ArgReduce { .. } | Self::RandomBits { .. } => Ok(vec![None]),
             Self::Reduce { op, axes } => match op {
                 ReduceOp::Sum => one(broadcast_to(g, x.shape())),
                 ReduceOp::Prod => one(multiply(
@@ -340,7 +345,9 @@ impl Primitive {
             Self::Transpose(axes) => one(transpose(&tangent(0)?, axes)),
             Self::Slice { .. } | Self::Broadcast(_) => one(record(self.clone(), vec![tangent(0)?])),
             Self::SliceUpdate { .. } => one(record(self.clone(), vec![tangent(0)?, tangent(1)?])),
-            Self::StopGradient | Self::ArgReduce { .. } => one(zeros_like(out)),
+            Self::StopGradient | Self::ArgReduce { .. } | Self::RandomBits { .. } => {
+                one(zeros_like(out))
+            }
             Self::Reduce { op, axes } => {
                 let summed = |t: Array| {
                     record(

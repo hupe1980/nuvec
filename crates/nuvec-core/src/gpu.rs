@@ -67,6 +67,7 @@ mod stub {
             publish(&node, outputs, &Ok(()));
         }
         pub(crate) fn commit(&mut self) {}
+        pub(crate) fn depend_on(&mut self, _: &[&crate::Array]) {}
         pub(crate) fn lookup(&self, _: &Arc<Node>, _: u32) -> Option<Data> {
             None
         }
@@ -82,7 +83,7 @@ mod metal {
 
     use std::sync::{Mutex, PoisonError};
 
-    use nuvec_gpu::{Arg, CommandBuffer, Device as MetalDevice, Pending, Timeline};
+    use nuvec_gpu::{Arg, CommandBuffer, Device as MetalDevice, Pending};
 
     use super::*;
     use crate::buffer::Buffer;
@@ -114,6 +115,33 @@ mod metal {
         error: Option<Error>,
     }
 
+    /// Lets later evaluations' GPU work read these outputs while they are in flight.
+    fn expose(chunk: &Chunk) {
+        for (node, outputs) in chunk {
+            for (output, data) in node.outputs.iter().zip(outputs) {
+                let _ = output.inflight.set(data.clone());
+            }
+        }
+    }
+
+    /// The first GPU command failure on this device. GPU work may read other evaluations'
+    /// in-flight results, so once a command fails every later GPU result is reported as
+    /// failed too (D-032), as in MLX, where a command-buffer error ends the stream.
+    static DEVICE_FAILURE: Mutex<Option<Error>> = Mutex::new(None);
+
+    fn device_result(result: Result<()>) -> Result<()> {
+        let mut failure = DEVICE_FAILURE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let (Err(e), None) = (&result, &*failure) {
+            *failure = Some(Error::Backend(format!("a GPU command failed earlier: {e}")));
+        }
+        match &*failure {
+            Some(e) if result.is_ok() => Err(e.clone()),
+            _ => result,
+        }
+    }
+
     impl Shared {
         /// Records chunk `k`'s result and publishes every chunk whose predecessors are all
         /// complete, in order.
@@ -137,7 +165,6 @@ mod metal {
     pub(crate) struct GpuEval {
         device: Option<&'static MetalDevice>,
         cmd: Option<CommandBuffer>,
-        timeline: Option<Timeline>,
         dispatches: usize,
         /// Outputs encoded into the open command buffer.
         chunk: Chunk,
@@ -146,10 +173,34 @@ mod metal {
         shared: Arc<Shared>,
         /// This evaluation's committed command buffers.
         submitted: Vec<Pending>,
+        /// Other evaluations' in-flight outputs that deferred views of the open chunk read.
+        foreign: Vec<crate::Array>,
     }
 
     fn backend(e: nuvec_gpu::GpuError) -> Error {
         Error::Backend(e.to_string())
+    }
+
+    /// Elements one threadgroup folds per slice in a split reduction.
+    const SLICE: usize = 4096;
+
+    /// Slices per output for a reduction of `n` elements into `groups` outputs: several
+    /// when there are too few outputs to occupy the GPU, each slice non-empty.
+    fn slices(groups: usize, n: usize) -> usize {
+        if groups >= 64 || n <= 2 * SLICE {
+            return 1;
+        }
+        let wanted = n.div_ceil(SLICE).min(1024 / groups.max(1)).max(1);
+        n.div_ceil(n.div_ceil(wanted))
+    }
+
+    /// Kept and reduced dimensions of a reduction's input.
+    struct Layout<'a> {
+        offset: isize,
+        ks: &'a [usize],
+        kt: &'a [isize],
+        rs: &'a [usize],
+        rt: &'a [isize],
     }
 
     /// How an element-wise operand maps onto the output's row-major index.
@@ -207,6 +258,7 @@ mod metal {
             UnaryOp::Tanh => "tanh",
             UnaryOp::Sigmoid => "sigmoid",
             UnaryOp::Conjugate => "conj",
+            UnaryOp::ErfInv => "erfinv",
         }
     }
 
@@ -241,12 +293,12 @@ mod metal {
             GpuEval {
                 device: None,
                 cmd: None,
-                timeline: None,
                 dispatches: 0,
                 chunk: Vec::new(),
                 index: NodeMap::default(),
                 shared: Arc::default(),
                 submitted: Vec::new(),
+                foreign: Vec::new(),
             }
         }
 
@@ -447,7 +499,6 @@ mod metal {
             let (rs, [rt]) = nuvec_cpu::collapse_dims(&rs, [&rt]);
             let groups: usize = ks.iter().product();
             let n: usize = rs.iter().product();
-            let threads = n.next_power_of_two().clamp(1, 256);
             let name = format!(
                 "nuvec_reduce_{}_{}",
                 match op {
@@ -460,23 +511,77 @@ mod metal {
                 },
                 meta.dtype.name()
             );
-            let consts = [
-                bytes(&(data.offset as i64)),
-                shape_bytes(&ks),
-                strides_bytes(&kt),
-                bytes(&(ks.len() as i32)),
-                shape_bytes(&rs),
-                strides_bytes(&rt),
-                bytes(&(rs.len() as i32)),
-                bytes(&(n as u32)),
-            ];
             let input = data.buffer.metal().expect("checked");
-            let mut args = vec![
-                Arg::read(input),
-                Arg::write(buffer.metal_mut().expect("device storage")),
+            let slices = slices(groups, n);
+            if slices == 1 {
+                let out = buffer.metal_mut().expect("device storage");
+                let layout = Layout {
+                    offset: data.offset,
+                    ks: &ks,
+                    kt: &kt,
+                    rs: &rs,
+                    rt: &rt,
+                };
+                return self.reduce_launch(&name, input, &layout, n, 1, out);
+            }
+            // Pass 1 folds slices of each output's range into partial results; pass 2 folds
+            // the partial results (contiguous, `slices` per output).
+            let mut partial = Buffer::try_alloc(groups * slices * meta.dtype.size())?;
+            let layout = Layout {
+                offset: data.offset,
+                ks: &ks,
+                kt: &kt,
+                rs: &rs,
+                rt: &rt,
+            };
+            let pass1 = partial.metal_mut().expect("device storage");
+            self.reduce_launch(&name, input, &layout, n, slices, pass1)?;
+            let (ks2, kt2, rs2, rt2) = ([groups], [slices as isize], [slices], [1isize]);
+            let layout = Layout {
+                offset: 0,
+                ks: &ks2,
+                kt: &kt2,
+                rs: &rs2,
+                rt: &rt2,
+            };
+            let out = buffer.metal_mut().expect("device storage");
+            self.reduce_launch(
+                &name,
+                partial.metal().expect("device storage"),
+                &layout,
+                slices,
+                1,
+                out,
+            )
+        }
+
+        /// One reduction launch over a `[outputs, slices]` grid of threadgroups.
+        fn reduce_launch(
+            &mut self,
+            name: &str,
+            input: &nuvec_gpu::Buffer,
+            layout: &Layout<'_>,
+            n: usize,
+            slices: usize,
+            out: &mut nuvec_gpu::Buffer,
+        ) -> Result<()> {
+            let groups: usize = layout.ks.iter().product();
+            let chunk = n.div_ceil(slices).max(1);
+            let threads = chunk.next_power_of_two().clamp(1, 256);
+            let consts = [
+                bytes(&(layout.offset as i64)),
+                shape_bytes(layout.ks),
+                strides_bytes(layout.kt),
+                bytes(&(layout.ks.len() as i32)),
+                shape_bytes(layout.rs),
+                strides_bytes(layout.rt),
+                bytes(&(layout.rs.len() as i32)),
+                bytes(&(n as u32)),
+                bytes(&(chunk as u32)),
             ];
+            let mut args = vec![Arg::read(input), Arg::write(out)];
             args.extend(consts.iter().map(|c| Arg::bytes(c)));
-            self.dispatch_groups(&name, &args, [groups, 1, 1], [threads, 1, 1])
+            self.dispatch_groups(name, &args, [groups, slices, 1], [threads, 1, 1])
         }
 
         fn arg_reduce(
@@ -569,11 +674,7 @@ mod metal {
                 let device = self
                     .device()
                     .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
-                if self.timeline.is_none() {
-                    self.timeline = Some(device.timeline().map_err(backend)?);
-                }
-                let timeline = self.timeline.as_mut().expect("just created");
-                self.cmd = Some(device.command_buffer_on(timeline).map_err(backend)?);
+                self.cmd = Some(device.ordered_command_buffer().map_err(backend)?);
             }
             Ok(self.cmd.as_mut().expect("just created"))
         }
@@ -626,18 +727,30 @@ mod metal {
                 if self.chunk.is_empty() {
                     return;
                 }
+                // No GPU work orders these views after their producers: wait for them.
+                let result = std::mem::take(&mut self.foreign)
+                    .iter()
+                    .try_for_each(|a| a.out().slot.wait().clone().map(|_| ()));
+                let committed = self.chunk.clone();
                 let k = self.reserve();
-                self.shared.complete(k, Ok(()));
+                self.shared.complete(k, result);
+                expose(&committed);
                 return;
             };
+            // This command buffer runs after every foreign producer (device timeline).
+            self.foreign.clear();
             if let Some(device) = self.device {
                 device.wait_for_capacity(MAX_IN_FLIGHT);
             }
+            let committed = self.chunk.clone();
             let k = self.reserve();
             let shared = self.shared.clone();
-            let pending =
-                cmd.commit_then(move |result| shared.complete(k, result.map_err(backend)));
+            let pending = cmd.commit_then(move |result| {
+                shared.complete(k, device_result(result.map_err(backend)));
+            });
             self.submitted.push(pending);
+            // Only now, after the commit, may other evaluations encode work that reads it.
+            expose(&committed);
         }
 
         /// Registers the open chunk as committed chunk `k`.
@@ -650,6 +763,11 @@ mod metal {
             p.chunks.push(Some(std::mem::take(&mut self.chunk)));
             p.results.push(None);
             p.chunks.len() - 1
+        }
+
+        /// Records that the open chunk reads other evaluations' in-flight `outputs`.
+        pub(crate) fn depend_on(&mut self, outputs: &[&crate::Array]) {
+            self.foreign.extend(outputs.iter().map(|&a| a.clone()));
         }
 
         /// Holds `outputs` of `node` until the GPU work producing them has completed.

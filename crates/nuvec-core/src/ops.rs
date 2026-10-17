@@ -162,6 +162,35 @@ unary_fn! {
     tanh => Tanh;
     /// Element-wise logistic function `1 / (1 + e^-a)`, in at least float32.
     sigmoid => Sigmoid;
+    /// Element-wise inverse error function, in at least float32.
+    erfinv => ErfInv;
+}
+
+/// `log(sum(exp(a)))` over `axes` (all axes if empty), computed stably as MLX does: the
+/// maximum is subtracted first (without gradient), and rows whose maximum is infinite
+/// return that maximum.
+pub fn logsumexp(a: &Array, axes: &[isize], keepdims: bool) -> Result<Array> {
+    check_inputs(&[a])?;
+    let a = astype(a, at_least_float(a.dtype()))?;
+    let maxval = stop_gradient(&max(&a, axes, true)?)?;
+    let out = log(&sum(&exp(&subtract(&a, &maxval)?)?, axes, true)?)?;
+    let out = add(&out, &maxval)?;
+    let out = where_(equal(&abs(&maxval)?, f64::INFINITY)?, &maxval, &out)?;
+    if keepdims {
+        Ok(out)
+    } else {
+        squeeze(&out, axes)
+    }
+}
+
+/// `exp(a) / sum(exp(a))` over `axes` (all axes if empty), with the maximum subtracted
+/// first (without gradient), as MLX does.
+pub fn softmax(a: &Array, axes: &[isize]) -> Result<Array> {
+    check_inputs(&[a])?;
+    let a = astype(a, at_least_float(a.dtype()))?;
+    let maxval = stop_gradient(&max(&a, axes, true)?)?;
+    let ex = exp(&subtract(&a, &maxval)?)?;
+    divide(&ex, sum(&ex, axes, true)?)
 }
 
 /// Element-wise selection: `a` where `condition` is true, otherwise `b`.

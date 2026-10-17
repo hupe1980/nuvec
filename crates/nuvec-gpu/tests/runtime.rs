@@ -188,17 +188,18 @@ fn misuse_is_reported() {
 fn cpu_access_waits_for_the_gpu() {
     let Some(device) = device() else { return };
     let n = 1 << 20;
-    let a = device.buffer_from(&f32s(&vec![1.0; n as usize])).unwrap();
+    let mut a = device.buffer_from(&f32s(&vec![1.0; n as usize])).unwrap();
     let mut out = device.new_buffer(n as usize * 4).unwrap();
     let mut cmd = device.command_buffer().unwrap();
     add(&mut cmd, &device, &a, &a, &mut out, n);
     let submitted = cmd.commit();
     assert!(out.in_use());
     assert_eq!(out.contents().unwrap_err(), GpuError::BufferInUse);
+    assert!(a.in_use());
     assert_eq!(
-        a.contents().unwrap_err(),
+        a.contents_mut().unwrap_err(),
         GpuError::BufferInUse,
-        "inputs are guarded too"
+        "inputs refuse CPU writes while the GPU reads them"
     );
     drop(submitted); // waits
     assert!(!out.in_use());
@@ -294,4 +295,58 @@ fn completion_handlers_report_and_back_pressure_bounds_in_flight_work() {
         assert_eq!(first, 2.0);
     }
     assert!(max_seen.load(std::sync::atomic::Ordering::SeqCst) < 4);
+}
+
+#[test]
+fn ordered_command_buffers_read_in_flight_results_across_threads() {
+    let Some(device) = device() else { return };
+    let n = 1 << 18;
+    let ones = std::sync::Arc::new(device.buffer_from(&f32s(&vec![1.0; n])).unwrap());
+    // Thread A commits a long chain without waiting; thread B then reads its in-flight
+    // result through an ordered command buffer.
+    let mut x = device.buffer_from(&f32s(&vec![0.0; n])).unwrap();
+    let mut y = device.new_buffer(n * 4).unwrap();
+    for i in 0..50 {
+        let mut cmd = device.ordered_command_buffer().unwrap();
+        let (src, dst) = if i % 2 == 0 {
+            (&x, &mut y)
+        } else {
+            (&y, &mut x)
+        };
+        add(&mut cmd, &device, src, &ones, dst, n as u32);
+        cmd.commit_then(|r| r.unwrap());
+    }
+    let (d, o) = (device.clone(), ones.clone());
+    let reader = std::thread::spawn(move || {
+        let mut out = d.new_buffer(n * 4).unwrap();
+        let mut cmd = d.ordered_command_buffer().unwrap();
+        add(&mut cmd, &d, &x, &o, &mut out, n as u32);
+        cmd.commit().wait().unwrap();
+        read_f32(&out)
+    });
+    let v = reader.join().unwrap();
+    assert!(v.iter().all(|&e| e == 51.0), "{}", v[0]);
+}
+
+#[test]
+fn cpu_reads_may_overlap_gpu_reads_but_not_gpu_writes() {
+    let Some(device) = device() else { return };
+    let n = 1 << 20;
+    let mut a = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
+    let mut out = device.new_buffer(n * 4).unwrap();
+    let mut cmd = device.command_buffer().unwrap();
+    add(&mut cmd, &device, &a, &a, &mut out, n as u32);
+    let submitted = cmd.commit();
+    assert!(a.contents().is_ok(), "a is only read by the GPU");
+    assert!(
+        matches!(a.contents_mut(), Err(GpuError::BufferInUse)),
+        "no CPU writes while read"
+    );
+    assert!(
+        matches!(out.contents(), Err(GpuError::BufferInUse)),
+        "out is being written"
+    );
+    submitted.wait().unwrap();
+    assert_eq!(read_f32(&out)[0], 2.0);
+    assert!(a.contents_mut().is_ok());
 }

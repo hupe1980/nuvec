@@ -38,6 +38,8 @@ pub enum UnaryOp {
     Sigmoid,
     /// The complex conjugate (identity for real numbers).
     Conjugate,
+    /// The inverse error function.
+    ErfInv,
 }
 
 impl UnaryOp {
@@ -58,6 +60,7 @@ impl UnaryOp {
             Self::Tanh => "tanh",
             Self::Sigmoid => "sigmoid",
             Self::Conjugate => "conjugate",
+            Self::ErfInv => "erfinv",
         }
     }
 }
@@ -230,6 +233,14 @@ pub enum Primitive {
     /// Batched matrix product of `[B..., M, K]` and `[B..., K, N]` with equal batch
     /// dimensions.
     Matmul,
+    /// Random bits from threefry2x32 keys of shape `[..., 2]` (uint32): the output has shape
+    /// `keys.shape[..-1] + shape` and `width` bytes per element (MLX's layout).
+    RandomBits {
+        /// The shape drawn per key.
+        shape: Vec<usize>,
+        /// Bytes per element: 1, 2 or 4.
+        width: u8,
+    },
     /// A call of a [`crate::custom_function`]: the inputs are the primals followed by the
     /// function's outputs, which this node presents unchanged (views); transforms use the
     /// function's custom rules.
@@ -265,6 +276,7 @@ impl Primitive {
             Self::Reduce { op, .. } => op.name(),
             Self::ArgReduce { op, .. } => op.name(),
             Self::Matmul => "matmul",
+            Self::RandomBits { .. } => "random_bits",
             Self::Custom(_) => "custom_function",
             #[cfg(test)]
             Self::AddMultiply => "add_multiply",
@@ -410,6 +422,32 @@ impl Primitive {
                 let mut shape: Shape = sa.into();
                 shape[n - 1] = sb[n - 1];
                 computed(a.dtype(), &shape)
+            }
+            Self::RandomBits { shape, width } => {
+                let [keys] = self.arity::<1>(inputs)?;
+                if keys.dtype() != DType::U32 || keys.shape().last() != Some(&2) {
+                    return Err(Error::InvalidArgument(format!(
+                        "random_bits: keys must be uint32 of shape [..., 2], got {} {:?}",
+                        keys.dtype(),
+                        keys.shape()
+                    )));
+                }
+                let dtype = match width {
+                    1 => DType::U8,
+                    2 => DType::U16,
+                    4 => DType::U32,
+                    _ => {
+                        return Err(Error::InvalidArgument(format!(
+                            "random_bits: width must be 1, 2 or 4, got {width}"
+                        )));
+                    }
+                };
+                let out: Vec<usize> = keys.shape()[..keys.ndim() - 1]
+                    .iter()
+                    .chain(shape)
+                    .copied()
+                    .collect();
+                computed(dtype, &out)
             }
             Self::Custom(call) => {
                 let outputs = inputs.get(call.primals..).unwrap_or_default();

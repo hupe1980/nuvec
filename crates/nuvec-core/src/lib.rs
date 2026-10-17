@@ -56,6 +56,7 @@ mod gpu;
 mod kernels;
 mod ops;
 mod primitive;
+pub mod random;
 mod scalar;
 mod shape;
 mod transforms;
@@ -69,9 +70,10 @@ pub use error::{Error, Result};
 pub use eval::{async_eval, eval};
 pub use ops::{
     abs, add, all, any, arange, argmax, argmin, astype, broadcast_to, conjugate, cos, divide,
-    equal, exp, expand_dims, greater, greater_equal, less, less_equal, log, matmul, max, maximum,
-    mean, min, minimum, multiply, negative, not_equal, ones, prod, reshape, sigmoid, sin, slice,
-    sqrt, squeeze, stop_gradient, subtract, sum, tanh, transpose, where_, zeros,
+    equal, erfinv, exp, expand_dims, greater, greater_equal, less, less_equal, log, logsumexp,
+    matmul, max, maximum, mean, min, minimum, multiply, negative, not_equal, ones, prod, reshape,
+    sigmoid, sin, slice, softmax, sqrt, squeeze, stop_gradient, subtract, sum, tanh, transpose,
+    where_, zeros,
 };
 pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, UnaryOp};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};

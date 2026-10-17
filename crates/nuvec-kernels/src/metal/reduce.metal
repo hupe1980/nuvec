@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// Reductions (one threadgroup per output element, tree combine in threadgroup memory) and
-// arg-reductions (one thread per output element). Inputs may have any layout: kept and
+// Reductions (threadgroups of a [outputs, slices] grid, tree combine in threadgroup memory)
+// and arg-reductions (one thread per output element). With several slices, threadgroup
+// (o, s) folds slice s of output o's reduced range into `out[o * slices + s]`, and a second
+// launch folds those partial results. Inputs may have any layout: kept and
 // reduced dimensions each come with their own shape and signed strides.
 
 #include "common.h"
@@ -87,15 +89,20 @@ template <typename T, typename A, typename Op>
     constant long* red_strides [[buffer(7)]],
     constant int& red_ndim [[buffer(8)]],
     constant uint& n [[buffer(9)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint threads [[threads_per_threadgroup]]) {
+    constant uint& chunk [[buffer(10)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 slices [[threadgroups_per_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 threads2 [[threads_per_threadgroup]]) {
     threadgroup A acc_s[MAX_THREADS];
     threadgroup bool valid_s[MAX_THREADS];
-    long base = offset + loc(group, kept_shape, kept_strides, kept_ndim);
+    uint tid = tid2.x;
+    uint threads = threads2.x;
+    long base = offset + loc(group.x, kept_shape, kept_strides, kept_ndim);
+    uint end = min(n, (group.y + 1) * chunk);
     A acc = A();
     bool valid = false;
-    for (uint j = tid; j < n; j += threads) {
+    for (uint j = group.y * chunk + tid; j < end; j += threads) {
         A x = Op::load(in[base + loc(j, red_shape, red_strides, red_ndim)]);
         acc = valid ? Op::combine(acc, x) : x;
         valid = true;
@@ -111,7 +118,7 @@ template <typename T, typename A, typename Op>
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0) {
-        out[group] = valid_s[0] ? Op::store(acc_s[0]) : Op::empty();
+        out[group.x * slices.y + group.y] = valid_s[0] ? Op::store(acc_s[0]) : Op::empty();
     }
 }
 
@@ -145,7 +152,8 @@ template <typename T, bool IS_MAX>
 #define NUVEC_REDUCE(op, Op, name, T, A)                                                        \
     template [[host_name("nuvec_reduce_" #op "_" #name)]] [[kernel]] void reduce<T, A, Op>(     \
         device const T*, device T*, constant long&, constant int*, constant long*, constant int&, \
-        constant int*, constant long*, constant int&, constant uint&, uint, uint, uint);
+        constant int*, constant long*, constant int&, constant uint&, constant uint&, uint2, uint2, \
+        uint2, uint2);
 
 #define NUVEC_ARG_REDUCE(name, T)                                                                 \
     template [[host_name("nuvec_argmax_" #name)]] [[kernel]] void arg_reduce<T, true>(            \

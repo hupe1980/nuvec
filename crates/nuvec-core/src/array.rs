@@ -42,6 +42,9 @@ pub(crate) struct Output {
     pub(crate) size: usize,
     /// Set exactly once, when the node is evaluated (or at creation for leaves).
     pub(crate) slot: OnceLock<Result<Data>>,
+    /// GPU data whose command buffer is committed on the device timeline but may not have
+    /// completed: later GPU work may read it before `slot` is set (D-032).
+    pub(crate) inflight: OnceLock<Data>,
 }
 
 /// Evaluated data: elements of a (possibly shared) buffer, starting at `offset` and laid
@@ -137,6 +140,7 @@ impl Output {
             flags,
             size,
             slot,
+            inflight: OnceLock::new(),
         })
     }
 }

@@ -83,6 +83,58 @@ pub(crate) fn slice_update(
     }
 }
 
+/// threefry2x32 (20 rounds), as in MLX's `threefry2x32_hash`.
+pub(crate) fn threefry2x32(key: (u32, u32), mut count: (u32, u32)) -> (u32, u32) {
+    const ROTATIONS: [[u32; 4]; 2] = [[13, 15, 26, 6], [17, 29, 16, 24]];
+    let ks = [key.0, key.1, key.0 ^ key.1 ^ 0x1BD1_1BDA];
+    count.0 = count.0.wrapping_add(ks[0]);
+    count.1 = count.1.wrapping_add(ks[1]);
+    for i in 0..5 {
+        for r in ROTATIONS[i % 2] {
+            count.0 = count.0.wrapping_add(count.1);
+            count.1 = count.1.rotate_left(r) ^ count.0;
+        }
+        count.0 = count.0.wrapping_add(ks[(i + 1) % 3]);
+        count.1 = count
+            .1
+            .wrapping_add(ks[(i + 2) % 3])
+            .wrapping_add(i as u32 + 1);
+    }
+    count
+}
+
+/// `bytes_per_key` random bytes per key of `keys` (uint32, shape `[..., 2]`), laid out as
+/// MLX's `RandomBits::eval_cpu`: words `i` and `half + odd + i` come from counter
+/// `(i, half + odd + i)`; an odd word count takes its last word from counter `(half, 0)`.
+pub(crate) fn random_bits(keys: Operand<'_>, bytes_per_key: usize) -> Result<Buffer> {
+    let keys = contiguous(keys.0, keys.1)?;
+    let keys = keys.typed::<u32>();
+    let num_keys = keys.len() / 2;
+    let mut out = Buffer::try_alloc(num_keys * bytes_per_key)?;
+    let words = bytes_per_key.div_ceil(4);
+    let (half, odd) = (words / 2, words % 2);
+    let mut block = vec![0u32; words];
+    for (key, dst) in keys
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(out.bytes_mut().chunks_exact_mut(bytes_per_key.max(1)))
+    {
+        let key = (key[0], key[1]);
+        for i in 0..half {
+            let (a, b) = threefry2x32(key, (i as u32, (half + odd + i) as u32));
+            block[i] = a;
+            block[half + odd + i] = b;
+        }
+        if odd == 1 {
+            block[half] = threefry2x32(key, (half as u32, 0)).0;
+        }
+        let bytes: Vec<u8> = block.iter().flat_map(|w| w.to_le_bytes()).collect();
+        dst.copy_from_slice(&bytes[..bytes_per_key]);
+    }
+    Ok(out)
+}
+
 /// Conversion to `to`.
 pub(crate) fn cast(a: Operand<'_>, to: DType) -> Result<Buffer> {
     with_type!(a.0.dtype, S => with_type!(to, D => {
@@ -148,6 +200,7 @@ pub(crate) fn unary(op: UnaryOp, a: Operand<'_>) -> Result<Buffer> {
             UnaryOp::Tanh => go!(|x: T| x.float_(UnaryOp::Tanh)),
             UnaryOp::Sigmoid => go!(|x: T| x.float_(UnaryOp::Sigmoid)),
             UnaryOp::Conjugate => go!(T::conj_),
+            UnaryOp::ErfInv => go!(|x: T| x.float_(UnaryOp::ErfInv)),
         }
         Ok(out)
     })
@@ -361,6 +414,7 @@ pub(crate) fn matmul(a: Operand<'_>, b: Operand<'_>) -> Result<Buffer> {
                 flags: m.flags,
                 size: m.size,
                 slot: Default::default(),
+                inflight: Default::default(),
             };
             let (ma, mb) = (row(a.0), row(b.0));
             let (da, db) = (Data::new(fa), Data::new(fb));
@@ -536,6 +590,8 @@ macro_rules! float_num {
                     UnaryOp::Cos => self.cos(),
                     UnaryOp::Tanh => self.tanh(),
                     UnaryOp::Sigmoid => sigmoid(self),
+                    // MLX computes erfinv in float32 for every float type.
+                    UnaryOp::ErfInv => erfinv(self as f32) as $t,
                     UnaryOp::Negative | UnaryOp::Abs | UnaryOp::Conjugate => unreachable!("not transcendental"),
                 }
             }
@@ -543,6 +599,44 @@ macro_rules! float_num {
     )*};
 }
 float_num!(f32, f64);
+
+/// The inverse error function: MLX's single-precision polynomial (Giles), with the same
+/// fused multiply-adds, so results agree with MLX up to the accuracy of `ln`.
+pub(crate) fn erfinv(a: f32) -> f32 {
+    let t = a.mul_add(0.0 - a, 1.0).ln();
+    let horner = |coefficients: &[f32]| {
+        coefficients[1..]
+            .iter()
+            .fold(coefficients[0], |p, &c| p.mul_add(t, c))
+    };
+    let p = if t.abs() > 6.125 {
+        horner(&[
+            3.036_975_7e-10,
+            2.932_431e-8,
+            1.221_503_3e-6,
+            2.841_089_6e-5,
+            3.935_529_7e-4,
+            3.026_988_1e-3,
+            4.831_858e-3,
+            -2.646_461_4e-1,
+            8.400_165e-1,
+        ])
+    } else {
+        horner(&[
+            5.438_778_3e-9,
+            1.432_854_5e-7,
+            1.227_748e-6,
+            1.129_636_3e-7,
+            -5.615_307_6e-5,
+            -1.476_976_3e-4,
+            2.314_686_8e-3,
+            1.153_925_8e-2,
+            -2.320_154_8e-1,
+            8.862_269e-1,
+        ])
+    };
+    a * p
+}
 
 /// Numerically stable logistic function.
 pub(crate) fn sigmoid<T: num_like::Float>(x: T) -> T {

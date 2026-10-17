@@ -391,3 +391,96 @@ fn async_eval_reports_known_errors() {
         ));
     });
 }
+
+#[test]
+fn long_reductions_split_into_two_passes_match_the_cpu() {
+    if !gpu_available() {
+        return;
+    }
+    let mut rng = Rng::new(17);
+    let n = 300_000;
+    let values: Vec<f32> = (0..n).map(|_| rng.f64() as f32 * 0.01).collect();
+    let both = |f: &dyn Fn() -> Result<Array>| {
+        let cpu = on(Device::cpu(), f)
+            .unwrap()
+            .astype(DType::F64)
+            .unwrap()
+            .to_vec::<f64>()
+            .unwrap();
+        let gpu = on(Device::gpu(0), f)
+            .unwrap()
+            .astype(DType::F64)
+            .unwrap()
+            .to_vec::<f64>()
+            .unwrap();
+        (cpu, gpu)
+    };
+    let close = |name: &str, (c, g): (Vec<f64>, Vec<f64>), tol: f64| {
+        assert_eq!(c.len(), g.len(), "{name}");
+        for (c, g) in c.iter().zip(&g) {
+            assert!(
+                (c.is_nan() && g.is_nan()) || (c - g).abs() <= tol * c.abs().max(1.0),
+                "{name}: cpu {c} gpu {g}"
+            );
+        }
+    };
+    let flat = || Array::from_slice(&values, &[n]);
+    let rows = || Array::from_slice(&values, &[3, n / 3]);
+    close("sum-1d", both(&|| sum(&flat()?, &[], false)), 1e-4);
+    close("sum-rows", both(&|| sum(&rows()?, &[1], false)), 1e-4);
+    close(
+        "sum-transposed",
+        both(&|| sum(&rows()?.t()?, &[0], true)),
+        1e-4,
+    );
+    close("max", both(&|| max(&flat()?, &[], false)), 0.0);
+    close("min-rows", both(&|| min(&rows()?, &[1], false)), 0.0);
+    close(
+        "sum-f16",
+        both(&|| sum(&flat()?.astype(DType::F16)?, &[], false)),
+        5e-3,
+    );
+    close(
+        "sum-i32",
+        both(&|| sum(&(flat()? * 100.0).astype(DType::I32)?, &[], false)),
+        0.0,
+    );
+    close("all", both(&|| all(&less(&flat()?, 1.0)?, &[], false)), 0.0);
+    close(
+        "any",
+        both(&|| any(&greater(&flat()?, 0.0999)?, &[], false)),
+        0.0,
+    );
+    let with_nan = || {
+        let mut v = values.clone();
+        v[n - 7] = f32::NAN;
+        Array::from_slice(&v, &[n])
+    };
+    close("max-nan", both(&|| max(&with_nan()?, &[], false)), 0.0);
+}
+
+#[test]
+fn later_evaluations_consume_in_flight_results() {
+    if !gpu_available() {
+        return;
+    }
+    on(Device::gpu(0), || {
+        let one = Array::full(&[1 << 16], 1.0f32).unwrap();
+        let mut a = Array::full(&[1 << 16], 0.0f32).unwrap();
+        for _ in 0..400 {
+            a = &a + &one;
+        }
+        async_eval(std::slice::from_ref(&a)).unwrap();
+        // Encoded while `a` may still be running: a GPU consumer, views of it, and a CPU
+        // (float64 fallback) consumer.
+        let gpu = &a * 2.0;
+        let view = a.reshape(&[256, 256]).unwrap().t().unwrap();
+        let cpu = a.astype(DType::F64).unwrap() + 1.0;
+        let step = sum(&(&gpu + &view.reshape(&[-1]).unwrap()), &[], false).unwrap();
+        async_eval(&[gpu.clone(), cpu.clone(), step.clone()]).unwrap();
+        assert!(gpu.to_vec::<f32>().unwrap().iter().all(|&v| v == 800.0));
+        assert!(view.to_vec::<f32>().unwrap().iter().all(|&v| v == 400.0));
+        assert!(cpu.to_vec::<f64>().unwrap().iter().all(|&v| v == 401.0));
+        assert_eq!(step.item::<f32>().unwrap(), 1200.0 * (1 << 16) as f32);
+    });
+}

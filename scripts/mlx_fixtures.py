@@ -111,7 +111,7 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
     unary = {
         "negative": mx.negative, "abs": mx.abs, "exp": mx.exp, "log": mx.log, "sqrt": mx.sqrt,
         "sin": mx.sin, "cos": mx.cos, "tanh": mx.tanh, "sigmoid": mx.sigmoid,
-        "conjugate": mx.conjugate,
+        "conjugate": mx.conjugate, "erfinv": mx.erfinv,
     }
     reductions = {
         "sum": mx.sum, "prod": mx.prod, "max": mx.max, "min": mx.min, "mean": mx.mean,
@@ -124,6 +124,34 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         return binary[op](xs[0], xs[1])
     if op in unary:
         return unary[op](xs[0])
+    if op in ("logsumexp", "softmax"):
+        axes = nums(p.get("axes", "")) or None
+        if op == "softmax":
+            return mx.softmax(xs[0], axis=axes)
+        return mx.logsumexp(xs[0], axis=axes, keepdims=p.get("keepdims") == "1")
+    if op == "random":
+        dtype = DTYPES[int(p.get("dtype", CODE["float32"]))][1]
+        shape = nums(p.get("shape", ""))
+        if p.get("seq") == "1":
+            mx.random.seed(int(p["seed"]))
+            key = None
+            for _ in range(int(p.get("skip", "0"))):
+                mx.random.uniform(shape=shape)
+        else:
+            key = mx.random.key(int(p["seed"]))
+        fn = p["fn"]
+        if fn == "bits":
+            return mx.random.bits(shape, width=int(p["width"]), key=key)
+        if fn == "split":
+            return mx.random.split(key, num=int(p["num"]))
+        if fn == "uniform":
+            return mx.random.uniform(float(p["low"]), float(p["high"]), shape, dtype, key=key)
+        if fn == "normal":
+            loc = float(p["loc"]) if "loc" in p else None
+            scale = float(p["scale"]) if "scale" in p else None
+            kw = {k: v for k, v in (("loc", loc), ("scale", scale)) if v is not None}
+            return mx.random.normal(shape, dtype, key=key, **kw)
+        raise ValueError(fn)
     if op == "where":
         return mx.where(xs[0], xs[1], xs[2])
     if op == "astype":
@@ -428,6 +456,48 @@ derivative("jvp", "jvp-c-prod", "prod", [c(2, 3)], axes="1", keepdims=0)
 derivative("vjp", "vjp-c-matmul", "matmul", [c(2, 3), c(3, 2)])
 derivative("jvp", "jvp-c-matmul", "matmul", [c(2, 3), c(3, 2)])
 batched("vmap-c-conjugate", "conjugate", [c(3, 2)], "1")
+
+# erfinv, logsumexp, softmax.
+case("erfinv-f32", "erfinv", [mx.array(np.linspace(-0.999, 0.999, 41, dtype=np.float32))])
+case("erfinv-edge", "erfinv", [mx.array(np.array([-1, 1, 0, -0.0, 0.9999999, 2.0], dtype=np.float32))])
+case("erfinv-f16", "erfinv", [mx.array(np.linspace(-0.99, 0.99, 9, dtype=np.float32)).astype(mx.float16)])
+case("logsumexp-all", "logsumexp", [make("float32", (3, 4))])
+case("logsumexp-axis", "logsumexp", [make("float32", (3, 4, 5))], axes="1", keepdims=0)
+case("logsumexp-keep", "logsumexp", [make("float32", (3, 4))], axes="-1", keepdims=1)
+case("logsumexp-inf", "logsumexp",
+     [mx.array(np.array([[-np.inf, -np.inf], [np.inf, 1.0], [1000.0, 1000.0]], dtype=np.float32))],
+     axes="1", keepdims=0)
+case("logsumexp-int", "logsumexp", [ints("int32", (2, 5), -3, 4)], axes="1", keepdims=0)
+case("softmax-last", "softmax", [make("float32", (3, 5))], axes="-1")
+case("softmax-axes", "softmax", [make("float32", (2, 3, 4))], axes="0,2")
+case("softmax-f16", "softmax", [make("float16", (4, 6))], axes="1")
+derivative("vjp", "vjp-erfinv", "erfinv", [mx.array(np.linspace(-0.9, 0.9, 7, dtype=np.float32))])
+derivative("vjp", "vjp-logsumexp", "logsumexp", [make("float32", (3, 4))], axes="1", keepdims=0)
+derivative("jvp", "jvp-logsumexp", "logsumexp", [make("float32", (3, 4))], axes="1", keepdims=0)
+derivative("vjp", "vjp-softmax", "softmax", [make("float32", (3, 4))], axes="1")
+derivative("jvp", "jvp-softmax", "softmax", [make("float32", (3, 4))], axes="1")
+batched("vmap-softmax", "softmax", [make("float32", (3, 2, 4))], "1", axes="-1")
+batched("vmap-logsumexp", "logsumexp", [make("float32", (3, 4))], "1", axes="0", keepdims=0)
+
+# Random numbers: bit for bit from explicit keys and from the seeded per-thread sequence.
+# (`bits` is not exposed in Python; uniform samples are exact functions of 32-bit bits, and
+# odd sizes exercise the odd-word tail of the layout.)
+for seed in [0, 1, (1 << 40) + 5]:
+    for shape in ["1", "4", "5", "7", "2,3"]:
+        case(f"random-bits-{seed}-{shape}", "random", [], fn="uniform", seed=seed, shape=shape,
+             low=0.0, high=1.0, dtype=CODE["float32"])
+case("random-split-2", "random", [], fn="split", seed=0, num=2)
+case("random-split-5", "random", [], fn="split", seed=1234, num=5)
+for dt in ["float32", "float16", "bfloat16"]:
+    case(f"random-uniform-{dt}", "random", [], fn="uniform", seed=7, shape="3,4", low=-2.0, high=3.0,
+         dtype=CODE[dt])
+    case(f"random-normal-{dt}", "random", [], fn="normal", seed=11, shape="64", dtype=CODE[dt])
+case("random-normal-loc-scale", "random", [], fn="normal", seed=3, shape="2,8", loc=1.5, scale=0.25,
+     dtype=CODE["float32"])
+case("random-seq-first", "random", [], fn="uniform", seq=1, seed=0, shape="5", low=0.0, high=1.0,
+     dtype=CODE["float32"])
+case("random-seq-third", "random", [], fn="uniform", seq=1, seed=0, skip=2, shape="5", low=0.0,
+     high=1.0, dtype=CODE["float32"])
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

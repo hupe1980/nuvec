@@ -316,6 +316,32 @@ fn parse_scalar(spec: &str) -> Option<Scalar> {
     })
 }
 
+/// MLX's random functions, from `key(seed)` or the seeded per-thread sequence.
+fn random_case(case: &Case) -> Result<Array> {
+    let p = |k: &str| case.params.get(k).map(String::as_str).unwrap_or("");
+    let f = |k: &str| p(k).parse::<f64>().unwrap();
+    let dtype = DTYPES[p("dtype").parse::<usize>().unwrap_or(11)];
+    let shape = usizes(p("shape"));
+    let seed: u64 = p("seed").parse().unwrap();
+    let key = if p("seq") == "1" {
+        random::seed(seed);
+        for _ in 0..p("skip").parse::<usize>().unwrap_or(0) {
+            random::uniform(0.0, 1.0, &shape, DType::F32, None)?;
+        }
+        None
+    } else {
+        Some(random::key(seed))
+    };
+    let opt = |k: &str| (!p(k).is_empty()).then(|| f(k));
+    match p("fn") {
+        "bits" => random::bits(&shape, p("width").parse().unwrap(), key.as_ref()),
+        "split" => random::split(key.as_ref().unwrap(), p("num").parse().unwrap()),
+        "uniform" => random::uniform(f("low"), f("high"), &shape, dtype, key.as_ref()),
+        "normal" => random::normal(&shape, dtype, opt("loc"), opt("scale"), key.as_ref()),
+        other => panic!("unknown random function {other}"),
+    }
+}
+
 /// A reduction operation: `(array, axes, keepdims)`.
 type Reduction = fn(&Array, &[isize], bool) -> Result<Array>;
 
@@ -399,6 +425,7 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "tanh" => Some(tanh),
         "sigmoid" => Some(sigmoid),
         "conjugate" => Some(conjugate),
+        "erfinv" => Some(erfinv),
         _ => None,
     };
     if let Some(f) = unary {
@@ -419,6 +446,9 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
     }
     match op {
         "where" => where_(&xs[0], &xs[1], &xs[2]),
+        "logsumexp" => logsumexp(&xs[0], &ints(p("axes")), keep),
+        "softmax" => softmax(&xs[0], &ints(p("axes"))),
+        "random" => random_case(case),
         "astype" => xs[0].astype(dtype()),
         "reshape" => xs[0].reshape(&ints(p("shape"))),
         "transpose" if p("axes").is_empty() => xs[0].t(),
@@ -472,6 +502,11 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
         op => op,
     };
     match op {
+        // Normal samples go through erfinv's logarithm, whose last bits differ between
+        // implementations; bits and uniform samples are exact.
+        "random" if case.params["fn"] == "normal" => 8.0 * eps * e.abs().max(1.0),
+        "erfinv" => 8.0 * eps * e.abs().max(f64::MIN_POSITIVE),
+        "logsumexp" | "softmax" => 8.0 * eps * e.abs().max(1.0),
         // Derivatives chain several rounded operations, accumulated over at most every
         // input element.
         "vjp" | "jvp" => {

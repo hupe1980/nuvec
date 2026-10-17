@@ -103,6 +103,15 @@ impl Primitive {
                 op: *op,
                 axes: reduced.iter().map(|a| a + 1).collect(),
             }),
+            // Keys `[..., 2]`: a batch of keys draws one sample per key.
+            Self::RandomBits { .. } => {
+                if axes[0] == Some(x.ndim() - 1) {
+                    return Err(crate::Error::InvalidArgument(
+                        "random_bits: the key pair axis cannot be batched".into(),
+                    ));
+                }
+                at_front(self.clone())
+            }
             Self::ArgReduce { op, axis } => at_front(Self::ArgReduce {
                 op: *op,
                 axis: axis + 1,

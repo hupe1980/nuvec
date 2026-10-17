@@ -55,6 +55,10 @@ fixtures:
 bench-mlx:
     uv run scripts/bench_vs_mlx.py
 
+# Downloads MNIST and trains MLX's example model with nuvec and MLX (M1 exit criterion).
+mnist:
+    uv run scripts/mnist_vs_mlx.py
+
 # ── Constitution gates ────────────────────────────────────────────────────────
 
 # Licenses, advisories, sources, and the ban on native C/C++ builds (Principle I).

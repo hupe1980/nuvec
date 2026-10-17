@@ -48,6 +48,8 @@ pub enum Error {
     UnsupportedDevice(Device),
     /// An argument is invalid for another reason.
     InvalidArgument(String),
+    /// Reading or writing a file failed.
+    Io(String),
 }
 
 /// `Result` with [`Error`] as the error type.
@@ -73,6 +75,7 @@ impl fmt::Display for Error {
             Self::Backend(msg) => write!(f, "GPU backend error: {msg}"),
             Self::UnsupportedDevice(device) => write!(f, "no backend for device {device} yet"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+            Self::Io(msg) => write!(f, "I/O error: {msg}"),
         }
     }
 }

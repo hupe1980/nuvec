@@ -77,6 +77,35 @@ inline float sigmoid_(float x) {
     return e / (1.0f + e);
 }
 
+// MLX's inverse error function (Giles' single-precision polynomial).
+inline float erfinv_(float a) {
+    float t = precise::log(fma(a, 0.0f - a, 1.0f));
+    float p;
+    if (fabs(t) > 6.125f) {
+        p = 3.03697567e-10f;
+        p = fma(p, t, 2.93243101e-8f);
+        p = fma(p, t, 1.22150334e-6f);
+        p = fma(p, t, 2.84108955e-5f);
+        p = fma(p, t, 3.93552968e-4f);
+        p = fma(p, t, 3.02698812e-3f);
+        p = fma(p, t, 4.83185798e-3f);
+        p = fma(p, t, -2.64646143e-1f);
+        p = fma(p, t, 8.40016484e-1f);
+    } else {
+        p = 5.43877832e-9f;
+        p = fma(p, t, 1.43285448e-7f);
+        p = fma(p, t, 1.22774793e-6f);
+        p = fma(p, t, 1.12963626e-7f);
+        p = fma(p, t, -5.61530760e-5f);
+        p = fma(p, t, -1.47697632e-4f);
+        p = fma(p, t, 2.31468678e-3f);
+        p = fma(p, t, 1.15392581e-2f);
+        p = fma(p, t, -2.32015476e-1f);
+        p = fma(p, t, 8.86226892e-1f);
+    }
+    return a * p;
+}
+
 #define NUVEC_FLOAT_OPS(T)                                                                     \
     inline T op_add(T a, T b) { return T(float(a) + float(b)); }                              \
     inline T op_sub(T a, T b) { return T(float(a) - float(b)); }                              \
@@ -99,7 +128,8 @@ inline float sigmoid_(float x) {
     inline T op_sin(T a) { return T(precise::sin(float(a))); }                                \
     inline T op_cos(T a) { return T(precise::cos(float(a))); }                                \
     inline T op_tanh(T a) { return T(precise::tanh(float(a))); }                              \
-    inline T op_sigmoid(T a) { return T(sigmoid_(float(a))); }
+    inline T op_sigmoid(T a) { return T(sigmoid_(float(a))); }                                \
+    inline T op_erfinv(T a) { return T(erfinv_(float(a))); }
 
 NUVEC_FLOAT_OPS(half)
 NUVEC_FLOAT_OPS(bfloat)

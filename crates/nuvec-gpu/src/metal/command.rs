@@ -1,7 +1,7 @@
 //! Command encoding with minimal barriers, and submission.
 
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
 use std::sync::{Arc, Mutex, PoisonError};
 
 use block2::RcBlock;
@@ -12,6 +12,7 @@ use objc2_metal::{
     MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLDispatchType, MTLFence, MTLSize,
 };
 
+use super::buffer::Guard;
 use super::{Buffer, Device, Pipeline};
 use crate::{GpuError, Result};
 
@@ -56,7 +57,7 @@ impl<'a> Arg<'a> {
     }
 }
 
-type Fence = Retained<ProtocolObject<dyn MTLFence>>;
+pub(crate) type Fence = Retained<ProtocolObject<dyn MTLFence>>;
 
 /// Orders command buffers that are committed without waiting: each command buffer created
 /// on a timeline starts its work only after the previous one's work has finished. Buffers
@@ -89,7 +90,7 @@ pub struct CommandBuffer {
     writes: Vec<usize>,
     barriers: usize,
     /// In-flight guards of the buffers used, and the buffers themselves (kept alive).
-    guards: Vec<Arc<AtomicUsize>>,
+    guards: Vec<(Arc<Guard>, bool)>,
     retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
@@ -125,6 +126,22 @@ impl Device {
             fence,
             started: false,
         })
+    }
+
+    /// A new command buffer whose work runs after the work of every *ordered* command
+    /// buffer committed before it on this device, from any thread: a device-wide timeline.
+    /// Work can therefore read the outputs of earlier ordered work that is still in flight.
+    pub fn ordered_command_buffer(&self) -> Result<CommandBuffer> {
+        let fence = self
+            .inner
+            .queue_fence
+            .get_or_init(|| self.raw().newFence())
+            .clone()
+            .ok_or_else(|| GpuError::CommandBuffer("cannot create a fence".into()))?;
+        let mut cmd = self.command_buffer()?;
+        // Waiting for a fence nothing has updated yet does not wait.
+        cmd.fence = Some((fence, true));
+        Ok(cmd)
     }
 
     /// A new command buffer whose work runs after the work of every command buffer created
@@ -242,8 +259,8 @@ impl CommandBuffer {
             })
             .push(buffer.id());
             let guard = buffer.guard();
-            guard.fetch_add(1, Ordering::AcqRel);
-            self.guards.push(guard);
+            guard.acquire(write);
+            self.guards.push((guard, write));
             self.retained.extend(buffer.retained());
         }
         dispatch(&encoder);
@@ -336,8 +353,8 @@ impl Drop for CommandBuffer {
         if let Some(encoder) = self.encoder.take() {
             encoder.endEncoding();
         }
-        for guard in self.guards.drain(..) {
-            guard.fetch_sub(1, Ordering::AcqRel);
+        for (guard, write) in self.guards.drain(..) {
+            guard.release(write);
         }
     }
 }
@@ -384,7 +401,7 @@ fn validate(args: &[Arg<'_>]) -> Result<()> {
 /// [`CommandBuffer::commit_then`] completes.
 struct Completion {
     on_complete: Box<dyn FnOnce(Result<()>) + Send>,
-    guards: Vec<Arc<AtomicUsize>>,
+    guards: Vec<(Arc<Guard>, bool)>,
     _retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     device: Device,
 }
@@ -402,8 +419,8 @@ fn complete(finish: &Finish, result: impl FnOnce() -> Result<()>) {
         return;
     };
     let result = result();
-    for guard in c.guards {
-        guard.fetch_sub(1, Ordering::AcqRel);
+    for (guard, write) in c.guards {
+        guard.release(write);
     }
     drop(c._retained);
     c.device.flights().end();
@@ -436,7 +453,7 @@ impl std::fmt::Debug for Pending {
 pub struct Submitted {
     device: Device,
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    guards: Vec<Arc<AtomicUsize>>,
+    guards: Vec<(Arc<Guard>, bool)>,
     _retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     done: bool,
 }
@@ -453,8 +470,8 @@ impl Submitted {
         }
         self.raw.waitUntilCompleted();
         self.done = true;
-        for guard in self.guards.drain(..) {
-            guard.fetch_sub(1, Ordering::AcqRel);
+        for (guard, write) in self.guards.drain(..) {
+            guard.release(write);
         }
         self.device.flights().end();
         status(&self.raw)

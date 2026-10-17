@@ -1,16 +1,12 @@
-//! Zero-copy safetensors, GGUF and npy loading, and graph export.
+//! Reading and writing arrays: the IDX format (MNIST) so far.
 //!
-//! **Status:** pre-alpha. This crate has no functional API yet.
+//! **Status:** pre-alpha.
 
 #![forbid(unsafe_code)]
 
+mod idx;
+
+pub use idx::{parse_idx, read_idx};
+
 /// The version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn version_is_set() {
-        assert!(!super::VERSION.is_empty());
-    }
-}

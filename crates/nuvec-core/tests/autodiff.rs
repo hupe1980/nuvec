@@ -109,6 +109,28 @@ fn unary_gradients() {
         check(name, f, &[&[2, 3]], lo, hi);
     }
     check("abs-negative", |x| abs(&x[0]), &[&[4]], -2.0, -0.5);
+    check(
+        "logsumexp",
+        |x| logsumexp(&x[0], &[1], false),
+        &[&[3, 4]],
+        -3.0,
+        3.0,
+    );
+    check(
+        "logsumexp-all",
+        |x| logsumexp(&x[0], &[], true),
+        &[&[2, 3]],
+        -3.0,
+        3.0,
+    );
+    check("softmax", |x| softmax(&x[0], &[-1]), &[&[3, 4]], -3.0, 3.0);
+    check(
+        "softmax-axes",
+        |x| softmax(&x[0], &[0, 2]),
+        &[&[2, 2, 3]],
+        -3.0,
+        3.0,
+    );
 }
 
 #[test]
@@ -752,5 +774,27 @@ fn conjugate_values_batching_and_devices() {
             Ok(v) => assert_eq!(v, expect),
             Err(e) => eprintln!("skipped: no Metal device ({e})"),
         }
+    }
+}
+
+/// erfinv is evaluated in float32 (as in MLX), so its derivative is checked with a float32
+/// step size.
+#[test]
+fn erfinv_gradient() {
+    let xs: Vec<f32> = vec![-0.9, -0.5, -0.1, 0.0, 0.3, 0.8];
+    let x = Array::from_slice(&xs, &[xs.len()]).unwrap();
+    let g = grad(|x: &Array| sum(&erfinv(x)?, &[], false))(&x)
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap();
+    let h = 1e-3f32;
+    let at = |v: f32| erfinv(&Array::scalar(v)).unwrap().item::<f32>().unwrap();
+    for (i, &v) in xs.iter().enumerate() {
+        let numeric = (at(v + h) - at(v - h)) / (2.0 * h);
+        assert!(
+            (g[i] - numeric).abs() <= 1e-2 * numeric.abs(),
+            "x = {v}: {} vs {numeric}",
+            g[i]
+        );
     }
 }

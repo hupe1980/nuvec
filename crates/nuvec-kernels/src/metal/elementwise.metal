@@ -27,6 +27,7 @@ NUVEC_UNARY_OP(Cos, op_cos)
 NUVEC_UNARY_OP(Tanh, op_tanh)
 NUVEC_UNARY_OP(Sigmoid, op_sigmoid)
 NUVEC_UNARY_OP(Conj, op_conj)
+NUVEC_UNARY_OP(ErfInv, op_erfinv)
 
 #define NUVEC_BINARY_OP(Name, expr)                                          \
     struct Name {                                                            \
@@ -185,7 +186,8 @@ template <typename T>
     NUVEC_UNARY(sin, Sin, name, T, T)           \
     NUVEC_UNARY(cos, Cos, name, T, T)           \
     NUVEC_UNARY(tanh, Tanh, name, T, T)         \
-    NUVEC_UNARY(sigmoid, Sigmoid, name, T, T)
+    NUVEC_UNARY(sigmoid, Sigmoid, name, T, T)    \
+    NUVEC_UNARY(erfinv, ErfInv, name, T, T)
 
 NUVEC_INT_KERNELS(uint8, uchar)
 NUVEC_INT_KERNELS(uint16, ushort)
