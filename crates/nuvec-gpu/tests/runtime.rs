@@ -356,7 +356,7 @@ fn function_constants_specialise_and_cache_pipelines() {
     let Some(device) = device() else { return };
     for (flag, expected) in [(false, 1.0), (true, 2.0), (false, 1.0)] {
         let pipeline = device
-            .pipeline_with("nuvec_function_constant_test", &[(0, flag)])
+            .pipeline_with("nuvec_function_constant_test", &[(300, flag)])
             .unwrap();
         let mut out = device.new_buffer(16).unwrap();
         let mut cmd = device.command_buffer().unwrap();

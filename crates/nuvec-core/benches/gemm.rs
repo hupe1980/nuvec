@@ -22,6 +22,10 @@ const SHAPES: &[(&str, usize, usize, usize, usize, bool)] = &[
     ("wide", 1, 4096, 512, 4096, false),
     ("batch8", 8, 512, 512, 512, false),
     ("mnist", 1, 256, 784, 32, true),
+    ("vec4096", 1, 1, 4096, 4096, true),
+    ("vecup", 1, 1, 4096, 11008, true),
+    ("vecdown", 1, 1, 11008, 4096, true),
+    ("matvec", 1, 4096, 4096, 1, false),
 ];
 
 fn main() -> Result<()> {

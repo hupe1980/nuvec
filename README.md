@@ -9,7 +9,8 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > zero-copy views, element-wise operations with weak Rust scalars (`&x * 2.0` keeps `x`'s
 > dtype), reductions, matmul and composable transforms (`grad`, `value_and_grad`, `vjp`,
 > `jvp`, `vmap`, `custom_function`, `checkpoint`; also through complex numbers), random numbers
-> bit-identical to MLX's, MLX's steel GEMM (ported, with split-K and a fused `addmm`), and first
+> bit-identical to MLX's, MLX's GEMM and GEMV kernels (ported, with split-K and a fused
+> `addmm`), and first
 > neural-network pieces (`nuvec-nn`: `Linear`,
 > cross-entropy, SGD, Adam; `just mnist` trains MLX's MNIST example model). Arrays are
 > evaluated on the GPU by default (Metal kernels on unified memory, submitted asynchronously;

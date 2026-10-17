@@ -595,3 +595,110 @@ fn steel_gemm_matches_the_cpu_over_shapes_layouts_batches_and_dtypes() {
     let f = || addmm(&bias, &v, &b, 1.0, 1.0);
     assert_eq!(on(Device::gpu(0), f).unwrap().shape(), &[41]);
 }
+
+#[test]
+fn gemv_matches_the_cpu_for_vector_shapes() {
+    if !gpu_available() {
+        return;
+    }
+    let mut rng = Rng::new(29);
+    let mut random = |shape: &[usize]| {
+        let n = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|_| rng.f64() as f32 * 0.1).collect();
+        Array::from_slice(&v, shape).unwrap()
+    };
+    let check = |name: &str, f: &dyn Fn() -> Result<Array>, k: usize, eps: f32| {
+        let cpu = on(Device::cpu(), f)
+            .unwrap()
+            .astype(DType::F32)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        let gpu = on(Device::gpu(0), f)
+            .unwrap()
+            .astype(DType::F32)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(cpu.len(), gpu.len(), "{name}");
+        for (i, (c, g)) in cpu.iter().zip(&gpu).enumerate() {
+            assert!(
+                (c - g).abs() <= eps * k as f32,
+                "{name} element {i}: cpu {c} gpu {g}"
+            );
+        }
+    };
+    // (M, K, N): every block-selection branch of gemv and gemv_t.
+    for (m, k, n) in [
+        (1, 300, 77),
+        (1, 8192, 2048),
+        (1, 40, 5000),
+        (1, 1000, 3),
+        (77, 300, 1),
+        (5000, 64, 1),
+        (3, 4096, 1),
+        (1, 1, 9),
+    ] {
+        let (x, w) = (random(&[m, k]), random(&[k, n]));
+        let wt = random(&[n, k]);
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let eps = match dtype {
+                DType::F32 => 1e-6,
+                DType::F16 => 2e-3,
+                _ => 1.6e-2,
+            };
+            let cast = |a: &Array| a.astype(dtype);
+            check(
+                &format!("{dtype} {m}x{k}x{n}"),
+                &|| matmul(&cast(&x)?, &cast(&w)?),
+                k,
+                eps,
+            );
+            check(
+                &format!("{dtype} {m}x{k}x{n} wT"),
+                &|| matmul(&cast(&x)?, &cast(&wt)?.t()?),
+                k,
+                eps,
+            );
+        }
+    }
+    // Vector times transposed matrix and matrix times vector views; a strided vector.
+    let (v, mat) = (random(&[2, 300]), random(&[300, 64]));
+    let strided = slice(&v, &[SliceArg::full(), SliceArg::new(None, None, 2)]).unwrap();
+    let half = random(&[150, 64]);
+    check(
+        "strided vector",
+        &|| matmul(&strided.reshape(&[-1])?.reshape(&[1, 300])?, &mat),
+        300,
+        1e-6,
+    );
+    check(
+        "strided k-vector",
+        &|| {
+            matmul(
+                &slice(
+                    &strided,
+                    &[SliceArg::new(Some(0), Some(1), 1), SliceArg::full()],
+                )?,
+                &half,
+            )
+        },
+        150,
+        1e-6,
+    );
+    // Batched vectors, one and two batch axes.
+    let (bv, bm) = (random(&[3, 1, 200]), random(&[3, 200, 50]));
+    check("batched", &|| matmul(&bv, &bm), 200, 1e-6);
+    let (nv, nm) = (random(&[2, 3, 1, 64]), random(&[2, 3, 64, 33]));
+    check(
+        "nc batch",
+        &|| matmul(&nv, &transpose(&nm, &[0, 1, 2, 3])?),
+        64,
+        1e-6,
+    );
+    // addmm through gemv: bias along N (M = 1) and along M (N = 1).
+    let (x, w, bias_n) = (random(&[1, 128]), random(&[128, 40]), random(&[40]));
+    check("addmm M=1", &|| addmm(&bias_n, &x, &w, 0.5, 2.0), 128, 1e-6);
+    let (a, y, bias_m) = (random(&[40, 128]), random(&[128, 1]), random(&[40, 1]));
+    check("addmm N=1", &|| addmm(&bias_m, &a, &y, 1.0, 1.0), 128, 1e-6);
+}

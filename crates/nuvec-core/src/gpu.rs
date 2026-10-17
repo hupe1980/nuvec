@@ -792,6 +792,10 @@ mod metal {
             let (m, n, k) = (out.shape[nd - 2], out.shape[nd - 1], a.0.shape[nd - 1]);
             let batch_shape = &out.shape[..nd - 2];
             let batch: usize = batch_shape.iter().product();
+            // A vector operand: matrix-vector kernels (MLX's routing).
+            if m.min(n) == 1 {
+                return self.gemv(a, b, c, (m, n, k), out, buffer);
+            }
             let ga = self.gemmand(a, m, k)?;
             let gb = self.gemmand(b, k, n)?;
             let class = self
@@ -1008,6 +1012,172 @@ mod metal {
                 .dispatch_threads(&pipeline, &args, [n, m, 1], [n.min(32), m.min(32), 1])
                 .map_err(backend)?;
             self.counted()
+        }
+
+        /// MLX's matrix-vector product (`gemv_axbpy`) for `M = 1` or `N = 1`: `gemv` when the
+        /// matrix is traversed by rows, `gemv_t` when by columns.
+        fn gemv(
+            &mut self,
+            a: Operand<'_>,
+            b: Operand<'_>,
+            c: Option<(Operand<'_>, f32, f32)>,
+            (m, n, k): (usize, usize, usize),
+            out: &Output,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let nd = out.shape.len();
+            let is_b_matrix = n != 1;
+            let (mat, vec) = if is_b_matrix { (b, a) } else { (a, b) };
+            let mat = if is_b_matrix {
+                self.gemmand(mat, k, n)?
+            } else {
+                self.gemmand(mat, m, k)?
+            };
+            // The vector is read contiguously along K.
+            let vec_k_stride = if is_b_matrix {
+                vec.0.strides[nd - 1]
+            } else {
+                vec.0.strides[nd - 2]
+            };
+            let vec = if k == 1 || vec_k_stride == 1 {
+                match Gemmand::view(
+                    vec,
+                    if is_b_matrix { 1 } else { k },
+                    if is_b_matrix { k } else { 1 },
+                ) {
+                    Some(g) => g,
+                    None => self.gemmand_copy(vec)?,
+                }
+            } else {
+                self.gemmand_copy(vec)?
+            };
+            let transpose_mat = if is_b_matrix {
+                !mat.transposed
+            } else {
+                mat.transposed
+            };
+            let (in_len, out_len) = (k, if is_b_matrix { n } else { m });
+            let (mut bm, mut bn, mut sm, mut sn, mut tm, mut tn) = (1, 1, 1, 32, 4, 4);
+            let (kind, per_group) = if transpose_mat {
+                (sm, sn) = if in_len >= 8192 && out_len >= 2048 {
+                    (4, 8)
+                } else {
+                    (8, 4)
+                };
+                bn = if out_len >= 2048 {
+                    16
+                } else if out_len >= 512 {
+                    4
+                } else {
+                    2
+                };
+                tn = if out_len < tn { 1 } else { tn };
+                ("gemv_t", bn * sn * tn)
+            } else {
+                bm = if out_len >= 4096 { 8 } else { 4 };
+                if k <= 64 {
+                    (bm, sm, sn) = (1, 8, 4);
+                } else if k >= 16 * out_len {
+                    (bm, bn) = (1, 8);
+                }
+                tm = if out_len < tm { 1 } else { tm };
+                ("gemv", bm * sm * tm)
+            };
+            let axpby = c.filter(|&(_, alpha, beta)| alpha != 1.0 || beta != 0.0);
+            let batch_shape: Vec<usize> = match &out.shape[..nd - 2] {
+                [] => vec![1],
+                s => s.to_vec(),
+            };
+            let batch: usize = batch_shape.iter().product();
+            let nc = batch_shape.len() > 1;
+            let name = format!(
+                "nuvec_{kind}_{}_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc{}_axpby{}",
+                out.dtype.name(),
+                u8::from(nc),
+                u8::from(axpby.is_some())
+            );
+            let strides = |v: &[isize]| -> Vec<u8> {
+                let v: Vec<i64> = if v.is_empty() {
+                    vec![0]
+                } else {
+                    v.iter().map(|&s| s as i64).collect()
+                };
+                bytemuck::cast_slice(&v).to_vec()
+            };
+            let (vec_strides, mat_strides) =
+                (strides(&vec.batch_strides), strides(&mat.batch_strides));
+            let (bias_strides, bias_stride, alpha, beta) = match axpby {
+                Some(((cm, _), alpha, beta)) => (
+                    strides(&cm.strides[..nd - 2]),
+                    // Along the output vector: N when the matrix is B, else M.
+                    cm.strides[if is_b_matrix { nd - 1 } else { nd - 2 }] as i32,
+                    alpha,
+                    beta,
+                ),
+                None => (strides(&[]), 0, 1.0, 0.0),
+            };
+            let ints = |v: usize| (v as i32).to_le_bytes();
+            let scalars = [
+                ints(in_len),
+                ints(out_len),
+                mat.ld.to_le_bytes(),
+                alpha.to_le_bytes(),
+                beta.to_le_bytes(),
+                ints(nd.saturating_sub(2).max(1)),
+                bias_stride.to_le_bytes(),
+            ];
+            let shape = shape_bytes(&batch_shape);
+            let unused = [0u8; 4];
+            let pipeline = self.pipeline_with(&name, &[])?;
+            let bias_arg = match axpby {
+                Some(((cm, cd), _, _)) => Arg::Read(
+                    cd.buffer.metal().expect("checked"),
+                    cd.offset as usize * cm.dtype.size(),
+                ),
+                None => Arg::bytes(&unused),
+            };
+            let args = [
+                mat.arg(),
+                vec.arg(),
+                bias_arg,
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&scalars[0]),
+                Arg::bytes(&scalars[1]),
+                Arg::bytes(&scalars[2]),
+                Arg::bytes(&scalars[3]),
+                Arg::bytes(&scalars[4]),
+                Arg::bytes(&scalars[5]),
+                Arg::bytes(&shape),
+                Arg::bytes(&vec_strides),
+                Arg::bytes(&mat_strides),
+                Arg::bytes(&bias_strides),
+                Arg::bytes(&scalars[6]),
+            ];
+            self.command_buffer()?
+                .dispatch_groups(
+                    &pipeline,
+                    &args,
+                    [out_len.div_ceil(per_group), 1, batch],
+                    [32, bn, bm],
+                )
+                .map_err(backend)?;
+            self.counted()
+        }
+
+        /// A contiguous copy of an operand (encoded now), row-major.
+        fn gemmand_copy<'a>(&mut self, operand: Operand<'_>) -> Result<Gemmand<'a>> {
+            let (meta, _) = operand;
+            let mut copy = Buffer::try_alloc(meta.size * meta.dtype.size())?;
+            self.copy(operand, &mut copy)?;
+            let strides = crate::shape::row_contiguous_strides(&meta.shape);
+            let nd = strides.len();
+            Ok(Gemmand {
+                buffer: GemmBuffer::Copy(copy),
+                offset: 0,
+                transposed: false,
+                ld: meta.shape[nd - 1] as i32,
+                batch_strides: strides[..nd - 2].to_vec(),
+            })
         }
 
         /// A GEMM operand: its own buffer if its last two dimensions are row- or

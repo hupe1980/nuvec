@@ -35,6 +35,10 @@ SHAPES = [
     ("wide", 1, 4096, 512, 4096, False),
     ("batch8", 8, 512, 512, 512, False),
     ("mnist", 1, 256, 784, 32, True),
+    ("vec4096", 1, 1, 4096, 4096, True),
+    ("vecup", 1, 1, 4096, 11008, True),
+    ("vecdown", 1, 1, 11008, 4096, True),
+    ("matvec", 1, 4096, 4096, 1, False),
 ]
 DTYPES = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 

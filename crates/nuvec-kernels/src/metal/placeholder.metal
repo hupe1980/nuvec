@@ -13,8 +13,8 @@ using namespace metal;
     out[i] = nuvec::twice(float(i));
 }
 
-// Function-constant specialisation test: writes 1 or 2 depending on constant 0.
-constant bool nuvec_test_flag [[function_constant(0)]];
+// Function-constant specialisation test: writes 1 or 2 depending on constant 300.
+constant bool nuvec_test_flag [[function_constant(300)]];
 
 [[kernel]] void nuvec_function_constant_test(
     device float* out [[buffer(0)]],
