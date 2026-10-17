@@ -126,6 +126,15 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         return unary[op](xs[0])
     if op == "addmm":
         return mx.addmm(xs[2], xs[0], xs[1], alpha=float(p["alpha"]), beta=float(p["beta"]))
+    if op == "quantize":
+        return list(mx.quantize(xs[0], group_size=int(p["group_size"]), bits=int(p["bits"])))
+    if op == "dequantize":
+        return mx.dequantize(xs[0], xs[1], xs[2], group_size=int(p["group_size"]),
+                             bits=int(p["bits"]))
+    if op in ("quantized_matmul", "quantized_matmul_xsb"):
+        x, w, s, b = xs if op == "quantized_matmul" else (xs[0], xs[3], xs[1], xs[2])
+        return mx.quantized_matmul(x, w, s, b, transpose=p["transpose"] == "1",
+                                   group_size=int(p["group_size"]), bits=int(p["bits"]))
     if op in ("logsumexp", "softmax"):
         axes = nums(p.get("axes", "")) or None
         if op == "softmax":
@@ -198,8 +207,9 @@ def case(name: str, op: str, inputs: list[mx.array], **params: object) -> None:
     p = {k: str(v) for k, v in params.items()}
     spelled = op + "".join(f"|{k}={v}" for k, v in p.items())
     out = apply(op, p, list(inputs))
-    mx.eval(out)
-    cases.append((name, spelled, list(inputs), [out]))
+    outs = out if isinstance(out, list) else [out]
+    mx.eval(outs)
+    cases.append((name, spelled, list(inputs), outs))
 
 
 ALL = [name for name, _ in DTYPES]
@@ -339,12 +349,18 @@ for op, dt, sc, side in SCALAR_CASES:
 
 # Derivatives: `vjp` cases record (primals..., cotangent) -> one gradient per primal;
 # `jvp` cases record (primals..., tangents...) -> the output tangent. `fn` names the op.
-def derivative(kind: str, name: str, fn: str, primals: list[mx.array], **params: object) -> None:
+# `consts` are further inputs that are not differentiated; they are recorded after the
+# primals (and before the cotangent or tangents) and passed to `fn` after the primals.
+def derivative(kind: str, name: str, fn: str, primals: list[mx.array],
+               consts: list[mx.array] | None = None, **params: object) -> None:
+    consts = consts or []
     p = {"fn": fn, **{k: str(v) for k, v in params.items()}}
+    if consts:
+        p["consts"] = str(len(consts))
     spelled = kind + "".join(f"|{k}={v}" for k, v in p.items())
 
     def f(*xs: mx.array) -> list[mx.array]:
-        return [apply(fn, p, list(xs))]
+        return [apply(fn, p, list(xs) + consts)]
 
     out = f(*primals)[0]
     if kind == "vjp":
@@ -354,7 +370,7 @@ def derivative(kind: str, name: str, fn: str, primals: list[mx.array], **params:
         extra = [make(NAME_OF[x.dtype], x.shape) for x in primals]
         _, results = mx.jvp(f, primals, extra)
     mx.eval(results)
-    cases.append((name, spelled, primals + extra, list(results)))
+    cases.append((name, spelled, primals + consts + extra, list(results)))
 
 
 def positive(dtype: str, shape: tuple[int, ...]) -> mx.array:
@@ -522,6 +538,54 @@ derivative("jvp", "jvp-addmm", "addmm", [make("float32", (3, 4)), make("float32"
            alpha=1.0, beta=1.0)
 batched("vmap-addmm", "addmm", [make("float32", (3, 2, 4)), make("float32", (4, 5)), make("float32", (5,))],
         "0,n,n", alpha=1.0, beta=1.0)
+
+# Affine quantization: bit-exact codes, scales and biases for every dtype, group size and
+# bit width; groups that are constant, one-signed or contain zero.
+QBITS = [1, 2, 3, 4, 5, 6, 8]
+for dt in ["float32", "float16", "bfloat16"]:
+    for gs in [32, 64, 128]:
+        for bits in QBITS:
+            case(f"quantize-{dt}-g{gs}-b{bits}", "quantize", [make(dt, (3, 2 * gs))],
+                 group_size=gs, bits=bits)
+EDGE_Q = np.concatenate([np.full(32, 0.75), -1 - np.arange(32) / 8, np.arange(32) / 31 - 0.25,
+                         np.arange(32) * 3.0]).astype(np.float32).reshape(4, 32)
+for bits in QBITS:
+    case(f"quantize-edges-b{bits}", "quantize", [mx.array(EDGE_Q)], group_size=32, bits=bits)
+
+
+def quantized(dt: str, shape: tuple[int, ...], gs: int, bits: int) -> list[mx.array]:
+    wq, s, b = mx.quantize(make(dt, shape), group_size=gs, bits=bits)
+    mx.eval(wq, s, b)
+    return [wq, s, b]
+
+
+for dt, gs in [("float32", 32), ("float16", 64), ("bfloat16", 128)]:
+    for bits in QBITS:
+        case(f"dequantize-{dt}-g{gs}-b{bits}", "dequantize", quantized(dt, (2, 2 * gs), gs, bits),
+             group_size=gs, bits=bits)
+
+# quantized_matmul: (x, w, scales, biases).
+for name, xs, ws, t, gs, bits, dt in [
+    ("qmm-vec", (64,), (8, 64), 1, 32, 4, "float32"),
+    ("qmm-rows", (5, 128), (12, 128), 1, 64, 4, "float32"),
+    ("qmm-3bit", (3, 96), (6, 96), 1, 32, 3, "float32"),
+    ("qmm-8bit-f16", (4, 128), (16, 128), 1, 128, 8, "float16"),
+    ("qmm-n", (3, 16), (16, 64), 0, 32, 4, "float32"),
+    ("qmm-n-6bit", (2, 32), (32, 128), 0, 64, 6, "float32"),
+    ("qmm-batch", (2, 3, 64), (2, 10, 64), 1, 32, 2, "float32"),
+    ("qmm-shared", (2, 3, 64), (10, 64), 1, 64, 5, "bfloat16"),
+]:
+    case(name, "quantized_matmul", [make(dt, xs)] + quantized(dt, ws, gs, bits),
+         transpose=t, group_size=gs, bits=bits)
+wq, s, b = quantized("float32", (6, 64), 32, 4)
+derivative("vjp", "vjp-qmm", "quantized_matmul_xsb", [make("float32", (3, 64)), s, b], [wq],
+           transpose=1, group_size=32, bits=4)
+wq, s, b = quantized("float32", (32, 64), 64, 4)
+derivative("vjp", "vjp-qmm-n", "quantized_matmul_xsb", [make("float32", (2, 32)), s, b], [wq],
+           transpose=0, group_size=64, bits=4)
+wq, s, b = quantized("float32", (6, 64), 32, 8)
+derivative("jvp", "jvp-qmm", "quantized_matmul", [make("float32", (2, 3, 64))], [wq, s, b],
+           transpose=1, group_size=32, bits=8)
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

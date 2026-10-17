@@ -60,6 +60,10 @@ bench-mlx:
 bench-gemm:
     uv run scripts/bench_gemm.py
 
+# GPU quantized matrix products (4-bit decode and prefill shapes): nuvec vs MLX.
+bench-quant:
+    uv run scripts/bench_quant.py
+
 # Downloads MNIST and trains MLX's example model with nuvec and MLX (M1 exit criterion).
 mnist:
     uv run scripts/mnist_vs_mlx.py

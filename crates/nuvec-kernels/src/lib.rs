@@ -5,7 +5,11 @@
 //! disabled with `NUVEC_METALLIB=off`, the sources are embedded instead so they can
 //! be compiled at runtime. [`MODE`] reports which of these happened.
 //!
-//! **Status:** pre-alpha. The only kernel is a placeholder that proves the pipeline.
+//! The kernels: element-wise operations, casts, copies, reductions, MLX's GEMM (steel,
+//! split-K) and GEMV, and MLX's affine quantization kernels (quantize, dequantize and the
+//! quantized matrix products).
+//!
+//! **Status:** pre-alpha.
 
 /// How the kernel library is provided in this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

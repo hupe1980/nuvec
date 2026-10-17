@@ -424,6 +424,71 @@ mod metal {
         bytes * 8
     }
 
+    /// An operand of the quantized kernels: its buffer and byte offset, in a layout the
+    /// kernels read (MLX's `ensure_row_contiguous[_matrix]`).
+    struct Packed<'a> {
+        buffer: GemmBuffer<'a>,
+        offset: usize,
+        shape: Vec<usize>,
+        strides: Vec<isize>,
+    }
+
+    impl Packed<'_> {
+        fn arg(&self) -> Arg<'_> {
+            match &self.buffer {
+                GemmBuffer::View(b) => Arg::Read(b, self.offset),
+                GemmBuffer::Copy(b) => Arg::Read(b.metal().expect("device storage"), 0),
+            }
+        }
+
+        fn row_contiguous(&self) -> bool {
+            crate::shape::flags_for(&self.shape, &self.strides).row_contiguous
+        }
+    }
+
+    /// Values per packing unit of `bits`-bit codes (MLX's `get_pack_factor`, in `word` bits).
+    fn pack_factor(bits: usize, word: usize) -> usize {
+        match bits {
+            3 | 5 => 8,
+            6 => 4,
+            _ => word / bits,
+        }
+    }
+
+    /// Rows up to which a transposed quantized product runs as matrix-vector products
+    /// (MLX's `get_qmv_batch_limit`), by GPU generation and class letter.
+    fn qmv_batch_limit(k: usize, n: usize, generation: u32, class: char) -> usize {
+        let (small, medium) = (k <= 2048 && n <= 2048, k <= 4096 && n <= 4096);
+        let pick = |a, b, c| {
+            if small {
+                a
+            } else if medium {
+                b
+            } else {
+                c
+            }
+        };
+        if generation >= 17 && class != 'd' {
+            pick(33, 25, 13)
+        } else if generation >= 15 && class != 'd' {
+            pick(13, 15, 13)
+        } else if class == 'd' {
+            pick(32, 18, 12)
+        } else if generation >= 13 {
+            pick(
+                14,
+                10,
+                if generation == 13 && class == 's' {
+                    7
+                } else {
+                    6
+                },
+            )
+        } else {
+            pick(18, 12, 10)
+        }
+    }
+
     impl GpuEval {
         pub(crate) fn new() -> Self {
             GpuEval {
@@ -500,6 +565,9 @@ mod metal {
                 (Primitive::Matmul | Primitive::AddMM { .. }, Some(d)) => {
                     is_float(d) && operands[0].0.shape.last().is_some_and(|&k| k > 0)
                 }
+                (Primitive::Quantize { .. }, Some(d)) => is_float(d) && operands[0].0.size > 0,
+                (Primitive::Dequantize { .. }, _) => outputs[0].size > 0,
+                (Primitive::QuantizedMatmul { .. }, Some(d)) => is_float(d) && outputs[0].size > 0,
                 _ => false,
             }
         }
@@ -511,6 +579,9 @@ mod metal {
             operands: &[Operand<'_>],
             outputs: &[Output],
         ) -> Result<Vec<Data>> {
+            if let Primitive::Quantize { group_size, bits } = primitive {
+                return self.quantize(operands[0], outputs, *group_size, usize::from(*bits));
+            }
             let out = &outputs[0];
             let mut buffer = Buffer::try_alloc(out.size * out.dtype.size())?;
             match primitive {
@@ -553,6 +624,19 @@ mod metal {
                     let c = Some((operands[2], alpha, beta));
                     self.gemm(operands[0], operands[1], c, out, &mut buffer)?
                 }
+                Primitive::Dequantize { group_size, bits } => {
+                    self.dequantize(operands, out, *group_size, usize::from(*bits), &mut buffer)?
+                }
+                Primitive::QuantizedMatmul {
+                    group_size,
+                    bits,
+                    transpose,
+                } => self.quantized_matmul(
+                    operands,
+                    out,
+                    (*group_size, usize::from(*bits), *transpose),
+                    &mut buffer,
+                )?,
                 _ => unreachable!("supports() rejects other primitives"),
             }
             Ok(vec![Data::new(buffer)])
@@ -1160,6 +1244,279 @@ mod metal {
                     [out_len.div_ceil(per_group), 1, batch],
                     [32, bn, bm],
                 )
+                .map_err(backend)?;
+            self.counted()
+        }
+
+        /// The operand as it is if its last two dimensions (all of it with `whole`) are
+        /// row-contiguous, else a row-contiguous copy (encoded now).
+        fn packed<'a>(&mut self, operand: Operand<'a>, whole: bool) -> Result<Packed<'a>> {
+            let (meta, data) = operand;
+            let nd = meta.shape.len();
+            let (sh, st) = (&meta.shape, &meta.strides);
+            let fits = if whole || nd < 2 {
+                meta.flags.row_contiguous
+            } else {
+                (sh[nd - 1] == 1 || st[nd - 1] == 1)
+                    && (sh[nd - 2] == 1 || st[nd - 2] == sh[nd - 1] as isize)
+                    && st.iter().all(|&s| s >= 0)
+            };
+            if fits
+                && data.offset >= 0
+                && let Some(b) = data.buffer.metal()
+            {
+                return Ok(Packed {
+                    buffer: GemmBuffer::View(b),
+                    offset: data.offset as usize * meta.dtype.size(),
+                    shape: sh.to_vec(),
+                    strides: st.to_vec(),
+                });
+            }
+            let mut copy = Buffer::try_alloc(meta.size * meta.dtype.size())?;
+            self.copy(operand, &mut copy)?;
+            Ok(Packed {
+                buffer: GemmBuffer::Copy(copy),
+                offset: 0,
+                shape: sh.to_vec(),
+                strides: crate::shape::row_contiguous_strides(sh).to_vec(),
+            })
+        }
+
+        /// A 1-D launch of `threads` threads in groups of at most the pipeline's maximum.
+        fn dispatch_linear(&mut self, name: &str, args: &[Arg<'_>], threads: usize) -> Result<()> {
+            let pipeline = self.pipeline(name)?;
+            let group = pipeline.max_threads_per_threadgroup().min(threads);
+            self.command_buffer()?
+                .dispatch_threads(&pipeline, args, [threads, 1, 1], [group, 1, 1])
+                .map_err(backend)?;
+            self.counted()
+        }
+
+        /// MLX's `affine_quantize`: one simdgroup per group of values.
+        fn quantize(
+            &mut self,
+            w: Operand<'_>,
+            outputs: &[Output],
+            group_size: usize,
+            bits: usize,
+        ) -> Result<Vec<Data>> {
+            let w = self.packed(w, true)?;
+            let n = w.shape.iter().product::<usize>();
+            let alloc = |o: &Output| Buffer::try_alloc(o.size * o.dtype.size());
+            let mut packed = Buffer::try_alloc(n * bits / 8)?;
+            let (mut scales, mut biases) = (alloc(&outputs[1])?, alloc(&outputs[2])?);
+            let name = format!(
+                "nuvec_affine_quantize_{}_gs{group_size}_b{bits}",
+                outputs[1].dtype.name()
+            );
+            let args = [
+                w.arg(),
+                Arg::write(packed.metal_mut().expect("device storage")),
+                Arg::write(scales.metal_mut().expect("device storage")),
+                Arg::write(biases.metal_mut().expect("device storage")),
+            ];
+            self.dispatch_linear(&name, &args, n / (group_size / 32))?;
+            Ok(vec![
+                Data::new(packed),
+                Data::new(scales),
+                Data::new(biases),
+            ])
+        }
+
+        /// MLX's `affine_dequantize`: one thread per packing unit.
+        fn dequantize(
+            &mut self,
+            operands: &[Operand<'_>],
+            out: &Output,
+            group_size: usize,
+            bits: usize,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let [w, s, b] = [0, 1, 2].map(|i| operands[i]);
+            let (w, s, b) = (
+                self.packed(w, true)?,
+                self.packed(s, true)?,
+                self.packed(b, true)?,
+            );
+            let name = format!(
+                "nuvec_affine_dequantize_{}_gs{group_size}_b{bits}",
+                out.dtype.name()
+            );
+            let args = [
+                w.arg(),
+                s.arg(),
+                b.arg(),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+            ];
+            self.dispatch_linear(&name, &args, out.size / pack_factor(bits, 8))
+        }
+
+        /// MLX's `QuantizedMatmul::eval_gpu`: tiled products (`qmm_t`, split-K, `qmm_n`) from
+        /// the GPU's vector limit on, matrix-vector products (`qmv_fast`, `qmv`, `qvm`) below.
+        fn quantized_matmul(
+            &mut self,
+            operands: &[Operand<'_>],
+            out: &Output,
+            (group_size, bits, transpose): (usize, usize, bool),
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let x = self.packed(operands[0], false)?;
+            let w = self.packed(operands[1], false)?;
+            let s = self.packed(operands[2], false)?;
+            let b = self.packed(operands[3], false)?;
+            let nd = x.shape.len();
+            let k = x.shape[nd - 1];
+            let n = out.shape[out.shape.len() - 1];
+            let flat = w.shape.len() == 2 && x.row_contiguous();
+            let m = if flat { out.size / n } else { x.shape[nd - 2] };
+            let batch = out.size / m / n;
+            let info = self
+                .device()
+                .map(|d| d.info())
+                .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+            let (generation, class) = (info.generation.unwrap_or(0), info.class.unwrap_or('g'));
+            let limit = if transpose {
+                qmv_batch_limit(k, n, generation, class)
+            } else {
+                4
+            };
+            let dtype = out.dtype.name();
+            let base = format!("{dtype}_gs{group_size}_b{bits}");
+            let batched = batch > 1;
+            if m >= limit && transpose && !batched {
+                return self.qmm_splitk(
+                    [&w, &s, &b, &x],
+                    (m, n, k),
+                    &base,
+                    out,
+                    buffer,
+                    group_size,
+                );
+            }
+            let ints = |v: usize| (v as i32).to_le_bytes();
+            let output = buffer.metal_mut().expect("device storage");
+            // Batch layout (buffers after the sizes), as MLX's `add_strides_and_shapes`.
+            let batch_info = [
+                ints(nd - 2).to_vec(),
+                shape_bytes(&x.shape),
+                strides_bytes(&x.strides),
+                ints(w.shape.len() - 2).to_vec(),
+                shape_bytes(&w.shape),
+                strides_bytes(&w.strides),
+                strides_bytes(&s.strides),
+                strides_bytes(&b.strides),
+            ];
+            let mut args = vec![w.arg(), s.arg(), b.arg(), x.arg(), Arg::write(output)];
+            let (kb, nb, mb) = (ints(k), ints(n), ints(m));
+            if m >= limit {
+                args.extend([Arg::bytes(&kb), Arg::bytes(&nb), Arg::bytes(&mb)]);
+                if batched {
+                    args.extend(batch_info.iter().map(|v| Arg::bytes(v)));
+                }
+                let name = if transpose {
+                    format!(
+                        "nuvec_affine_qmm_t_{base}_al{}_batch{}",
+                        u8::from(n.is_multiple_of(32)),
+                        u8::from(batched)
+                    )
+                } else {
+                    format!("nuvec_affine_qmm_n_{base}_batch{}", u8::from(batched))
+                };
+                return self.dispatch_groups(
+                    &name,
+                    &args,
+                    [n.div_ceil(32), m.div_ceil(32), batch],
+                    [32, 2, 2],
+                );
+            }
+            args.extend([Arg::bytes(&kb), Arg::bytes(&nb)]);
+            if batched {
+                args.extend(batch_info.iter().map(|v| Arg::bytes(v)));
+            }
+            let (name, per_group) = if transpose {
+                let fast = k % (pack_factor(bits, 32) * if bits == 2 { 1 } else { 2 } * 32) == 0;
+                let name = if fast {
+                    format!(
+                        "nuvec_affine_qmv_fast_{base}_batch{}_pr{}",
+                        u8::from(batched),
+                        u8::from(!n.is_multiple_of(8))
+                    )
+                } else {
+                    format!("nuvec_affine_qmv_{base}_batch{}", u8::from(batched))
+                };
+                (name, 8)
+            } else {
+                (
+                    format!("nuvec_affine_qvm_{base}_batch{}", u8::from(batched)),
+                    group_size.min(32) * 2,
+                )
+            };
+            self.dispatch_groups(&name, &args, [m, n.div_ceil(per_group), batch], [32, 2, 1])
+        }
+
+        /// MLX's `qmm_splitk`: K split into partitions of whole groups, partial products in
+        /// float32, summed by the GEMM's split-K accumulation. One partition runs `qmm_t`.
+        #[allow(clippy::too_many_arguments)]
+        fn qmm_splitk(
+            &mut self,
+            [w, s, b, x]: [&Packed<'_>; 4],
+            (m, n, k): (usize, usize, usize),
+            base: &str,
+            out: &Output,
+            buffer: &mut Buffer,
+            group_size: usize,
+        ) -> Result<()> {
+            let (n_tiles, m_tiles) = (n.div_ceil(32), m.div_ceil(32));
+            let k_align = group_size.max(32);
+            let mut split = (512 / (n_tiles * m_tiles)).max(1).min(k / k_align);
+            while split > 1 && k % (split * k_align) != 0 {
+                split -= 1;
+            }
+            let ints = |v: usize| (v as i32).to_le_bytes();
+            let (kb, nb, mb) = (ints(k), ints(n), ints(m));
+            let aligned = u8::from(n % 32 == 0);
+            if split <= 1 {
+                let args = [
+                    w.arg(),
+                    s.arg(),
+                    b.arg(),
+                    x.arg(),
+                    Arg::write(buffer.metal_mut().expect("device storage")),
+                    Arg::bytes(&kb),
+                    Arg::bytes(&nb),
+                    Arg::bytes(&mb),
+                ];
+                let name = format!("nuvec_affine_qmm_t_{base}_al{aligned}_batch0");
+                return self.dispatch_groups(&name, &args, [n_tiles, m_tiles, 1], [32, 2, 2]);
+            }
+            let mut partial = Buffer::try_alloc(split * m * n * 4)?;
+            let (size, stride) = (ints(k / split), ints(m * n));
+            let args = [
+                w.arg(),
+                s.arg(),
+                b.arg(),
+                x.arg(),
+                Arg::write(partial.metal_mut().expect("device storage")),
+                Arg::bytes(&kb),
+                Arg::bytes(&nb),
+                Arg::bytes(&mb),
+                Arg::bytes(&size),
+                Arg::bytes(&stride),
+            ];
+            let name = format!("nuvec_affine_qmm_t_splitk_{base}_al{aligned}");
+            self.dispatch_groups(&name, &args, [n_tiles, m_tiles, split], [32, 2, 2])?;
+            let parts = ints(split);
+            let args = [
+                Arg::read(partial.metal().expect("device storage")),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&parts),
+                Arg::bytes(&stride),
+                Arg::bytes(&nb),
+            ];
+            let name = format!("nuvec_gemm_splitk_accum_{}", out.dtype.name());
+            let pipeline = self.pipeline(&name)?;
+            self.command_buffer()?
+                .dispatch_threads(&pipeline, &args, [n, m, 1], [n.min(32), m.min(32), 1])
                 .map_err(backend)?;
             self.counted()
         }

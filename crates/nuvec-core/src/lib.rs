@@ -56,6 +56,7 @@ mod gpu;
 mod kernels;
 mod ops;
 mod primitive;
+mod quantized;
 pub mod random;
 mod scalar;
 mod shape;
@@ -76,6 +77,7 @@ pub use ops::{
     transpose, where_, zeros,
 };
 pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, UnaryOp};
+pub use quantized::{dequantize, quantize, quantized_matmul};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
 pub use shape::Flags;
 pub use transforms::{grad, jvp, value_and_grad, vjp, vmap};

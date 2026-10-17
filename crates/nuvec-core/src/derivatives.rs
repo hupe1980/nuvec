@@ -12,6 +12,7 @@ use crate::ops::{
     matmul, multiply, negative, reshape, sin, subtract, sum, transpose, where_,
 };
 use crate::primitive::{BinaryOp, Primitive, ReduceOp, UnaryOp};
+use crate::quantized::{dequantize, quantized_matmul};
 use crate::{DType, Error, Result};
 
 /// Records `primitive` on `inputs` (single output).
@@ -23,6 +24,68 @@ fn record(primitive: Primitive, inputs: Vec<Array>) -> Result<Array> {
 pub(crate) fn zeros_like(a: &Array) -> Result<Array> {
     let zero = ops::filled(&[], a.dtype(), |_| Canon::Int(0))?;
     broadcast_to(&zero, a.shape())
+}
+
+/// Ones shaped like `a`, as a broadcast scalar.
+fn ones_like(a: &Array) -> Result<Array> {
+    let one = ops::filled(&[], a.dtype(), |_| Canon::Int(1))?;
+    broadcast_to(&one, a.shape())
+}
+
+/// `a` with its last axis split into groups: `[..., C]` → `[..., C / size, size]`.
+fn grouped(a: &Array, size: usize) -> Result<Array> {
+    let mut shape = isize_shape(a.shape());
+    let last = shape.pop().expect("at least 1-D");
+    shape.extend([last / size as isize, size as isize]);
+    reshape(a, &shape)
+}
+
+/// `a` with its leading axes flattened into one, leaving `ndim` axes.
+fn flatten_front(a: &Array, ndim: usize) -> Result<Array> {
+    let mut shape = vec![-1];
+    shape.extend(isize_shape(&a.shape()[a.ndim() + 1 - ndim..]));
+    reshape(a, &shape)
+}
+
+/// The gradients of `scales` and `biases` from `dw`, the gradient of the dequantized
+/// weights (MLX's `QuantizedMatmul::vjp`): per group, `Σ dw · code` and `Σ dw`.
+fn scale_bias_grads(
+    dw: &Array,
+    inputs: &[Array],
+    group_size: usize,
+    bits: u8,
+    wanted: [bool; 2],
+) -> Result<[Option<Array>; 2]> {
+    let (w, scales, biases) = (&inputs[0], &inputs[1], &inputs[2]);
+    let dw = grouped(dw, group_size)?;
+    let ds = match wanted[0] {
+        true => {
+            let codes = dequantize(
+                w,
+                &ones_like(scales)?,
+                &zeros_like(biases)?,
+                group_size,
+                u32::from(bits),
+            )?;
+            Some(sum(
+                &multiply(&dw, grouped(&codes, group_size)?)?,
+                &[-1],
+                false,
+            )?)
+        }
+        false => None,
+    };
+    let db = match wanted[1] {
+        true => Some(sum(&dw, &[-1], false)?),
+        false => None,
+    };
+    Ok([ds, db])
+}
+
+fn no_weight_gradient(op: &str) -> Error {
+    Error::InvalidArgument(format!(
+        "{op}: there is no gradient with respect to the packed (quantized) weights"
+    ))
 }
 
 fn isize_shape(shape: &[usize]) -> Vec<isize> {
@@ -283,6 +346,53 @@ impl Primitive {
                 };
                 Ok(vec![da, db, dc])
             }
+            Self::Quantize { .. } => Ok(vec![None]),
+            Self::Dequantize { group_size, bits } => {
+                if wanted[0] {
+                    return Err(no_weight_gradient("dequantize"));
+                }
+                let [ds, db] =
+                    scale_bias_grads(g, inputs, *group_size, *bits, [wanted[1], wanted[2]])?;
+                Ok(vec![None, ds, db])
+            }
+            Self::QuantizedMatmul {
+                group_size,
+                bits,
+                transpose,
+            } => {
+                if wanted[1] {
+                    return Err(no_weight_gradient("quantized_matmul"));
+                }
+                let (x, w, scales, biases) = (&inputs[0], &inputs[1], &inputs[2], &inputs[3]);
+                let dx = match wanted[0] {
+                    true => Some(quantized_matmul(
+                        g,
+                        w,
+                        scales,
+                        biases,
+                        !transpose,
+                        *group_size,
+                        u32::from(*bits),
+                    )?),
+                    false => None,
+                };
+                let [ds, db] = match wanted[2] || wanted[3] {
+                    true => {
+                        // The gradient of the dequantized weights, summed over the batch
+                        // dimensions `w` does not have.
+                        let keep = w.ndim();
+                        let (fg, fx) = (flatten_front(g, keep)?, flatten_front(x, keep)?);
+                        let dw = match transpose {
+                            true => matmul(&swap_last(&fg)?, &fx)?,
+                            false => matmul(&swap_last(&fx)?, &fg)?,
+                        };
+                        let rest = [w.clone(), scales.clone(), biases.clone()];
+                        scale_bias_grads(&dw, &rest, *group_size, *bits, [wanted[2], wanted[3]])?
+                    }
+                    false => [None, None],
+                };
+                Ok(vec![dx, None, ds, db])
+            }
             Self::Custom(call) => {
                 let n = call.primals;
                 let primals = &inputs[..n];
@@ -409,6 +519,41 @@ impl Primitive {
                 total = multiply(&total, f64::from(alpha))?;
                 if let Some(tc) = &tangents[2] {
                     total = ops::add(&total, multiply(tc, f64::from(beta))?)?;
+                }
+                one(Ok(total))
+            }
+            Self::Quantize { .. } => outputs.iter().map(zeros_like).collect(),
+            // Linear in `(scales, biases)`: `dequantize(w, dscales, dbiases)`.
+            Self::Dequantize { group_size, bits } => one(dequantize(
+                &inputs[0],
+                &tangent(1)?,
+                &tangent(2)?,
+                *group_size,
+                u32::from(*bits),
+            )),
+            Self::QuantizedMatmul {
+                group_size,
+                bits,
+                transpose,
+            } => {
+                let (x, w) = (&inputs[0], &inputs[1]);
+                let mut total = match &tangents[0] {
+                    Some(t) => quantized_matmul(
+                        t,
+                        w,
+                        &inputs[2],
+                        &inputs[3],
+                        *transpose,
+                        *group_size,
+                        u32::from(*bits),
+                    )?,
+                    None => zeros_like(out)?,
+                };
+                if tangents[2].is_some() || tangents[3].is_some() {
+                    let dw =
+                        dequantize(w, &tangent(2)?, &tangent(3)?, *group_size, u32::from(*bits))?;
+                    let dw = if *transpose { swap_last(&dw)? } else { dw };
+                    total = ops::add(&total, matmul(x, &dw)?)?;
                 }
                 one(Ok(total))
             }

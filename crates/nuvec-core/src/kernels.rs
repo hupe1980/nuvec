@@ -479,6 +479,167 @@ pub(crate) fn matmul(a: Operand<'_>, b: Operand<'_>) -> Result<Buffer> {
     }
 }
 
+// ── Affine quantization (MLX's CPU semantics) ──────────────────────────────
+
+/// The code of value `i` in a little-endian stream of `bits`-bit values.
+fn code(bytes: &[u8], i: usize, bits: usize) -> u32 {
+    let (byte, shift) = (i * bits / 8, i * bits % 8);
+    let mut v = u32::from(bytes[byte]) >> shift;
+    if shift + bits > 8 {
+        v |= u32::from(bytes[byte + 1]) << (8 - shift);
+    }
+    v & ((1 << bits) - 1)
+}
+
+fn real<T: Scalar>(x: T) -> f64 {
+    match x.to_canon() {
+        Canon::Float(f) => f,
+        Canon::Int(i) => i as f64,
+        Canon::Complex(z) => f64::from(z.re),
+    }
+}
+
+/// `x` rounded once to `T`.
+fn round_to<T: Scalar>(x: f64) -> T {
+    T::from_canon(Canon::Float(x))
+}
+
+/// MLX's affine quantization (`backend/cpu/quantized.cpp`): per group, f32 extremes; a scale
+/// that snaps the edge of larger magnitude to a code; codes rounded half to even and clamped.
+/// Returns the packed codes, scales and biases.
+pub(crate) fn quantize(
+    w: Operand<'_>,
+    group_size: usize,
+    bits: usize,
+) -> Result<(Buffer, Buffer, Buffer)> {
+    let values = cast(w, DType::F32)?;
+    let values = values.typed::<f32>();
+    let groups = values.len() / group_size;
+    let n_bins = ((1u32 << bits) - 1) as f32;
+    let eps = 1e-7f32;
+    let mut packed = output::<u32>(values.len() * bits / 32)?;
+    let bytes = packed.bytes_mut();
+    bytes.fill(0);
+    let (mut scales, mut biases) = (Vec::with_capacity(groups), Vec::with_capacity(groups));
+    for (g, group) in values.chunks_exact(group_size).enumerate() {
+        let (lo, hi) = group
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        let (scale, bias) = if bits == 1 {
+            ((hi - lo).max(eps), lo)
+        } else {
+            let wide = lo.abs() > hi.abs();
+            let scale = ((hi - lo) / n_bins).max(eps);
+            let scale = if wide { scale } else { -scale };
+            let edge = if wide { lo } else { hi };
+            let q0 = (edge / scale).round_ties_even();
+            if q0 == 0.0 {
+                (scale, 0.0)
+            } else {
+                (edge / q0, edge)
+            }
+        };
+        for (j, &v) in group.iter().enumerate() {
+            let q = ((v - bias) / scale).round_ties_even().clamp(0.0, n_bins) as u32;
+            let bit = (g * group_size + j) * bits;
+            let (byte, shift) = (bit / 8, bit % 8);
+            let wide = q << shift;
+            bytes[byte] |= wide as u8;
+            if shift + bits > 8 {
+                bytes[byte + 1] |= (wide >> 8) as u8;
+            }
+        }
+        scales.push(f64::from(scale));
+        biases.push(f64::from(bias));
+    }
+    let typed = |xs: Vec<f64>| -> Result<Buffer> {
+        with_type!(w.0.dtype, T => {
+            let mut out = output::<T>(xs.len())?;
+            for (o, x) in out.typed_mut::<T>().iter_mut().zip(xs) {
+                *o = round_to::<T>(x);
+            }
+            Ok(out)
+        })
+    };
+    Ok((packed, typed(scales)?, typed(biases)?))
+}
+
+/// `code · scale + bias` per value, each operation rounded to the scales' type (as MLX's
+/// graph of `multiply` and `add`), row-contiguous with `values_per_row` values per row.
+pub(crate) fn dequantize(
+    w: Operand<'_>,
+    scales: Operand<'_>,
+    biases: Operand<'_>,
+    group_size: usize,
+    bits: usize,
+) -> Result<Buffer> {
+    let codes = contiguous(w.0, w.1)?;
+    let codes = codes.bytes();
+    let (s, b) = (
+        contiguous(scales.0, scales.1)?,
+        contiguous(biases.0, biases.1)?,
+    );
+    let n = w.0.size * 32 / bits;
+    with_type!(scales.0.dtype, T => {
+        let (s, b) = (s.typed::<T>(), b.typed::<T>());
+        let mut out = output::<T>(n)?;
+        for (i, o) in out.typed_mut::<T>().iter_mut().enumerate() {
+            let g = i / group_size;
+            let product: T = round_to(f64::from(code(codes, i, bits)) * real(s[g]));
+            *o = round_to(real(product) + real(b[g]));
+        }
+        Ok(out)
+    })
+}
+
+/// Metadata for a matrix operand with explicit strides.
+fn strided(dtype: DType, shape: &[usize], strides: &[isize]) -> Output {
+    Output {
+        dtype,
+        shape: shape.into(),
+        strides: strides.into(),
+        flags: shape::flags_for(shape, strides),
+        size: shape.iter().product(),
+        slot: Default::default(),
+        inflight: Default::default(),
+    }
+}
+
+/// `x · dequantize(w)ᵀ` (`transpose`) or `x · dequantize(w)`: the weights are dequantized,
+/// then multiplied with the GEMM (accumulating in f32 for half types).
+pub(crate) fn quantized_matmul(
+    operands: &[Operand<'_>],
+    group_size: usize,
+    bits: usize,
+    transpose: bool,
+) -> Result<Buffer> {
+    let (x, w) = (operands[0], operands[1]);
+    let dense = Data::new(dequantize(w, operands[2], operands[3], group_size, bits)?);
+    let (xn, wn) = (x.0.shape.len(), w.0.shape.len());
+    let rows = w.0.shape[wn - 2];
+    let cols = w.0.shape[wn - 1] * 32 / bits;
+    let (k, n, sk, sn) = if transpose {
+        (cols, rows, 1, cols as isize)
+    } else {
+        (rows, cols, cols as isize, 1)
+    };
+    let mut shape: Vec<usize> = x.0.shape[..xn - 2].to_vec();
+    let mut strides: Vec<isize> = if wn == 2 {
+        vec![0; xn - 2]
+    } else {
+        shape::row_contiguous_strides(&w.0.shape[..wn - 2])
+            .iter()
+            .map(|s| s * (rows * cols) as isize)
+            .collect()
+    };
+    shape.extend([k, n]);
+    strides.extend([sk, sn]);
+    let meta = strided(x.0.dtype, &shape, &strides);
+    matmul(x, (&meta, &dense))
+}
+
 /// `T` is the storage type, `G` the GEMM element type with the same layout.
 fn matmul_typed<T: Pod, G: Gemm + Pod>(a: Operand<'_>, b: Operand<'_>) -> Result<Buffer> {
     let (sa, sb) = (&a.0.shape, &b.0.shape);

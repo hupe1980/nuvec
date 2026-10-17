@@ -10,8 +10,9 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > dtype), reductions, matmul and composable transforms (`grad`, `value_and_grad`, `vjp`,
 > `jvp`, `vmap`, `custom_function`, `checkpoint`; also through complex numbers), random numbers
 > bit-identical to MLX's, MLX's GEMM and GEMV kernels (ported, with split-K and a fused
-> `addmm`), and first
-> neural-network pieces (`nuvec-nn`: `Linear`,
+> `addmm`), MLX-compatible affine quantization (`quantize`, `dequantize` and
+> `quantized_matmul` with MLX's packing and kernels, 1–8 bits), and first
+> neural-network pieces (`nuvec-nn`: `Linear`, `QuantizedLinear`,
 > cross-entropy, SGD, Adam; `just mnist` trains MLX's MNIST example model). Arrays are
 > evaluated on the GPU by default (Metal kernels on unified memory, submitted asynchronously;
 > `async_eval` overlaps host work with GPU work) or on the CPU
@@ -55,6 +56,8 @@ Python is not needed to build or test. With [uv](https://docs.astral.sh/uv/) ins
 
 - `just fixtures`: re-records the fixtures with the pinned MLX version on its CPU device
 - `just bench-mlx`: prints a same-machine benchmark table, nuvec vs MLX
+- `just bench-gemm`, `just bench-quant`: GPU matrix and quantized matrix products, nuvec vs
+  MLX
 
 ## Crates
 

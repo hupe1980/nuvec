@@ -8,6 +8,7 @@
 use crate::array::Array;
 use crate::ops::{broadcast_to, expand_dims, matmul, reshape, transpose};
 use crate::primitive::Primitive;
+use crate::quantized::{dequantize, quantize, quantized_matmul};
 use crate::{Result, view};
 
 fn record(primitive: Primitive, inputs: Vec<Array>) -> Result<Vec<Array>> {
@@ -128,6 +129,48 @@ impl Primitive {
                 let b = front(&inputs[1], axes[1])?;
                 let c = front(&inputs[2], axes[2])?;
                 Ok((vec![crate::ops::addmm(&c, &a, &b, alpha, beta)?], 0))
+            }
+            Self::Quantize { group_size, bits } => {
+                let (wq, scales, biases) =
+                    quantize(&front(x, axes[0])?, *group_size, u32::from(*bits))?;
+                Ok((vec![wq, scales, biases], 0))
+            }
+            // Packed weights, scales and biases share their batch dimensions.
+            Self::Dequantize { group_size, bits } => {
+                let [w, s, bias] = [0, 1, 2].map(|i| front_full(&inputs[i], axes[i], b));
+                Ok((
+                    vec![dequantize(&w?, &s?, &bias?, *group_size, u32::from(*bits))?],
+                    0,
+                ))
+            }
+            // MLX has no rule. With unbatched weights, the batch joins `x`'s leading
+            // dimensions; otherwise every operand gets the batch axis first, and 2-D weights
+            // get size-1 axes for `x`'s other batch dimensions.
+            Self::QuantizedMatmul {
+                group_size,
+                bits,
+                transpose,
+            } => {
+                let x = front(x, axes[0])?;
+                let mut weights = [inputs[1].clone(), inputs[2].clone(), inputs[3].clone()];
+                if axes[1..].iter().any(Option::is_some) {
+                    for (i, a) in weights.iter_mut().enumerate() {
+                        *a = front_full(a, axes[i + 1], b)?;
+                        while a.ndim() < x.ndim() {
+                            *a = expand_dims(a, 1)?;
+                        }
+                    }
+                }
+                let out = quantized_matmul(
+                    &x,
+                    &weights[0],
+                    &weights[1],
+                    &weights[2],
+                    *transpose,
+                    *group_size,
+                    u32::from(*bits),
+                )?;
+                Ok((vec![out], 0))
             }
             Self::Custom(call) => {
                 let (primals, axes) = (&inputs[..call.primals], &axes[..call.primals]);

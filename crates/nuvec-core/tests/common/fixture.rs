@@ -349,15 +349,31 @@ type Reduction = fn(&Array, &[isize], bool) -> Result<Array>;
 pub fn run(case: &Case) -> Result<Vec<Array>> {
     let p = |k: &str| case.params.get(k).map(String::as_str).unwrap_or("");
     let xs: Vec<Array> = case.inputs.iter().map(to_array).collect();
-    let f = |xs: &[Array]| Ok(vec![apply(case, p("fn"), xs.to_vec())?]);
+    // Inputs that are passed to `fn` after the primals but not differentiated.
+    let consts = p("consts").parse::<usize>().unwrap_or(0);
+    let f = |ps: &[Array], cs: &[Array]| {
+        let mut all = ps.to_vec();
+        all.extend_from_slice(cs);
+        Ok(vec![apply(case, p("fn"), all)?])
+    };
     match case.op.as_str() {
         "vjp" => {
-            let n = xs.len() - 1;
-            Ok(vjp(f, &xs[..n], &xs[n..])?.1)
+            let n = xs.len() - 1 - consts;
+            let cs = &xs[n..n + consts];
+            Ok(vjp(|ps: &[Array]| f(ps, cs), &xs[..n], &xs[n + consts..])?.1)
         }
         "jvp" => {
-            let n = xs.len() / 2;
-            Ok(jvp(f, &xs[..n], &xs[n..])?.1)
+            let n = (xs.len() - consts) / 2;
+            let cs = &xs[n..n + consts];
+            Ok(jvp(|ps: &[Array]| f(ps, cs), &xs[..n], &xs[n + consts..])?.1)
+        }
+        "quantize" => {
+            let (wq, s, b) = quantize(
+                &xs[0],
+                p("group_size").parse().unwrap(),
+                p("bits").parse().unwrap(),
+            )?;
+            Ok(vec![wq, s, b])
         }
         "vmap" => {
             let in_axes: Vec<Option<isize>> = p("in_axes")
@@ -365,7 +381,7 @@ pub fn run(case: &Case) -> Result<Vec<Array>> {
                 .map(|a| (a != "n").then(|| a.parse().unwrap()))
                 .collect();
             let out_axes = [p("out_axes").parse().unwrap()];
-            vmap(f, &in_axes, &out_axes)(&xs)
+            vmap(|ps: &[Array]| f(ps, &[]), &in_axes, &out_axes)(&xs)
         }
         op => Ok(vec![apply(case, op, xs)?]),
     }
@@ -387,6 +403,9 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
     }
     let dtype = || DTYPES[p("dtype").parse::<usize>().unwrap()];
     let keep = p("keepdims") == "1";
+    let gs = || p("group_size").parse().unwrap();
+    let bits = || p("bits").parse().unwrap();
+    let t = || p("transpose") == "1";
     if op == "matmul" {
         return matmul(&xs[0], &xs[1]);
     }
@@ -453,6 +472,11 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
             p("alpha").parse().unwrap(),
             p("beta").parse().unwrap(),
         ),
+        "dequantize" => dequantize(&xs[0], &xs[1], &xs[2], gs(), bits()),
+        "quantized_matmul" => quantized_matmul(&xs[0], &xs[1], &xs[2], &xs[3], t(), gs(), bits()),
+        "quantized_matmul_xsb" => {
+            quantized_matmul(&xs[0], &xs[3], &xs[1], &xs[2], t(), gs(), bits())
+        }
         "logsumexp" => logsumexp(&xs[0], &ints(p("axes")), keep),
         "softmax" => softmax(&xs[0], &ints(p("axes"))),
         "random" => random_case(case),
@@ -536,6 +560,14 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
             let n = case.inputs[0].data.len() / expected.data.len().max(1) * expected.dtype.size()
                 / case.inputs[0].dtype.size().max(1);
             (n.max(1) as f64 + 1.0) * eps * e.abs().max(1.0)
+        }
+        // Bounded by K · max|x| · max|dequantized w|, with codes up to 2^bits - 1.
+        "quantized_matmul" => {
+            let bound = |t: &Tensor| values(t).iter().fold(1.0f64, |m, &(re, _)| m.max(re.abs()));
+            let bits: i32 = case.params["bits"].parse().unwrap();
+            let k = case.inputs[0].shape.last().copied().unwrap_or(1) as f64;
+            let w = bound(&case.inputs[2]) * f64::from((1 << bits) - 1) + bound(&case.inputs[3]);
+            4.0 * (k + 1.0) * eps * bound(&case.inputs[0]) * w
         }
         "matmul" | "addmm" => {
             let bound = |t: &Tensor| {

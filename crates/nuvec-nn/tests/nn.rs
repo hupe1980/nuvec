@@ -3,7 +3,7 @@
 use nuvec::{Array, Result, random};
 use nuvec_nn::losses::{Reduction, cross_entropy};
 use nuvec_nn::optim::{Adam, Optimizer, Sgd};
-use nuvec_nn::{Linear, Module, relu, value_and_grad};
+use nuvec_nn::{Linear, Module, QuantizedLinear, relu, value_and_grad};
 
 fn values(a: &Array) -> Vec<f32> {
     a.to_vec::<f32>().unwrap()
@@ -198,4 +198,36 @@ fn value_and_grad_matches_the_core_transform_and_training_learns() {
     let end = values(&value_and_grad(&model, loss).unwrap().0)[0];
     assert!(end < 0.3 * start, "loss {start} -> {end}");
     assert!(model.set_parameters(&params[..2]).is_err());
+}
+
+#[test]
+fn quantized_linear_equals_mlx() {
+    random::seed(0);
+    let q = QuantizedLinear::from_linear(&Linear::new(64, 3, true).unwrap(), 32, 4).unwrap();
+    assert_eq!(q.weight.shape(), &[3, 8]);
+    assert_eq!(q.scales.shape(), &[3, 2]);
+    let x = nuvec::arange(0.0, 128.0, 1.0, nuvec::DType::F32).unwrap();
+    let x = (x.reshape(&[2, 64]).unwrap() / 64.0) - 0.5;
+    // mlx.nn.QuantizedLinear.from_linear(nn.Linear(64, 3), group_size=32, bits=4) after
+    // mx.random.seed(0), on the CPU.
+    let expected = [
+        0.3646765351295471,
+        -0.15546883642673492,
+        0.23967400193214417,
+        -0.7248094081878662,
+        -0.07878664135932922,
+        -0.29476773738861084,
+    ];
+    close(
+        &values(&q.forward(&x).unwrap()),
+        &expected,
+        "QuantizedLinear",
+    );
+    // Only the bias trains (as MLX's from_linear); gradients reach it through the layer.
+    assert_eq!(q.parameters().len(), 1);
+    let (_, grads) = value_and_grad(&q, |m: &QuantizedLinear| {
+        nuvec::sum(&m.forward(&x)?, &[], false)
+    })
+    .unwrap();
+    assert_eq!(values(&grads[0]), vec![2.0; 3]);
 }

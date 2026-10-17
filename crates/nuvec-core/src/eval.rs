@@ -258,6 +258,32 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
                 n * primitive_width(primitive),
             )?)
         }
+        Primitive::Quantize { group_size, bits } => {
+            let (packed, scales, biases) =
+                kernels::quantize(operands[0], *group_size, usize::from(*bits))?;
+            Ok(vec![
+                Data::new(packed),
+                Data::new(scales),
+                Data::new(biases),
+            ])
+        }
+        Primitive::Dequantize { group_size, bits } => new(kernels::dequantize(
+            operands[0],
+            operands[1],
+            operands[2],
+            *group_size,
+            usize::from(*bits),
+        )?),
+        Primitive::QuantizedMatmul {
+            group_size,
+            bits,
+            transpose,
+        } => new(kernels::quantized_matmul(
+            operands,
+            *group_size,
+            usize::from(*bits),
+            *transpose,
+        )?),
         Primitive::SliceUpdate { .. } => new(kernels::slice_update(
             operands[0],
             operands[1],

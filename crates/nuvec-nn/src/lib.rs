@@ -1,5 +1,6 @@
 //! Neural-network building blocks on nuvec, following MLX's `mlx.nn` and `mlx.optimizers`:
-//! a [`Module`] trait (parameters out, parameters in), the [`Linear`] layer, [`relu`],
+//! a [`Module`] trait (parameters out, parameters in), the [`Linear`] and [`QuantizedLinear`]
+//! layers, [`relu`],
 //! [`losses::cross_entropy`], the [`optim::Sgd`] and [`optim::Adam`] optimizers, and
 //! [`value_and_grad`] for a model's loss.
 //!
@@ -31,7 +32,7 @@
 
 #![forbid(unsafe_code)]
 
-use nuvec::{Array, Error, Result, matmul, maximum, random};
+use nuvec::{Array, Error, Result, add, matmul, maximum, quantize, quantized_matmul, random};
 
 pub mod losses;
 pub mod optim;
@@ -152,6 +153,77 @@ impl Module for Linear {
         self.weight = parameters[0].clone();
         if self.bias.is_some() {
             self.bias = Some(parameters[1].clone());
+        }
+        Ok(())
+    }
+}
+
+/// A [`Linear`] layer with its weight quantized (MLX's `nn.QuantizedLinear`): `x Wᵀ + b`
+/// computed by `quantized_matmul` from the packed weight, its scales and biases.
+///
+/// The quantized weight, scales and biases are frozen; as with MLX's `from_linear`, the bias
+/// stays trainable ([`Module::parameters`] is the bias, if any). Gradients flow to the input.
+#[derive(Debug, Clone)]
+pub struct QuantizedLinear {
+    /// The packed weight (uint32), `[output_dims, input_dims · bits / 32]`.
+    pub weight: Array,
+    /// One scale per group of input values, `[output_dims, input_dims / group_size]`.
+    pub scales: Array,
+    /// One bias per group of input values, shaped like `scales`.
+    pub biases: Array,
+    /// The layer's bias, `[output_dims]`.
+    pub bias: Option<Array>,
+    /// Input values per scale and bias.
+    pub group_size: usize,
+    /// Bits per weight.
+    pub bits: u32,
+}
+
+impl QuantizedLinear {
+    /// Quantizes `linear`'s weight in groups of `group_size` (32, 64 or 128) input values
+    /// with `bits` (1–6 or 8) bits each; the bias is kept. MLX's defaults are 64 and 4.
+    pub fn from_linear(linear: &Linear, group_size: usize, bits: u32) -> Result<Self> {
+        let (weight, scales, biases) = quantize(&linear.weight, group_size, bits)?;
+        Ok(Self {
+            weight,
+            scales,
+            biases,
+            bias: linear.bias.clone(),
+            group_size,
+            bits,
+        })
+    }
+
+    /// `x Wᵀ + b` over the last axis of `x`.
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        let y = quantized_matmul(
+            x,
+            &self.weight,
+            &self.scales,
+            &self.biases,
+            true,
+            self.group_size,
+            self.bits,
+        )?;
+        match &self.bias {
+            Some(b) => add(&y, b),
+            None => Ok(y),
+        }
+    }
+}
+
+impl Module for QuantizedLinear {
+    fn parameters(&self) -> Vec<Array> {
+        self.bias.iter().cloned().collect()
+    }
+
+    fn set_parameters(&mut self, parameters: &[Array]) -> Result<()> {
+        let expected = usize::from(self.bias.is_some());
+        if parameters.len() != expected {
+            return Err(count_mismatch(parameters.len(), expected));
+        }
+        if let Some(b) = parameters.first() {
+            self.bias = Some(b.clone());
         }
         Ok(())
     }

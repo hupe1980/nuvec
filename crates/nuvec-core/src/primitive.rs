@@ -241,6 +241,31 @@ pub enum Primitive {
         /// `f32::to_bits` of beta.
         beta: u32,
     },
+    /// Affine quantization of the last axis in groups (MLX's `quantize`). Outputs the packed
+    /// codes (uint32, `bits` per value), the scales and the biases (the input's dtype).
+    Quantize {
+        /// Values per scale and bias: 32, 64 or 128.
+        group_size: usize,
+        /// Bits per value: 1–6 or 8.
+        bits: u8,
+    },
+    /// `(w, scales, biases)`: `code · scale + bias` per value, in the scales' dtype.
+    Dequantize {
+        /// Values per scale and bias.
+        group_size: usize,
+        /// Bits per value.
+        bits: u8,
+    },
+    /// `(x, w, scales, biases)`: `x · dequantize(w)ᵀ` (`transpose`) or `x · dequantize(w)`.
+    /// `w` is two-dimensional, or has `x`'s batch dimensions.
+    QuantizedMatmul {
+        /// Values per scale and bias.
+        group_size: usize,
+        /// Bits per value.
+        bits: u8,
+        /// Whether the dequantized matrix is used transposed (MLX's default).
+        transpose: bool,
+    },
     /// Random bits from threefry2x32 keys of shape `[..., 2]` (uint32): the output has shape
     /// `keys.shape[..-1] + shape` and `width` bytes per element (MLX's layout).
     RandomBits {
@@ -294,6 +319,9 @@ impl Primitive {
             Self::Matmul => "matmul",
             Self::AddMM { .. } => "addmm",
             Self::RandomBits { .. } => "random_bits",
+            Self::Quantize { .. } => "quantize",
+            Self::Dequantize { .. } => "dequantize",
+            Self::QuantizedMatmul { .. } => "quantized_matmul",
             Self::Custom(_) => "custom_function",
             #[cfg(test)]
             Self::AddMultiply => "add_multiply",
@@ -486,6 +514,72 @@ impl Primitive {
                     .collect();
                 computed(dtype, &out)
             }
+            Self::Quantize { group_size, bits } => {
+                let [w] = self.arity::<1>(inputs)?;
+                let n = w.ndim();
+                if !matches!(w.dtype(), DType::F16 | DType::BF16 | DType::F32) {
+                    return Err(Error::UnsupportedDType {
+                        op: "quantize",
+                        dtype: w.dtype(),
+                    });
+                }
+                if n < 2 || w.shape()[n - 1] % group_size != 0 {
+                    return Err(Error::InvalidArgument(format!(
+                        "quantize: needs at least 2 dimensions with the last divisible by \
+                         the group size {group_size}, got shape {:?}",
+                        w.shape()
+                    )));
+                }
+                let last = w.shape()[n - 1];
+                let with_last = |d: usize| {
+                    let mut s: Shape = w.shape().into();
+                    s[n - 1] = d;
+                    s
+                };
+                let packed = computed(DType::U32, &with_last(last * usize::from(*bits) / 32));
+                let groups = computed(w.dtype(), &with_last(last / group_size));
+                return Ok(smallvec![packed, groups.clone(), groups]);
+            }
+            Self::Dequantize { group_size, bits } => {
+                let [w, scales, _] = self.arity::<3>(inputs)?;
+                let mut shape: Shape = w.shape().into();
+                let n = shape.len();
+                shape[n - 1] = self.quantized_columns(w, &inputs[1..], *group_size, *bits)?;
+                computed(scales.dtype(), &shape)
+            }
+            Self::QuantizedMatmul {
+                group_size,
+                bits,
+                transpose,
+            } => {
+                let [x, w, scales, _] = self.arity::<4>(inputs)?;
+                let columns = self.quantized_columns(w, &inputs[2..], *group_size, *bits)?;
+                let rows = w.shape()[w.ndim() - 2];
+                let (inner, outer) = if *transpose {
+                    (columns, rows)
+                } else {
+                    (rows, columns)
+                };
+                let (xn, wn) = (x.ndim(), w.ndim());
+                let batch_ok = wn == 2 || (xn == wn && x.shape()[..xn - 2] == w.shape()[..wn - 2]);
+                if xn == 0 || x.shape()[xn - 1] != inner || !batch_ok {
+                    return Err(Error::ShapeMismatch {
+                        op: "quantized_matmul",
+                        lhs: x.shape().to_vec(),
+                        rhs: w.shape().to_vec(),
+                    });
+                }
+                if x.dtype() != scales.dtype() {
+                    return Err(Error::DTypeMismatch {
+                        op: "quantized_matmul",
+                        lhs: x.dtype(),
+                        rhs: scales.dtype(),
+                    });
+                }
+                let mut shape: Shape = x.shape().into();
+                shape[xn - 1] = outer;
+                computed(x.dtype(), &shape)
+            }
             Self::Custom(call) => {
                 let outputs = inputs.get(call.primals..).unwrap_or_default();
                 if outputs.is_empty() {
@@ -532,6 +626,52 @@ impl Primitive {
                 "slice: one start, step and length per dimension".into(),
             )),
         }
+    }
+
+    /// The number of values per row of packed codes `w` (uint32, at least 2-D), after
+    /// validating it against `[scales, biases]` (one float dtype, equal shapes, one value per
+    /// group), as MLX's `validate_quantized_input`.
+    fn quantized_columns(
+        &self,
+        w: &Array,
+        groups: &[Array],
+        group_size: usize,
+        bits: u8,
+    ) -> Result<usize> {
+        let (scales, biases) = (&groups[0], &groups[1]);
+        let n = w.ndim();
+        let invalid =
+            |what: String| Err(Error::InvalidArgument(format!("{}: {what}", self.name())));
+        if w.dtype() != DType::U32 {
+            return invalid(format!("packed weights must be uint32, got {}", w.dtype()));
+        }
+        if !matches!(scales.dtype(), DType::F16 | DType::BF16 | DType::F32)
+            || biases.dtype() != scales.dtype()
+            || biases.shape() != scales.shape()
+        {
+            return invalid(format!(
+                "scales and biases must share a float dtype and shape, got {} {:?} and {} {:?}",
+                scales.dtype(),
+                scales.shape(),
+                biases.dtype(),
+                biases.shape()
+            ));
+        }
+        let packed = w.shape().last().copied().unwrap_or(0) * 32;
+        let groups = scales.shape().last().copied().unwrap_or(0) * group_size;
+        if n < 2
+            || scales.ndim() != n
+            || w.shape()[..n - 1] != scales.shape()[..n - 1]
+            || packed != groups * usize::from(bits)
+        {
+            return invalid(format!(
+                "packed weights {:?} and scales {:?} do not match group size {group_size} \
+                 and {bits} bits",
+                w.shape(),
+                scales.shape()
+            ));
+        }
+        Ok(groups)
     }
 
     /// `shape` with `axes` set to 1, after validating the axes.
