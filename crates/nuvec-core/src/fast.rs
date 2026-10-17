@@ -1,5 +1,6 @@
 //! Fused operations with dedicated GPU kernels, as MLX's `mx.fast`: [`rms_norm`],
-//! [`layer_norm`], [`rope`] and [`cross_entropy`] (and, through [`crate::softmax`] and
+//! [`layer_norm`], [`rope`], [`cross_entropy`] and [`scaled_dot_product_attention`] (and,
+//! through [`crate::softmax`] and
 //! [`crate::logsumexp`] over the last axis, MLX's softmax and log-sum-exp kernels).
 //!
 //! Each operation is one GPU kernel (MLX's, ported) with an equivalent graph of ordinary
@@ -78,6 +79,31 @@ pub enum FastOp {
     CrossEntropy,
     /// `(logits, targets, loss, g)`: the gradient of [`FastOp::CrossEntropy`] for the logits.
     CrossEntropyVjp,
+    /// `(q, k, v[, mask][, sinks])`: scaled dot-product attention (see
+    /// [`scaled_dot_product_attention`]).
+    Attention {
+        /// `f32::to_bits` of the score scale.
+        scale: u32,
+        /// Causal masking (keys after the query's position, aligned at the end, are hidden).
+        causal: bool,
+        /// Whether an array mask (bool or additive, `[B, Hq, Lq, Lk]`) is the fourth input.
+        mask: bool,
+        /// Whether per-head attention sinks (`[Hq]`) are the last input.
+        sinks: bool,
+    },
+}
+
+/// The mask of [`scaled_dot_product_attention`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum AttentionMask<'a> {
+    /// Every query attends to every key.
+    None,
+    /// Query `i` attends to keys `0..=i + Lk - Lq` (the queries are the last `Lq` positions).
+    Causal,
+    /// A boolean mask (true attends) or an additive mask, broadcastable to
+    /// `[B, Hq, Lq, Lk]`.
+    Array(&'a Array),
 }
 
 fn float(bits: u32) -> f32 {
@@ -371,6 +397,7 @@ impl FastOp {
             Self::LogSumExp => "logsumexp",
             Self::CrossEntropy => "cross_entropy",
             Self::CrossEntropyVjp => "cross_entropy_vjp",
+            Self::Attention { .. } => "scaled_dot_product_attention",
         }
     }
 
@@ -382,6 +409,7 @@ impl FastOp {
             Self::RmsNormVjp { .. } | Self::LayerNorm { .. } => 3,
             Self::LayerNormVjp { .. } | Self::CrossEntropyVjp => 4,
             Self::Rope { .. } => inputs.len().clamp(2, 3),
+            Self::Attention { mask, sinks, .. } => 3 + usize::from(*mask) + usize::from(*sinks),
         };
         if inputs.len() != arity || inputs[0].ndim() == 0 {
             return Err(Error::InvalidArgument(format!(
@@ -405,6 +433,11 @@ impl FastOp {
             Self::LayerNormVjp { .. } => vec![like(x), like(&inputs[1]), like(&inputs[2])],
             Self::CrossEntropy => vec![(DType::F32, inputs[1].shape().to_vec())],
             Self::CrossEntropyVjp => vec![like(x)],
+            Self::Attention { .. } => {
+                let mut shape = x.shape().to_vec();
+                shape[3] = inputs[2].shape()[3];
+                vec![(x.dtype(), shape)]
+            }
         })
     }
 
@@ -470,6 +503,18 @@ impl FastOp {
                 };
                 vec![dx, dw, db]
             }
+            Self::Attention {
+                scale,
+                causal,
+                mask,
+                sinks,
+            } => vec![attention_graph(
+                inputs,
+                float(*scale),
+                *causal,
+                *mask,
+                *sinks,
+            )?],
             Self::Rope {
                 dims,
                 traditional,
@@ -592,9 +637,10 @@ impl FastOp {
                 ];
                 Ok(vec![Some(one(Self::CrossEntropyVjp, all)?), None])
             }
-            Self::RmsNormVjp { .. } | Self::LayerNormVjp { .. } | Self::CrossEntropyVjp => {
-                self.fallback_vjp(inputs, cotangents, wanted)
-            }
+            Self::RmsNormVjp { .. }
+            | Self::LayerNormVjp { .. }
+            | Self::CrossEntropyVjp
+            | Self::Attention { .. } => self.fallback_vjp(inputs, cotangents, wanted),
         }
     }
 
@@ -776,4 +822,202 @@ fn rope_graph(
     let out = update_last(&x4, &full(r1)?, 0, step)?;
     let out = update_last(&out, &full(r2)?, start2, step)?;
     reshape(&out, &shape)
+}
+
+/// Scaled dot-product attention, as MLX's `fast.scaled_dot_product_attention`:
+/// `softmax(scale · q kᵀ + mask) v` over `[B, H, L, D]` arrays.
+///
+/// `k` and `v` may have fewer heads than `q` (grouped-query attention; `Hq` a multiple of
+/// `Hkv`), and `v` its own head size. Optional `sinks` (`[Hq]`) add one logit per head that
+/// takes part in the softmax but attends to nothing. On the GPU, short queries (at most 8)
+/// use MLX's vector kernels and longer ones its tiled kernel, for the head sizes MLX
+/// supports; other cases run the equivalent composition (as MLX does).
+pub fn scaled_dot_product_attention(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    mask: AttentionMask<'_>,
+    sinks: Option<&Array>,
+) -> Result<Array> {
+    check_inputs(&[q, k, v])?;
+    let invalid = |msg: String| {
+        Err(Error::InvalidArgument(format!(
+            "scaled_dot_product_attention: {msg}"
+        )))
+    };
+    if [q, k, v].iter().any(|a| a.ndim() != 4) {
+        return invalid(format!(
+            "q, k and v must be 4-D, got {:?}, {:?} and {:?}",
+            q.shape(),
+            k.shape(),
+            v.shape()
+        ));
+    }
+    let (qs, ks, vs) = (q.shape(), k.shape(), v.shape());
+    if ks[0] != qs[0] || vs[0] != qs[0] || qs[3] != ks[3] || ks[1] != vs[1] || ks[2] != vs[2] {
+        return invalid(format!("incompatible shapes {qs:?}, {ks:?} and {vs:?}"));
+    }
+    if ks[1] == 0 || qs[1] % ks[1] != 0 {
+        return invalid(format!(
+            "the query heads ({}) must be a multiple of the key heads ({})",
+            qs[1], ks[1]
+        ));
+    }
+    let dtype = crate::promote_types(crate::promote_types(q.dtype(), k.dtype()), v.dtype());
+    floating("scaled_dot_product_attention", dtype)?;
+    let mut inputs = vec![astype(q, dtype)?, astype(k, dtype)?, astype(v, dtype)?];
+    let (causal, has_mask) = match mask {
+        AttentionMask::None => (false, false),
+        AttentionMask::Causal => (true, false),
+        AttentionMask::Array(m) => {
+            check_inputs(&[m])?;
+            if m.ndim() > 4 {
+                return invalid(format!(
+                    "the mask must have at most 4 dimensions, got {:?}",
+                    m.shape()
+                ));
+            }
+            let m = if m.dtype() == DType::Bool {
+                m.clone()
+            } else if crate::promote_types(m.dtype(), dtype) == dtype {
+                astype(m, dtype)?
+            } else {
+                return invalid(format!("a {} mask does not promote to {dtype}", m.dtype()));
+            };
+            inputs.push(broadcast_to(&m, &[qs[0], qs[1], qs[2], ks[2]])?);
+            (false, true)
+        }
+    };
+    if let Some(s) = sinks {
+        check_inputs(&[s])?;
+        if s.ndim() != 1 || s.size() != qs[1] || crate::promote_types(s.dtype(), dtype) != dtype {
+            return invalid(format!(
+                "sinks must be [{}] of a type promoting to {dtype}",
+                qs[1]
+            ));
+        }
+        inputs.push(astype(s, dtype)?);
+    }
+    let op = FastOp::Attention {
+        scale: scale.to_bits(),
+        causal,
+        mask: has_mask,
+        sinks: sinks.is_some(),
+    };
+    if on_gpu(dtype, q.size()) && attention_kernel(&inputs, causal, has_mask) {
+        Ok(Array::from_op(Primitive::Fast(op), inputs)?.swap_remove(0))
+    } else {
+        Ok(op.fallback(&inputs)?.swap_remove(0))
+    }
+}
+
+/// Whether MLX routes these shapes to a fused kernel (`has_fused_kernel` and
+/// `use_fallback`, without the NAX and blocked head-size-512 kernels).
+fn attention_kernel(inputs: &[Array], causal: bool, has_mask: bool) -> bool {
+    let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
+    let (lq, lk, d, dv) = (q.shape()[2], k.shape()[2], q.shape()[3], v.shape()[3]);
+    let gqa = q.shape()[1] / k.shape()[1];
+    if lk == 0 || lq == 0 {
+        return false;
+    }
+    if lq > 8 {
+        let head =
+            (d == dv && matches!(d, 64 | 72 | 80 | 96 | 128 | 192 | 256)) || (d, dv) == (96, 64);
+        let causal_ok = !causal || lq <= lk;
+        // MLX: the composition is faster for these head sizes, except long causal
+        // self-attention in half precision.
+        let slow = match d {
+            192 => true,
+            256 => !(q.dtype() != DType::F32 && causal && lq >= 2048 && lq == lk),
+            _ => false,
+        };
+        head && causal_ok && !slow
+    } else {
+        let head = (d == dv && matches!(d, 64 | 96 | 128 | 256 | 512))
+            || (d, dv) == (192, 128)
+            || (d, dv) == (96, 64);
+        let d512 = d != 512 || (lq == 1 && gqa == 8 && !has_mask && lk >= 1024);
+        head && lq <= lk && lq * gqa <= 32 && d512
+    }
+}
+
+/// MLX's attention fallback, with sinks folded into the softmax.
+fn attention_graph(
+    inputs: &[Array],
+    scale: f32,
+    causal: bool,
+    has_mask: bool,
+    has_sinks: bool,
+) -> Result<Array> {
+    let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
+    let dtype = q.dtype();
+    let (b, hq, lq) = (q.shape()[0], q.shape()[1], q.shape()[2]);
+    let (hkv, lk) = (k.shape()[1], k.shape()[2]);
+    let rep = hq / hkv;
+    let i = |n: usize| n as isize;
+    let mut q = multiply(q, f64::from(scale))?;
+    let (mut k, mut v) = (k.clone(), v.clone());
+    if rep > 1 {
+        q = reshape(&q, &[i(b), i(hkv), i(rep), i(lq), i(q.shape()[3])])?;
+        k = expand_dims(&k, 2)?;
+        v = expand_dims(&v, 2)?;
+    }
+    let n = k.ndim();
+    let mut axes: Vec<usize> = (0..n).collect();
+    axes.swap(n - 2, n - 1);
+    let mut scores = crate::matmul(&q, &crate::transpose(&k, &axes)?)?;
+    let mask = if causal {
+        let offset = lk as f64 - lq as f64;
+        let qi = expand_dims(&arange(offset, offset + lq as f64, 1.0, DType::I32)?, 1)?;
+        let ki = expand_dims(&arange(0.0, lk as f64, 1.0, DType::I32)?, 0)?;
+        Some(crate::greater_equal(&qi, &ki)?)
+    } else if has_mask {
+        let m = &inputs[3];
+        Some(if rep > 1 {
+            reshape(m, &[i(b), i(hkv), i(rep), i(lq), i(lk)])?
+        } else {
+            m.clone()
+        })
+    } else {
+        None
+    };
+    if let Some(m) = mask {
+        scores = if m.dtype() == DType::Bool {
+            let lowest = match dtype {
+                DType::F16 => f64::from(crate::f16::MIN),
+                DType::BF16 => f64::from(crate::bf16::MIN),
+                DType::F64 => f64::MIN,
+                _ => f64::from(f32::MIN),
+            };
+            where_(&m, &scores, lowest)?
+        } else {
+            add(&scores, &m)?
+        };
+    }
+    let probs = if has_sinks {
+        // softmax over [sink, scores...], without the sink's column.
+        let s = astype(&scores, DType::F32)?;
+        let sink = astype(inputs.last().expect("sinks"), DType::F32)?;
+        let shape: Vec<isize> = if rep > 1 {
+            vec![1, i(hkv), i(rep), 1, 1]
+        } else {
+            vec![1, i(hq), 1, 1]
+        };
+        let sink = reshape(&sink, &shape)?;
+        let m = stop_gradient(&crate::maximum(&max(&s, &[-1], true)?, &sink)?)?;
+        let e = exp(&subtract(&s, &m)?)?;
+        let denom = add(sum(&e, &[-1], true)?, exp(&subtract(&sink, &m)?)?)?;
+        astype(&divide(&e, &denom)?, dtype)?
+    } else if on_gpu(dtype, scores.size()) {
+        crate::softmax(&scores, &[-1])?
+    } else {
+        softmax_graph(&scores)?
+    };
+    let out = crate::matmul(&probs, &v)?;
+    if rep > 1 {
+        reshape(&out, &[i(b), i(hq), i(lq), i(v.shape()[n - 1])])
+    } else {
+        Ok(out)
+    }
 }

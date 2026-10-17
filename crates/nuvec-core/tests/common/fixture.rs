@@ -484,6 +484,23 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
             xs.get(2),
         ),
         "cross_entropy" => fast::cross_entropy(&xs[0], &xs[1]),
+        "sdpa" => {
+            let mut rest = xs[3..].iter();
+            let mask = match p("mask") {
+                "causal" => fast::AttentionMask::Causal,
+                "array" => fast::AttentionMask::Array(rest.next().unwrap()),
+                _ => fast::AttentionMask::None,
+            };
+            let sinks = rest.next();
+            fast::scaled_dot_product_attention(
+                &xs[0],
+                &xs[1],
+                &xs[2],
+                p("scale").parse().unwrap(),
+                mask,
+                sinks,
+            )
+        }
         "dequantize" => dequantize(&xs[0], &xs[1], &xs[2], gs(), bits()),
         "quantized_matmul" => quantized_matmul(&xs[0], &xs[1], &xs[2], &xs[3], t(), gs(), bits()),
         "quantized_matmul_xsb" => {
@@ -553,6 +570,12 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
         // Statistics in float32, then rounded; kernels and fallbacks round at different
         // points.
         "rms_norm" | "layer_norm" | "rope" => 16.0 * eps * e.abs().max(1.0),
+        // Two products and a softmax; kernels accumulate in float32, MLX's CPU fallback in
+        // the input type.
+        "sdpa" => {
+            let k = case.inputs[1].shape[2] as f64;
+            4.0 * (k + 8.0) * eps * e.abs().max(1.0)
+        }
         // A float32 loss that MLX's fallback computes in the logits' (half) type.
         "cross_entropy" => 16.0 * epsilon(case.inputs[0].dtype) * e.abs().max(1.0),
         // Derivatives chain several rounded operations, accumulated over at most every

@@ -12,8 +12,8 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > bit-identical to MLX's, MLX's GEMM and GEMV kernels (ported, with split-K and a fused
 > `addmm`), MLX-compatible affine quantization (`quantize`, `dequantize` and
 > `quantized_matmul` with MLX's packing and kernels, 1–8 bits), MLX's fused kernels
-> (`fast::rms_norm`, `fast::layer_norm`, `fast::rope`, `fast::cross_entropy`, last-axis
-> `softmax` and `logsumexp`), and first
+> (`fast::rms_norm`, `fast::layer_norm`, `fast::rope`, `fast::cross_entropy`,
+> `fast::scaled_dot_product_attention`, last-axis `softmax` and `logsumexp`), and first
 > neural-network pieces (`nuvec-nn`: `Linear`, `QuantizedLinear`,
 > cross-entropy, SGD, Adam; `just mnist` trains MLX's MNIST example model). Arrays are
 > evaluated on the GPU by default (Metal kernels on unified memory, submitted asynchronously;

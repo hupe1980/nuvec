@@ -34,7 +34,8 @@ pub use info::DeviceInfo;
 mod metal;
 #[cfg(target_os = "macos")]
 pub use metal::{
-    Arg, Buffer, CommandBuffer, Device, MemoryStats, Pending, Pipeline, Submitted, Timeline,
+    Arg, Buffer, CommandBuffer, Constant, Device, MemoryStats, Pending, Pipeline, Submitted,
+    Timeline,
 };
 
 #[cfg(not(target_os = "macos"))]

@@ -26,6 +26,10 @@ const MACOS_MIN: &str = "-mmacosx-version-min=15.0";
 const PRECISE: &str = "-fno-fast-math";
 /// No implicit fused multiply-add: element-wise results round like the CPU backend.
 const NO_CONTRACT: &str = "-ffp-contract=off";
+/// Kernels compiled with contraction (MLX's default): they have no bit-exact CPU
+/// counterpart, and fused multiply-adds speed up their dot products (attention decode by
+/// about 15%).
+const CONTRACTED: &[&str] = &["sdpa.metal"];
 
 fn main() {
     println!(
@@ -101,7 +105,10 @@ fn precompile(files: &[PathBuf], out_dir: &Path) -> Vec<String> {
         let air = out_dir
             .join(src.file_stem().expect("shader file has a name"))
             .with_extension("air");
-        let mut args = vec![METAL_STD, MACOS_MIN, PRECISE, NO_CONTRACT];
+        let mut args = vec![METAL_STD, MACOS_MIN, PRECISE];
+        if !CONTRACTED.iter().any(|f| src.ends_with(f)) {
+            args.push(NO_CONTRACT);
+        }
         if debug {
             args.extend(["-gline-tables-only", "-frecord-sources"]);
         }

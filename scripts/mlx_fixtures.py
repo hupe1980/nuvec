@@ -138,6 +138,13 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
                             freqs=xs[2] if len(xs) > 2 else None)
     if op == "cross_entropy":
         return mx.fast.cross_entropy(xs[0], xs[1])
+    if op == "sdpa":
+        mode = p.get("mask", "none")
+        rest = xs[3:]
+        mask = "causal" if mode == "causal" else (rest.pop(0) if mode == "array" else None)
+        sinks = rest[0] if rest else None
+        return mx.fast.scaled_dot_product_attention(xs[0], xs[1], xs[2], scale=float(p["scale"]),
+                                                    mask=mask, sinks=sinks)
     if op == "quantize":
         return list(mx.quantize(xs[0], group_size=int(p["group_size"]), bits=int(p["bits"])))
     if op == "dequantize":
@@ -622,6 +629,25 @@ derivative("vjp", "vjp-rope", "rope", [make("float32", (2, 3, 4, 8))],
            [mx.array(2, dtype=mx.int32)], dims=8, traditional=0, base=10000.0, scale=1.0)
 derivative("vjp", "vjp-cross_entropy", "cross_entropy", [make("float32", (5, 7))],
            [ints("int32", (5,), 0, 7)])
+# Scaled dot-product attention: (q, k, v[, mask][, sinks]).
+for dt in ["float32", "float16"]:
+    case(f"sdpa-{dt}", "sdpa", [make(dt, (2, 4, 6, 16)), make(dt, (2, 4, 9, 16)),
+                                make(dt, (2, 4, 9, 16))], scale=0.25)
+    case(f"sdpa-causal-gqa-{dt}", "sdpa", [make(dt, (1, 8, 5, 8)), make(dt, (1, 2, 7, 8)),
+                                           make(dt, (1, 2, 7, 12))], scale=0.35, mask="causal")
+    case(f"sdpa-bool-{dt}", "sdpa", [make(dt, (1, 2, 3, 8)), make(dt, (1, 2, 4, 8)),
+                                     make(dt, (1, 2, 4, 8)), make("bool", (3, 4))], scale=0.5,
+         mask="array")
+    case(f"sdpa-additive-sinks-{dt}", "sdpa",
+         [make(dt, (1, 4, 2, 8)), make(dt, (1, 2, 5, 8)), make(dt, (1, 2, 5, 8)),
+          make(dt, (1, 4, 1, 5)), make(dt, (4,))], scale=0.5, mask="array")
+# Shapes the GPU kernels take (vector for one query, tiled for 40), replayed on both devices.
+case("sdpa-vector-kernel", "sdpa", [make("float32", (1, 4, 1, 64)), make("float32", (1, 2, 40, 64)),
+                                    make("float32", (1, 2, 40, 64))], scale=0.125)
+case("sdpa-full-kernel", "sdpa", [make("float16", (1, 2, 40, 64)), make("float16", (1, 2, 40, 64)),
+                                  make("float16", (1, 2, 40, 64))], scale=0.125, mask="causal")
+derivative("vjp", "vjp-sdpa", "sdpa", [make("float32", (1, 2, 4, 8)), make("float32", (1, 2, 5, 8)),
+                                       make("float32", (1, 2, 5, 8))], scale=0.3, mask="causal")
 derivative("jvp", "jvp-rms_norm", "rms_norm", [make("float32", (2, 8)), make("float32", (8,))],
            eps=1e-5)
 

@@ -21,10 +21,24 @@ const CASES: &[(&str, &[usize])] = &[
     ("logsumexp-vocab", &[64, 32000]),
     ("cross_entropy-vocab", &[64, 32000]),
     ("cross_entropy-mnist", &[256, 10]),
+    // Attention: (B, Hq, Hkv, Lq, Lk, D); decode with GQA, causal prefill.
+    ("sdpa-decode512", &[1, 32, 8, 1, 512, 128]),
+    ("sdpa-decode4096", &[1, 32, 8, 1, 4096, 128]),
+    ("sdpa-prefill", &[1, 32, 8, 1024, 1024, 128]),
+    ("sdpa-prefill64", &[1, 16, 16, 2048, 2048, 64]),
 ];
 
 fn op(name: &str, x: &Array, w: &Array, targets: &Array) -> Result<Array> {
     match name.split('-').next().expect("prefix") {
+        // `x` is q, `w` the keys and values (one array), as set up in `main`.
+        "sdpa" => {
+            let mask = if x.shape()[2] > 1 {
+                fast::AttentionMask::Causal
+            } else {
+                fast::AttentionMask::None
+            };
+            fast::scaled_dot_product_attention(x, w, w, 0.088, mask, None)
+        }
         "rms_norm" => fast::rms_norm(x, Some(w), 1e-5),
         "layer_norm" => fast::layer_norm(x, Some(w), Some(w), 1e-5),
         "rope" => fast::rope(
@@ -46,9 +60,19 @@ fn main() -> Result<()> {
     set_default_stream(Stream::default_for(Device::gpu(0)));
     for (dtype, label) in [(DType::F32, "float32"), (DType::F16, "float16")] {
         for &(name, shape) in CASES {
-            let x = random::uniform(-1.0, 1.0, shape, DType::F32, None)?.astype(dtype)?;
-            let w = random::uniform(-1.0, 1.0, &shape[shape.len() - 1..], DType::F32, None)?
-                .astype(dtype)?;
+            let uniform =
+                |s: &[usize]| random::uniform(-1.0, 1.0, s, DType::F32, None)?.astype(dtype);
+            let (x, w, shape) = if name.starts_with("sdpa") {
+                let (b, hq, hkv, lq, lk, d) =
+                    (shape[0], shape[1], shape[2], shape[3], shape[4], shape[5]);
+                (
+                    uniform(&[b, hq, lq, d])?,
+                    uniform(&[b, hkv, lk, d])?,
+                    &[b * hq * lq, d][..],
+                )
+            } else {
+                (uniform(shape)?, uniform(&shape[shape.len() - 1..])?, shape)
+            };
             let rows = &shape[..shape.len() - 1];
             let classes = shape[shape.len() - 1];
             let n: usize = rows.iter().product();

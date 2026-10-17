@@ -243,6 +243,30 @@ mod metal {
         gemm_k_iterations_aligned: i32,
     }
 
+    /// `AttnParams` (MLX steel attention).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+    struct AttnParams {
+        b: i32,
+        h: i32,
+        d: i32,
+        ql: i32,
+        kl: i32,
+        gqa_factor: i32,
+        scale: f32,
+        nq: i32,
+        nk: i32,
+        nq_aligned: i32,
+        nk_aligned: i32,
+        ql_rem: i32,
+        kl_rem: i32,
+        ql_off: i32,
+        q_strides: [i64; 3],
+        k_strides: [i64; 3],
+        v_strides: [i64; 3],
+        o_strides: [i64; 3],
+    }
+
     /// `GEMMAddMMParams` (MLX steel).
     #[repr(C)]
     #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1359,6 +1383,18 @@ mod metal {
         ) -> Result<Vec<Data>> {
             use crate::fast::FastOp;
             let alloc = |o: &Output| Buffer::try_alloc(o.size * o.dtype.size());
+            if let FastOp::Attention {
+                scale,
+                causal,
+                mask,
+                sinks,
+            } = op
+            {
+                let mut out = alloc(&outputs[0])?;
+                let flags = (f32::from_bits(*scale), *causal, *mask, *sinks);
+                self.attention(operands, &outputs[0], flags, &mut out)?;
+                return Ok(vec![Data::new(out)]);
+            }
             let mut out = alloc(&outputs[0])?;
             let x = self.packed(operands[0], true)?;
             let dt = operands[0].0.dtype;
@@ -1568,6 +1604,7 @@ mod metal {
                         .map_err(backend)?;
                     self.counted()?;
                 }
+                FastOp::Attention { .. } => unreachable!("handled above"),
                 FastOp::CrossEntropy | FastOp::CrossEntropyVjp => {
                     let vjp = *op == FastOp::CrossEntropyVjp;
                     let name =
@@ -1591,6 +1628,340 @@ mod metal {
             let mut data = vec![Data::new(out)];
             data.extend(extra.into_iter().map(Data::new));
             Ok(data)
+        }
+
+        /// The operand as it is if `ok` (and its strides are non-negative), else a
+        /// row-contiguous copy.
+        fn view_if<'a>(&mut self, operand: Operand<'a>, ok: bool) -> Result<Packed<'a>> {
+            let (meta, data) = operand;
+            if ok
+                && data.offset >= 0
+                && meta.strides.iter().all(|&s| s >= 0)
+                && let Some(b) = data.buffer.metal()
+            {
+                return Ok(Packed {
+                    buffer: GemmBuffer::View(b),
+                    offset: data.offset as usize * meta.dtype.size(),
+                    shape: meta.shape.to_vec(),
+                    strides: meta.strides.to_vec(),
+                });
+            }
+            self.packed(operand, true)
+        }
+
+        /// MLX's `ScaledDotProductAttention::eval_gpu` (without NAX): the vector kernels
+        /// (one or two passes) for up to 8 queries, the tiled steel kernel otherwise.
+        fn attention(
+            &mut self,
+            operands: &[Operand<'_>],
+            out: &Output,
+            (scale, causal, has_mask, has_sinks): (f32, bool, bool, bool),
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            use nuvec_gpu::Constant;
+            let (qm, km) = (operands[0].0, operands[1].0);
+            let (b, hq, lq, d) = (qm.shape[0], qm.shape[1], qm.shape[2], qm.shape[3]);
+            let (hkv, lk) = (km.shape[1], km.shape[2]);
+            let dv = operands[2].0.shape[3];
+            let gqa = hq / hkv;
+            let dtn = qm.dtype.name();
+            let class = self
+                .device()
+                .and_then(|dev| dev.info().class)
+                .unwrap_or('g');
+            let unit = |m: &Output| m.shape[3] == 1 || m.strides[3] == 1;
+            let mask_op = has_mask.then(|| operands[3]);
+            let sinks = match has_sinks {
+                true => Some(self.packed(operands[operands.len() - 1], true)?),
+                false => None,
+            };
+            let bool_mask = mask_op.is_some_and(|(m, _)| m.dtype == DType::Bool);
+            let i32b = |v: usize| (v as i32).to_le_bytes();
+            let u64b = |v: isize| (v as u64).to_le_bytes();
+            let unused = [0u8; 4];
+            if lq <= 8 {
+                let q = self.packed(operands[0], true)?;
+                let kv_ok = |m: &Output| {
+                    unit(m)
+                        && (m.shape[0] == 1
+                            || m.shape[1] == 1
+                            || m.strides[0] == m.strides[1] * m.shape[1] as isize)
+                };
+                let k = self.view_if(operands[1], kv_ok(km))?;
+                let v = self.view_if(operands[2], kv_ok(operands[2].0))?;
+                let mask = match mask_op {
+                    Some(m) => {
+                        let ok = m.0.flags.row_contiguous
+                            || b == 1
+                            || hq == 1
+                            || m.0.strides[0] == m.0.strides[1] * m.0.shape[1] as isize;
+                        Some(self.view_if(m, ok)?)
+                    }
+                    None => None,
+                };
+                let head = |p: &Packed<'_>| {
+                    if p.shape[1] == 1 {
+                        p.strides[0]
+                    } else {
+                        p.strides[1]
+                    }
+                };
+                let strides = [
+                    u64b(head(&k)),
+                    u64b(k.strides[2]),
+                    u64b(head(&v)),
+                    u64b(v.strides[2]),
+                ];
+                let mask_strides = mask.as_ref().map(|m| {
+                    let pick = |i: usize| {
+                        if m.shape[i] > 1 {
+                            m.strides[i] as i32
+                        } else {
+                            0
+                        }
+                    };
+                    let head = if m.shape[1] > 1 { pick(1) } else { pick(0) };
+                    [
+                        pick(3).to_le_bytes(),
+                        pick(2).to_le_bytes(),
+                        head.to_le_bytes(),
+                    ]
+                });
+                let constants = |extra: Option<i32>| {
+                    let mut c = vec![
+                        (30, Constant::Bool(has_mask)),
+                        (31, Constant::Bool(false)),
+                        (32, Constant::Bool(causal && lq > 1)),
+                        (33, Constant::Bool(bool_mask)),
+                        (34, Constant::Bool(has_mask && !bool_mask)),
+                        (35, Constant::Bool(has_sinks)),
+                    ];
+                    if let Some(n) = extra {
+                        c.push((36, Constant::Int(n)));
+                    }
+                    c
+                };
+                let (sc, n, nh) = (scale.to_le_bytes(), i32b(lk), i32b(hq));
+                // Pads unbound argument slots up to `at`.
+                fn pad<'a>(args: &mut Vec<Arg<'a>>, at: usize, filler: &'a [u8]) {
+                    while args.len() < at {
+                        args.push(Arg::bytes(filler));
+                    }
+                }
+                let push_mask = |args: &mut Vec<Arg<'_>>, at: usize| pad(args, at, &[0u8; 4]);
+                let two_pass =
+                    (matches!(class, 'd' | 's') && lk >= 1024) || (hkv < hq && lk >= 4096);
+                if !two_pass {
+                    let name = format!("nuvec_sdpa_vector_{dtn}_{d}_{dv}");
+                    let device = self
+                        .device()
+                        .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+                    let pipeline = device
+                        .pipeline_with_constants(&name, &constants(None))
+                        .map_err(backend)?;
+                    let g = i32b(gqa);
+                    let mut args = vec![
+                        q.arg(),
+                        k.arg(),
+                        v.arg(),
+                        Arg::write(buffer.metal_mut().expect("device storage")),
+                        Arg::bytes(&g),
+                        Arg::bytes(&n),
+                        Arg::bytes(&strides[0]),
+                        Arg::bytes(&strides[1]),
+                        Arg::bytes(&strides[2]),
+                        Arg::bytes(&strides[3]),
+                        Arg::bytes(&sc),
+                    ];
+                    if let (Some(m), Some(ms)) = (&mask, &mask_strides) {
+                        push_mask(&mut args, 11 + usize::from(!bool_mask));
+                        args.push(m.arg());
+                        push_mask(&mut args, 13);
+                        args.extend(ms.iter().map(|s| Arg::bytes(s)));
+                    }
+                    if let Some(s) = &sinks {
+                        push_mask(&mut args, 16);
+                        args.extend([s.arg(), Arg::bytes(&nh)]);
+                    }
+                    self.command_buffer()?
+                        .dispatch_groups(&pipeline, &args, [b * hq, lq, 1], [1024, 1, 1])
+                        .map_err(backend)?;
+                    return self.counted();
+                }
+                let n_simds = gqa * lq;
+                let blocks: usize = match class {
+                    's' if lk > 1024 && n_simds > 4 => match lk {
+                        ..=8192 => 128,
+                        8193..=32768 => 256,
+                        32769..=65536 => 512,
+                        _ => 1024,
+                    },
+                    's' => 64,
+                    'd' if n_simds <= 2 && lk > 8192 => 256,
+                    'd' if n_simds >= 6 && lk >= 65536 => 1024,
+                    'd' if n_simds >= 6 && lk >= 16384 => 512,
+                    'd' => 128,
+                    _ if n_simds >= 4 => 64,
+                    _ => 32,
+                };
+                let gqa_kernel = !has_mask
+                    && !has_sinks
+                    && lq == 1
+                    && d == dv
+                    && lk >= 8192
+                    && ((gqa == 8 && (d == 64 || d == 128))
+                        || ((gqa == 12 || gqa == 16) && d == 128));
+                let mut name = format!(
+                    "nuvec_sdpa_vector_2pass_1_{}{dtn}_{d}_{dv}",
+                    if gqa_kernel {
+                        format!("gqa_{gqa}_")
+                    } else {
+                        String::new()
+                    }
+                );
+                let device = self
+                    .device()
+                    .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+                let consts = constants(Some(blocks as i32));
+                let mut pipeline = device
+                    .pipeline_with_constants(&name, &consts)
+                    .map_err(backend)?;
+                let tk1 = (qm.dtype == DType::BF16 && d == 256 && dv == 256)
+                    || (qm.dtype == DType::F32 && d == dv && (d == 192 || d == 256));
+                if tk1 && 32 * gqa * lq > pipeline.max_threads_per_threadgroup() {
+                    name.push_str("_tk1");
+                    pipeline = device
+                        .pipeline_with_constants(&name, &consts)
+                        .map_err(backend)?;
+                }
+                let rows = b * hq * lq;
+                let mut partial = Buffer::try_alloc(rows * blocks * dv * qm.dtype.size())?;
+                let mut sums = Buffer::try_alloc(rows * blocks * 4)?;
+                let mut maxs = Buffer::try_alloc(rows * blocks * 4)?;
+                {
+                    let mut args = vec![
+                        q.arg(),
+                        k.arg(),
+                        v.arg(),
+                        Arg::write(partial.metal_mut().expect("device storage")),
+                        Arg::write(sums.metal_mut().expect("device storage")),
+                        Arg::write(maxs.metal_mut().expect("device storage")),
+                        Arg::bytes(&unused),
+                        Arg::bytes(&n),
+                        Arg::bytes(&strides[0]),
+                        Arg::bytes(&strides[1]),
+                        Arg::bytes(&strides[2]),
+                        Arg::bytes(&strides[3]),
+                        Arg::bytes(&sc),
+                    ];
+                    if let (Some(m), Some(ms)) = (&mask, &mask_strides) {
+                        push_mask(&mut args, 13 + usize::from(!bool_mask));
+                        args.push(m.arg());
+                        push_mask(&mut args, 15);
+                        args.extend(ms.iter().map(|s| Arg::bytes(s)));
+                    }
+                    if let Some(s) = &sinks {
+                        push_mask(&mut args, 18);
+                        args.push(s.arg());
+                    }
+                    self.command_buffer()?
+                        .dispatch_groups(&pipeline, &args, [hkv, b, blocks], [32, gqa, lq])
+                        .map_err(backend)?;
+                    self.counted()?;
+                }
+                let name = format!("nuvec_sdpa_vector_2pass_2_{dtn}_{dv}");
+                let bl = i32b(blocks);
+                let args = [
+                    Arg::read(partial.metal().expect("device storage")),
+                    Arg::read(sums.metal().expect("device storage")),
+                    Arg::read(maxs.metal().expect("device storage")),
+                    Arg::write(buffer.metal_mut().expect("device storage")),
+                    Arg::bytes(&bl),
+                ];
+                return self.dispatch_groups(&name, &args, [b * hq, lq, 1], [1024, 1, 1]);
+            }
+            // Tiled attention: inputs need a unit stride along the head dimension.
+            let q = self.view_if(operands[0], unit(qm))?;
+            let k = self.view_if(operands[1], unit(km))?;
+            let v = self.view_if(operands[2], unit(operands[2].0))?;
+            let mask = match mask_op {
+                Some(m) => Some(self.view_if(m, unit(m.0))?),
+                None => None,
+            };
+            let (bq, wm) = (32usize, 4usize);
+            let bk = if (d == 256 && qm.dtype != DType::F32 && class == 'd') || d < 128 {
+                32
+            } else {
+                16
+            };
+            let wn = if d == 256 { 2 } else { 1 };
+            let mask_name = match mask_op {
+                Some((m, _)) if m.dtype == DType::Bool => "bool",
+                _ => dtn,
+            };
+            let name = format!(
+                "nuvec_steel_attention_{dtn}_bq{bq}_bk{bk}_bd{d}_bv{dv}_wm{wm}_wn{wn}_mask{mask_name}"
+            );
+            let constants = [
+                (210, lq % bq == 0),
+                (211, lk % bk == 0),
+                (310, has_mask),
+                (311, causal),
+                (312, has_sinks),
+                (313, false),
+            ];
+            let pipeline = self.pipeline_with(&name, &constants)?;
+            let (nq, nk) = (lq.div_ceil(bq), lk.div_ceil(bk));
+            let s3 = |p: &Packed<'_>| {
+                [
+                    p.strides[0] as i64,
+                    p.strides[1] as i64,
+                    p.strides[2] as i64,
+                ]
+            };
+            let params = AttnParams {
+                b: b as i32,
+                h: hq as i32,
+                d: d as i32,
+                ql: lq as i32,
+                kl: lk as i32,
+                gqa_factor: gqa as i32,
+                scale,
+                nq: nq as i32,
+                nk: nk as i32,
+                nq_aligned: (lq / bq) as i32,
+                nk_aligned: (lk / bk) as i32,
+                ql_rem: (lq % bq) as i32,
+                kl_rem: (lk % bk) as i32,
+                ql_off: lk as i32 - lq as i32,
+                q_strides: s3(&q),
+                k_strides: s3(&k),
+                v_strides: s3(&v),
+                o_strides: [(hq * lq * dv) as i64, (lq * dv) as i64, dv as i64],
+            };
+            let params = bytes(&params);
+            let mask_params = mask.as_ref().map(|m| bytes(&s3(m)));
+            let mut args = vec![
+                q.arg(),
+                k.arg(),
+                v.arg(),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&params),
+            ];
+            if let (Some(m), Some(mp)) = (&mask, &mask_params) {
+                args.extend([Arg::bytes(mp), m.arg()]);
+            }
+            if let Some(s) = &sinks {
+                while args.len() < 7 {
+                    args.push(Arg::bytes(&unused));
+                }
+                args.push(s.arg());
+            }
+            let _ = out;
+            self.command_buffer()?
+                .dispatch_groups(&pipeline, &args, [nq, hq, b], [32, wm, wn])
+                .map_err(backend)?;
+            self.counted()
         }
 
         /// MLX's `affine_quantize`: one simdgroup per group of values.

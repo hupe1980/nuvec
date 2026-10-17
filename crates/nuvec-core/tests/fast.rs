@@ -354,3 +354,196 @@ mod gpu {
         });
     }
 }
+
+/// Attention by hand for one head: `softmax(scale · q kᵀ) v`.
+#[test]
+fn attention_fallback_matches_a_direct_formula() {
+    let mut rng = Rng::new(0x65);
+    let (lq, lk, d) = (3, 5, 4);
+    let q = random(&mut rng, &[1, 1, lq, d], DType::F32);
+    let k = random(&mut rng, &[1, 1, lk, d], DType::F32);
+    let v = random(&mut rng, &[1, 1, lk, d], DType::F32);
+    let (qv, kv, vv) = (values(&q), values(&k), values(&v));
+    let causal =
+        fast::scaled_dot_product_attention(&q, &k, &v, 0.5, fast::AttentionMask::Causal, None)
+            .unwrap();
+    let got = values(&causal);
+    for i in 0..lq {
+        let visible = i + lk - lq + 1;
+        let s: Vec<f64> = (0..visible)
+            .map(|j| 0.5 * (0..d).map(|c| qv[i * d + c] * kv[j * d + c]).sum::<f64>())
+            .collect();
+        let m = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let z: f64 = s.iter().map(|x| (x - m).exp()).sum();
+        for c in 0..d {
+            let want: f64 = (0..visible)
+                .map(|j| (s[j] - m).exp() / z * vv[j * d + c])
+                .sum();
+            assert!((got[i * d + c] - want).abs() < 1e-5, "{i},{c}");
+        }
+    }
+    // Errors: shapes, head grouping.
+    let bad = random(&mut rng, &[1, 3, lk, d], DType::F32);
+    let q2 = random(&mut rng, &[1, 2, lq, d], DType::F32);
+    assert!(
+        fast::scaled_dot_product_attention(&q2, &bad, &bad, 1.0, fast::AttentionMask::None, None)
+            .is_err()
+    );
+    assert!(
+        fast::scaled_dot_product_attention(
+            &q.reshape(&[1, lq as isize, d as isize]).unwrap(),
+            &k,
+            &v,
+            1.0,
+            fast::AttentionMask::None,
+            None
+        )
+        .is_err()
+    );
+}
+
+#[cfg(target_os = "macos")]
+mod attention_gpu {
+    use super::*;
+
+    fn on<R>(device: Device, f: impl FnOnce() -> R) -> R {
+        let previous = default_stream();
+        set_default_stream(Stream::default_for(device));
+        let r = f();
+        set_default_stream(previous);
+        r
+    }
+
+    #[test]
+    fn attention_kernels_match_the_fallback() {
+        if cfg!(miri) || on(Device::gpu(0), || (Array::scalar(1.0f32) * 2.0).eval()).is_err() {
+            return;
+        }
+        let mut rng = Rng::new(0x66);
+        // (B, Hq, Hkv, Lq, Lk, D, Dv): vector (one pass, two passes, GQA kernel) and tiled.
+        let shapes: &[(usize, usize, usize, usize, usize, usize, usize)] = &[
+            (2, 4, 4, 1, 37, 64, 64),
+            (1, 8, 2, 4, 50, 128, 128),
+            (1, 4, 4, 2, 33, 96, 64),
+            (1, 2, 1, 1, 20, 192, 128),
+            (1, 8, 1, 1, 1100, 128, 128),
+            (1, 16, 2, 1, 9000, 128, 128),
+            (2, 4, 2, 33, 45, 64, 64),
+            (1, 2, 2, 100, 100, 80, 80),
+            (1, 4, 4, 64, 96, 128, 128),
+            (1, 2, 2, 40, 40, 96, 64),
+        ];
+        for &(b, hq, hkv, lq, lk, d, dv) in shapes {
+            // Every shape here has a kernel: the recorded node is the fused primitive.
+            let fused = on(Device::gpu(0), || {
+                let z = |l, n, e| zeros(&[b, n, l, e], DType::F16).unwrap();
+                let out = fast::scaled_dot_product_attention(
+                    &z(lq, hq, d),
+                    &z(lk, hkv, d),
+                    &z(lk, hkv, dv),
+                    1.0,
+                    fast::AttentionMask::None,
+                    None,
+                )
+                .unwrap();
+                matches!(
+                    out.primitive(),
+                    Some(Primitive::Fast(fast::FastOp::Attention { .. }))
+                )
+            });
+            assert!(
+                fused,
+                "{:?} should use a kernel",
+                (b, hq, hkv, lq, lk, d, dv)
+            );
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let q = random(&mut rng, &[b, hq, lq, d], dtype);
+                // Keys and values as transposed views of [B, L, H, D] (as in a model).
+                let k =
+                    transpose(&random(&mut rng, &[b, lk, hkv, d], dtype), &[0, 2, 1, 3]).unwrap();
+                let v =
+                    transpose(&random(&mut rng, &[b, lk, hkv, dv], dtype), &[0, 2, 1, 3]).unwrap();
+                let bmask = greater(random(&mut rng, &[lq, lk], DType::F32), -0.5).unwrap();
+                let amask = random(&mut rng, &[1, hq, lq, lk], dtype);
+                let sinks = random(&mut rng, &[hq], dtype);
+                let tol = match dtype {
+                    DType::F32 => 1e-4,
+                    DType::F16 => 1e-2,
+                    _ => 5e-2,
+                };
+                let masks: [(&str, fast::AttentionMask<'_>); 4] = [
+                    ("none", fast::AttentionMask::None),
+                    ("causal", fast::AttentionMask::Causal),
+                    ("bool", fast::AttentionMask::Array(&bmask)),
+                    ("additive", fast::AttentionMask::Array(&amask)),
+                ];
+                for (mname, mask) in masks {
+                    for with_sinks in [false, true] {
+                        let s = with_sinks.then_some(&sinks);
+                        let run = || {
+                            fast::scaled_dot_product_attention(&q, &k, &v, 0.3, mask, s).unwrap()
+                        };
+                        // The reference: the composition in float32 on the CPU, rounded once.
+                        let reference = || {
+                            let f = |a: &Array| a.astype(DType::F32).unwrap();
+                            let amask32;
+                            let mask32 = match mask {
+                                fast::AttentionMask::Array(m) if m.dtype() != DType::Bool => {
+                                    amask32 = f(m);
+                                    fast::AttentionMask::Array(&amask32)
+                                }
+                                other => other,
+                            };
+                            let s32 = s.map(f);
+                            fast::scaled_dot_product_attention(
+                                &f(&q),
+                                &f(&k),
+                                &f(&v),
+                                0.3,
+                                mask32,
+                                s32.as_ref(),
+                            )
+                            .unwrap()
+                            .astype(dtype)
+                            .unwrap()
+                        };
+                        let (gpu, cpu) = (on(Device::gpu(0), run), on(Device::cpu(), reference));
+                        let name = format!(
+                            "{dtype} {:?} {mname} sinks={with_sinks}",
+                            (b, hq, hkv, lq, lk, d, dv)
+                        );
+                        assert_close(&name, &gpu, &cpu, tol);
+                    }
+                }
+            }
+        }
+        // Gradients through the fused forward match the CPU.
+        let q = random(&mut rng, &[1, 4, 40, 64], DType::F32);
+        let k = random(&mut rng, &[1, 2, 40, 64], DType::F32);
+        let v = random(&mut rng, &[1, 2, 40, 64], DType::F32);
+        let g = random(&mut rng, &[1, 4, 40, 64], DType::F32);
+        let grads = || {
+            let f = |xs: &[Array]| {
+                Ok(vec![fast::scaled_dot_product_attention(
+                    &xs[0],
+                    &xs[1],
+                    &xs[2],
+                    0.125,
+                    fast::AttentionMask::Causal,
+                    None,
+                )?])
+            };
+            vjp(
+                f,
+                &[q.clone(), k.clone(), v.clone()],
+                std::slice::from_ref(&g),
+            )
+            .unwrap()
+            .1
+        };
+        let (gpu, cpu) = (on(Device::gpu(0), grads), on(Device::cpu(), grads));
+        for (i, (a, c)) in gpu.iter().zip(&cpu).enumerate() {
+            assert_close(&format!("attention vjp #{i}"), a, c, 1e-4);
+        }
+    }
+}

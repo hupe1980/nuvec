@@ -26,6 +26,15 @@ use crate::{DeviceInfo, GpuError, Result};
 
 type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 
+/// A function constant value for [`Device::pipeline_with_constants`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Constant {
+    /// A `bool` constant.
+    Bool(bool),
+    /// An `int` constant.
+    Int(i32),
+}
+
 /// A Metal GPU with its command queue, kernel library and pipeline cache. Cheap to clone.
 #[derive(Clone)]
 pub struct Device {
@@ -176,8 +185,25 @@ impl Device {
     /// The pipeline for kernel `name` specialised with boolean function constants
     /// `(index, value)`, compiled on first use and cached per name and constants.
     pub fn pipeline_with(&self, name: &str, constants: &[(usize, bool)]) -> Result<Pipeline> {
+        let constants: Vec<(usize, Constant)> = constants
+            .iter()
+            .map(|&(i, v)| (i, Constant::Bool(v)))
+            .collect();
+        self.pipeline_with_constants(name, &constants)
+    }
+
+    /// The pipeline for kernel `name` specialised with boolean or integer function constants
+    /// `(index, value)`, compiled on first use and cached per name and constants.
+    pub fn pipeline_with_constants(
+        &self,
+        name: &str,
+        constants: &[(usize, Constant)],
+    ) -> Result<Pipeline> {
         let key = constants.iter().fold(name.to_owned(), |mut k, (i, v)| {
-            k.push_str(&format!("#{i}={}", u8::from(*v)));
+            match v {
+                Constant::Bool(b) => k.push_str(&format!("#{i}={}", u8::from(*b))),
+                Constant::Int(n) => k.push_str(&format!("#{i}=i{n}")),
+            }
             k
         });
         let mut cache = self
@@ -197,14 +223,24 @@ impl Device {
         } else {
             let values = MTLFunctionConstantValues::new();
             for &(index, value) in constants {
-                // SAFETY: `value` is a live `bool`, which Metal copies during the call; its
-                // layout matches `MTLDataType::Bool` (one byte).
-                unsafe {
-                    values.setConstantValue_type_atIndex(
-                        NonNull::from(&value).cast(),
-                        MTLDataType::Bool,
-                        index,
-                    );
+                match value {
+                    // SAFETY: `b` is a live local, which Metal copies during the call; `bool`
+                    // matches `MTLDataType::Bool` (one byte).
+                    Constant::Bool(b) => unsafe {
+                        values.setConstantValue_type_atIndex(
+                            NonNull::from(&b).cast(),
+                            MTLDataType::Bool,
+                            index,
+                        );
+                    },
+                    // SAFETY: as above; `i32` matches `MTLDataType::Int`.
+                    Constant::Int(n) => unsafe {
+                        values.setConstantValue_type_atIndex(
+                            NonNull::from(&n).cast(),
+                            MTLDataType::Int,
+                            index,
+                        );
+                    },
                 }
             }
             library

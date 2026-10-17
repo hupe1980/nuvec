@@ -35,12 +35,19 @@ CASES = [
     ("logsumexp-vocab", (64, 32000)),
     ("cross_entropy-vocab", (64, 32000)),
     ("cross_entropy-mnist", (256, 10)),
+    ("sdpa-decode512", (1, 32, 8, 1, 512, 128)),
+    ("sdpa-decode4096", (1, 32, 8, 1, 4096, 128)),
+    ("sdpa-prefill", (1, 32, 8, 1024, 1024, 128)),
+    ("sdpa-prefill64", (1, 16, 16, 2048, 2048, 64)),
 ]
 DTYPES = {"float32": mx.float32, "float16": mx.float16}
 
 
 def op(name: str, x: mx.array, w: mx.array, targets: mx.array) -> mx.array:
     kind = name.split("-")[0]
+    if kind == "sdpa":
+        mask = "causal" if x.shape[2] > 1 else None
+        return mx.fast.scaled_dot_product_attention(x, w, w, scale=0.088, mask=mask)
     if kind == "rms_norm":
         return mx.fast.rms_norm(x, w, 1e-5)
     if kind == "layer_norm":
@@ -59,8 +66,14 @@ def mlx_results() -> dict[tuple[str, str], tuple[float, float]]:
     out = {}
     for label, dtype in DTYPES.items():
         for name, shape in CASES:
-            x = mx.random.uniform(-1, 1, shape).astype(dtype)
-            w = mx.random.uniform(-1, 1, shape[-1:]).astype(dtype)
+            if name.startswith("sdpa"):
+                b, hq, hkv, lq, lk, d = shape
+                x = mx.random.uniform(-1, 1, (b, hq, lq, d)).astype(dtype)
+                w = mx.random.uniform(-1, 1, (b, hkv, lk, d)).astype(dtype)
+                shape = (b * hq * lq, d)
+            else:
+                x = mx.random.uniform(-1, 1, shape).astype(dtype)
+                w = mx.random.uniform(-1, 1, shape[-1:]).astype(dtype)
             rows = shape[:-1]
             n = math.prod(rows)
             targets = mx.array([i * 7919 % shape[-1] for i in range(n)], dtype=mx.int32)
