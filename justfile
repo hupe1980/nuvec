@@ -64,6 +64,10 @@ bench-gemm:
 bench-quant:
     uv run scripts/bench_quant.py
 
+# GPU fused operations (norms, RoPE, softmax, log-sum-exp, cross entropy): nuvec vs MLX.
+bench-fast:
+    uv run scripts/bench_fast.py
+
 # Downloads MNIST and trains MLX's example model with nuvec and MLX (M1 exit criterion).
 mnist:
     uv run scripts/mnist_vs_mlx.py

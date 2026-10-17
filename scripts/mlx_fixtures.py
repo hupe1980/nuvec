@@ -126,6 +126,18 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         return unary[op](xs[0])
     if op == "addmm":
         return mx.addmm(xs[2], xs[0], xs[1], alpha=float(p["alpha"]), beta=float(p["beta"]))
+    if op == "rms_norm":
+        return mx.fast.rms_norm(xs[0], xs[1] if len(xs) > 1 else None, float(p["eps"]))
+    if op == "layer_norm":
+        w, b = (xs + [None, None])[1:3]
+        return mx.fast.layer_norm(xs[0], w, b, float(p["eps"]))
+    if op == "rope":
+        base = float(p["base"]) if "base" in p else None
+        return mx.fast.rope(xs[0], int(p["dims"]), traditional=p["traditional"] == "1", base=base,
+                            scale=float(p["scale"]), offset=xs[1],
+                            freqs=xs[2] if len(xs) > 2 else None)
+    if op == "cross_entropy":
+        return mx.fast.cross_entropy(xs[0], xs[1])
     if op == "quantize":
         return list(mx.quantize(xs[0], group_size=int(p["group_size"]), bits=int(p["bits"])))
     if op == "dequantize":
@@ -586,6 +598,32 @@ derivative("vjp", "vjp-qmm-n", "quantized_matmul_xsb", [make("float32", (2, 32))
 wq, s, b = quantized("float32", (6, 64), 32, 8)
 derivative("jvp", "jvp-qmm", "quantized_matmul", [make("float32", (2, 3, 64))], [wq, s, b],
            transpose=1, group_size=32, bits=8)
+
+# Fused operations (`mx.fast`; MLX's CPU runs their fallback graphs).
+for dt in ["float32", "float16", "bfloat16"]:
+    case(f"rms_norm-{dt}", "rms_norm", [make(dt, (3, 4, 16)), make(dt, (16,))], eps=1e-5)
+    case(f"rms_norm-bare-{dt}", "rms_norm", [make(dt, (5, 33))], eps=1e-6)
+    case(f"layer_norm-{dt}", "layer_norm", [make(dt, (3, 24)), make(dt, (24,)), make(dt, (24,))],
+         eps=1e-5)
+    case(f"layer_norm-bare-{dt}", "layer_norm", [make(dt, (2, 3, 7))], eps=1e-5)
+    case(f"rope-{dt}", "rope", [make(dt, (2, 3, 5, 8)), mx.array(3, dtype=mx.int32)], dims=8,
+         traditional=0, base=10000.0, scale=1.0)
+    case(f"rope-trad-{dt}", "rope", [make(dt, (2, 4, 12)), mx.array([1, 7], dtype=mx.int32)],
+         dims=8, traditional=1, base=500.0, scale=0.5)
+    case(f"rope-freqs-{dt}", "rope", [make(dt, (1, 2, 3, 8)), mx.array(0, dtype=mx.int32),
+                                      mx.array([1.0, 4.0, 9.0, 30.0])], dims=8, traditional=0,
+         scale=1.0)
+    case(f"cross_entropy-{dt}", "cross_entropy", [make(dt, (4, 11)), ints("int32", (4,), -11, 11)])
+derivative("vjp", "vjp-rms_norm", "rms_norm", [make("float32", (3, 16)), make("float32", (16,))],
+           eps=1e-5)
+derivative("vjp", "vjp-layer_norm", "layer_norm",
+           [make("float32", (3, 16)), make("float32", (16,)), make("float32", (16,))], eps=1e-5)
+derivative("vjp", "vjp-rope", "rope", [make("float32", (2, 3, 4, 8))],
+           [mx.array(2, dtype=mx.int32)], dims=8, traditional=0, base=10000.0, scale=1.0)
+derivative("vjp", "vjp-cross_entropy", "cross_entropy", [make("float32", (5, 7))],
+           [ints("int32", (5,), 0, 7)])
+derivative("jvp", "jvp-rms_norm", "rms_norm", [make("float32", (2, 8)), make("float32", (8,))],
+           eps=1e-5)
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

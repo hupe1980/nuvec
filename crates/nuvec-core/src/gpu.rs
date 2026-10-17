@@ -446,6 +446,33 @@ mod metal {
         }
     }
 
+    /// MLX's `get_block_dims`: power-of-two threadgroup sides with at most 1024 threads.
+    fn block_dims(dims: [usize; 3]) -> [usize; 3] {
+        let mut pows = [0usize; 3];
+        let mut sum = 0;
+        loop {
+            let before = sum;
+            for i in 0..3 {
+                if dims[i] >= 1 << (pows[i] + 1) {
+                    pows[i] += 1;
+                    sum += 1;
+                }
+                if sum == 10 {
+                    return pows.map(|p| 1 << p);
+                }
+            }
+            if sum == before {
+                return pows.map(|p| 1 << p);
+            }
+        }
+    }
+
+    /// Threads per row for MLX's single-row kernels: whole simdgroups covering the row at
+    /// `reads` values per thread.
+    fn row_threads(axis: usize, reads: usize) -> usize {
+        axis.div_ceil(reads).div_ceil(32) * 32
+    }
+
     /// Values per packing unit of `bits`-bit codes (MLX's `get_pack_factor`, in `word` bits).
     fn pack_factor(bits: usize, word: usize) -> usize {
         match bits {
@@ -566,6 +593,7 @@ mod metal {
                     is_float(d) && operands[0].0.shape.last().is_some_and(|&k| k > 0)
                 }
                 (Primitive::Quantize { .. }, Some(d)) => is_float(d) && operands[0].0.size > 0,
+                (Primitive::Fast(_), Some(d)) => is_float(d) && operands[0].0.size > 0,
                 (Primitive::Dequantize { .. }, _) => outputs[0].size > 0,
                 (Primitive::QuantizedMatmul { .. }, Some(d)) => is_float(d) && outputs[0].size > 0,
                 _ => false,
@@ -579,6 +607,9 @@ mod metal {
             operands: &[Operand<'_>],
             outputs: &[Output],
         ) -> Result<Vec<Data>> {
+            if let Primitive::Fast(op) = primitive {
+                return self.fast(op, operands, outputs);
+            }
             if let Primitive::Quantize { group_size, bits } = primitive {
                 return self.quantize(operands[0], outputs, *group_size, usize::from(*bits));
             }
@@ -1290,6 +1321,276 @@ mod metal {
                 .dispatch_threads(&pipeline, args, [threads, 1, 1], [group, 1, 1])
                 .map_err(backend)?;
             self.counted()
+        }
+
+        /// One threadgroup of `group` threads per row, `rows` rows.
+        fn dispatch_rows(
+            &mut self,
+            pipeline: &nuvec_gpu::Pipeline,
+            args: &[Arg<'_>],
+            rows: usize,
+            group: usize,
+        ) -> Result<()> {
+            self.command_buffer()?
+                .dispatch_threads(pipeline, args, [rows * group, 1, 1], [group, 1, 1])
+                .map_err(backend)?;
+            self.counted()
+        }
+
+        /// `temp` (`[rows, axis]`, row-contiguous) summed over its rows into `out`.
+        fn sum_rows(
+            &mut self,
+            temp: Buffer,
+            dtype: DType,
+            (rows, axis): (usize, usize),
+            out: &mut Buffer,
+        ) -> Result<()> {
+            let meta = crate::kernels::strided(dtype, &[rows, axis], &[axis as isize, 1]);
+            let data = Data::new(temp);
+            self.reduce(ReduceOp::Sum, &[0], (&meta, &data), out)
+        }
+
+        /// The fused operations (MLX's `fast` kernels and its softmax and log-sum-exp).
+        fn fast(
+            &mut self,
+            op: &crate::fast::FastOp,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+        ) -> Result<Vec<Data>> {
+            use crate::fast::FastOp;
+            let alloc = |o: &Output| Buffer::try_alloc(o.size * o.dtype.size());
+            let mut out = alloc(&outputs[0])?;
+            let x = self.packed(operands[0], true)?;
+            let dt = operands[0].0.dtype;
+            let dtn = dt.name();
+            let axis = x.shape[x.shape.len() - 1];
+            let rows = x.shape.iter().product::<usize>() / axis;
+            let u32b = |v: usize| (v as u32).to_le_bytes();
+            let i32b = |v: usize| (v as i32).to_le_bytes();
+            // A 1-D parameter's stride (0 for the scalar placeholders).
+            let stride = |p: &Packed<'_>| u32b(usize::from(!p.shape.is_empty()));
+            let mut extra = Vec::new();
+            match op {
+                FastOp::Softmax | FastOp::LogSumExp => {
+                    let kind = if *op == FastOp::Softmax {
+                        "softmax"
+                    } else {
+                        "logsumexp"
+                    };
+                    let looped = axis > 4096;
+                    let name = format!(
+                        "nuvec_{kind}_{}_{dtn}",
+                        if looped { "looped" } else { "block" }
+                    );
+                    let pipeline = self.pipeline(&name)?;
+                    let group = if looped {
+                        pipeline.max_threads_per_threadgroup()
+                    } else {
+                        row_threads(axis, 4)
+                    };
+                    let n = i32b(axis);
+                    let args = [
+                        x.arg(),
+                        Arg::write(out.metal_mut().expect("device storage")),
+                        Arg::bytes(&n),
+                    ];
+                    self.dispatch_rows(&pipeline, &args, rows, group)?;
+                }
+                FastOp::RmsNorm { eps } | FastOp::LayerNorm { eps } => {
+                    let layer = matches!(op, FastOp::LayerNorm { .. });
+                    let w = self.packed(operands[1], true)?;
+                    let b = match layer {
+                        true => Some(self.packed(operands[2], true)?),
+                        false => None,
+                    };
+                    let (limit, reads) = if layer { (6656, 8) } else { (4096, 4) };
+                    let looped = axis > limit;
+                    let name = format!(
+                        "nuvec_{}{}_{dtn}",
+                        if layer { "layer_norm" } else { "rms" },
+                        if looped { "_looped" } else { "" }
+                    );
+                    let pipeline = self.pipeline(&name)?;
+                    let group = if looped {
+                        pipeline.max_threads_per_threadgroup()
+                    } else {
+                        row_threads(axis, reads)
+                    };
+                    let (e, n, ws) = (eps.to_le_bytes(), u32b(axis), stride(&w));
+                    let bs = b.as_ref().map(stride).unwrap_or_default();
+                    let mut args = vec![x.arg(), w.arg()];
+                    if let Some(b) = &b {
+                        args.push(b.arg());
+                    }
+                    args.push(Arg::write(out.metal_mut().expect("device storage")));
+                    args.extend([Arg::bytes(&e), Arg::bytes(&n), Arg::bytes(&ws)]);
+                    if layer {
+                        args.push(Arg::bytes(&bs));
+                    }
+                    self.dispatch_rows(&pipeline, &args, rows, group)?;
+                }
+                FastOp::RmsNormVjp { eps } | FastOp::LayerNormVjp { eps } => {
+                    let layer = matches!(op, FastOp::LayerNormVjp { .. });
+                    let w = self.packed(operands[1], true)?;
+                    let g = self.packed(operands[if layer { 3 } else { 2 }], true)?;
+                    let has_w = !w.shape.is_empty();
+                    let (limit, reads) = if layer { (8192, 8) } else { (4096, 4) };
+                    let looped = axis > limit;
+                    // RMS rows are grouped (about 512 threadgroups); layer norm: one row each.
+                    let per_group = if !layer && !looped {
+                        rows.div_ceil(512)
+                    } else {
+                        1
+                    };
+                    let groups = rows.div_ceil(per_group);
+                    let name = format!(
+                        "nuvec_vjp_{}{}_{dtn}",
+                        if layer { "layer_norm" } else { "rms" },
+                        if looped { "_looped" } else { "" }
+                    );
+                    let pipeline = self.pipeline_with(&name, &[(20, has_w)])?;
+                    let group = if looped {
+                        pipeline.max_threads_per_threadgroup()
+                    } else {
+                        row_threads(axis, reads)
+                    };
+                    let mut temp = Buffer::try_alloc(if has_w {
+                        groups * axis * dt.size()
+                    } else {
+                        dt.size()
+                    })?;
+                    let (e, n, ws) = (eps.to_le_bytes(), u32b(axis), stride(&w));
+                    let (nr, rpg) = (u32b(rows), u32b(per_group));
+                    let mut args = vec![
+                        x.arg(),
+                        w.arg(),
+                        g.arg(),
+                        Arg::write(out.metal_mut().expect("device storage")),
+                        Arg::write(temp.metal_mut().expect("device storage")),
+                        Arg::bytes(&e),
+                        Arg::bytes(&n),
+                        Arg::bytes(&ws),
+                    ];
+                    if !layer && !looped {
+                        args.extend([Arg::bytes(&nr), Arg::bytes(&rpg)]);
+                    }
+                    let launches = if !layer && !looped { groups } else { rows };
+                    self.dispatch_rows(&pipeline, &args, launches, group)?;
+                    drop(args);
+                    let mut dw = alloc(&outputs[1])?;
+                    if has_w {
+                        self.sum_rows(temp, dt, (groups, axis), &mut dw)?;
+                    } else {
+                        dw.bytes_mut().fill(0);
+                    }
+                    extra.push(dw);
+                    if layer {
+                        let mut db = alloc(&outputs[2])?;
+                        if operands[2].0.shape.is_empty() {
+                            db.bytes_mut().fill(0);
+                        } else {
+                            let g = operands[3];
+                            let axes: Vec<usize> = (0..g.0.shape.len() - 1).collect();
+                            self.reduce(ReduceOp::Sum, &axes, g, &mut db)?;
+                        }
+                        extra.push(db);
+                    }
+                }
+                FastOp::Rope {
+                    dims,
+                    traditional,
+                    base,
+                    scale,
+                    forward,
+                } => {
+                    let nd = x.shape.len();
+                    let (b, t, d) = (x.shape[0], x.shape[nd - 2], x.shape[nd - 1]);
+                    let heads = x.shape[1..nd - 2].iter().product::<usize>();
+                    if *dims < d {
+                        // The features past `dims` pass through unchanged.
+                        self.copy(operands[0], &mut out)?;
+                    }
+                    let offset = self.packed(operands[1], true)?;
+                    let freqs = match operands.get(2) {
+                        Some(f) => Some(self.packed(*f, true)?),
+                        None => None,
+                    };
+                    let size = x.shape.iter().product::<usize>();
+                    let large = size > i32::MAX as usize;
+                    let single = t == 1 && operands[1].0.size == 1 && !large;
+                    let name = format!(
+                        "nuvec_rope_{}{}{}{dtn}",
+                        if single { "single_" } else { "" },
+                        if freqs.is_some() { "freqs_" } else { "" },
+                        if large { "large_" } else { "" }
+                    );
+                    let constants = [(21, *forward), (22, *traditional), (23, false)];
+                    let pipeline = self.pipeline_with(&name, &constants)?;
+                    let mat = (t * d) as i64;
+                    let strides: [i64; 3] = [mat, d as i64, 1];
+                    let strides = bytemuck::bytes_of(&strides).to_vec();
+                    let offset_stride = i64::from(operands[1].0.size > 1).to_le_bytes();
+                    let (sc, nh) = (scale.to_le_bytes(), i32b(heads));
+                    let log_base = f32::from_bits(*base).log2().to_le_bytes();
+                    let mat_b = mat.to_le_bytes();
+                    let freq_stride = 1i64.to_le_bytes();
+                    let mut args = vec![
+                        x.arg(),
+                        Arg::write(out.metal_mut().expect("device storage")),
+                        offset.arg(),
+                        Arg::bytes(&sc),
+                    ];
+                    let (grid, group) = if single {
+                        args.push(Arg::bytes(&mat_b));
+                        let grid = [dims / 2, b * heads, 1];
+                        (grid, block_dims(grid))
+                    } else {
+                        args.extend([
+                            Arg::bytes(&strides),
+                            Arg::bytes(&strides),
+                            Arg::bytes(&offset_stride),
+                            Arg::bytes(&nh),
+                        ]);
+                        let grid = [dims / 2, t, b * heads.div_ceil(4)];
+                        (grid, block_dims(grid))
+                    };
+                    // Buffers 10 and 11: the frequencies (or the base) sit at fixed indices.
+                    let unused = [0u8; 4];
+                    while args.len() < 10 {
+                        args.push(Arg::bytes(&unused));
+                    }
+                    match &freqs {
+                        Some(f) => args.extend([f.arg(), Arg::bytes(&freq_stride)]),
+                        None => args.push(Arg::bytes(&log_base)),
+                    }
+                    self.command_buffer()?
+                        .dispatch_threads(&pipeline, &args, grid, group)
+                        .map_err(backend)?;
+                    self.counted()?;
+                }
+                FastOp::CrossEntropy | FastOp::CrossEntropyVjp => {
+                    let vjp = *op == FastOp::CrossEntropyVjp;
+                    let name =
+                        format!("nuvec_cross_entropy{}_{dtn}", if vjp { "_vjp" } else { "" });
+                    let pipeline = self.pipeline(&name)?;
+                    let max = pipeline.max_threads_per_threadgroup() / 32 * 32;
+                    let group = row_threads(axis, 4).clamp(32, max);
+                    let rest = (1..operands.len())
+                        .map(|i| self.packed(operands[i], true))
+                        .collect::<Result<Vec<_>>>()?;
+                    let n = i32b(axis);
+                    let mut args = vec![x.arg()];
+                    args.extend(rest.iter().map(Packed::arg));
+                    args.extend([
+                        Arg::write(out.metal_mut().expect("device storage")),
+                        Arg::bytes(&n),
+                    ]);
+                    self.dispatch_rows(&pipeline, &args, rows, group)?;
+                }
+            }
+            let mut data = vec![Data::new(out)];
+            data.extend(extra.into_iter().map(Data::new));
+            Ok(data)
         }
 
         /// MLX's `affine_quantize`: one simdgroup per group of values.

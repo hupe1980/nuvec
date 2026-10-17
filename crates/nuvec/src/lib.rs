@@ -33,7 +33,7 @@
 //!
 //! **Status:** pre-alpha. NumPy/MLX semantics (promotion, broadcasting, zero-copy views,
 //! element-wise operations, weak scalar operands, reductions, matmul, MLX-compatible affine
-//! quantization) and composable
+//! quantization, fused `fast` kernels) and composable
 //! transforms (`grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`,
 //! `checkpoint`), evaluated on the GPU by default (asynchronously submitted; see
 //! `async_eval`) or on the CPU.
@@ -42,7 +42,6 @@
 
 pub use nuvec_compile as compile;
 pub use nuvec_core as core;
-pub use nuvec_core::random;
 pub use nuvec_core::{
     ArgReduceOp, Array, BinaryOp, Category, Complex64, CustomCall, CustomFunction, DType, Device,
     DeviceKind, Element, Error, Flags, Primitive, ReduceOp, Result, Scalar, ScalarOperand,
@@ -55,6 +54,7 @@ pub use nuvec_core::{
     squeeze, stop_gradient, subtract, sum, tanh, transpose, value_and_grad, vjp, vmap, where_,
     zeros,
 };
+pub use nuvec_core::{fast, random};
 pub use nuvec_cpu as cpu;
 pub use nuvec_distributed as distributed;
 pub use nuvec_gpu as gpu;

@@ -37,3 +37,7 @@ harness = false
 [[bench]]
 name = "quant"
 harness = false
+
+[[bench]]
+name = "fast"
+harness = false

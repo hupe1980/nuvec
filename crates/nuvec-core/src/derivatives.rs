@@ -346,6 +346,7 @@ impl Primitive {
                 };
                 Ok(vec![da, db, dc])
             }
+            Self::Fast(op) => op.vjp(inputs, outputs, cotangents, wanted),
             Self::Quantize { .. } => Ok(vec![None]),
             Self::Dequantize { group_size, bits } => {
                 if wanted[0] {
@@ -522,6 +523,7 @@ impl Primitive {
                 }
                 one(Ok(total))
             }
+            Self::Fast(op) => op.jvp(inputs, tangents),
             Self::Quantize { .. } => outputs.iter().map(zeros_like).collect(),
             // Linear in `(scales, biases)`: `dequantize(w, dscales, dbiases)`.
             Self::Dequantize { group_size, bits } => one(dequantize(

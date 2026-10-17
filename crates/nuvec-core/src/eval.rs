@@ -258,6 +258,7 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
                 n * primitive_width(primitive),
             )?)
         }
+        Primitive::Fast(op) => op.eval_cpu(operands),
         Primitive::Quantize { group_size, bits } => {
             let (packed, scales, biases) =
                 kernels::quantize(operands[0], *group_size, usize::from(*bits))?;

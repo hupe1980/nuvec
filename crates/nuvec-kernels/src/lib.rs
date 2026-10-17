@@ -6,8 +6,9 @@
 //! be compiled at runtime. [`MODE`] reports which of these happened.
 //!
 //! The kernels: element-wise operations, casts, copies, reductions, MLX's GEMM (steel,
-//! split-K) and GEMV, and MLX's affine quantization kernels (quantize, dequantize and the
-//! quantized matrix products).
+//! split-K) and GEMV, MLX's affine quantization kernels (quantize, dequantize and the
+//! quantized matrix products), and MLX's fused kernels (softmax, log-sum-exp, RMS and layer
+//! normalisation, RoPE, cross entropy).
 //!
 //! **Status:** pre-alpha.
 

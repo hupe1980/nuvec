@@ -595,7 +595,7 @@ pub(crate) fn dequantize(
 }
 
 /// Metadata for a matrix operand with explicit strides.
-fn strided(dtype: DType, shape: &[usize], strides: &[isize]) -> Output {
+pub(crate) fn strided(dtype: DType, shape: &[usize], strides: &[isize]) -> Output {
     Output {
         dtype,
         shape: shape.into(),

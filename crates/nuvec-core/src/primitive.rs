@@ -266,6 +266,8 @@ pub enum Primitive {
         /// Whether the dequantized matrix is used transposed (MLX's default).
         transpose: bool,
     },
+    /// A fused operation with a dedicated GPU kernel ([`crate::fast`]).
+    Fast(crate::fast::FastOp),
     /// Random bits from threefry2x32 keys of shape `[..., 2]` (uint32): the output has shape
     /// `keys.shape[..-1] + shape` and `width` bytes per element (MLX's layout).
     RandomBits {
@@ -319,6 +321,7 @@ impl Primitive {
             Self::Matmul => "matmul",
             Self::AddMM { .. } => "addmm",
             Self::RandomBits { .. } => "random_bits",
+            Self::Fast(op) => op.name(),
             Self::Quantize { .. } => "quantize",
             Self::Dequantize { .. } => "dequantize",
             Self::QuantizedMatmul { .. } => "quantized_matmul",
@@ -513,6 +516,13 @@ impl Primitive {
                     .copied()
                     .collect();
                 computed(dtype, &out)
+            }
+            Self::Fast(op) => {
+                return Ok(op
+                    .outputs(inputs)?
+                    .into_iter()
+                    .map(|(dtype, shape)| computed(dtype, &shape))
+                    .collect());
             }
             Self::Quantize { group_size, bits } => {
                 let [w] = self.arity::<1>(inputs)?;

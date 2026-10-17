@@ -130,6 +130,7 @@ impl Primitive {
                 let c = front(&inputs[2], axes[2])?;
                 Ok((vec![crate::ops::addmm(&c, &a, &b, alpha, beta)?], 0))
             }
+            Self::Fast(op) => op.vmap(inputs, axes),
             Self::Quantize { group_size, bits } => {
                 let (wq, scales, biases) =
                     quantize(&front(x, axes[0])?, *group_size, u32::from(*bits))?;

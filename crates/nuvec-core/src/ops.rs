@@ -172,6 +172,15 @@ unary_fn! {
 pub fn logsumexp(a: &Array, axes: &[isize], keepdims: bool) -> Result<Array> {
     check_inputs(&[a])?;
     let a = astype(a, at_least_float(a.dtype()))?;
+    if last_axis_only(&a, axes) && crate::fast::on_gpu(a.dtype(), a.size()) {
+        let out = Array::from_op(Primitive::Fast(crate::fast::FastOp::LogSumExp), vec![a])?;
+        let out = out.into_iter().next().expect("one output");
+        return if keepdims {
+            Ok(out)
+        } else {
+            squeeze(&out, axes)
+        };
+    }
     let maxval = stop_gradient(&max(&a, axes, true)?)?;
     let out = log(&sum(&exp(&subtract(&a, &maxval)?)?, axes, true)?)?;
     let out = add(&out, &maxval)?;
@@ -188,9 +197,30 @@ pub fn logsumexp(a: &Array, axes: &[isize], keepdims: bool) -> Result<Array> {
 pub fn softmax(a: &Array, axes: &[isize]) -> Result<Array> {
     check_inputs(&[a])?;
     let a = astype(a, at_least_float(a.dtype()))?;
+    if last_axis_only(&a, axes) && crate::fast::on_gpu(a.dtype(), a.size()) {
+        return single(Primitive::Fast(crate::fast::FastOp::Softmax), vec![a]);
+    }
     let maxval = stop_gradient(&max(&a, axes, true)?)?;
     let ex = exp(&subtract(&a, &maxval)?)?;
     divide(&ex, sum(&ex, axes, true)?)
+}
+
+/// Whether `axes` (all if empty) reduce the last axis and otherwise only axes of size 1:
+/// MLX's condition for its last-axis softmax and log-sum-exp kernels.
+fn last_axis_only(a: &Array, axes: &[isize]) -> bool {
+    let n = a.ndim() as isize;
+    let all: Vec<isize> = if axes.is_empty() {
+        (0..n).collect()
+    } else {
+        axes.to_vec()
+    };
+    n > 0
+        && a.dtype() != DType::Complex64
+        && all.iter().all(|&ax| (-n..n).contains(&ax))
+        && all.iter().any(|&ax| ax.rem_euclid(n) == n - 1)
+        && all
+            .iter()
+            .all(|&ax| ax.rem_euclid(n) == n - 1 || a.shape()[ax.rem_euclid(n) as usize] == 1)
 }
 
 /// Element-wise selection: `a` where `condition` is true, otherwise `b`.

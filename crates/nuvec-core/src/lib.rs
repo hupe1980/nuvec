@@ -52,6 +52,7 @@ mod device;
 mod dtype;
 mod error;
 mod eval;
+pub mod fast;
 mod gpu;
 mod kernels;
 mod ops;

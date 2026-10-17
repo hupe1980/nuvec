@@ -472,6 +472,18 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
             p("alpha").parse().unwrap(),
             p("beta").parse().unwrap(),
         ),
+        "rms_norm" => fast::rms_norm(&xs[0], xs.get(1), p("eps").parse().unwrap()),
+        "layer_norm" => fast::layer_norm(&xs[0], xs.get(1), xs.get(2), p("eps").parse().unwrap()),
+        "rope" => fast::rope(
+            &xs[0],
+            p("dims").parse().unwrap(),
+            p("traditional") == "1",
+            p("base").parse().ok(),
+            p("scale").parse().unwrap(),
+            &xs[1],
+            xs.get(2),
+        ),
+        "cross_entropy" => fast::cross_entropy(&xs[0], &xs[1]),
         "dequantize" => dequantize(&xs[0], &xs[1], &xs[2], gs(), bits()),
         "quantized_matmul" => quantized_matmul(&xs[0], &xs[1], &xs[2], &xs[3], t(), gs(), bits()),
         "quantized_matmul_xsb" => {
@@ -538,6 +550,11 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
         "random" if case.params["fn"] == "normal" => 8.0 * eps * e.abs().max(1.0),
         "erfinv" => 8.0 * eps * e.abs().max(f64::MIN_POSITIVE),
         "logsumexp" | "softmax" => 8.0 * eps * e.abs().max(1.0),
+        // Statistics in float32, then rounded; kernels and fallbacks round at different
+        // points.
+        "rms_norm" | "layer_norm" | "rope" => 16.0 * eps * e.abs().max(1.0),
+        // A float32 loss that MLX's fallback computes in the logits' (half) type.
+        "cross_entropy" => 16.0 * epsilon(case.inputs[0].dtype) * e.abs().max(1.0),
         // Derivatives chain several rounded operations, accumulated over at most every
         // input element.
         "vjp" | "jvp" => {

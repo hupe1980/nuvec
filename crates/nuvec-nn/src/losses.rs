@@ -19,7 +19,7 @@ pub enum Reduction {
 /// Cross entropy of `logits` (classes on the last axis) against integer class indices
 /// `targets` (the logits' shape without the last axis), as MLX's `nn.losses.cross_entropy`:
 /// `logsumexp(z) − z[target]` with `z = logits − max(logits)` (the maximum without
-/// gradient).
+/// gradient); on the GPU, the fused [`nuvec::fast::cross_entropy`] in the logits' dtype.
 pub fn cross_entropy(logits: &Array, targets: &Array, reduction: Reduction) -> Result<Array> {
     let classes = *logits
         .shape()
@@ -38,11 +38,16 @@ pub fn cross_entropy(logits: &Array, targets: &Array, reduction: Reduction) -> R
             targets.dtype()
         )));
     }
-    let z = subtract(logits, stop_gradient(&max(logits, &[-1], true)?)?)?;
-    let positions = arange(0.0, classes as f64, 1.0, targets.dtype())?;
-    let hit = nuvec::equal(&positions, expand_dims(targets, -1)?)?;
-    let score = sum(&where_(&hit, &z, 0.0)?, &[-1], false)?;
-    let loss = subtract(logsumexp(&z, &[-1], false)?, &score)?;
+    let loss = if nuvec::default_device().kind == nuvec::DeviceKind::Gpu {
+        // One fused kernel (and one for the gradient), as MLX on the GPU.
+        nuvec::fast::cross_entropy(logits, targets)?.astype(logits.dtype())?
+    } else {
+        let z = subtract(logits, stop_gradient(&max(logits, &[-1], true)?)?)?;
+        let positions = arange(0.0, classes as f64, 1.0, targets.dtype())?;
+        let hit = nuvec::equal(&positions, expand_dims(targets, -1)?)?;
+        let score = sum(&where_(&hit, &z, 0.0)?, &[-1], false)?;
+        subtract(logsumexp(&z, &[-1], false)?, &score)?
+    };
     match reduction {
         Reduction::None => Ok(loss),
         Reduction::Mean => mean(&loss, &[], false),
