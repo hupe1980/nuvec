@@ -111,6 +111,7 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
     unary = {
         "negative": mx.negative, "abs": mx.abs, "exp": mx.exp, "log": mx.log, "sqrt": mx.sqrt,
         "sin": mx.sin, "cos": mx.cos, "tanh": mx.tanh, "sigmoid": mx.sigmoid,
+        "conjugate": mx.conjugate,
     }
     reductions = {
         "sum": mx.sum, "prod": mx.prod, "max": mx.max, "min": mx.min, "mean": mx.mean,
@@ -403,6 +404,30 @@ batched("vmap-matmul", "matmul", [make("float32", (2, 3, 4)), make("float32", (2
 batched("vmap-matmul-shared-left", "matmul", [make("float32", (3, 4)), make("float32", (4, 2, 5))], "n,1")
 batched("vmap-matmul-shared-right", "matmul", [make("float32", (3, 2, 4)), make("float32", (4, 5))], "1,n")
 batched("vmap-matmul-vector", "matmul", [make("float32", (4, 3)), make("float32", (4, 2))], "1,n")
+
+# Complex numbers: conjugation, and MLX's conjugation convention for derivatives.
+case("conjugate-complex64", "conjugate", [make("complex64", (2, 3))])
+case("conjugate-float32", "conjugate", [make("float32", (4,), edge=True)])
+case("conjugate-t", "conjugate", [make("complex64", (3, 2))], pre="t")
+c = lambda *s: make("complex64", s)
+derivative("vjp", "vjp-c-negative", "negative", [c(2, 3)])
+derivative("vjp", "vjp-c-conjugate", "conjugate", [c(2, 3)])
+derivative("vjp", "vjp-c-abs", "abs", [c(2, 3)])
+derivative("jvp", "jvp-c-abs", "abs", [c(2, 3)])
+for op in ["add", "subtract", "multiply", "divide"]:
+    derivative("vjp", f"vjp-c-{op}", op, [c(2, 3), c(3)])
+    derivative("jvp", f"jvp-c-{op}", op, [c(2, 3), c(3)])
+derivative("vjp", "vjp-c-multiply-real", "multiply", [c(2, 3), make("float32", (3,))])
+derivative("vjp", "vjp-c-where", "where", [make("bool", (2, 3)), c(2, 3), c(3)])
+derivative("vjp", "vjp-c-astype-real", "astype", [c(4)], dtype=CODE["float32"])
+derivative("vjp", "vjp-c-astype-complex", "astype", [make("float32", (4,))], dtype=CODE["complex64"])
+derivative("vjp", "vjp-c-slice", "slice", [c(5, 4)], args="1:4:1;::-2")
+derivative("vjp", "vjp-c-sum", "sum", [c(2, 3)], axes="1", keepdims=0)
+derivative("vjp", "vjp-c-prod", "prod", [c(2, 3)], axes="1", keepdims=0)
+derivative("jvp", "jvp-c-prod", "prod", [c(2, 3)], axes="1", keepdims=0)
+derivative("vjp", "vjp-c-matmul", "matmul", [c(2, 3), c(3, 2)])
+derivative("jvp", "jvp-c-matmul", "matmul", [c(2, 3), c(3, 2)])
+batched("vmap-c-conjugate", "conjugate", [c(3, 2)], "1")
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

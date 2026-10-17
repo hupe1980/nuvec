@@ -68,10 +68,10 @@ pub use dtype::{Category, Complex64, DType, Element, at_least_float, bf16, f16, 
 pub use error::{Error, Result};
 pub use eval::eval;
 pub use ops::{
-    abs, add, all, any, arange, argmax, argmin, astype, broadcast_to, cos, divide, equal, exp,
-    expand_dims, greater, greater_equal, less, less_equal, log, matmul, max, maximum, mean, min,
-    minimum, multiply, negative, not_equal, ones, prod, reshape, sigmoid, sin, slice, sqrt,
-    squeeze, stop_gradient, subtract, sum, tanh, transpose, where_, zeros,
+    abs, add, all, any, arange, argmax, argmin, astype, broadcast_to, conjugate, cos, divide,
+    equal, exp, expand_dims, greater, greater_equal, less, less_equal, log, matmul, max, maximum,
+    mean, min, minimum, multiply, negative, not_equal, ones, prod, reshape, sigmoid, sin, slice,
+    sqrt, squeeze, stop_gradient, subtract, sum, tanh, transpose, where_, zeros,
 };
 pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, UnaryOp};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};

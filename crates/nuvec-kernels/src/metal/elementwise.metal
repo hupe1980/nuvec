@@ -26,6 +26,7 @@ NUVEC_UNARY_OP(Sin, op_sin)
 NUVEC_UNARY_OP(Cos, op_cos)
 NUVEC_UNARY_OP(Tanh, op_tanh)
 NUVEC_UNARY_OP(Sigmoid, op_sigmoid)
+NUVEC_UNARY_OP(Conj, op_conj)
 
 #define NUVEC_BINARY_OP(Name, expr)                                          \
     struct Name {                                                            \
@@ -212,8 +213,10 @@ NUVEC_BINARY(le, Le, bool, nbool, nbool)
 NUVEC_BINARY(gt, Gt, bool, nbool, nbool)
 NUVEC_BINARY(ge, Ge, bool, nbool, nbool)
 
-// complex64: arithmetic and equality (ordering is rejected by the ops layer; abs runs on CPU).
+// complex64: arithmetic, conjugation and equality (ordering is rejected by the ops layer; abs
+// runs on CPU).
 NUVEC_UNARY(neg, Neg, complex64, complex64_t, complex64_t)
+NUVEC_UNARY(conj, Conj, complex64, complex64_t, complex64_t)
 NUVEC_BINARY(add, Add, complex64, complex64_t, complex64_t)
 NUVEC_BINARY(sub, Sub, complex64, complex64_t, complex64_t)
 NUVEC_BINARY(mul, Mul, complex64, complex64_t, complex64_t)

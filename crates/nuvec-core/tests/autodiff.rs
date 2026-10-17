@@ -440,13 +440,6 @@ fn errors() {
     let failing =
         |_: &[Array]| -> Result<Vec<Array>> { Err(Error::InvalidArgument("user".into())) };
     assert!(matches!(vjp(failing, &[], &[]), Err(Error::InvalidArgument(m)) if m == "user"));
-    let z = Array::from_slice(&[Complex64::new(1.0, 1.0)], &[1]).unwrap();
-    let c = Array::from_slice(&[Complex64::new(1.0, 0.0)], &[1]).unwrap();
-    let sq = |xs: &[Array]| Ok(vec![multiply(&xs[0], &xs[0])?]);
-    assert!(matches!(
-        vjp(sq, &[z], &[c]),
-        Err(Error::UnsupportedDType { .. })
-    ));
 }
 
 #[test]
@@ -504,5 +497,257 @@ fn gradients_on_the_gpu_match_the_cpu() {
             }
         }
         Err(e) => eprintln!("skipped: no Metal device ({e})"),
+    }
+}
+
+// ── Complex numbers ─────────────────────────────────────────────────────────
+
+fn complex_values(a: &Array) -> Vec<Complex64> {
+    match a.dtype() {
+        DType::Complex64 => a.to_vec().unwrap(),
+        _ => a
+            .astype(DType::F32)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap()
+            .iter()
+            .map(|&v| Complex64::new(v, 0.0))
+            .collect(),
+    }
+}
+
+/// `Re Σ conj(c)·y`, the pairing under which MLX's complex cotangents are defined.
+fn pair(c: &[Complex64], y: &[Complex64]) -> f32 {
+    c.iter()
+        .zip(y)
+        .map(|(c, y)| c.re * y.re + c.im * y.im)
+        .sum()
+}
+
+/// [`check`] for complex inputs (real where `real[k]`), in complex64 precision:
+/// - `vjp(c)` against `∂L/∂x + i·∂L/∂y` (MLX's convention) for `L = Re Σ conj(c)·f(z)`,
+///   by central differences in the real and the imaginary direction;
+/// - `Re⟨c, jvp(t)⟩ = Re Σ⟨vjpᵢ(c), tᵢ⟩`.
+fn check_complex(name: &str, f: F, shapes: &[&[usize]], real: &[bool]) {
+    let mut rng = Rng::new(name.bytes().map(u64::from).sum());
+    let is_real = |k: usize| real.get(k).copied().unwrap_or(false);
+    let random = |rng: &mut Rng, n: usize, real: bool| -> Vec<Complex64> {
+        (0..n)
+            .map(|_| {
+                let re = (unit(rng) * 2.0 - 1.0) as f32;
+                let im = if real {
+                    0.0
+                } else {
+                    (unit(rng) * 2.0 - 1.0) as f32
+                };
+                Complex64::new(re, im)
+            })
+            .collect()
+    };
+    let array = |d: &[Complex64], s: &[usize], real: bool| -> Array {
+        if real {
+            Array::from_slice(&d.iter().map(|z| z.re).collect::<Vec<f32>>(), s).unwrap()
+        } else {
+            Array::from_slice(d, s).unwrap()
+        }
+    };
+    let data: Vec<Vec<Complex64>> = shapes
+        .iter()
+        .enumerate()
+        .map(|(k, s)| random(&mut rng, s.iter().product(), is_real(k)))
+        .collect();
+    let build = |data: &[Vec<Complex64>]| -> Vec<Array> {
+        (0..shapes.len())
+            .map(|k| array(&data[k], shapes[k], is_real(k)))
+            .collect()
+    };
+    let primals: Vec<Array> = (0..shapes.len())
+        .map(|k| {
+            if is_real(k) {
+                let v: Vec<f32> = data[k].iter().map(|z| z.re).collect();
+                random_layout(&mut rng, shapes[k], v).0
+            } else {
+                random_layout(&mut rng, shapes[k], data[k].clone()).0
+            }
+        })
+        .collect();
+    let out = f(&build(&data)).unwrap();
+    let out_real = out.dtype() != DType::Complex64;
+    let c = random(&mut rng, out.size(), out_real);
+    let cot = array(&c, out.shape(), out_real);
+    let (_, grads) = vjp(|xs| Ok(vec![f(xs)?]), &primals, &[cot]).unwrap();
+
+    let h = 1e-2f32;
+    let grads: Vec<Vec<Complex64>> = grads
+        .iter()
+        .enumerate()
+        .map(|(k, g)| {
+            assert_eq!(g.shape(), shapes[k], "{name}: gradient {k} shape");
+            complex_values(g)
+        })
+        .collect();
+    for (k, g) in grads.iter().enumerate() {
+        for j in 0..data[k].len() {
+            let at = |re: f32, im: f32| {
+                let mut d = data.clone();
+                d[k][j] = Complex64::new(d[k][j].re + re, d[k][j].im + im);
+                pair(&c, &complex_values(&f(&build(&d)).unwrap()))
+            };
+            let d_re = (at(h, 0.0) - at(-h, 0.0)) / (2.0 * h);
+            let d_im = if is_real(k) {
+                0.0
+            } else {
+                (at(0.0, h) - at(0.0, -h)) / (2.0 * h)
+            };
+            let tol = 1e-2 * d_re.hypot(d_im).max(1.0);
+            assert!(
+                (g[j].re - d_re).abs() <= tol && (g[j].im - d_im).abs() <= tol,
+                "{name}: d/dz{k}[{j}] = {:?} vs finite differences ({d_re}, {d_im})",
+                g[j]
+            );
+        }
+    }
+
+    let t: Vec<Vec<Complex64>> = shapes
+        .iter()
+        .enumerate()
+        .map(|(k, s)| random(&mut rng, s.iter().product(), is_real(k)))
+        .collect();
+    let (_, jt) = jvp(|xs| Ok(vec![f(xs)?]), &primals, &build(&t)).unwrap();
+    let lhs = pair(&c, &complex_values(&jt[0]));
+    let rhs: f32 = grads.iter().zip(&t).map(|(g, t)| pair(g, t)).sum();
+    assert!(
+        (lhs - rhs).abs() <= 1e-4 * lhs.abs().max(1.0),
+        "{name}: Re<c, jvp(t)> = {lhs} vs Re<vjp(c), t> = {rhs}"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "hundreds of evaluations: too slow under Miri, and covered natively"
+)]
+fn complex_gradients() {
+    let unary: [(&str, F); 3] = [
+        ("c-negative", |x| negative(&x[0])),
+        ("c-conjugate", |x| conjugate(&x[0])),
+        ("c-abs", |x| abs(&x[0])),
+    ];
+    for (name, f) in unary {
+        check_complex(name, f, &[&[2, 3]], &[]);
+    }
+    let binary: [(&str, F); 4] = [
+        ("c-add", |x| add(&x[0], &x[1])),
+        ("c-subtract", |x| subtract(&x[0], &x[1])),
+        ("c-multiply", |x| multiply(&x[0], &x[1])),
+        ("c-divide", |x| {
+            divide(&x[0], &add(&x[1], Complex64::new(2.0, 0.5))?)
+        }),
+    ];
+    for (name, f) in binary {
+        check_complex(name, f, &[&[2, 3], &[3]], &[]);
+        check_complex(
+            &format!("{name}-real-rhs"),
+            f,
+            &[&[2, 3], &[3]],
+            &[false, true],
+        );
+    }
+    check_complex(
+        "c-where",
+        |x| where_(greater(&x[0], 0.0)?, &x[1], &x[2]),
+        &[&[2, 3], &[2, 3], &[3]],
+        &[true],
+    );
+    check_complex("c-astype-real", |x| x[0].astype(DType::F32), &[&[4]], &[]);
+    check_complex(
+        "c-astype-complex",
+        |x| x[0].astype(DType::Complex64),
+        &[&[4]],
+        &[true],
+    );
+    let views: [(&str, F, &[usize]); 4] = [
+        ("c-reshape", |x| x[0].reshape(&[3, 2]), &[2, 3]),
+        ("c-transpose", |x| x[0].t(), &[2, 3]),
+        (
+            "c-slice",
+            |x| slice(&x[0], &[SliceArg::new(None, None, -2)]),
+            &[5],
+        ),
+        ("c-broadcast", |x| broadcast_to(&x[0], &[2, 3]), &[3]),
+    ];
+    for (name, f, shape) in views {
+        check_complex(name, f, &[shape], &[]);
+    }
+    check_complex("c-sum", |x| sum(&x[0], &[1], false), &[&[2, 3]], &[]);
+    check_complex("c-prod", |x| prod(&x[0], &[1], false), &[&[2, 3]], &[]);
+    check_complex(
+        "c-matmul",
+        |x| matmul(&x[0], &x[1]),
+        &[&[2, 3], &[3, 2]],
+        &[],
+    );
+    check_complex(
+        "c-composite",
+        |x| abs(&add(multiply(&x[0], &x[1])?, conjugate(&x[2])?)?),
+        &[&[3], &[3], &[3]],
+        &[],
+    );
+    check_complex(
+        "real-through-complex",
+        |x| {
+            let z = multiply(x[0].astype(DType::Complex64)?, &x[1])?;
+            sum(&abs(&z)?, &[], false)
+        },
+        &[&[3], &[3]],
+        &[true],
+    );
+}
+
+#[test]
+fn complex_abs_at_zero_has_zero_derivative() {
+    let z = Array::from_slice(&[Complex64::new(0.0, 0.0), Complex64::new(3.0, 4.0)], &[2]).unwrap();
+    let ones = Array::from_slice(&[1.0f32, 1.0], &[2]).unwrap();
+    let (_, g) = vjp(|x| Ok(vec![abs(&x[0])?]), std::slice::from_ref(&z), &[ones]).unwrap();
+    let g = g[0].to_vec::<Complex64>().unwrap();
+    assert_eq!((g[0].re, g[0].im), (0.0, 0.0));
+    assert!((g[1].re - 0.6).abs() < 1e-6 && (g[1].im - 0.8).abs() < 1e-6);
+    let t = Array::from_slice(&[Complex64::new(1.0, 1.0); 2], &[2]).unwrap();
+    let (_, jt) = jvp(|x| Ok(vec![abs(&x[0])?]), std::slice::from_ref(&z), &[t]).unwrap();
+    let jt = jt[0].to_vec::<f32>().unwrap();
+    assert_eq!(jt[0], 0.0);
+    assert!((jt[1] - 1.4).abs() < 1e-6, "Re((3-4i)(1+i)) / 5 = 7/5");
+}
+
+#[test]
+fn conjugate_values_batching_and_devices() {
+    let z = Array::from_slice(
+        &[Complex64::new(1.0, 2.0), Complex64::new(-3.0, -0.5)],
+        &[2],
+    )
+    .unwrap();
+    let expect = [Complex64::new(1.0, -2.0), Complex64::new(-3.0, 0.5)];
+    assert_eq!(
+        conjugate(&z).unwrap().to_vec::<Complex64>().unwrap(),
+        expect
+    );
+    let real = Array::from_slice(&[1.0f32, -2.0], &[2]).unwrap();
+    assert_eq!(
+        conjugate(&real).unwrap().to_vec::<f32>().unwrap(),
+        [1.0, -2.0]
+    );
+    let batched =
+        vmap(|x| Ok(vec![conjugate(&x[0])?]), &[], &[])(std::slice::from_ref(&z)).unwrap();
+    assert_eq!(batched[0].to_vec::<Complex64>().unwrap(), expect);
+    #[cfg(target_os = "macos")]
+    if !cfg!(miri) {
+        let previous = default_stream();
+        set_default_stream(Stream::default_for(Device::gpu(0)));
+        let gpu = conjugate(&(&z * 1)).and_then(|c| c.to_vec::<Complex64>());
+        set_default_stream(previous);
+        match gpu {
+            Ok(v) => assert_eq!(v, expect),
+            Err(e) => eprintln!("skipped: no Metal device ({e})"),
+        }
     }
 }

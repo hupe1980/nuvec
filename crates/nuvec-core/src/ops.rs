@@ -113,7 +113,7 @@ fn unary(op: UnaryOp, a: &Array) -> Result<Array> {
     };
     let unsupported = match op {
         UnaryOp::Negative => dtype == DType::Bool,
-        UnaryOp::Abs => false,
+        UnaryOp::Abs | UnaryOp::Conjugate => false,
         _ => dtype == DType::Complex64,
     };
     if unsupported {
@@ -123,6 +123,15 @@ fn unary(op: UnaryOp, a: &Array) -> Result<Array> {
         });
     }
     single(Primitive::Unary(op), vec![astype(a, dtype)?])
+}
+
+/// Element-wise complex conjugate. Real arrays are returned unchanged.
+pub fn conjugate(a: &Array) -> Result<Array> {
+    check_inputs(&[a])?;
+    if a.dtype() != DType::Complex64 {
+        return Ok(a.clone());
+    }
+    unary(UnaryOp::Conjugate, a)
 }
 
 macro_rules! unary_fn {

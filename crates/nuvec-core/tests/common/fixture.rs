@@ -398,6 +398,7 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "cos" => Some(cos),
         "tanh" => Some(tanh),
         "sigmoid" => Some(sigmoid),
+        "conjugate" => Some(conjugate),
         _ => None,
     };
     if let Some(f) = unary {

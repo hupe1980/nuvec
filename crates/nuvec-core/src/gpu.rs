@@ -146,6 +146,7 @@ mod metal {
             UnaryOp::Cos => "cos",
             UnaryOp::Tanh => "tanh",
             UnaryOp::Sigmoid => "sigmoid",
+            UnaryOp::Conjugate => "conj",
         }
     }
 
@@ -221,6 +222,7 @@ mod metal {
                         && match op {
                             UnaryOp::Negative => d != DType::Bool,
                             UnaryOp::Abs => d != DType::Complex64,
+                            UnaryOp::Conjugate => d == DType::Complex64,
                             _ => is_float(d),
                         }
                 }

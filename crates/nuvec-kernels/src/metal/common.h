@@ -129,6 +129,7 @@ inline complex64_t op_div(complex64_t a, complex64_t b) {
     return {precise::divide(a.re * b.re + a.im * b.im, d), precise::divide(a.im * b.re - a.re * b.im, d)};
 }
 inline complex64_t op_neg(complex64_t a) { return {-a.re, -a.im}; }
+inline complex64_t op_conj(complex64_t a) { return {a.re, -a.im}; }
 inline bool op_eq(complex64_t a, complex64_t b) { return a.re == b.re && a.im == b.im; }
 
 // ── Conversions (the CPU backend's rules) ────────────────────────────────────

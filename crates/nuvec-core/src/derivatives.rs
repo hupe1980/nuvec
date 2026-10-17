@@ -2,13 +2,14 @@
 //!
 //! The rules follow MLX's `primitives.cpp` and are built from ops, so derivatives are lazy
 //! graphs that can be evaluated anywhere and differentiated again. Every primitive has both
-//! rules (D-015: a missing rule is a compile error). Complex numbers are not supported yet.
+//! rules (D-015: a missing rule is a compile error). Complex reverse-mode rules follow MLX's
+//! convention: the cotangent times the conjugate derivative (D-030).
 
 use crate::array::Array;
 use crate::cast::Canon;
 use crate::ops::{
-    self, broadcast_to, cos, divide, equal, greater, greater_equal, less, less_equal, matmul,
-    multiply, negative, reshape, sin, subtract, sum, transpose, where_,
+    self, broadcast_to, conjugate, cos, divide, equal, greater, greater_equal, less, less_equal,
+    matmul, multiply, negative, reshape, sin, subtract, sum, transpose, where_,
 };
 use crate::primitive::{BinaryOp, Primitive, ReduceOp, UnaryOp};
 use crate::{DType, Error, Result};
@@ -97,6 +98,12 @@ fn first_extreme(x: &Array, axes: &[usize], op: ReduceOp) -> Result<Array> {
     transpose(&reshape(&onehot, &isize_shape(moved.shape()))?, &inverse)
 }
 
+/// `z / |z|` as complex64 (0 at 0): the reverse-mode derivative of complex `abs`.
+fn complex_sign(z: &Array, magnitude: &Array) -> Result<Array> {
+    let unit = divide(z, magnitude.astype(DType::Complex64)?)?;
+    where_(equal(magnitude, 0)?, 0, &unit)
+}
+
 /// `∂out/∂x` of `max`/`min` over reduced axes: ties share the derivative evenly.
 fn extreme_weights(x: &Array, out: &Array, axes: &[usize]) -> Result<Array> {
     let axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
@@ -106,20 +113,6 @@ fn extreme_weights(x: &Array, out: &Array, axes: &[usize]) -> Result<Array> {
 }
 
 impl Primitive {
-    fn check_real(&self, arrays: &[&[Array]]) -> Result<()> {
-        if arrays
-            .iter()
-            .flat_map(|a| a.iter())
-            .any(|a| a.dtype() == DType::Complex64)
-        {
-            return Err(Error::UnsupportedDType {
-                op: self.name(),
-                dtype: DType::Complex64,
-            });
-        }
-        Ok(())
-    }
-
     /// `J_i · v` for element-wise primitives, whose Jacobians are diagonal: the same rule
     /// serves reverse mode (`v` a cotangent) and forward mode (`v` a tangent). `None` for
     /// inputs without a derivative.
@@ -142,6 +135,7 @@ impl Primitive {
                 UnaryOp::Cos => multiply(v, negative(&sin(x)?)?)?,
                 UnaryOp::Tanh => multiply(v, subtract(1, multiply(out, out)?)?)?,
                 UnaryOp::Sigmoid => multiply(v, multiply(out, subtract(1, out)?)?)?,
+                UnaryOp::Conjugate => conjugate(v)?,
             },
             Self::Binary(op) => {
                 let (a, b) = (&inputs[0], &inputs[1]);
@@ -184,12 +178,22 @@ impl Primitive {
         cotangents: &[Array],
         wanted: &[bool],
     ) -> Result<Vec<Option<Array>>> {
-        self.check_real(&[inputs, outputs, cotangents])?;
         let g = &cotangents[0];
+        if let (Self::Unary(UnaryOp::Abs), DType::Complex64) = (self, inputs[0].dtype()) {
+            return Ok(vec![Some(multiply(
+                g.astype(DType::Complex64)?,
+                complex_sign(&inputs[0], &outputs[0])?,
+            )?)]);
+        }
         if self.is_elementwise() {
+            // MLX's convention: the cotangent times the conjugate derivative. These
+            // operations have real coefficients, so that is the rule evaluated on conjugated
+            // primals (`conjugate` is the identity on real arrays).
+            let inputs = inputs.iter().map(conjugate).collect::<Result<Vec<_>>>()?;
+            let out = conjugate(&outputs[0])?;
             return (0..inputs.len())
                 .map(|i| match wanted[i] {
-                    true => self.elementwise_partial(inputs, &outputs[0], i, g),
+                    true => self.elementwise_partial(&inputs, &out, i, g),
                     false => Ok(None),
                 })
                 .collect();
@@ -235,7 +239,10 @@ impl Primitive {
             Self::StopGradient | Self::ArgReduce { .. } => Ok(vec![None]),
             Self::Reduce { op, axes } => match op {
                 ReduceOp::Sum => one(broadcast_to(g, x.shape())),
-                ReduceOp::Prod => one(multiply(g, prod_weights(x, &outputs[0], axes)?)),
+                ReduceOp::Prod => one(multiply(
+                    g,
+                    conjugate(&prod_weights(x, &outputs[0], axes)?)?,
+                )),
                 ReduceOp::Max | ReduceOp::Min => {
                     one(multiply(g, extreme_weights(x, &outputs[0], axes)?))
                 }
@@ -244,11 +251,11 @@ impl Primitive {
             Self::Matmul => {
                 let (a, b) = (&inputs[0], &inputs[1]);
                 let da = match wanted[0] {
-                    true => Some(matmul(g, &swap_last(b)?)?),
+                    true => Some(matmul(g, &conjugate(&swap_last(b)?)?)?),
                     false => None,
                 };
                 let db = match wanted[1] {
-                    true => Some(matmul(&swap_last(a)?, g)?),
+                    true => Some(matmul(&conjugate(&swap_last(a)?)?, g)?),
                     false => None,
                 };
                 Ok(vec![da, db])
@@ -295,7 +302,13 @@ impl Primitive {
         outputs: &[Array],
         tangents: &[Option<Array>],
     ) -> Result<Vec<Array>> {
-        self.check_real(&[inputs, outputs])?;
+        if let (Self::Unary(UnaryOp::Abs), DType::Complex64) = (self, inputs[0].dtype()) {
+            // d|z| = Re(conj(z) dz) / |z|, zero at z = 0 (MLX).
+            let (z, out) = (&inputs[0], &outputs[0]);
+            let t = tangents[0].clone().map_or_else(|| zeros_like(z), Ok)?;
+            let re = multiply(conjugate(z)?, &t)?.astype(DType::F32)?;
+            return Ok(vec![where_(equal(out, 0)?, 0, divide(&re, out)?)?]);
+        }
         let tangent = |i: usize| -> Result<Array> {
             match &tangents[i] {
                 Some(t) => Ok(t.clone()),

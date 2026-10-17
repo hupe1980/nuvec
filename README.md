@@ -8,7 +8,8 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > **Status: pre-alpha.** Lazy arrays with 14 dtypes, MLX type promotion, broadcasting,
 > zero-copy views, element-wise operations with weak Rust scalars (`&x * 2.0` keeps `x`'s
 > dtype), reductions, matmul and composable transforms (`grad`, `value_and_grad`, `vjp`,
-> `jvp`, `vmap`, `custom_function`, `checkpoint`), evaluated on the CPU or on
+> `jvp`, `vmap`, `custom_function`, `checkpoint`; also through complex numbers), evaluated on
+> the CPU or on
 > the GPU (Metal kernels on unified memory, selected with
 > `set_default_stream(Stream::default_for(Device::gpu(0)))`).
 

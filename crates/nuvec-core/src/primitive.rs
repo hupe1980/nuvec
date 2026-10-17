@@ -36,12 +36,14 @@ pub enum UnaryOp {
     Tanh,
     /// `1 / (1 + e^-x)`.
     Sigmoid,
+    /// The complex conjugate (identity for real numbers).
+    Conjugate,
 }
 
 impl UnaryOp {
     /// Whether the function computes in floating point (integer inputs are promoted).
     pub(crate) fn is_transcendental(self) -> bool {
-        !matches!(self, Self::Negative | Self::Abs)
+        !matches!(self, Self::Negative | Self::Abs | Self::Conjugate)
     }
 
     pub(crate) fn name(self) -> &'static str {
@@ -55,6 +57,7 @@ impl UnaryOp {
             Self::Cos => "cos",
             Self::Tanh => "tanh",
             Self::Sigmoid => "sigmoid",
+            Self::Conjugate => "conjugate",
         }
     }
 }

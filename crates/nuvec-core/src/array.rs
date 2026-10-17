@@ -436,7 +436,11 @@ mod tests {
         let build = BuildHasherDefault::<NodeHasher>::default();
         // 336-byte nodes, as allocated: every low table index should be reachable.
         let buckets: HashSet<u64> = (0..1024u64)
-            .map(|i| build.hash_one((0x6000_0000_0000 + i * 336) as *const Node) & 1023)
+            .map(|i| {
+                build.hash_one(std::ptr::without_provenance::<Node>(
+                    0x6000_0000_0000 + i as usize * 336,
+                )) & 1023
+            })
             .collect();
         // A random hash fills about 1 - 1/e ≈ 63% of them.
         assert!(

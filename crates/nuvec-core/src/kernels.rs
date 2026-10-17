@@ -147,6 +147,7 @@ pub(crate) fn unary(op: UnaryOp, a: Operand<'_>) -> Result<Buffer> {
             UnaryOp::Cos => go!(|x: T| x.float_(UnaryOp::Cos)),
             UnaryOp::Tanh => go!(|x: T| x.float_(UnaryOp::Tanh)),
             UnaryOp::Sigmoid => go!(|x: T| x.float_(UnaryOp::Sigmoid)),
+            UnaryOp::Conjugate => go!(T::conj_),
         }
         Ok(out)
     })
@@ -440,6 +441,9 @@ trait Num: Scalar {
     fn le_(self, o: Self) -> bool;
     fn neg_(self) -> Self;
     fn abs_(self) -> Self;
+    fn conj_(self) -> Self {
+        self
+    }
     fn float_(self, op: UnaryOp) -> Self;
     fn is_nan_(self) -> bool {
         false
@@ -532,7 +536,7 @@ macro_rules! float_num {
                     UnaryOp::Cos => self.cos(),
                     UnaryOp::Tanh => self.tanh(),
                     UnaryOp::Sigmoid => sigmoid(self),
-                    UnaryOp::Negative | UnaryOp::Abs => unreachable!("not transcendental"),
+                    UnaryOp::Negative | UnaryOp::Abs | UnaryOp::Conjugate => unreachable!("not transcendental"),
                 }
             }
         }
@@ -637,6 +641,9 @@ impl Num for Complex64 {
     }
     fn abs_(self) -> Self {
         unreachable!("complex abs produces float32 and is handled separately")
+    }
+    fn conj_(self) -> Self {
+        Complex64::new(self.re, -self.im)
     }
     fn float_(self, _: UnaryOp) -> Self {
         unreachable!("complex transcendental: {REJECTED}")
