@@ -350,3 +350,18 @@ fn cpu_reads_may_overlap_gpu_reads_but_not_gpu_writes() {
     assert_eq!(read_f32(&out)[0], 2.0);
     assert!(a.contents_mut().is_ok());
 }
+
+#[test]
+fn function_constants_specialise_and_cache_pipelines() {
+    let Some(device) = device() else { return };
+    for (flag, expected) in [(false, 1.0), (true, 2.0), (false, 1.0)] {
+        let pipeline = device
+            .pipeline_with("nuvec_function_constant_test", &[(0, flag)])
+            .unwrap();
+        let mut out = device.new_buffer(16).unwrap();
+        let mut cmd = device.command_buffer().unwrap();
+        cmd.dispatch(&pipeline, &[Arg::write(&mut out)], 4).unwrap();
+        cmd.commit().wait().unwrap();
+        assert_eq!(read_f32(&out), [expected; 4]);
+    }
+}

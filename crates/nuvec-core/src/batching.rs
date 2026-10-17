@@ -121,6 +121,14 @@ impl Primitive {
                 vec![matmul(&front(x, axes[0])?, &front(&inputs[1], axes[1])?)?],
                 0,
             )),
+            // `addmm` broadcasts `c` and size-1 batch axes, as `matmul` does.
+            Self::AddMM { .. } => {
+                let (alpha, beta) = self.addmm_factors();
+                let a = front(x, axes[0])?;
+                let b = front(&inputs[1], axes[1])?;
+                let c = front(&inputs[2], axes[2])?;
+                Ok((vec![crate::ops::addmm(&c, &a, &b, alpha, beta)?], 0))
+            }
             Self::Custom(call) => {
                 let (primals, axes) = (&inputs[..call.primals], &axes[..call.primals]);
                 match &call.rules.vmap {

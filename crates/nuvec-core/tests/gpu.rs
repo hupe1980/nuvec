@@ -484,3 +484,114 @@ fn later_evaluations_consume_in_flight_results() {
         assert_eq!(step.item::<f32>().unwrap(), 1200.0 * (1 << 16) as f32);
     });
 }
+
+#[test]
+fn steel_gemm_matches_the_cpu_over_shapes_layouts_batches_and_dtypes() {
+    if !gpu_available() {
+        return;
+    }
+    let mut rng = Rng::new(23);
+    let mut random = |shape: &[usize]| {
+        let n = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|_| rng.f64() as f32 * 0.1).collect();
+        Array::from_slice(&v, shape).unwrap()
+    };
+    // (A shape, B shape, how to present A, how to present B)
+    let cases: Vec<(Vec<usize>, Vec<usize>, &str, &str)> = vec![
+        (vec![64, 64], vec![64, 64], "", ""),
+        (vec![129, 67], vec![67, 200], "", ""),
+        (vec![1, 300], vec![300, 77], "", ""),
+        (vec![77, 300], vec![300, 1], "", ""),
+        (vec![300, 77], vec![65, 300], "t", "t"),
+        (vec![33, 50], vec![65, 50], "", "t"),
+        (vec![50, 33], vec![50, 65], "t", ""),
+        (vec![40, 60], vec![60, 70], "strided", "strided"),
+        (vec![3, 70, 40], vec![3, 40, 90], "", ""),
+        (vec![3, 70, 40], vec![40, 90], "", ""),
+        (vec![2, 3, 20, 30], vec![3, 2, 30, 10], "batch-t", ""),
+    ];
+    let present = |x: &Array, how: &str| -> Array {
+        match how {
+            "t" => x.t().unwrap(),
+            "strided" => {
+                let args: Vec<SliceArg> = x
+                    .shape()
+                    .iter()
+                    .map(|_| SliceArg::new(None, None, 2))
+                    .collect();
+                slice(x, &args).unwrap()
+            }
+            "batch-t" => transpose(x, &[1, 0, 2, 3]).unwrap(),
+            _ => x.clone(),
+        }
+    };
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        for (sa, sb, ha, hb) in &cases {
+            let (a, b) = (random(sa), random(sb));
+            let (pa, pb) = (present(&a, ha), present(&b, hb));
+            let k = pa.shape()[pa.ndim() - 1];
+            let f = || matmul(&pa.astype(dtype)?, &pb.astype(dtype)?);
+            let cpu = on(Device::cpu(), f)
+                .unwrap()
+                .astype(DType::F32)
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap();
+            let gpu = on(Device::gpu(0), f)
+                .unwrap()
+                .astype(DType::F32)
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap();
+            let eps = match dtype {
+                DType::F32 => 1e-6,
+                DType::F16 => 2e-3,
+                _ => 1.6e-2,
+            };
+            // Standard GEMM error bound: eps · K · max|a| · max|b| (inputs are within ±1).
+            let tol = eps * k as f32;
+            for (i, (c, g)) in cpu.iter().zip(&gpu).enumerate() {
+                assert!(
+                    (c - g).abs() <= tol,
+                    "{dtype} {sa:?}x{sb:?} ({ha},{hb}) element {i}: cpu {c} gpu {g}"
+                );
+            }
+        }
+    }
+    // addmm: broadcast bias, full c, alpha/beta; vector operands.
+    let (a, b) = (random(&[37, 50]), random(&[50, 41]));
+    let (bias, full) = (random(&[41]), random(&[37, 41]));
+    for (c, alpha, beta) in [
+        (&bias, 1.0, 1.0),
+        (&full, 0.5, -2.0),
+        (&bias, 0.0, 3.0),
+        (&full, 2.0, 0.0),
+    ] {
+        let f = || addmm(c, &a, &b, alpha, beta);
+        let cpu = on(Device::cpu(), f).unwrap().to_vec::<f32>().unwrap();
+        let gpu = on(Device::gpu(0), f).unwrap().to_vec::<f32>().unwrap();
+        for (c, g) in cpu.iter().zip(&gpu) {
+            assert!(
+                (c - g).abs() <= 1e-6 * 50.0 * 4.0,
+                "addmm {alpha} {beta}: {c} vs {g}"
+            );
+        }
+    }
+    // Split-K (long K, few output tiles) with the AddMM epilogue.
+    let (a, b, full) = (random(&[20, 640]), random(&[640, 30]), random(&[20, 30]));
+    for (c, alpha, beta) in [(&full, 1.0, 1.0), (&full, 0.5, -2.0)] {
+        let f = || addmm(c, &a, &b, alpha, beta);
+        let cpu = on(Device::cpu(), f).unwrap().to_vec::<f32>().unwrap();
+        let gpu = on(Device::gpu(0), f).unwrap().to_vec::<f32>().unwrap();
+        for (c, g) in cpu.iter().zip(&gpu) {
+            assert!(
+                (c - g).abs() <= 1e-6 * 640.0 * 4.0,
+                "split-K addmm {alpha} {beta}: {c} vs {g}"
+            );
+        }
+    }
+    let (b, bias) = (random(&[50, 41]), random(&[41]));
+    let v = random(&[50]);
+    let f = || addmm(&bias, &v, &b, 1.0, 1.0);
+    assert_eq!(on(Device::gpu(0), f).unwrap().shape(), &[41]);
+}

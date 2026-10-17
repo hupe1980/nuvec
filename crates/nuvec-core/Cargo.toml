@@ -29,3 +29,7 @@ workspace = true
 [[bench]]
 name = "vs_mlx"
 harness = false
+
+[[bench]]
+name = "gemm"
+harness = false

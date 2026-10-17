@@ -203,6 +203,142 @@ mod metal {
         rt: &'a [isize],
     }
 
+    /// `GEMMParams` (MLX steel), with the trailing padding Metal's layout has.
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct GemmParams {
+        m: i32,
+        n: i32,
+        k: i32,
+        lda: i32,
+        ldb: i32,
+        ldd: i32,
+        tiles_n: i32,
+        tiles_m: i32,
+        batch_stride_a: i64,
+        batch_stride_b: i64,
+        batch_stride_d: i64,
+        swizzle_log: i32,
+        gemm_k_iterations_aligned: i32,
+        batch_ndim: i32,
+        _pad: i32,
+    }
+
+    /// `GEMMSpiltKParams` (MLX steel).
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct SplitKParams {
+        m: i32,
+        n: i32,
+        k: i32,
+        lda: i32,
+        ldb: i32,
+        ldc: i32,
+        tiles_n: i32,
+        tiles_m: i32,
+        partitions: i32,
+        partition_stride: i32,
+        partition_size: i32,
+        swizzle_log: i32,
+        gemm_k_iterations_aligned: i32,
+    }
+
+    /// `GEMMAddMMParams` (MLX steel).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+    struct AddMmParams {
+        ldc: i32,
+        fdc: i32,
+        batch_stride_c: i64,
+        alpha: f32,
+        beta: f32,
+    }
+
+    enum GemmBuffer<'a> {
+        View(&'a nuvec_gpu::Buffer),
+        Copy(Buffer),
+    }
+
+    /// A GEMM operand: buffer, byte offset, layout of its last two dimensions, batch strides.
+    struct Gemmand<'a> {
+        buffer: GemmBuffer<'a>,
+        offset: usize,
+        transposed: bool,
+        ld: i32,
+        batch_strides: Vec<isize>,
+    }
+
+    impl<'a> Gemmand<'a> {
+        /// The operand as it is, if its last two dimensions (`rows × cols`) are row-major
+        /// (`transposed = false`) or column-major, with non-negative strides (MLX's
+        /// `check_transpose`; size-1 dimensions fit either).
+        fn view((meta, data): Operand<'a>, rows: usize, cols: usize) -> Option<Self> {
+            let nd = meta.shape.len();
+            if meta.strides.iter().any(|&s| s < 0) || data.offset < 0 {
+                return None;
+            }
+            let (sr, sc) = (meta.strides[nd - 2], meta.strides[nd - 1]);
+            let (transposed, ld) = if sc == 1 || cols == 1 {
+                (false, if rows == 1 { cols as isize } else { sr })
+            } else if sr == 1 || rows == 1 {
+                (true, if cols == 1 { rows as isize } else { sc })
+            } else {
+                return None;
+            };
+            Some(Self {
+                buffer: GemmBuffer::View(data.buffer.metal()?),
+                offset: data.offset as usize * meta.dtype.size(),
+                transposed,
+                ld: i32::try_from(ld).ok()?,
+                batch_strides: meta.strides[..nd - 2].to_vec(),
+            })
+        }
+
+        fn arg(&self) -> Arg<'_> {
+            match &self.buffer {
+                GemmBuffer::View(b) => Arg::Read(b, self.offset),
+                GemmBuffer::Copy(b) => Arg::Read(b.metal().expect("device storage"), 0),
+            }
+        }
+    }
+
+    /// MLX's tile choice (`GEMM_TPARAM_MACRO`) by GPU class letter: `(bm, bn, bk, wm, wn)`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_tiles(
+        class: char,
+        dtype: DType,
+        transpose_a: bool,
+        transpose_b: bool,
+        out_elements: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> (usize, usize, usize, usize, usize) {
+        let half = dtype != DType::F32;
+        let nt = !transpose_a && transpose_b;
+        match class {
+            // Small devices.
+            'g' | 'p' if nt => (64, 32, 32, 2, 2),
+            'g' | 'p' if half => (64, 64, 16, 1, 2),
+            'g' | 'p' => (64, 64, 16, 2, 2),
+            // Large devices.
+            'd' if out_elements >= 1 << 20 => match (half, 2 * m.max(n) > k, nt) {
+                (true, true, _) => (64, 64, 16, 1, 2),
+                (true, false, true) => (64, 32, 32, 2, 2),
+                (true, false, false) => (32, 64, 16, 1, 2),
+                (false, ..) => (64, 64, 16, 2, 2),
+            },
+            'd' => match (half, nt) {
+                (true, true) => (64, 32, 32, 2, 2),
+                (true, false) => (64, 64, 16, 1, 2),
+                (false, true) => (32, 64, 16, 1, 2),
+                (false, false) => (64, 32, 32, 2, 2),
+            },
+            // Medium devices.
+            _ => (64, 64, 16, 2, 2),
+        }
+    }
+
     /// How an element-wise operand maps onto the output's row-major index.
     enum Mode {
         /// Same layout as the output.
@@ -361,7 +497,9 @@ mod metal {
                     }
                 },
                 (Primitive::ArgReduce { .. }, Some(d)) => not64(d) && d != DType::Complex64,
-                (Primitive::Matmul, Some(d)) => is_float(d),
+                (Primitive::Matmul | Primitive::AddMM { .. }, Some(d)) => {
+                    is_float(d) && operands[0].0.shape.last().is_some_and(|&k| k > 0)
+                }
                 _ => false,
             }
         }
@@ -410,6 +548,11 @@ mod metal {
                     self.arg_reduce(*op, *axis, operands[0], out, &mut buffer)?
                 }
                 Primitive::Matmul => self.matmul(operands, out, &mut buffer)?,
+                Primitive::AddMM { .. } => {
+                    let (alpha, beta) = primitive.addmm_factors();
+                    let c = Some((operands[2], alpha, beta));
+                    self.gemm(operands[0], operands[1], c, out, &mut buffer)?
+                }
                 _ => unreachable!("supports() rejects other primitives"),
             }
             Ok(vec![Data::new(buffer)])
@@ -628,45 +771,279 @@ mod metal {
             out: &Output,
             buffer: &mut Buffer,
         ) -> Result<()> {
-            let ((ma, da), (mb, db)) = (operands[0], operands[1]);
-            let nd = ma.shape.len();
-            let (m, k, n) = (ma.shape[nd - 2], ma.shape[nd - 1], mb.shape[nd - 1]);
-            let batch_shape = &ma.shape[..nd - 2];
+            self.gemm(operands[0], operands[1], None, out, buffer)
+        }
+
+        /// MLX's steel GEMM: `D = A·B`, or `D = alpha·A·B + beta·C` for `addmm` (ported
+        /// from `steel_matmul_regular_axpby`: tile table, transpose detection, a copy for
+        /// other layouts, batching).
+        pub(crate) fn gemm(
+            &mut self,
+            a: Operand<'_>,
+            b: Operand<'_>,
+            c: Option<(Operand<'_>, f32, f32)>,
+            out: &Output,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            if out.size == 0 {
+                return Ok(());
+            }
+            let nd = out.shape.len();
+            let (m, n, k) = (out.shape[nd - 2], out.shape[nd - 1], a.0.shape[nd - 1]);
+            let batch_shape = &out.shape[..nd - 2];
             let batch: usize = batch_shape.iter().product();
-            let mnk: [i32; 3] = [m as i32, n as i32, k as i32];
-            let mat = |meta: &Output, d: &Data| -> [i64; 3] {
-                [
-                    d.offset as i64,
-                    meta.strides[nd - 2] as i64,
-                    meta.strides[nd - 1] as i64,
-                ]
+            let ga = self.gemmand(a, m, k)?;
+            let gb = self.gemmand(b, k, n)?;
+            let class = self
+                .device()
+                .and_then(|d| d.info().architecture.chars().last())
+                .unwrap_or('s');
+            // Few output tiles over a long K: split K (MLX's case 1, without NAX).
+            let threshold = if matches!(class, 's' | 'd') {
+                2048
+            } else {
+                1024
             };
-            let consts = [
-                bytemuck::cast_slice(&mnk).to_vec(),
-                bytemuck::cast_slice(&mat(ma, da)).to_vec(),
-                bytemuck::cast_slice(&mat(mb, db)).to_vec(),
-                shape_bytes(batch_shape),
-                strides_bytes(&ma.strides[..nd - 2]),
-                strides_bytes(&mb.strides[..nd - 2]),
-                bytes(&(batch_shape.len() as i32)),
-            ];
-            let name = format!("nuvec_matmul_{}", out.dtype.name());
-            let (ia, ib) = (
-                da.buffer.metal().expect("checked"),
-                db.buffer.metal().expect("checked"),
+            if batch == 1
+                && m.div_ceil(16) * n.div_ceil(16) <= threshold
+                && k / 16 >= 8
+                && k >= m.max(n)
+            {
+                return self.gemm_splitk(&ga, &gb, c, (m, n, k), out, buffer);
+            }
+            let (bm, bn, bk, wm, wn) = gemm_tiles(
+                class,
+                out.dtype,
+                ga.transposed,
+                gb.transposed,
+                batch * m * n,
+                m,
+                n,
+                k,
             );
-            let mut args = vec![
-                Arg::read(ia),
-                Arg::read(ib),
-                Arg::write(buffer.metal_mut().expect("device storage")),
+            let has_batch = batch_shape.len() > 1;
+            let source = c.filter(|&(_, alpha, beta)| alpha != 0.0 || beta != 1.0);
+            let axpby = source.is_some_and(|(_, alpha, beta)| alpha != 1.0 || beta != 1.0);
+            let name = format!(
+                "nuvec_gemm_{}{}_{}_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}",
+                if ga.transposed { 't' } else { 'n' },
+                if gb.transposed { 't' } else { 'n' },
+                out.dtype.name()
+            );
+            let constants = [
+                (10, has_batch),
+                (100, source.is_some()),
+                (110, axpby),
+                (200, m % bm == 0),
+                (201, n % bn == 0),
+                (202, k % bk == 0),
             ];
-            args.extend(consts.iter().map(|c| Arg::bytes(c)));
-            self.dispatch_groups(
-                &name,
-                &args,
-                [n.div_ceil(16), m.div_ceil(16), batch],
-                [16, 16, 1],
-            )
+            let first = |strides: &[isize]| strides.first().map_or(0, |&s| s as i64);
+            let params = GemmParams {
+                m: m as i32,
+                n: n as i32,
+                k: k as i32,
+                lda: ga.ld,
+                ldb: gb.ld,
+                ldd: n as i32,
+                tiles_n: n.div_ceil(bn) as i32,
+                tiles_m: m.div_ceil(bm) as i32,
+                batch_stride_a: first(&ga.batch_strides),
+                batch_stride_b: first(&gb.batch_strides),
+                batch_stride_d: (m * n) as i64,
+                swizzle_log: 0,
+                gemm_k_iterations_aligned: (k / bk) as i32,
+                batch_ndim: batch_shape.len() as i32,
+                _pad: 0,
+            };
+            let mut batch_strides: Vec<i64> = ga
+                .batch_strides
+                .iter()
+                .chain(&gb.batch_strides)
+                .map(|&s| s as i64)
+                .collect();
+            let mut addmm = AddMmParams::default();
+            if let Some(((cm, _), alpha, beta)) = source {
+                addmm = AddMmParams {
+                    ldc: cm.strides[nd - 2] as i32,
+                    fdc: cm.strides[nd - 1] as i32,
+                    batch_stride_c: first(&cm.strides[..nd - 2]),
+                    alpha,
+                    beta,
+                };
+                batch_strides.extend(cm.strides[..nd - 2].iter().map(|&s| s as i64));
+            }
+            batch_strides.push(0); // never empty (Metal rejects empty inline data)
+            let pipeline = self.pipeline_with(&name, &constants)?;
+            let (params, addmm) = (bytemuck::bytes_of(&params), bytemuck::bytes_of(&addmm));
+            let (shape, strides) = (
+                shape_bytes(batch_shape),
+                bytemuck::cast_slice(&batch_strides),
+            );
+            let unused = [0u8; 4];
+            let c_arg = match source {
+                Some(((cm, cd), _, _)) => Arg::Read(
+                    cd.buffer.metal().expect("checked"),
+                    cd.offset as usize * cm.dtype.size(),
+                ),
+                None => Arg::bytes(&unused),
+            };
+            let args = [
+                ga.arg(),
+                gb.arg(),
+                c_arg,
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(params),
+                Arg::bytes(addmm),
+                Arg::bytes(&shape),
+                Arg::bytes(strides),
+            ];
+            self.command_buffer()?
+                .dispatch_groups(
+                    &pipeline,
+                    &args,
+                    [n.div_ceil(bn), m.div_ceil(bm), batch],
+                    [32, wn, wm],
+                )
+                .map_err(backend)?;
+            self.counted()
+        }
+
+        /// MLX's split-K GEMM (`steel_gemm_splitk_axpby`): partial products of K partitions
+        /// in float32, summed (and, for `addmm`, scaled and added to `c`) by an accumulation
+        /// kernel.
+        fn gemm_splitk(
+            &mut self,
+            ga: &Gemmand<'_>,
+            gb: &Gemmand<'_>,
+            c: Option<(Operand<'_>, f32, f32)>,
+            (m, n, k): (usize, usize, usize),
+            out: &Output,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let (bm, bn, bk, wm, wn) = (
+                if m < 40 { 16 } else { 32 },
+                if n < 40 { 16 } else { 32 },
+                16,
+                2,
+                2,
+            );
+            let tiles = m.div_ceil(32) * n.div_ceil(32);
+            let partitions = ((k / 16) / tiles).next_power_of_two().clamp(2, 32);
+            let iterations = (k / bk) / partitions;
+            let mut partial = Buffer::try_alloc(partitions * m * n * 4)?;
+            let name = format!(
+                "nuvec_gemm_splitk_{}{}_{}_bm{bm}_bn{bn}_MN_{}_K_{}",
+                if ga.transposed { 't' } else { 'n' },
+                if gb.transposed { 't' } else { 'n' },
+                out.dtype.name(),
+                if m % bm == 0 && n % bn == 0 { 't' } else { 'n' },
+                if k % bk == 0 { 't' } else { 'n' },
+            );
+            let params = SplitKParams {
+                m: m as i32,
+                n: n as i32,
+                k: k as i32,
+                lda: ga.ld,
+                ldb: gb.ld,
+                ldc: n as i32,
+                tiles_n: n.div_ceil(bn) as i32,
+                tiles_m: m.div_ceil(bm) as i32,
+                partitions: partitions as i32,
+                partition_stride: (m * n) as i32,
+                partition_size: (iterations * bk) as i32,
+                swizzle_log: 0,
+                gemm_k_iterations_aligned: iterations as i32,
+            };
+            let pipeline = self.pipeline_with(&name, &[])?;
+            let params = bytemuck::bytes_of(&params);
+            let args = [
+                ga.arg(),
+                gb.arg(),
+                Arg::write(partial.metal_mut().expect("device storage")),
+                Arg::bytes(params),
+            ];
+            self.command_buffer()?
+                .dispatch_groups(
+                    &pipeline,
+                    &args,
+                    [n.div_ceil(bn), m.div_ceil(bm), partitions],
+                    [32, wn, wm],
+                )
+                .map_err(backend)?;
+            self.counted()?;
+            let axpby = c.filter(|&(_, alpha, beta)| alpha != 1.0 || beta != 0.0);
+            let name = match axpby {
+                Some(_) => format!("nuvec_gemm_splitk_accum_axpby_{}", out.dtype.name()),
+                None => format!("nuvec_gemm_splitk_accum_{}", out.dtype.name()),
+            };
+            let pipeline = self.pipeline_with(&name, &[])?;
+            let ints = |v: usize| (v as i32).to_le_bytes();
+            let (parts, stride, ldd) = (ints(partitions), ints(m * n), ints(n));
+            let mut args = vec![
+                Arg::read(partial.metal().expect("device storage")),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&parts),
+                Arg::bytes(&stride),
+                Arg::bytes(&ldd),
+            ];
+            let epilogue = axpby.map(|((cm, cd), alpha, beta)| {
+                let nd = cm.shape.len();
+                let scalars = [
+                    (cm.strides[nd - 2] as i32).to_le_bytes(),
+                    (cm.strides[nd - 1] as i32).to_le_bytes(),
+                    alpha.to_le_bytes(),
+                    beta.to_le_bytes(),
+                ];
+                (cm, cd, scalars)
+            });
+            if let Some((cm, cd, scalars)) = &epilogue {
+                args.push(Arg::Read(
+                    cd.buffer.metal().expect("checked"),
+                    cd.offset as usize * cm.dtype.size(),
+                ));
+                args.extend(scalars.iter().map(|b| Arg::bytes(b)));
+            }
+            self.command_buffer()?
+                .dispatch_threads(&pipeline, &args, [n, m, 1], [n.min(32), m.min(32), 1])
+                .map_err(backend)?;
+            self.counted()
+        }
+
+        /// A GEMM operand: its own buffer if its last two dimensions are row- or
+        /// column-major, else a contiguous copy (encoded now).
+        fn gemmand<'a>(
+            &mut self,
+            operand: Operand<'a>,
+            rows: usize,
+            cols: usize,
+        ) -> Result<Gemmand<'a>> {
+            if let Some(g) = Gemmand::view(operand, rows, cols) {
+                return Ok(g);
+            }
+            let (meta, _) = operand;
+            let mut copy = Buffer::try_alloc(meta.size * meta.dtype.size())?;
+            self.copy(operand, &mut copy)?;
+            let strides = crate::shape::row_contiguous_strides(&meta.shape);
+            let nd = strides.len();
+            Ok(Gemmand {
+                buffer: GemmBuffer::Copy(copy),
+                offset: 0,
+                transposed: false,
+                ld: cols as i32,
+                batch_strides: strides[..nd - 2].to_vec(),
+            })
+        }
+
+        fn pipeline_with(
+            &mut self,
+            name: &str,
+            constants: &[(usize, bool)],
+        ) -> Result<nuvec_gpu::Pipeline> {
+            let device = self
+                .device()
+                .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+            device.pipeline_with(name, constants).map_err(backend)
         }
 
         fn command_buffer(&mut self) -> Result<&mut CommandBuffer> {

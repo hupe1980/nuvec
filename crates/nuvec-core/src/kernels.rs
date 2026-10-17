@@ -83,6 +83,53 @@ pub(crate) fn slice_update(
     }
 }
 
+/// `alpha · (a @ b) + beta · c` (`c` has the output's shape), computed in f64 and rounded
+/// once.
+pub(crate) fn addmm(
+    a: Operand<'_>,
+    b: Operand<'_>,
+    c: Operand<'_>,
+    alpha: f32,
+    beta: f32,
+) -> Result<Buffer> {
+    let (meta, n) = (c.0, c.0.size);
+    let strides = shape::row_contiguous_strides(&meta.shape);
+    let product_meta = Output {
+        dtype: meta.dtype,
+        shape: meta.shape.clone(),
+        flags: shape::flags_for(&meta.shape, &strides),
+        strides,
+        size: n,
+        slot: Default::default(),
+        inflight: Default::default(),
+    };
+    let product = Data::new(matmul(a, b)?);
+    let (alpha, beta) = (f64::from(alpha), f64::from(beta));
+    let real = |x: Canon| match x {
+        Canon::Int(i) => i as f64,
+        Canon::Float(f) => f,
+        Canon::Complex(z) => f64::from(z.re),
+    };
+    let axpby = move |x: Canon, y: Canon| match (x, y) {
+        (Canon::Complex(x), Canon::Complex(y)) => Canon::Complex(Complex64::new(
+            (alpha * f64::from(x.re) + beta * f64::from(y.re)) as f32,
+            (alpha * f64::from(x.im) + beta * f64::from(y.im)) as f32,
+        )),
+        (x, y) => Canon::Float(alpha * real(x) + beta * real(y)),
+    };
+    with_type!(meta.dtype, T => {
+        let mut result = output::<T>(n)?;
+        map2(
+            &meta.shape,
+            view::<T>((&product_meta, &product)),
+            view::<T>(c),
+            result.typed_mut::<T>(),
+            |x: T, y: T| T::from_canon(axpby(x.to_canon(), y.to_canon())),
+        );
+        Ok(result)
+    })
+}
+
 /// threefry2x32 (20 rounds), as in MLX's `threefry2x32_hash`.
 pub(crate) fn threefry2x32(key: (u32, u32), mut count: (u32, u32)) -> (u32, u32) {
     const ROTATIONS: [[u32; 4]; 2] = [[13, 15, 26, 6], [17, 29, 16, 24]];

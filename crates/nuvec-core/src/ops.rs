@@ -492,18 +492,35 @@ pub fn argmin(a: &Array, axis: Option<isize>, keepdims: bool) -> Result<Array> {
 /// A 1-D `a` is a row vector and a 1-D `b` a column vector; the inserted dimension is
 /// removed from the result. The promoted type must be floating point or complex.
 pub fn matmul(a: &Array, b: &Array) -> Result<Array> {
+    product(a, b, None)
+}
+
+/// `alpha · (a @ b) + beta · c`, with `c` broadcast to the product's shape, as MLX's
+/// `addmm`. On the GPU it is one kernel (the GEMM's epilogue), so `Linear` layers use it for
+/// their bias.
+pub fn addmm(c: &Array, a: &Array, b: &Array, alpha: f32, beta: f32) -> Result<Array> {
+    product(a, b, Some((c, alpha, beta)))
+}
+
+/// Matrix product with NumPy's rules for 1-D operands and batch broadcasting, optionally
+/// fused with `alpha·(·) + beta·c`.
+fn product(a: &Array, b: &Array, c: Option<(&Array, f32, f32)>) -> Result<Array> {
+    let op = if c.is_some() { "addmm" } else { "matmul" };
     check_inputs(&[a, b])?;
-    if a.ndim() == 0 || b.ndim() == 0 {
-        return Err(Error::InvalidArgument(
-            "matmul: operands need at least one dimension".into(),
-        ));
+    if let Some((c, ..)) = c {
+        check_inputs(&[c])?;
     }
-    let dtype = promote_types(a.dtype(), b.dtype());
+    if a.ndim() == 0 || b.ndim() == 0 {
+        return Err(Error::InvalidArgument(format!(
+            "{op}: operands need at least one dimension"
+        )));
+    }
+    let mut dtype = promote_types(a.dtype(), b.dtype());
+    if let Some((c, ..)) = c {
+        dtype = promote_types(dtype, c.dtype());
+    }
     if !matches!(dtype.category(), Category::Float | Category::Complex) {
-        return Err(Error::UnsupportedDType {
-            op: "matmul",
-            dtype,
-        });
+        return Err(Error::UnsupportedDType { op, dtype });
     }
     let a2 = if a.ndim() == 1 {
         expand_dims(a, 0)?
@@ -518,44 +535,79 @@ pub fn matmul(a: &Array, b: &Array) -> Result<Array> {
     let (sa, sb) = (a2.shape(), b2.shape());
     if sa[sa.len() - 1] != sb[sb.len() - 2] {
         return Err(Error::ShapeMismatch {
-            op: "matmul",
+            op,
             lhs: a.shape().to_vec(),
             rhs: b.shape().to_vec(),
         });
     }
     let (a2, b2) = (astype(&a2, dtype)?, astype(&b2, dtype)?);
-    let out = if a2.ndim() > 2 && b2.ndim() == 2 {
+    let (na, nb) = (a2.ndim(), b2.ndim());
+    let batch = view::broadcast_shapes(op, &a2.shape()[..na - 2], &b2.shape()[..nb - 2])?;
+    let (m, n) = (a2.shape()[na - 2], b2.shape()[nb - 1]);
+    let mut expanded: Shape = batch.clone();
+    expanded.extend_from_slice(&[m, n]);
+    // Dimensions inserted for 1-D operands, removed from the result.
+    let mut drop = Vec::new();
+    if a.ndim() == 1 {
+        drop.push(expanded.len() as isize - 2);
+    }
+    if b.ndim() == 1 {
+        drop.push(expanded.len() as isize - 1);
+    }
+    // `c`, broadcast to the result and then to the expanded product shape.
+    let c_full = match c {
+        Some((c, alpha, beta)) => {
+            let final_shape: Vec<usize> = expanded
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !drop.contains(&(*i as isize)))
+                .map(|(_, &d)| d)
+                .collect();
+            let mut cc = broadcast_to(&astype(c, dtype)?, &final_shape)?;
+            for &d in &drop {
+                cc = expand_dims(&cc, d)?;
+            }
+            Some((broadcast_to(&cc, &expanded)?, alpha, beta))
+        }
+        None => None,
+    };
+    let record = |x: Array, y: Array, z: Option<(Array, f32, f32)>| match z {
+        None => single(Primitive::Matmul, vec![x, y]),
+        Some((z, alpha, beta)) => single(
+            Primitive::AddMM {
+                alpha: alpha.to_bits(),
+                beta: beta.to_bits(),
+            },
+            vec![x, y, z],
+        ),
+    };
+    let out = if na > 2 && nb == 2 {
         // One large product instead of a batch of small ones (as in MLX).
-        let k = a2.shape()[a2.ndim() - 1];
+        let k = a2.shape()[na - 1];
         let rows = a2
             .size()
             .checked_div(k)
-            .unwrap_or_else(|| a2.shape()[..a2.ndim() - 1].iter().product());
-        let flat = single(
-            Primitive::Matmul,
-            vec![reshape_to(&a2, smallvec::smallvec![rows, k])?, b2.clone()],
+            .unwrap_or_else(|| a2.shape()[..na - 1].iter().product());
+        let flat_c = match c_full {
+            Some((z, alpha, beta)) => {
+                Some((reshape_to(&z, smallvec::smallvec![rows, n])?, alpha, beta))
+            }
+            None => None,
+        };
+        let flat = record(
+            reshape_to(&a2, smallvec::smallvec![rows, k])?,
+            b2.clone(),
+            flat_c,
         )?;
-        let mut shape: Shape = a2.shape().into();
-        *shape.last_mut().expect("ndim > 2") = b2.shape()[1];
-        reshape_to(&flat, shape)?
+        reshape_to(&flat, expanded)?
     } else {
-        let (na, nb) = (a2.ndim(), b2.ndim());
-        let batch = view::broadcast_shapes("matmul", &a2.shape()[..na - 2], &b2.shape()[..nb - 2])?;
         let full = |x: &Array, nd: usize| -> Result<Array> {
             let mut shape = batch.clone();
             shape.extend_from_slice(&x.shape()[nd - 2..]);
             broadcast_to(x, &shape)
         };
-        single(Primitive::Matmul, vec![full(&a2, na)?, full(&b2, nb)?])?
+        record(full(&a2, na)?, full(&b2, nb)?, c_full)?
     };
-    // Remove the dimensions inserted for 1-D operands.
-    let mut drop = Vec::new();
-    if a.ndim() == 1 {
-        drop.push(out.ndim() as isize - 2);
-    }
-    if b.ndim() == 1 {
-        drop.push(-1);
-    }
     if drop.is_empty() {
         Ok(out)
     } else {

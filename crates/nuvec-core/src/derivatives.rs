@@ -265,6 +265,24 @@ impl Primitive {
                 };
                 Ok(vec![da, db])
             }
+            Self::AddMM { .. } => {
+                let (alpha, beta) = self.addmm_factors();
+                let (a, b) = (&inputs[0], &inputs[1]);
+                let scaled = multiply(g, f64::from(alpha))?;
+                let da = match wanted[0] {
+                    true => Some(matmul(&scaled, &conjugate(&swap_last(b)?)?)?),
+                    false => None,
+                };
+                let db = match wanted[1] {
+                    true => Some(matmul(&conjugate(&swap_last(a)?)?, &scaled)?),
+                    false => None,
+                };
+                let dc = match wanted[2] {
+                    true => Some(multiply(g, f64::from(beta))?),
+                    false => None,
+                };
+                Ok(vec![da, db, dc])
+            }
             Self::Custom(call) => {
                 let n = call.primals;
                 let primals = &inputs[..n];
@@ -377,6 +395,21 @@ impl Primitive {
                     (None, Some(tb)) => matmul(a, tb)?,
                     (None, None) => zeros_like(out)?,
                 };
+                one(Ok(total))
+            }
+            Self::AddMM { .. } => {
+                let (alpha, beta) = self.addmm_factors();
+                let (a, b) = (&inputs[0], &inputs[1]);
+                let mut total = match (&tangents[0], &tangents[1]) {
+                    (Some(ta), Some(tb)) => ops::add(matmul(ta, b)?, matmul(a, tb)?)?,
+                    (Some(ta), None) => matmul(ta, b)?,
+                    (None, Some(tb)) => matmul(a, tb)?,
+                    (None, None) => zeros_like(out)?,
+                };
+                total = multiply(&total, f64::from(alpha))?;
+                if let Some(tc) = &tangents[2] {
+                    total = ops::add(&total, multiply(tc, f64::from(beta))?)?;
+                }
                 one(Ok(total))
             }
             Self::Custom(call) => {

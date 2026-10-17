@@ -233,6 +233,14 @@ pub enum Primitive {
     /// Batched matrix product of `[B..., M, K]` and `[B..., K, N]` with equal batch
     /// dimensions.
     Matmul,
+    /// `alpha · (a @ b) + beta · c` for inputs `(a, b, c)`: a `Matmul` whose `c` has the
+    /// output's shape. The factors are stored as `f32` bits (so the enum stays `Eq + Hash`).
+    AddMM {
+        /// `f32::to_bits` of alpha.
+        alpha: u32,
+        /// `f32::to_bits` of beta.
+        beta: u32,
+    },
     /// Random bits from threefry2x32 keys of shape `[..., 2]` (uint32): the output has shape
     /// `keys.shape[..-1] + shape` and `width` bytes per element (MLX's layout).
     RandomBits {
@@ -260,6 +268,14 @@ pub(crate) struct OutputSpec {
 }
 
 impl Primitive {
+    /// `(alpha, beta)` of an `AddMM`.
+    pub(crate) fn addmm_factors(&self) -> (f32, f32) {
+        match self {
+            Self::AddMM { alpha, beta } => (f32::from_bits(*alpha), f32::from_bits(*beta)),
+            _ => (1.0, 0.0),
+        }
+    }
+
     /// The operation's name, as used in error messages.
     pub fn name(&self) -> &'static str {
         match self {
@@ -276,6 +292,7 @@ impl Primitive {
             Self::Reduce { op, .. } => op.name(),
             Self::ArgReduce { op, .. } => op.name(),
             Self::Matmul => "matmul",
+            Self::AddMM { .. } => "addmm",
             Self::RandomBits { .. } => "random_bits",
             Self::Custom(_) => "custom_function",
             #[cfg(test)]
@@ -399,28 +416,48 @@ impl Primitive {
                 let [a] = self.arity::<1>(inputs)?;
                 computed(DType::U32, &self.reduced_shape(a.shape(), &[*axis])?)
             }
-            Self::Matmul => {
-                let [a, b] = self.arity::<2>(inputs)?;
+            Self::Matmul | Self::AddMM { .. } => {
+                let (a, b) = match self {
+                    Self::Matmul => {
+                        let [a, b] = self.arity::<2>(inputs)?;
+                        (a, b)
+                    }
+                    _ => {
+                        let [a, b, _] = self.arity::<3>(inputs)?;
+                        (a, b)
+                    }
+                };
                 let (sa, sb) = (a.shape(), b.shape());
                 let n = sa.len();
                 let valid =
                     n >= 2 && sb.len() == n && sa[..n - 2] == sb[..n - 2] && sa[n - 1] == sb[n - 2];
                 if !valid {
                     return Err(Error::ShapeMismatch {
-                        op: "matmul",
+                        op: self.name(),
                         lhs: sa.to_vec(),
                         rhs: sb.to_vec(),
                     });
                 }
                 if a.dtype() != b.dtype() {
                     return Err(Error::DTypeMismatch {
-                        op: "matmul",
+                        op: self.name(),
                         lhs: a.dtype(),
                         rhs: b.dtype(),
                     });
                 }
                 let mut shape: Shape = sa.into();
                 shape[n - 1] = sb[n - 1];
+                if let Self::AddMM { .. } = self {
+                    let c = &inputs[2];
+                    if c.shape() != shape.as_slice() || c.dtype() != a.dtype() {
+                        return Err(Error::InvalidArgument(format!(
+                            "addmm: c must be {} of shape {shape:?}, got {} {:?}",
+                            a.dtype(),
+                            c.dtype(),
+                            c.shape()
+                        )));
+                    }
+                }
                 computed(a.dtype(), &shape)
             }
             Self::RandomBits { shape, width } => {

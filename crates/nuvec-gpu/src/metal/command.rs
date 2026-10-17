@@ -214,6 +214,31 @@ impl CommandBuffer {
         })
     }
 
+    /// Encodes `pipeline` over exactly `grid` threads in up to three dimensions, in
+    /// threadgroups of `group` threads (the edge threadgroups are partial).
+    pub fn dispatch_threads(
+        &mut self,
+        pipeline: &Pipeline,
+        args: &[Arg<'_>],
+        grid: [usize; 3],
+        group: [usize; 3],
+    ) -> Result<()> {
+        let per_group: usize = group.iter().product();
+        if per_group > pipeline.max_threads_per_threadgroup() {
+            return Err(GpuError::InvalidArgument(format!(
+                "{per_group} threads per threadgroup; `{}` allows {}",
+                pipeline.name(),
+                pipeline.max_threads_per_threadgroup()
+            )));
+        }
+        if grid.contains(&0) || per_group == 0 {
+            return validate(args);
+        }
+        self.encode(pipeline, args, |encoder| {
+            encoder.dispatchThreads_threadsPerThreadgroup(size(grid), size(group));
+        })
+    }
+
     /// Validates and binds `args`, inserts a barrier if needed, then lets `dispatch` encode.
     fn encode(
         &mut self,

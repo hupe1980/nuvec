@@ -12,3 +12,12 @@ using namespace metal;
     uint i [[thread_position_in_grid]]) {
     out[i] = nuvec::twice(float(i));
 }
+
+// Function-constant specialisation test: writes 1 or 2 depending on constant 0.
+constant bool nuvec_test_flag [[function_constant(0)]];
+
+[[kernel]] void nuvec_function_constant_test(
+    device float* out [[buffer(0)]],
+    uint i [[thread_position_in_grid]]) {
+    out[i] = nuvec_test_flag ? 2.0f : 1.0f;
+}

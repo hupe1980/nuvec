@@ -44,6 +44,7 @@ metallib-check:
 # GPU runtime tests with Metal API validation (skip without a Metal device).
 metal-check:
     MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu
+    NUVEC_METALLIB=off MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu --test runtime
 
 # ── MLX reference (needs uv; never part of `ci`) ──────────────────────────────
 
@@ -54,6 +55,10 @@ fixtures:
 # Same-machine benchmark table: nuvec vs MLX (CPU device).
 bench-mlx:
     uv run scripts/bench_vs_mlx.py
+
+# GPU GEMM shape matrix: nuvec vs MLX (TFLOP/s).
+bench-gemm:
+    uv run scripts/bench_gemm.py
 
 # Downloads MNIST and trains MLX's example model with nuvec and MLX (M1 exit criterion).
 mnist:

@@ -127,12 +127,12 @@ impl Linear {
         Ok(Self { weight, bias })
     }
 
-    /// `x Wᵀ + b` over the last axis of `x`.
+    /// `x Wᵀ + b` over the last axis of `x`; with a bias it is one fused `addmm`, as in
+    /// MLX.
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let y = matmul(x, &self.weight.t()?)?;
         match &self.bias {
-            Some(b) => nuvec::add(&y, b),
-            None => Ok(y),
+            Some(b) => nuvec::addmm(b, x, &self.weight.t()?, 1.0, 1.0),
+            None => matmul(x, &self.weight.t()?),
         }
     }
 }

@@ -241,6 +241,16 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
         Primitive::Reduce { op, axes } => new(kernels::reduce(*op, operands[0], axes)?),
         Primitive::ArgReduce { op, axis } => new(kernels::arg_reduce(*op, operands[0], *axis)?),
         Primitive::Matmul => new(kernels::matmul(operands[0], operands[1])?),
+        Primitive::AddMM { .. } => {
+            let (alpha, beta) = primitive.addmm_factors();
+            new(kernels::addmm(
+                operands[0],
+                operands[1],
+                operands[2],
+                alpha,
+                beta,
+            )?)
+        }
         Primitive::RandomBits { shape, .. } => {
             let n: usize = shape.iter().product();
             new(kernels::random_bits(

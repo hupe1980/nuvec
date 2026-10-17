@@ -124,6 +124,8 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         return binary[op](xs[0], xs[1])
     if op in unary:
         return unary[op](xs[0])
+    if op == "addmm":
+        return mx.addmm(xs[2], xs[0], xs[1], alpha=float(p["alpha"]), beta=float(p["beta"]))
     if op in ("logsumexp", "softmax"):
         axes = nums(p.get("axes", "")) or None
         if op == "softmax":
@@ -498,6 +500,28 @@ case("random-seq-first", "random", [], fn="uniform", seq=1, seed=0, shape="5", l
      dtype=CODE["float32"])
 case("random-seq-third", "random", [], fn="uniform", seq=1, seed=0, skip=2, shape="5", low=0.0,
      high=1.0, dtype=CODE["float32"])
+
+# addmm: alpha * (a @ b) + beta * c, with c broadcast (inputs: a, b, c).
+case("addmm-bias", "addmm", [make("float32", (5, 7)), make("float32", (7, 3)), make("float32", (3,))],
+     alpha=1.0, beta=1.0)
+case("addmm-axpby", "addmm", [make("float32", (4, 6)), make("float32", (6, 5)), make("float32", (4, 5))],
+     alpha=0.5, beta=-2.0)
+case("addmm-batch", "addmm", [make("float32", (2, 3, 4)), make("float32", (4, 5)), make("float32", (5,))],
+     alpha=2.0, beta=1.0)
+case("addmm-vector", "addmm", [make("float32", (4,)), make("float32", (4, 3)), make("float32", (3,))],
+     alpha=1.0, beta=0.5)
+case("addmm-f16", "addmm", [make("float16", (8, 16)), make("float16", (16, 4)), make("float16", (4,))],
+     alpha=1.0, beta=1.0)
+case("addmm-t", "addmm", [make("float32", (6, 4)), make("float32", (6, 3)), make("float32", (3,))],
+     alpha=1.0, beta=1.0, pre="t")
+derivative("vjp", "vjp-addmm", "addmm", [make("float32", (3, 4)), make("float32", (4, 2)), make("float32", (2,))],
+           alpha=1.5, beta=0.5)
+# alpha = beta = 1: MLX 0.32.4's AddMM jvp ignores alpha and beta (a bug; its vjp is
+# correct, and nuvec keeps `alpha (dA B + A dB) + beta dC`, see the decision log).
+derivative("jvp", "jvp-addmm", "addmm", [make("float32", (3, 4)), make("float32", (4, 2)), make("float32", (3, 2))],
+           alpha=1.0, beta=1.0)
+batched("vmap-addmm", "addmm", [make("float32", (3, 2, 4)), make("float32", (4, 5)), make("float32", (5,))],
+        "0,n,n", alpha=1.0, beta=1.0)
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

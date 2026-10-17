@@ -40,13 +40,13 @@ template <typename T> struct IProd {
     static T store(T a) { return a; }
     static T empty() { return T(1); }
 };
-template <typename T> struct Max {
+template <typename T> struct RMax {
     static T load(T x) { return x; }
     static T combine(T a, T b) { return op_max(a, b); }
     static T store(T a) { return a; }
     static T empty() { return T(0); }
 };
-template <typename T> struct Min {
+template <typename T> struct RMin {
     static T load(T x) { return x; }
     static T combine(T a, T b) { return op_min(a, b); }
     static T store(T a) { return a; }
@@ -166,8 +166,8 @@ template <typename T, bool IS_MAX>
 #define NUVEC_INT_REDUCE(name, T)                       \
     NUVEC_REDUCE(sum, ISum<T>, name, T, T)              \
     NUVEC_REDUCE(prod, IProd<T>, name, T, T)            \
-    NUVEC_REDUCE(max, Max<T>, name, T, T)               \
-    NUVEC_REDUCE(min, Min<T>, name, T, T)               \
+    NUVEC_REDUCE(max, RMax<T>, name, T, T)               \
+    NUVEC_REDUCE(min, RMin<T>, name, T, T)               \
     NUVEC_ARG_REDUCE(name, T)
 
 // Floats accumulate in float32 (as in MLX on the GPU). Single-parameter aliases keep the
@@ -178,8 +178,8 @@ template <typename T> using FProd = Prod<T, float>;
 #define NUVEC_FLOAT_REDUCE(name, T)                     \
     NUVEC_REDUCE(sum, FSum<T>, name, T, float)          \
     NUVEC_REDUCE(prod, FProd<T>, name, T, float)        \
-    NUVEC_REDUCE(max, Max<T>, name, T, T)               \
-    NUVEC_REDUCE(min, Min<T>, name, T, T)               \
+    NUVEC_REDUCE(max, RMax<T>, name, T, T)               \
+    NUVEC_REDUCE(min, RMin<T>, name, T, T)               \
     NUVEC_ARG_REDUCE(name, T)
 
 NUVEC_INT_REDUCE(uint8, uchar)

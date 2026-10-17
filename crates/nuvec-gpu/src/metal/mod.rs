@@ -5,6 +5,7 @@ mod buffer;
 mod command;
 
 use std::collections::{HashMap, HashSet};
+use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 
 pub use allocator::MemoryStats;
@@ -16,7 +17,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+    MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice,
+    MTLFunctionConstantValues, MTLLibrary,
 };
 
 use crate::info::parse_architecture;
@@ -168,31 +170,63 @@ impl Device {
     /// The compute pipeline for the kernel `name` from nuvec's kernel library, compiled on
     /// first use and cached.
     pub fn pipeline(&self, name: &str) -> Result<Pipeline> {
+        self.pipeline_with(name, &[])
+    }
+
+    /// The pipeline for kernel `name` specialised with boolean function constants
+    /// `(index, value)`, compiled on first use and cached per name and constants.
+    pub fn pipeline_with(&self, name: &str, constants: &[(usize, bool)]) -> Result<Pipeline> {
+        let key = constants.iter().fold(name.to_owned(), |mut k, (i, v)| {
+            k.push_str(&format!("#{i}={}", u8::from(*v)));
+            k
+        });
         let mut cache = self
             .inner
             .pipelines
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(p) = cache.get(name) {
+        if let Some(p) = cache.get(&key) {
             return Ok(p.clone());
         }
-        let function = self
-            .library()?
-            .newFunctionWithName(&NSString::from_str(name))
-            .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))?;
+        let library = self.library()?;
+        let ns_name = NSString::from_str(name);
+        let function = if constants.is_empty() {
+            library
+                .newFunctionWithName(&ns_name)
+                .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))?
+        } else {
+            let values = MTLFunctionConstantValues::new();
+            for &(index, value) in constants {
+                // SAFETY: `value` is a live `bool`, which Metal copies during the call; its
+                // layout matches `MTLDataType::Bool` (one byte).
+                unsafe {
+                    values.setConstantValue_type_atIndex(
+                        NonNull::from(&value).cast(),
+                        MTLDataType::Bool,
+                        index,
+                    );
+                }
+            }
+            library
+                .newFunctionWithName_constantValues_error(&ns_name, &values)
+                .map_err(|e| GpuError::Pipeline {
+                    name: key.clone(),
+                    message: e.localizedDescription().to_string(),
+                })?
+        };
         let state = self
             .inner
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| GpuError::Pipeline {
-                name: name.to_owned(),
+                name: key.clone(),
                 message: e.localizedDescription().to_string(),
             })?;
         let pipeline = Pipeline {
             state,
-            name: name.into(),
+            name: key.as_str().into(),
         };
-        cache.insert(name.to_owned(), pipeline.clone());
+        cache.insert(key, pipeline.clone());
         Ok(pipeline)
     }
 

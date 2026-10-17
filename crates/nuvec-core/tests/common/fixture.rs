@@ -446,6 +446,13 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
     }
     match op {
         "where" => where_(&xs[0], &xs[1], &xs[2]),
+        "addmm" => addmm(
+            &xs[2],
+            &xs[0],
+            &xs[1],
+            p("alpha").parse().unwrap(),
+            p("beta").parse().unwrap(),
+        ),
         "logsumexp" => logsumexp(&xs[0], &ints(p("axes")), keep),
         "softmax" => softmax(&xs[0], &ints(p("axes"))),
         "random" => random_case(case),
@@ -530,7 +537,7 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
                 / case.inputs[0].dtype.size().max(1);
             (n.max(1) as f64 + 1.0) * eps * e.abs().max(1.0)
         }
-        "matmul" => {
+        "matmul" | "addmm" => {
             let bound = |t: &Tensor| {
                 values(t)
                     .iter()
