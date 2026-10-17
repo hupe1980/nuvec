@@ -12,6 +12,7 @@ use crate::buffer::Buffer;
 use crate::cast::{B8, Canon, Scalar, convert, with_type};
 use crate::primitive::{ArgReduceOp, BinaryOp, ReduceOp, UnaryOp};
 use crate::shape::{self, Shape, Strides};
+use crate::view::{self, DimSlice};
 use crate::{Category, Complex64, DType, Result, bf16, f16};
 
 /// An evaluated operand: its metadata and data.
@@ -41,6 +42,44 @@ pub(crate) fn contiguous(meta: &Output, data: &Data) -> Result<Buffer> {
         2 => copy::<u16>((meta, data)),
         4 => copy::<u32>((meta, data)),
         _ => copy::<u64>((meta, data)),
+    }
+}
+
+/// A row-contiguous copy of `base` with the region `slices` replaced by `update`.
+pub(crate) fn slice_update(
+    base: Operand<'_>,
+    update: Operand<'_>,
+    slices: &[DimSlice],
+) -> Result<Buffer> {
+    fn run<T: Pod>(base: Operand<'_>, update: Operand<'_>, slices: &[DimSlice]) -> Result<Buffer> {
+        let mut out = contiguous(base.0, base.1)?;
+        let values = contiguous(update.0, update.1)?;
+        let (strides, offset) =
+            view::slice_geometry(&shape::row_contiguous_strides(&base.0.shape), slices);
+        let shape = &update.0.shape;
+        let dst = out.typed_mut::<T>();
+        // Walk the update in row-major order with an odometer over the region's strides.
+        let mut index = vec![0usize; shape.len()];
+        let mut at = offset;
+        for &x in values.typed::<T>() {
+            dst[at as usize] = x;
+            for d in (0..shape.len()).rev() {
+                index[d] += 1;
+                at += strides[d];
+                if index[d] < shape[d] {
+                    break;
+                }
+                at -= strides[d] * shape[d] as isize;
+                index[d] = 0;
+            }
+        }
+        Ok(out)
+    }
+    match base.0.dtype.size() {
+        1 => run::<u8>(base, update, slices),
+        2 => run::<u16>(base, update, slices),
+        4 => run::<u32>(base, update, slices),
+        _ => run::<u64>(base, update, slices),
     }
 }
 

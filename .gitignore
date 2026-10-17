@@ -47,3 +47,6 @@ rustc-ice-*.txt
 /.claude/
 /.github/skills/speckit-*/
 /CLAUDE.md
+
+# Python placeholder package build output
+/python/dist/

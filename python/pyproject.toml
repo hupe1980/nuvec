@@ -1,0 +1,23 @@
+[project]
+name = "nuvec"
+version = "0.0.1"
+description = "Placeholder for Python bindings to nuvec, a pure-Rust array framework for Apple Silicon in the spirit of MLX."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "hupe1980" }]
+keywords = ["array", "machine-learning", "apple-silicon", "metal", "mlx"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Homepage = "https://github.com/hupe1980/nuvec"
+Repository = "https://github.com/hupe1980/nuvec"
+
+[build-system]
+requires = ["uv_build>=0.9,<0.14"]
+build-backend = "uv_build"

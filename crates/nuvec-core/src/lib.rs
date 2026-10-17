@@ -43,8 +43,11 @@
 #![forbid(unsafe_code)]
 
 mod array;
+mod batching;
 mod buffer;
 mod cast;
+mod custom;
+mod derivatives;
 mod device;
 mod dtype;
 mod error;
@@ -55,9 +58,11 @@ mod ops;
 mod primitive;
 mod scalar;
 mod shape;
+mod transforms;
 mod view;
 
 pub use array::Array;
+pub use custom::{CustomCall, CustomFunction, checkpoint, custom_function};
 pub use device::{Device, DeviceKind, Stream, default_stream, set_default_stream};
 pub use dtype::{Category, Complex64, DType, Element, at_least_float, bf16, f16, promote_types};
 pub use error::{Error, Result};
@@ -66,11 +71,12 @@ pub use ops::{
     abs, add, all, any, arange, argmax, argmin, astype, broadcast_to, cos, divide, equal, exp,
     expand_dims, greater, greater_equal, less, less_equal, log, matmul, max, maximum, mean, min,
     minimum, multiply, negative, not_equal, ones, prod, reshape, sigmoid, sin, slice, sqrt,
-    squeeze, subtract, sum, tanh, transpose, where_, zeros,
+    squeeze, stop_gradient, subtract, sum, tanh, transpose, where_, zeros,
 };
 pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, UnaryOp};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
 pub use shape::Flags;
+pub use transforms::{grad, jvp, value_and_grad, vjp, vmap};
 pub use view::SliceArg;
 
 /// The version of this crate.

@@ -306,6 +306,104 @@ SCALAR_CASES = [
 for op, dt, sc, side in SCALAR_CASES:
     case(f"{op}-{dt}-scalar-{side}", op, [make(dt, (2, 3), edge=dt in FLOATS)], scalar=sc, side=side)
 
+# Derivatives: `vjp` cases record (primals..., cotangent) -> one gradient per primal;
+# `jvp` cases record (primals..., tangents...) -> the output tangent. `fn` names the op.
+def derivative(kind: str, name: str, fn: str, primals: list[mx.array], **params: object) -> None:
+    p = {"fn": fn, **{k: str(v) for k, v in params.items()}}
+    spelled = kind + "".join(f"|{k}={v}" for k, v in p.items())
+
+    def f(*xs: mx.array) -> list[mx.array]:
+        return [apply(fn, p, list(xs))]
+
+    out = f(*primals)[0]
+    if kind == "vjp":
+        extra = [make(NAME_OF[out.dtype], out.shape)]
+        _, results = mx.vjp(f, primals, extra)
+    else:
+        extra = [make(NAME_OF[x.dtype], x.shape) for x in primals]
+        _, results = mx.jvp(f, primals, extra)
+    mx.eval(results)
+    cases.append((name, spelled, primals + extra, list(results)))
+
+
+def positive(dtype: str, shape: tuple[int, ...]) -> mx.array:
+    return (mx.abs(make("float32", shape)) + 0.5).astype(MX[dtype])
+
+
+for op in ["negative", "abs", "exp", "log", "sqrt", "sin", "cos", "tanh", "sigmoid"]:
+    x = positive("float32", (2, 3)) if op in ("log", "sqrt") else make("float32", (2, 3))
+    derivative("vjp", f"vjp-{op}", op, [x])
+derivative("vjp", "vjp-exp-f16", "exp", [make("float16", (5,))])
+derivative("vjp", "vjp-tanh-f64", "tanh", [make("float64", (4,))])
+for op in ["add", "subtract", "multiply", "divide", "maximum", "minimum"]:
+    derivative("vjp", f"vjp-{op}-broadcast", op, [make("float32", (2, 3)), positive("float32", (3,))])
+tie = ints("float32", (6,), -2, 3)
+derivative("vjp", "vjp-maximum-ties", "maximum", [tie, ints("float32", (6,), -2, 3)])
+derivative("vjp", "vjp-minimum-ties", "minimum", [tie, ints("float32", (6,), -2, 3)])
+derivative("vjp", "vjp-multiply-t", "multiply", [make("float32", (4, 3)), make("float32", (3, 4))], pre="t")
+derivative("vjp", "vjp-where", "where", [make("bool", (2, 3)), make("float32", (2, 3)), make("float32", (3,))])
+derivative("vjp", "vjp-astype-f16", "astype", [make("float32", (5,))], dtype=CODE["float16"])
+derivative("vjp", "vjp-reshape", "reshape", [make("float32", (2, 3))], shape="3,2")
+derivative("vjp", "vjp-transpose", "transpose", [make("float32", (2, 3, 4))], axes="1,2,0")
+derivative("vjp", "vjp-slice", "slice", [make("float32", (5, 6))], args="1:4:1;::-2")
+derivative("vjp", "vjp-broadcast_to", "broadcast_to", [make("float32", (3, 1))], shape="2,3,4")
+derivative("vjp", "vjp-expand_dims", "expand_dims", [make("float32", (2, 3))], axis=-1)
+derivative("vjp", "vjp-squeeze", "squeeze", [make("float32", (1, 3, 1))])
+derivative("vjp", "vjp-sum", "sum", [make("float32", (2, 3, 4))], axes="0,2", keepdims=0)
+derivative("vjp", "vjp-mean", "mean", [make("float32", (2, 3, 4))], axes="1", keepdims=1)
+derivative("vjp", "vjp-prod-zeros", "prod", [ints("float32", (4, 5), -1, 2)], axes="1", keepdims=0)
+derivative("vjp", "vjp-max-ties", "max", [ints("float32", (4, 5), 0, 3)], axes="1", keepdims=0)
+derivative("vjp", "vjp-min-all", "min", [ints("float32", (3, 4), 0, 3)])
+derivative("vjp", "vjp-matmul", "matmul", [make("float32", (4, 5)), make("float32", (5, 3))])
+derivative("vjp", "vjp-matmul-batch", "matmul", [make("float32", (2, 1, 3, 4)), make("float32", (3, 4, 2))])
+derivative("jvp", "jvp-sin", "sin", [make("float32", (2, 3))])
+derivative("jvp", "jvp-divide", "divide", [make("float32", (2, 3)), positive("float32", (3,))])
+derivative("jvp", "jvp-where", "where", [make("bool", (2, 3)), make("float32", (2, 3)), make("float32", (3,))])
+derivative("jvp", "jvp-slice", "slice", [make("float32", (5, 6))], args="::2;-1::-1")
+derivative("jvp", "jvp-sum", "sum", [make("float32", (3, 4))], axes="1", keepdims=1)
+derivative("jvp", "jvp-prod-zeros", "prod", [ints("float32", (4, 5), -1, 2)], axes="1", keepdims=0)
+derivative("jvp", "jvp-max-ties", "max", [ints("float32", (4, 5), 0, 3)], axes="0", keepdims=0)
+derivative("jvp", "jvp-matmul", "matmul", [make("float32", (3, 4)), make("float32", (4, 2))])
+
+# vmap: `in_axes` per input ("n" for unbatched), one `out_axes`; inputs are the batched
+# arrays, the output is the batched result.
+def batched(name: str, fn: str, inputs: list[mx.array], in_axes: str, out_axes: int = 0,
+            **params: object) -> None:
+    p = {"fn": fn, "in_axes": in_axes, "out_axes": str(out_axes),
+         **{k: str(v) for k, v in params.items()}}
+    spelled = "vmap" + "".join(f"|{k}={v}" for k, v in p.items())
+    axes = tuple(None if a == "n" else int(a) for a in in_axes.split(","))
+    out = mx.vmap(lambda *xs: apply(fn, p, list(xs)), in_axes=axes, out_axes=out_axes)(*inputs)
+    mx.eval(out)
+    cases.append((name, spelled, list(inputs), [out]))
+
+
+batched("vmap-sin", "sin", [make("float32", (2, 3, 4))], "1")
+batched("vmap-exp-out1", "exp", [make("float32", (3, 2))], "0", out_axes=1)
+batched("vmap-abs-neg", "abs", [make("float32", (2, 3))], "-1")
+batched("vmap-add-shared", "add", [make("float32", (3, 4)), make("float32", (4,))], "0,n")
+batched("vmap-multiply-axes", "multiply", [make("float32", (2, 3)), make("float32", (3, 2))], "1,0")
+batched("vmap-multiply-f16", "multiply", [make("float16", (3, 4)), make("float16", (3, 4))], "0,0")
+batched("vmap-divide", "divide", [make("float32", (3, 2)), positive("float32", (2, 3))], "0,1", out_axes=1)
+batched("vmap-maximum", "maximum", [make("float32", (4,)), make("float32", (4, 2))], "n,1")
+batched("vmap-less", "less", [make("float32", (3, 2)), make("float32", (3, 2))], "0,0")
+batched("vmap-where", "where", [make("bool", (2, 3)), make("float32", (4, 2, 3)), make("float32", (3,))], "n,0,n")
+batched("vmap-astype", "astype", [make("float32", (3, 4))], "0", dtype=CODE["float16"])
+batched("vmap-reshape", "reshape", [make("float32", (2, 3, 4))], "1", shape="4,2")
+batched("vmap-transpose", "transpose", [make("float32", (2, 3, 4, 5))], "2", axes="2,0,1")
+batched("vmap-slice", "slice", [make("float32", (3, 5, 6))], "0", args="1:4:1;::-2")
+batched("vmap-broadcast_to", "broadcast_to", [make("float32", (3, 1, 2))], "2", shape="2,3,4")
+batched("vmap-expand_dims", "expand_dims", [make("float32", (2, 3))], "1", axis=0)
+batched("vmap-squeeze", "squeeze", [make("float32", (1, 3, 2, 1))], "2")
+batched("vmap-sum", "sum", [make("float32", (2, 3, 4))], "1", axes="1", keepdims=0)
+batched("vmap-prod-keep", "prod", [make("float32", (3, 2, 4))], "0", axes="0", keepdims=1)
+batched("vmap-max-all", "max", [make("float32", (3, 4, 2))], "2")
+batched("vmap-argmax", "argmax", [make("float32", (2, 5, 3))], "2", axis=1, keepdims=0)
+batched("vmap-matmul", "matmul", [make("float32", (2, 3, 4)), make("float32", (2, 4, 5))], "0,0")
+batched("vmap-matmul-shared-left", "matmul", [make("float32", (3, 4)), make("float32", (4, 2, 5))], "n,1")
+batched("vmap-matmul-shared-right", "matmul", [make("float32", (3, 2, 4)), make("float32", (4, 5))], "1,n")
+batched("vmap-matmul-vector", "matmul", [make("float32", (4, 3)), make("float32", (4, 2))], "1,n")
+
 # ── Writer ──────────────────────────────────────────────────────────────────
 
 def string(s: str) -> bytes:

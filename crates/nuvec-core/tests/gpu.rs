@@ -38,15 +38,7 @@ fn mlx_fixtures_on_gpu() {
     }
     let (_, cases) = fixture::load();
     let failures: Vec<String> = on(Device::gpu(0), || {
-        cases
-            .iter()
-            .filter_map(
-                |case| match fixture::run(case).and_then(|a| fixture::from_array(&a)) {
-                    Ok(t) => fixture::compare(case, &t, &case.outputs[0]).err(),
-                    Err(e) => Some(format!("{} ({}): nuvec error: {e}", case.name, case.op)),
-                },
-            )
-            .collect()
+        cases.iter().filter_map(fixture::check).collect()
     });
     assert!(
         failures.is_empty(),

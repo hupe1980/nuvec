@@ -231,6 +231,13 @@ pub fn slice(a: &Array, args: &[SliceArg]) -> Result<Array> {
     single(primitive, vec![a.clone()])
 }
 
+/// `a` unchanged, but no gradient flows through it in [`crate::vjp`], [`crate::jvp`] and
+/// [`crate::grad`]. Shares the data.
+pub fn stop_gradient(a: &Array) -> Result<Array> {
+    check_inputs(&[a])?;
+    single(Primitive::StopGradient, vec![a.clone()])
+}
+
 /// Presents `a` as the larger `shape` (NumPy broadcasting rules). Shares the data.
 pub fn broadcast_to(a: &Array, shape: &[usize]) -> Result<Array> {
     if a.shape() == shape {

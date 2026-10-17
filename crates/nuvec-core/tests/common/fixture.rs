@@ -319,10 +319,35 @@ fn parse_scalar(spec: &str) -> Option<Scalar> {
 /// A reduction operation: `(array, axes, keepdims)`.
 type Reduction = fn(&Array, &[isize], bool) -> Result<Array>;
 
-/// Runs the case's operation in nuvec.
-pub fn run(case: &Case) -> Result<Array> {
+/// Runs the case in nuvec: one array per recorded output.
+pub fn run(case: &Case) -> Result<Vec<Array>> {
     let p = |k: &str| case.params.get(k).map(String::as_str).unwrap_or("");
-    let mut xs: Vec<Array> = case.inputs.iter().map(to_array).collect();
+    let xs: Vec<Array> = case.inputs.iter().map(to_array).collect();
+    let f = |xs: &[Array]| Ok(vec![apply(case, p("fn"), xs.to_vec())?]);
+    match case.op.as_str() {
+        "vjp" => {
+            let n = xs.len() - 1;
+            Ok(vjp(f, &xs[..n], &xs[n..])?.1)
+        }
+        "jvp" => {
+            let n = xs.len() / 2;
+            Ok(jvp(f, &xs[..n], &xs[n..])?.1)
+        }
+        "vmap" => {
+            let in_axes: Vec<Option<isize>> = p("in_axes")
+                .split(',')
+                .map(|a| (a != "n").then(|| a.parse().unwrap()))
+                .collect();
+            let out_axes = [p("out_axes").parse().unwrap()];
+            vmap(f, &in_axes, &out_axes)(&xs)
+        }
+        op => Ok(vec![apply(case, op, xs)?]),
+    }
+}
+
+/// Runs operation `op` with the case's parameters on `xs`.
+fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
+    let p = |k: &str| case.params.get(k).map(String::as_str).unwrap_or("");
     if let Some(x) = xs.first_mut() {
         *x = match p("pre") {
             "t" => x.t()?,
@@ -336,11 +361,11 @@ pub fn run(case: &Case) -> Result<Array> {
     }
     let dtype = || DTYPES[p("dtype").parse::<usize>().unwrap()];
     let keep = p("keepdims") == "1";
-    if case.op == "matmul" {
+    if op == "matmul" {
         return matmul(&xs[0], &xs[1]);
     }
     type S = ScalarOrArray;
-    let binary: Option<fn(S, S) -> Result<Array>> = match case.op.as_str() {
+    let binary: Option<fn(S, S) -> Result<Array>> = match op {
         "add" => Some(add),
         "subtract" => Some(subtract),
         "multiply" => Some(multiply),
@@ -363,7 +388,7 @@ pub fn run(case: &Case) -> Result<Array> {
             (Some(s), _) => f(array, s.into()),
         };
     }
-    let unary: Option<fn(&Array) -> Result<Array>> = match case.op.as_str() {
+    let unary: Option<fn(&Array) -> Result<Array>> = match op {
         "negative" => Some(negative),
         "abs" => Some(abs),
         "exp" => Some(exp),
@@ -378,7 +403,7 @@ pub fn run(case: &Case) -> Result<Array> {
     if let Some(f) = unary {
         return f(&xs[0]);
     }
-    let reduction: Option<Reduction> = match case.op.as_str() {
+    let reduction: Option<Reduction> = match op {
         "sum" => Some(sum),
         "prod" => Some(prod),
         "max" => Some(max),
@@ -391,7 +416,7 @@ pub fn run(case: &Case) -> Result<Array> {
     if let Some(f) = reduction {
         return f(&xs[0], &ints(p("axes")), keep);
     }
-    match case.op.as_str() {
+    match op {
         "where" => where_(&xs[0], &xs[1], &xs[2]),
         "astype" => xs[0].astype(dtype()),
         "reshape" => xs[0].reshape(&ints(p("shape"))),
@@ -407,7 +432,7 @@ pub fn run(case: &Case) -> Result<Array> {
             } else {
                 Some(p("axis").parse().unwrap())
             };
-            if case.op == "argmax" {
+            if op == "argmax" {
                 argmax(&xs[0], axis, keep)
             } else {
                 argmin(&xs[0], axis, keep)
@@ -440,7 +465,22 @@ fn epsilon(dtype: DType) -> f64 {
 /// The allowed absolute error per element for `case`, given the expected values.
 fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
     let eps = epsilon(expected.dtype);
-    match case.op.as_str() {
+    // A vmap case is as exact as the operation it batches.
+    let op = match case.op.as_str() {
+        "vmap" => case.params["fn"].as_str(),
+        op => op,
+    };
+    match op {
+        // Derivatives chain several rounded operations, accumulated over at most every
+        // input element.
+        "vjp" | "jvp" => {
+            let n = case
+                .inputs
+                .iter()
+                .map(|t| t.shape.iter().product::<usize>())
+                .max();
+            (n.unwrap_or(1) as f64 + 8.0) * eps * e.abs().max(1.0)
+        }
         "exp" | "log" | "sqrt" | "sin" | "cos" | "tanh" | "sigmoid" => {
             4.0 * eps * e.abs().max(f64::MIN_POSITIVE)
         }
@@ -469,6 +509,27 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
 
 fn close(got: f64, expected: f64, tol: f64) -> bool {
     got == expected || (got.is_nan() && expected.is_nan()) || (got - expected).abs() <= tol
+}
+
+/// Runs `case` and compares every output with MLX's; `Some` describes the first failure.
+pub fn check(case: &Case) -> Option<String> {
+    let got = match run(case)
+        .and_then(|arrays| arrays.iter().map(from_array).collect::<Result<Vec<_>>>())
+    {
+        Ok(got) => got,
+        Err(e) => return Some(format!("{} ({}): nuvec error: {e}", case.name, case.op)),
+    };
+    if got.len() != case.outputs.len() {
+        return Some(format!(
+            "{}: {} outputs vs MLX {}",
+            case.name,
+            got.len(),
+            case.outputs.len()
+        ));
+    }
+    got.iter()
+        .zip(&case.outputs)
+        .find_map(|(g, e)| compare(case, g, e).err())
 }
 
 /// Compares nuvec's output with MLX's; `Err` describes the first mismatch.

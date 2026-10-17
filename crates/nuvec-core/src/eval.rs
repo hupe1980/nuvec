@@ -1,9 +1,8 @@
 //! Graph evaluation.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::array::{Data, Node, State};
+use crate::array::{Data, Node, NodeSet, State};
 use crate::gpu::GpuEval;
 use crate::kernels::{self, Operand};
 use crate::primitive::Primitive;
@@ -36,7 +35,7 @@ pub fn eval(arrays: &[Array]) -> Result<()> {
 /// Unevaluated nodes reachable from `arrays`, inputs before consumers. Iterative, so graph
 /// depth is limited only by memory.
 fn topological_order(arrays: &[Array]) -> Vec<Arc<Node>> {
-    let mut visited = HashSet::new();
+    let mut visited = NodeSet::default();
     let mut order = Vec::new();
     let mut stack: Vec<(Arc<Node>, bool)> =
         arrays.iter().map(|a| (a.node.clone(), false)).collect();
@@ -50,7 +49,7 @@ fn topological_order(arrays: &[Array]) -> Vec<Arc<Node>> {
         }
         let inputs: Vec<Arc<Node>> = match &*node.lock() {
             State::Pending { inputs, .. } => inputs.iter().map(|a| a.node.clone()).collect(),
-            State::Done => continue,
+            State::Retained { .. } | State::Done => continue,
         };
         stack.push((node, true));
         stack.extend(
@@ -64,11 +63,15 @@ fn topological_order(arrays: &[Array]) -> Vec<Arc<Node>> {
 }
 
 /// Runs one node whose inputs are all evaluated, stores (or, for GPU work, defers) its
-/// outputs, and detaches it.
+/// outputs, and detaches it (unless a running transform needs its graph).
 fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
     let mut state = node.lock();
-    let State::Pending { primitive, inputs } = std::mem::replace(&mut *state, State::Done) else {
-        return; // evaluated meanwhile by another thread
+    let (primitive, inputs) = match std::mem::replace(&mut *state, State::Done) {
+        State::Pending { primitive, inputs } => (primitive, inputs),
+        evaluated => {
+            *state = evaluated; // evaluated meanwhile by another thread
+            return;
+        }
     };
     #[cfg(test)]
     counter::inc();
@@ -84,6 +87,10 @@ fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
                 let _ = output.slot.set(Err(err.clone()));
             }
         }
+    }
+    if node.tracer && crate::transforms::tracing() {
+        *state = State::Retained { primitive, inputs };
+        return;
     }
     drop(state);
     drop(inputs); // detach: release the inputs outside the lock
@@ -146,13 +153,21 @@ fn view_outputs(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Optio
         }])
     };
     Ok(match primitive {
-        Primitive::Transpose(_) | Primitive::Broadcast(_) => share(operands[0].1.offset),
+        Primitive::Transpose(_) | Primitive::Broadcast(_) | Primitive::StopGradient => {
+            share(operands[0].1.offset)
+        }
         Primitive::Slice { .. } => {
             let (meta, data) = operands[0];
             let (_, delta) =
                 view::slice_geometry(&meta.strides, &primitive.dim_slices(meta.shape.len())?);
             share(data.offset + delta)
         }
+        Primitive::Custom(call) => Some(
+            operands[call.primals..]
+                .iter()
+                .map(|(_, data)| (*data).clone())
+                .collect(),
+        ),
         Primitive::Reshape(shape) => {
             let (meta, data) = operands[0];
             view::nocopy_reshape(&meta.shape, &meta.strides, shape).and_then(|_| share(data.offset))
@@ -172,9 +187,18 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
         Primitive::Reduce { op, axes } => new(kernels::reduce(*op, operands[0], axes)?),
         Primitive::ArgReduce { op, axis } => new(kernels::arg_reduce(*op, operands[0], *axis)?),
         Primitive::Matmul => new(kernels::matmul(operands[0], operands[1])?),
+        Primitive::SliceUpdate { .. } => new(kernels::slice_update(
+            operands[0],
+            operands[1],
+            &primitive.dim_slices(operands[0].0.shape.len())?,
+        )?),
         // A reshape that `view_outputs` could not express as a view copies.
         Primitive::Reshape(_) => new(kernels::contiguous(operands[0].0, operands[0].1)?),
-        Primitive::Transpose(_) | Primitive::Broadcast(_) | Primitive::Slice { .. } => {
+        Primitive::Transpose(_)
+        | Primitive::Broadcast(_)
+        | Primitive::Slice { .. }
+        | Primitive::StopGradient
+        | Primitive::Custom(_) => {
             unreachable!("views are handled by view_outputs")
         }
         #[cfg(test)]
@@ -258,6 +282,59 @@ mod tests {
         assert_eq!(counter::take(), 1);
         drop(sum);
         assert_eq!(product.to_vec::<i32>().unwrap(), vec![10, 21]);
+    }
+
+    #[test]
+    fn slice_update_writes_a_strided_region() {
+        // Base: a transposed view; region: rows 0..3 step 2, columns reversed.
+        let base = crate::arange(0.0, 12.0, 1.0, crate::DType::I32)
+            .unwrap()
+            .reshape(&[4, 3])
+            .unwrap()
+            .t()
+            .unwrap(); // [[0,3,6,9],[1,4,7,10],[2,5,8,11]]
+        let update = Array::from_slice(&[-1i32, -2, -3, -4, -5, -6, -7, -8], &[2, 4]).unwrap();
+        let primitive = Primitive::SliceUpdate {
+            start: vec![0, 3],
+            step: vec![2, -1],
+            len: vec![2, 4],
+        };
+        let out = Array::from_op(primitive.clone(), vec![base.clone(), update.clone()])
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            out.to_vec::<i32>().unwrap(),
+            [-4, -3, -2, -1, 1, 4, 7, 10, -8, -7, -6, -5]
+        );
+        let wrong = Array::from_slice(&[0i32; 3], &[3]).unwrap();
+        assert!(Array::from_op(primitive, vec![base, wrong]).is_err());
+    }
+
+    #[test]
+    fn tracer_nodes_keep_their_graph_only_while_tracing() {
+        let x = Array::scalar(2.0f32);
+        let kept = std::cell::Cell::new(false);
+        let g = crate::grad(|x: &Array| {
+            let y = x * x;
+            y.eval()?;
+            kept.set(matches!(&*y.node.lock(), State::Retained { .. }));
+            Ok(y)
+        });
+        assert_eq!(g(&x).unwrap().item::<f32>().unwrap(), 4.0);
+        assert!(kept.get(), "retained inside a transform");
+        let traced = crate::vjp(
+            |xs| Ok(vec![&xs[0] * &xs[0]]),
+            &[x],
+            &[Array::scalar(1.0f32)],
+        )
+        .unwrap()
+        .0
+        .remove(0);
+        traced.eval().unwrap();
+        assert!(
+            matches!(&*traced.node.lock(), State::Done),
+            "outside a transform"
+        );
     }
 
     #[test]

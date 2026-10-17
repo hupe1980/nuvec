@@ -68,7 +68,7 @@ mod stub {
 
 #[cfg(all(target_os = "macos", not(miri)))]
 mod metal {
-    use std::collections::HashMap;
+    use crate::array::NodeMap;
 
     use nuvec_gpu::{Arg, CommandBuffer, Device as MetalDevice};
 
@@ -85,7 +85,7 @@ mod metal {
         cmd: Option<CommandBuffer>,
         dispatches: usize,
         pending: Vec<(Arc<Node>, Vec<Data>)>,
-        index: HashMap<*const Node, usize>,
+        index: NodeMap<*const Node, usize>,
     }
 
     fn backend(e: nuvec_gpu::GpuError) -> Error {
@@ -182,7 +182,7 @@ mod metal {
                 cmd: None,
                 dispatches: 0,
                 pending: Vec::new(),
-                index: HashMap::new(),
+                index: NodeMap::default(),
             }
         }
 

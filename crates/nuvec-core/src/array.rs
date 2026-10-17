@@ -1,6 +1,8 @@
 //! The lazy array handle and the graph nodes behind it.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use smallvec::SmallVec;
@@ -24,6 +26,9 @@ pub struct Array {
 /// One recorded computation, possibly with several outputs.
 pub(crate) struct Node {
     pub(crate) stream: Stream,
+    /// Whether the node depends on a transform's tracer (see `transforms`). Tracer nodes
+    /// keep their graph when evaluated inside a transform.
+    pub(crate) tracer: bool,
     pub(crate) outputs: SmallVec<[Output; 1]>,
     pub(crate) state: Mutex<State>,
 }
@@ -57,14 +62,51 @@ impl Data {
     }
 }
 
-/// Whether a node still has to run. `Done` nodes have dropped their inputs (detach).
+/// Whether a node still has to run. `Done` nodes have dropped their inputs (detach);
+/// `Retained` nodes are evaluated but keep their graph for a running transform.
 pub(crate) enum State {
     Pending {
         primitive: Primitive,
         inputs: Vec<Array>,
     },
+    Retained {
+        primitive: Primitive,
+        inputs: Vec<Array>,
+    },
     Done,
 }
+
+/// Hashes node addresses, the keys of the graph walks' sets and maps. Addresses are
+/// unique and not attacker-controlled, so a multiplicative hash replaces SipHash.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct NodeHasher(u64);
+
+impl Hasher for NodeHasher {
+    fn finish(&self) -> u64 {
+        // Move the well-mixed high bits of the product to the low bits the table indexes
+        // with.
+        self.0.rotate_left(26)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(u64::from(n));
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+/// A set of nodes by address.
+pub(crate) type NodeSet = HashSet<*const Node, BuildHasherDefault<NodeHasher>>;
+/// A map keyed by node address (optionally with an output index).
+pub(crate) type NodeMap<K, V> = HashMap<K, V, BuildHasherDefault<NodeHasher>>;
 
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
@@ -145,6 +187,7 @@ impl Array {
         let output = Output::new(dtype, shape, None, OnceLock::from(data))?;
         Ok(Self::from_node(Node {
             stream: default_stream(),
+            tracer: false,
             outputs: SmallVec::from_buf([output]),
             state: Mutex::new(State::Done),
         }))
@@ -161,9 +204,29 @@ impl Array {
     ///
     /// Inputs that already failed short-circuit with their error.
     pub(crate) fn from_op(primitive: Primitive, inputs: Vec<Array>) -> Result<Vec<Array>> {
+        let tracer = inputs.iter().any(|a| a.node.tracer);
+        Self::record(primitive, inputs, tracer)
+    }
+
+    /// [`Array::from_op`] with an explicit tracer flag.
+    pub(crate) fn record(
+        primitive: Primitive,
+        inputs: Vec<Array>,
+        tracer: bool,
+    ) -> Result<Vec<Array>> {
         if let Some(err) = inputs.iter().find_map(Array::error) {
             return Err(err);
         }
+        Self::record_unchecked(primitive, inputs, tracer)
+    }
+
+    /// [`Array::record`] without the failed-input check: the node fails only when
+    /// evaluated. Used for `vmap` placeholders.
+    pub(crate) fn record_unchecked(
+        primitive: Primitive,
+        inputs: Vec<Array>,
+        tracer: bool,
+    ) -> Result<Vec<Array>> {
         let outputs = primitive
             .output_specs(&inputs)?
             .into_iter()
@@ -172,6 +235,7 @@ impl Array {
         let count = outputs.len() as u32;
         let node = Arc::new(Node {
             stream: default_stream(),
+            tracer,
             outputs,
             state: Mutex::new(State::Pending { primitive, inputs }),
         });
@@ -264,7 +328,7 @@ impl Array {
     pub fn primitive(&self) -> Option<Primitive> {
         match &*self.node.lock() {
             State::Pending { primitive, .. } => Some(primitive.clone()),
-            State::Done => None,
+            State::Retained { .. } | State::Done => None,
         }
     }
 
@@ -357,7 +421,7 @@ impl Drop for Node {
 fn take_inputs(node: &mut Node) -> Vec<Array> {
     let state = node.state.get_mut().unwrap_or_else(PoisonError::into_inner);
     match std::mem::replace(state, State::Done) {
-        State::Pending { inputs, .. } => inputs,
+        State::Pending { inputs, .. } | State::Retained { inputs, .. } => inputs,
         State::Done => Vec::new(),
     }
 }
@@ -365,6 +429,22 @@ fn take_inputs(node: &mut Node) -> Vec<Array> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_hasher_spreads_aligned_addresses() {
+        use std::hash::BuildHasher;
+        let build = BuildHasherDefault::<NodeHasher>::default();
+        // 336-byte nodes, as allocated: every low table index should be reachable.
+        let buckets: HashSet<u64> = (0..1024u64)
+            .map(|i| build.hash_one((0x6000_0000_0000 + i * 336) as *const Node) & 1023)
+            .collect();
+        // A random hash fills about 1 - 1/e ≈ 63% of them.
+        assert!(
+            buckets.len() > 600,
+            "only {} of 1024 buckets used",
+            buckets.len()
+        );
+    }
 
     #[test]
     fn metadata_without_eval() {

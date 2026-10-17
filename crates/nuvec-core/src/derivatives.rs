@@ -1,0 +1,391 @@
+//! Derivative rules: `Primitive::vjp` (reverse mode) and `Primitive::jvp` (forward mode).
+//!
+//! The rules follow MLX's `primitives.cpp` and are built from ops, so derivatives are lazy
+//! graphs that can be evaluated anywhere and differentiated again. Every primitive has both
+//! rules (D-015: a missing rule is a compile error). Complex numbers are not supported yet.
+
+use crate::array::Array;
+use crate::cast::Canon;
+use crate::ops::{
+    self, broadcast_to, cos, divide, equal, greater, greater_equal, less, less_equal, matmul,
+    multiply, negative, reshape, sin, subtract, sum, transpose, where_,
+};
+use crate::primitive::{BinaryOp, Primitive, ReduceOp, UnaryOp};
+use crate::{DType, Error, Result};
+
+/// Records `primitive` on `inputs` (single output).
+fn record(primitive: Primitive, inputs: Vec<Array>) -> Result<Array> {
+    Ok(Array::from_op(primitive, inputs)?.swap_remove(0))
+}
+
+/// Zeros shaped like `a`, as a broadcast scalar (no allocation).
+pub(crate) fn zeros_like(a: &Array) -> Result<Array> {
+    let zero = ops::filled(&[], a.dtype(), |_| Canon::Int(0))?;
+    broadcast_to(&zero, a.shape())
+}
+
+fn isize_shape(shape: &[usize]) -> Vec<isize> {
+    shape.iter().map(|&n| n as isize).collect()
+}
+
+/// `a` with its last two axes swapped.
+fn swap_last(a: &Array) -> Result<Array> {
+    let n = a.ndim();
+    let mut axes: Vec<usize> = (0..n).collect();
+    axes.swap(n - 2, n - 1);
+    transpose(a, &axes)
+}
+
+/// `-1`, `0` or `1` per element, in `x`'s dtype.
+fn sign(x: &Array) -> Result<Array> {
+    subtract(
+        greater(x, 0)?.astype(x.dtype())?,
+        less(x, 0)?.astype(x.dtype())?,
+    )
+}
+
+/// `g`, of the reduced (keepdims) shape, summed down from a broadcast of `shape`.
+fn sum_to(g: &Array, shape: &[usize]) -> Result<Array> {
+    let extra = g.ndim() - shape.len();
+    let axes: Vec<isize> = (0..g.ndim())
+        .filter(|&i| i < extra || (shape[i - extra] == 1 && g.shape()[i] != 1))
+        .map(|i| i as isize)
+        .collect();
+    let summed = if axes.is_empty() {
+        g.clone()
+    } else {
+        sum(g, &axes, true)?
+    };
+    reshape(&summed, &isize_shape(shape))
+}
+
+/// `∂out/∂x` of `prod` over `axes`: the product of the other elements, exact with zeros.
+fn prod_weights(x: &Array, out: &Array, axes: &[usize]) -> Result<Array> {
+    let axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
+    let zero = equal(x, 0)?;
+    let zeros = sum(&zero.astype(x.dtype())?, &axes, true)?;
+    let others = ops::prod(&where_(&zero, 1, x)?, &axes, true)?;
+    let only_zero = multiply(&zero, equal(&zeros, 1)?)?;
+    where_(
+        equal(&zeros, 0)?,
+        divide(out, x)?,
+        where_(&only_zero, &others, 0)?,
+    )
+}
+
+/// A one-hot mask (in `x`'s dtype) of the first maximum (`ReduceOp::Max`) or minimum over
+/// `axes`, in row-major order of the reduced axes. MLX's forward-mode rule takes the
+/// tangent there, while its reverse-mode rule splits ties evenly ([`extreme_weights`]).
+fn first_extreme(x: &Array, axes: &[usize], op: ReduceOp) -> Result<Array> {
+    let kept: Vec<usize> = (0..x.ndim()).filter(|a| !axes.contains(a)).collect();
+    let perm: Vec<usize> = kept.iter().chain(axes).copied().collect();
+    let moved = transpose(x, &perm)?;
+    let mut flat = isize_shape(&moved.shape()[..kept.len()]);
+    let reduced: usize = axes.iter().map(|&a| x.shape()[a]).product();
+    flat.push(reduced as isize);
+    let rows = reshape(&moved, &flat)?;
+    let index = match op {
+        ReduceOp::Max => ops::argmax(&rows, Some(-1), true)?,
+        _ => ops::argmin(&rows, Some(-1), true)?,
+    };
+    let positions = ops::arange(0.0, reduced as f64, 1.0, DType::U32)?;
+    let onehot = equal(&positions, &index)?.astype(x.dtype())?;
+    let mut inverse = vec![0; perm.len()];
+    for (i, &a) in perm.iter().enumerate() {
+        inverse[a] = i;
+    }
+    transpose(&reshape(&onehot, &isize_shape(moved.shape()))?, &inverse)
+}
+
+/// `∂out/∂x` of `max`/`min` over reduced axes: ties share the derivative evenly.
+fn extreme_weights(x: &Array, out: &Array, axes: &[usize]) -> Result<Array> {
+    let axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
+    let mask = equal(x, out)?.astype(x.dtype())?;
+    let count = sum(&mask, &axes, true)?;
+    divide(&mask, &count)
+}
+
+impl Primitive {
+    fn check_real(&self, arrays: &[&[Array]]) -> Result<()> {
+        if arrays
+            .iter()
+            .flat_map(|a| a.iter())
+            .any(|a| a.dtype() == DType::Complex64)
+        {
+            return Err(Error::UnsupportedDType {
+                op: self.name(),
+                dtype: DType::Complex64,
+            });
+        }
+        Ok(())
+    }
+
+    /// `J_i · v` for element-wise primitives, whose Jacobians are diagonal: the same rule
+    /// serves reverse mode (`v` a cotangent) and forward mode (`v` a tangent). `None` for
+    /// inputs without a derivative.
+    fn elementwise_partial(
+        &self,
+        inputs: &[Array],
+        out: &Array,
+        i: usize,
+        v: &Array,
+    ) -> Result<Option<Array>> {
+        let x = &inputs[0];
+        Ok(Some(match self {
+            Self::Unary(op) => match op {
+                UnaryOp::Negative => negative(v)?,
+                UnaryOp::Abs => multiply(v, sign(x)?)?,
+                UnaryOp::Exp => multiply(v, out)?,
+                UnaryOp::Log => divide(v, x)?,
+                UnaryOp::Sqrt => divide(v, multiply(2, out)?)?,
+                UnaryOp::Sin => multiply(v, cos(x)?)?,
+                UnaryOp::Cos => multiply(v, negative(&sin(x)?)?)?,
+                UnaryOp::Tanh => multiply(v, subtract(1, multiply(out, out)?)?)?,
+                UnaryOp::Sigmoid => multiply(v, multiply(out, subtract(1, out)?)?)?,
+            },
+            Self::Binary(op) => {
+                let (a, b) = (&inputs[0], &inputs[1]);
+                match (op, i) {
+                    (BinaryOp::Add, _) => v.clone(),
+                    (BinaryOp::Subtract, 0) => v.clone(),
+                    (BinaryOp::Subtract, _) => negative(v)?,
+                    (BinaryOp::Multiply, 0) => multiply(v, b)?,
+                    (BinaryOp::Multiply, _) => multiply(v, a)?,
+                    (BinaryOp::Divide, 0) => divide(v, b)?,
+                    (BinaryOp::Divide, _) => negative(&divide(multiply(v, a)?, multiply(b, b)?)?)?,
+                    // Ties go to `b`, as in MLX.
+                    (BinaryOp::Maximum, 0) => multiply(v, greater(a, b)?.astype(a.dtype())?)?,
+                    (BinaryOp::Maximum, _) => multiply(v, less_equal(a, b)?.astype(a.dtype())?)?,
+                    (BinaryOp::Minimum, 0) => multiply(v, less(a, b)?.astype(a.dtype())?)?,
+                    (BinaryOp::Minimum, _) => multiply(v, greater_equal(a, b)?.astype(a.dtype())?)?,
+                    // Comparisons have no derivative.
+                    _ => return Ok(None),
+                }
+            }
+            Self::Select => match i {
+                0 => return Ok(None),
+                1 => where_(x, v, 0)?,
+                _ => where_(x, 0, v)?,
+            },
+            _ => unreachable!("not element-wise: {}", self.name()),
+        }))
+    }
+
+    fn is_elementwise(&self) -> bool {
+        matches!(self, Self::Unary(_) | Self::Binary(_) | Self::Select)
+    }
+
+    /// Cotangents of the inputs marked in `wanted`, given one cotangent per output.
+    /// `None` means a zero cotangent.
+    pub(crate) fn vjp(
+        &self,
+        inputs: &[Array],
+        outputs: &[Array],
+        cotangents: &[Array],
+        wanted: &[bool],
+    ) -> Result<Vec<Option<Array>>> {
+        self.check_real(&[inputs, outputs, cotangents])?;
+        let g = &cotangents[0];
+        if self.is_elementwise() {
+            return (0..inputs.len())
+                .map(|i| match wanted[i] {
+                    true => self.elementwise_partial(inputs, &outputs[0], i, g),
+                    false => Ok(None),
+                })
+                .collect();
+        }
+        let x = &inputs[0];
+        let one = |a: Result<Array>| a.map(|a| vec![Some(a)]);
+        match self {
+            Self::AsType(_) => one(g.astype(x.dtype())),
+            Self::Reshape(_) => one(reshape(g, &isize_shape(x.shape()))),
+            Self::Transpose(axes) => {
+                let mut inverse = vec![0; axes.len()];
+                for (i, &a) in axes.iter().enumerate() {
+                    inverse[a] = i;
+                }
+                one(transpose(g, &inverse))
+            }
+            Self::Slice { start, step, len } => {
+                let update = Self::SliceUpdate {
+                    start: start.clone(),
+                    step: step.clone(),
+                    len: len.clone(),
+                };
+                one(record(update, vec![zeros_like(x)?, g.clone()]))
+            }
+            Self::SliceUpdate { start, step, len } => {
+                let update = &inputs[1];
+                let base = match wanted[0] {
+                    true => Some(record(self.clone(), vec![g.clone(), zeros_like(update)?])?),
+                    false => None,
+                };
+                let slice = Self::Slice {
+                    start: start.clone(),
+                    step: step.clone(),
+                    len: len.clone(),
+                };
+                let update = match wanted[1] {
+                    true => Some(record(slice, vec![g.clone()])?),
+                    false => None,
+                };
+                Ok(vec![base, update])
+            }
+            Self::Broadcast(_) => one(sum_to(g, x.shape())),
+            Self::StopGradient | Self::ArgReduce { .. } => Ok(vec![None]),
+            Self::Reduce { op, axes } => match op {
+                ReduceOp::Sum => one(broadcast_to(g, x.shape())),
+                ReduceOp::Prod => one(multiply(g, prod_weights(x, &outputs[0], axes)?)),
+                ReduceOp::Max | ReduceOp::Min => {
+                    one(multiply(g, extreme_weights(x, &outputs[0], axes)?))
+                }
+                ReduceOp::And | ReduceOp::Or => Ok(vec![None]),
+            },
+            Self::Matmul => {
+                let (a, b) = (&inputs[0], &inputs[1]);
+                let da = match wanted[0] {
+                    true => Some(matmul(g, &swap_last(b)?)?),
+                    false => None,
+                };
+                let db = match wanted[1] {
+                    true => Some(matmul(&swap_last(a)?, g)?),
+                    false => None,
+                };
+                Ok(vec![da, db])
+            }
+            Self::Custom(call) => {
+                let n = call.primals;
+                let primals = &inputs[..n];
+                let grads = match &call.rules.vjp {
+                    Some(rule) => rule(primals, outputs, cotangents)?,
+                    None => crate::vjp(|xs| (call.rules.body)(xs), primals, cotangents)?.1,
+                };
+                if grads.len() != n {
+                    return Err(Error::InvalidArgument(format!(
+                        "custom_function: the vjp rule returned {} cotangents for {n} primals",
+                        grads.len()
+                    )));
+                }
+                // The function's outputs (the remaining inputs) get no cotangent.
+                Ok(grads
+                    .into_iter()
+                    .zip(wanted)
+                    .map(|(g, &w)| w.then_some(g))
+                    .chain(std::iter::repeat_n(None, inputs.len() - n))
+                    .collect())
+            }
+            #[cfg(test)]
+            Self::AddMultiply => {
+                let (a, b) = (&inputs[0], &inputs[1]);
+                let h = &cotangents[1];
+                Ok(vec![
+                    Some(ops::add(g, multiply(h, b)?)?),
+                    Some(ops::add(g, multiply(h, a)?)?),
+                ])
+            }
+            Self::Unary(_) | Self::Binary(_) | Self::Select => unreachable!(),
+        }
+    }
+
+    /// One tangent per output, given the inputs' tangents (`None` is zero; at least one is
+    /// present).
+    pub(crate) fn jvp(
+        &self,
+        inputs: &[Array],
+        outputs: &[Array],
+        tangents: &[Option<Array>],
+    ) -> Result<Vec<Array>> {
+        self.check_real(&[inputs, outputs])?;
+        let tangent = |i: usize| -> Result<Array> {
+            match &tangents[i] {
+                Some(t) => Ok(t.clone()),
+                None => zeros_like(&inputs[i]),
+            }
+        };
+        let out = &outputs[0];
+        if self.is_elementwise() {
+            let mut total: Option<Array> = None;
+            for (i, t) in tangents.iter().enumerate() {
+                let Some(t) = t else { continue };
+                if let Some(d) = self.elementwise_partial(inputs, out, i, t)? {
+                    total = Some(match total {
+                        Some(sum) => ops::add(&sum, &d)?,
+                        None => d,
+                    });
+                }
+            }
+            return Ok(vec![match total {
+                Some(t) => t,
+                None => zeros_like(out)?,
+            }]);
+        }
+        let x = &inputs[0];
+        let one = |a: Result<Array>| a.map(|a| vec![a]);
+        match self {
+            Self::AsType(dtype) => one(tangent(0)?.astype(*dtype)),
+            Self::Reshape(_) => one(reshape(&tangent(0)?, &isize_shape(out.shape()))),
+            Self::Transpose(axes) => one(transpose(&tangent(0)?, axes)),
+            Self::Slice { .. } | Self::Broadcast(_) => one(record(self.clone(), vec![tangent(0)?])),
+            Self::SliceUpdate { .. } => one(record(self.clone(), vec![tangent(0)?, tangent(1)?])),
+            Self::StopGradient | Self::ArgReduce { .. } => one(zeros_like(out)),
+            Self::Reduce { op, axes } => {
+                let summed = |t: Array| {
+                    record(
+                        Self::Reduce {
+                            op: ReduceOp::Sum,
+                            axes: axes.clone(),
+                        },
+                        vec![t],
+                    )
+                };
+                match op {
+                    ReduceOp::Sum => one(summed(tangent(0)?)),
+                    ReduceOp::Prod => {
+                        one(summed(multiply(tangent(0)?, prod_weights(x, out, axes)?)?))
+                    }
+                    ReduceOp::Max | ReduceOp::Min => {
+                        one(summed(multiply(tangent(0)?, first_extreme(x, axes, *op)?)?))
+                    }
+                    ReduceOp::And | ReduceOp::Or => one(zeros_like(out)),
+                }
+            }
+            Self::Matmul => {
+                let (a, b) = (&inputs[0], &inputs[1]);
+                let total = match (&tangents[0], &tangents[1]) {
+                    (Some(ta), Some(tb)) => ops::add(matmul(ta, b)?, matmul(a, tb)?)?,
+                    (Some(ta), None) => matmul(ta, b)?,
+                    (None, Some(tb)) => matmul(a, tb)?,
+                    (None, None) => zeros_like(out)?,
+                };
+                one(Ok(total))
+            }
+            Self::Custom(call) => {
+                let n = call.primals;
+                let primals = &inputs[..n];
+                let tangents = (0..n).map(tangent).collect::<Result<Vec<_>>>()?;
+                let result = match &call.rules.jvp {
+                    Some(rule) => rule(primals, &tangents)?,
+                    None => crate::jvp(|xs| (call.rules.body)(xs), primals, &tangents)?.1,
+                };
+                if result.len() != outputs.len() {
+                    return Err(Error::InvalidArgument(format!(
+                        "custom_function: the jvp rule returned {} tangents for {} outputs",
+                        result.len(),
+                        outputs.len()
+                    )));
+                }
+                Ok(result)
+            }
+            #[cfg(test)]
+            Self::AddMultiply => {
+                let (a, b) = (&inputs[0], &inputs[1]);
+                let (ta, tb) = (tangent(0)?, tangent(1)?);
+                Ok(vec![
+                    ops::add(&ta, &tb)?,
+                    ops::add(multiply(&ta, b)?, multiply(a, &tb)?)?,
+                ])
+            }
+            Self::Unary(_) | Self::Binary(_) | Self::Select => unreachable!(),
+        }
+    }
+}

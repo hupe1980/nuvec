@@ -9,6 +9,7 @@
 
 use smallvec::{SmallVec, smallvec};
 
+use crate::custom::CustomCall;
 use crate::shape::{Shape, Strides};
 use crate::view::{self, DimSlice};
 use crate::{Array, DType, Error, Result};
@@ -197,6 +198,18 @@ pub enum Primitive {
     },
     /// Presented as a larger shape with zero strides. A view.
     Broadcast(Vec<usize>),
+    /// The input unchanged, but no gradient flows through it. A view.
+    StopGradient,
+    /// `(base, update)`: a copy of `base` whose region selected as by `Slice` is replaced by
+    /// `update` (of shape `len`).
+    SliceUpdate {
+        /// First index per dimension.
+        start: Vec<usize>,
+        /// Step per dimension (non-zero, may be negative).
+        step: Vec<isize>,
+        /// Number of selected indices per dimension (the update's shape).
+        len: Vec<usize>,
+    },
     /// Reduction over sorted, unique `axes`; reduced dimensions become size 1.
     Reduce {
         /// The reduction.
@@ -214,6 +227,10 @@ pub enum Primitive {
     /// Batched matrix product of `[B..., M, K]` and `[B..., K, N]` with equal batch
     /// dimensions.
     Matmul,
+    /// A call of a [`crate::custom_function`]: the inputs are the primals followed by the
+    /// function's outputs, which this node presents unchanged (views); transforms use the
+    /// function's custom rules.
+    Custom(CustomCall),
     /// Test-only two-output primitive: `(a + b, a * b)`.
     #[cfg(test)]
     AddMultiply,
@@ -240,9 +257,12 @@ impl Primitive {
             Self::Transpose(_) => "transpose",
             Self::Slice { .. } => "slice",
             Self::Broadcast(_) => "broadcast_to",
+            Self::StopGradient => "stop_gradient",
+            Self::SliceUpdate { .. } => "slice_update",
             Self::Reduce { op, .. } => op.name(),
             Self::ArgReduce { op, .. } => op.name(),
             Self::Matmul => "matmul",
+            Self::Custom(_) => "custom_function",
             #[cfg(test)]
             Self::AddMultiply => "add_multiply",
         }
@@ -325,6 +345,37 @@ impl Primitive {
                     strides: Some(strides),
                 }
             }
+            Self::StopGradient => {
+                let [a] = self.arity::<1>(inputs)?;
+                OutputSpec {
+                    dtype: a.dtype(),
+                    shape: a.shape().into(),
+                    strides: Some(a.strides().into()),
+                }
+            }
+            Self::SliceUpdate { len, .. } => {
+                let [base, update] = self.arity::<2>(inputs)?;
+                let dims = self.dim_slices(base.ndim())?;
+                let in_bounds = dims.iter().zip(base.shape()).all(|(d, &n)| {
+                    let last = d.start as isize + (d.len as isize - 1) * d.step;
+                    d.len == 0 || (d.start < n && (0..n as isize).contains(&last))
+                });
+                if !in_bounds || update.shape() != len.as_slice() {
+                    return Err(Error::InvalidArgument(format!(
+                        "slice_update: region {dims:?} does not fit shape {:?} with update {:?}",
+                        base.shape(),
+                        update.shape()
+                    )));
+                }
+                if base.dtype() != update.dtype() {
+                    return Err(Error::DTypeMismatch {
+                        op: "slice_update",
+                        lhs: base.dtype(),
+                        rhs: update.dtype(),
+                    });
+                }
+                computed(base.dtype(), base.shape())
+            }
             Self::Reduce { axes, .. } => {
                 let [a] = self.arity::<1>(inputs)?;
                 computed(a.dtype(), &self.reduced_shape(a.shape(), axes)?)
@@ -357,6 +408,22 @@ impl Primitive {
                 shape[n - 1] = sb[n - 1];
                 computed(a.dtype(), &shape)
             }
+            Self::Custom(call) => {
+                let outputs = inputs.get(call.primals..).unwrap_or_default();
+                if outputs.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "custom_function: the function must return at least one array".into(),
+                    ));
+                }
+                return Ok(outputs
+                    .iter()
+                    .map(|a| OutputSpec {
+                        dtype: a.dtype(),
+                        shape: a.shape().into(),
+                        strides: Some(a.strides().into()),
+                    })
+                    .collect());
+            }
             #[cfg(test)]
             Self::AddMultiply => {
                 let [a, b] = self.arity::<2>(inputs)?;
@@ -368,10 +435,11 @@ impl Primitive {
         Ok(smallvec![spec])
     }
 
-    /// The per-dimension slices of a `Slice` primitive over `ndim` dimensions.
+    /// The per-dimension slices of a `Slice` or `SliceUpdate` primitive over `ndim`
+    /// dimensions.
     pub(crate) fn dim_slices(&self, ndim: usize) -> Result<Vec<DimSlice>> {
         match self {
-            Self::Slice { start, step, len }
+            Self::Slice { start, step, len } | Self::SliceUpdate { start, step, len }
                 if start.len() == ndim && step.len() == ndim && len.len() == ndim =>
             {
                 Ok((0..ndim)
