@@ -6,7 +6,7 @@
 
 #![allow(dead_code, unreachable_pub)]
 
-use nuvec_core::{Array, Element, SliceArg, slice};
+use nuvec_core::{Array, Device, Element, SliceArg, Stream, set_default_stream, slice};
 
 /// Deterministic xorshift64* generator.
 pub struct Rng(u64);
@@ -54,6 +54,13 @@ impl Rng {
             .map(|&d| if self.below(3) == 0 { 1 } else { d })
             .collect()
     }
+}
+
+/// Records this thread's operations on the CPU: for tests of CPU semantics and accuracy,
+/// and oracle sweeps that run thousands of tiny evaluations (GPU coverage lives in
+/// `tests/gpu.rs` and in each suite's GPU tests).
+pub fn on_cpu() {
+    set_default_stream(Stream::default_for(Device::cpu()));
 }
 
 pub fn size(shape: &[usize]) -> usize {

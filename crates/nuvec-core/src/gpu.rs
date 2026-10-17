@@ -1,11 +1,12 @@
 //! GPU evaluation: encodes supported primitives as Metal kernels on unified memory.
 //!
-//! Outputs of encoded kernels stay *pending* (in a side table, not yet in the nodes' slots)
-//! until their command buffer has completed. [`GpuEval::flush`] commits, waits, and then
-//! publishes every pending output, or the GPU error, to its node. This keeps two invariants:
-//! data in a slot is always complete, and a failed command marks exactly its outputs as
-//! failed. Primitives without a GPU kernel fall back to the CPU after a flush (unified memory
-//! needs no copies).
+//! Work is committed in chunks without waiting; an evaluation's chunks are ordered on the GPU
+//! by a timeline (D-031). Outputs of encoded kernels stay *pending* (in a side table, not yet
+//! in the nodes' slots) until their chunk has completed; completion handlers then publish
+//! them, chunk by chunk in commit order, so data in a slot is always complete and a failure
+//! marks the outputs of its chunk and of every later chunk of the evaluation as failed.
+//! Primitives without a GPU kernel fall back to the CPU after [`GpuEval::flush`], which waits
+//! for this evaluation's outstanding work (unified memory needs no copies).
 
 use std::sync::Arc;
 
@@ -13,6 +14,14 @@ use crate::array::{Data, Node, Output};
 use crate::kernels::Operand;
 use crate::primitive::Primitive;
 use crate::{Device, Result};
+
+/// Whether a Metal GPU is available to evaluate on.
+pub(crate) fn available() -> bool {
+    #[cfg(all(target_os = "macos", not(miri)))]
+    return nuvec_gpu::Device::shared().is_some();
+    #[cfg(not(all(target_os = "macos", not(miri))))]
+    false
+}
 
 #[cfg(all(target_os = "macos", not(miri)))]
 pub(crate) use metal::GpuEval;
@@ -57,6 +66,7 @@ mod stub {
         pub(crate) fn defer(&mut self, node: Arc<Node>, outputs: Vec<Data>) {
             publish(&node, outputs, &Ok(()));
         }
+        pub(crate) fn commit(&mut self) {}
         pub(crate) fn lookup(&self, _: &Arc<Node>, _: u32) -> Option<Data> {
             None
         }
@@ -70,22 +80,72 @@ mod stub {
 mod metal {
     use crate::array::NodeMap;
 
-    use nuvec_gpu::{Arg, CommandBuffer, Device as MetalDevice};
+    use std::sync::{Mutex, PoisonError};
+
+    use nuvec_gpu::{Arg, CommandBuffer, Device as MetalDevice, Pending, Timeline};
 
     use super::*;
     use crate::buffer::Buffer;
     use crate::primitive::{ArgReduceOp, BinaryOp, ReduceOp, UnaryOp};
     use crate::{Category, DType, DeviceKind, Error};
 
-    /// Dispatches per command buffer before it is committed (bounded latency and memory).
+    /// Dispatches per command buffer before it is committed.
     const MAX_DISPATCHES: usize = 256;
+    /// Command buffers in flight per device before submission blocks (MLX: 10).
+    const MAX_IN_FLIGHT: usize = 10;
+
+    type Chunk = Vec<(Arc<Node>, Vec<Data>)>;
+
+    /// Completion state shared with an evaluation's completion handlers.
+    #[derive(Default)]
+    struct Shared {
+        state: Mutex<Publishing>,
+    }
+
+    #[derive(Default)]
+    struct Publishing {
+        /// Per committed chunk: its outputs, until published.
+        chunks: Vec<Option<Chunk>>,
+        /// Per committed chunk: its result, once complete.
+        results: Vec<Option<Result<()>>>,
+        /// Chunks published so far (in commit order).
+        next: usize,
+        /// The first failure; it fails every later chunk too.
+        error: Option<Error>,
+    }
+
+    impl Shared {
+        /// Records chunk `k`'s result and publishes every chunk whose predecessors are all
+        /// complete, in order.
+        fn complete(&self, k: usize, result: Result<()>) {
+            let mut p = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            p.results[k] = Some(result);
+            while let Some(Some(result)) = p.results.get(p.next).cloned() {
+                if let (Err(e), None) = (&result, &p.error) {
+                    p.error = Some(e.clone());
+                }
+                let result = p.error.clone().map_or(Ok(()), Err);
+                let next = p.next;
+                for (node, outputs) in p.chunks[next].take().unwrap_or_default() {
+                    publish(&node, outputs, &result);
+                }
+                p.next += 1;
+            }
+        }
+    }
 
     pub(crate) struct GpuEval {
         device: Option<&'static MetalDevice>,
         cmd: Option<CommandBuffer>,
+        timeline: Option<Timeline>,
         dispatches: usize,
-        pending: Vec<(Arc<Node>, Vec<Data>)>,
-        index: NodeMap<*const Node, usize>,
+        /// Outputs encoded into the open command buffer.
+        chunk: Chunk,
+        /// Every pending output of this evaluation, for consumers encoded later.
+        index: NodeMap<*const Node, Vec<Data>>,
+        shared: Arc<Shared>,
+        /// This evaluation's committed command buffers.
+        submitted: Vec<Pending>,
     }
 
     fn backend(e: nuvec_gpu::GpuError) -> Error {
@@ -181,9 +241,12 @@ mod metal {
             GpuEval {
                 device: None,
                 cmd: None,
+                timeline: None,
                 dispatches: 0,
-                pending: Vec::new(),
+                chunk: Vec::new(),
                 index: NodeMap::default(),
+                shared: Arc::default(),
+                submitted: Vec::new(),
             }
         }
 
@@ -506,7 +569,11 @@ mod metal {
                 let device = self
                     .device()
                     .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
-                self.cmd = Some(device.command_buffer().map_err(backend)?);
+                if self.timeline.is_none() {
+                    self.timeline = Some(device.timeline().map_err(backend)?);
+                }
+                let timeline = self.timeline.as_mut().expect("just created");
+                self.cmd = Some(device.command_buffer_on(timeline).map_err(backend)?);
             }
             Ok(self.cmd.as_mut().expect("just created"))
         }
@@ -544,40 +611,77 @@ mod metal {
         fn counted(&mut self) -> Result<()> {
             self.dispatches += 1;
             if self.dispatches >= MAX_DISPATCHES {
-                self.commit_and_wait()
-            } else {
-                Ok(())
+                self.commit();
             }
+            Ok(())
         }
 
-        fn commit_and_wait(&mut self) -> Result<()> {
+        /// Submits the open command buffer, if any, without waiting; its outputs are
+        /// published when it completes. Blocks while too many command buffers are in flight.
+        pub(crate) fn commit(&mut self) {
             self.dispatches = 0;
-            match self.cmd.take() {
-                Some(cmd) => cmd.commit().wait().map_err(backend),
-                None => Ok(()),
+            let Some(cmd) = self.cmd.take() else {
+                // Outputs deferred without GPU work (views of pending data) still need a
+                // chunk, published after the work they view.
+                if self.chunk.is_empty() {
+                    return;
+                }
+                let k = self.reserve();
+                self.shared.complete(k, Ok(()));
+                return;
+            };
+            if let Some(device) = self.device {
+                device.wait_for_capacity(MAX_IN_FLIGHT);
             }
+            let k = self.reserve();
+            let shared = self.shared.clone();
+            let pending =
+                cmd.commit_then(move |result| shared.complete(k, result.map_err(backend)));
+            self.submitted.push(pending);
+        }
+
+        /// Registers the open chunk as committed chunk `k`.
+        fn reserve(&mut self) -> usize {
+            let mut p = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            p.chunks.push(Some(std::mem::take(&mut self.chunk)));
+            p.results.push(None);
+            p.chunks.len() - 1
         }
 
         /// Holds `outputs` of `node` until the GPU work producing them has completed.
         pub(crate) fn defer(&mut self, node: Arc<Node>, outputs: Vec<Data>) {
-            self.index.insert(Arc::as_ptr(&node), self.pending.len());
-            self.pending.push((node, outputs));
+            self.index.insert(Arc::as_ptr(&node), outputs.clone());
+            self.chunk.push((node, outputs));
         }
 
         /// The pending output `output` of `node`, if it was encoded in this evaluation.
+        /// GPU consumers may use it at once (the timeline orders them after its producer);
+        /// CPU consumers must [`flush`](Self::flush) first.
         pub(crate) fn lookup(&self, node: &Arc<Node>, output: u32) -> Option<Data> {
-            let i = *self.index.get(&Arc::as_ptr(node))?;
-            self.pending[i].1.get(output as usize).cloned()
+            self.index
+                .get(&Arc::as_ptr(node))?
+                .get(output as usize)
+                .cloned()
         }
 
-        /// Completes all encoded work and publishes pending outputs (or the GPU error).
+        /// Commits and waits until every chunk of this evaluation is complete and published,
+        /// completing them on this thread (lower latency than waiting for Metal's handlers).
+        /// Returns the evaluation's first GPU error.
         pub(crate) fn flush(&mut self) -> Result<()> {
-            let result = self.commit_and_wait();
-            for (node, outputs) in self.pending.drain(..) {
-                publish(&node, outputs, &result);
+            self.commit();
+            for pending in self.submitted.drain(..) {
+                pending.wait();
             }
-            self.index.clear();
-            result
+            let p = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            p.error.clone().map_or(Ok(()), Err)
         }
     }
 
@@ -601,9 +705,51 @@ mod metal {
     }
 
     impl Drop for GpuEval {
-        /// Never leave encoded work unpublished (for example after a panic).
+        /// Never leave encoded work unsubmitted (for example after a panic).
         fn drop(&mut self) {
-            let _ = self.flush();
+            self.commit();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::Array;
+
+        fn pending() -> (Arc<Node>, Vec<Data>) {
+            let x = Array::scalar(1.0f32);
+            let y = crate::negative(&x).unwrap();
+            let data = x.out().slot.get().unwrap().clone().unwrap();
+            (y.node.clone(), vec![data])
+        }
+
+        #[test]
+        fn chunks_publish_in_order_and_failures_poison_later_chunks() {
+            let shared = Shared::default();
+            let nodes: Vec<_> = (0..3).map(|_| pending()).collect();
+            {
+                let mut p = shared.state.lock().unwrap();
+                for n in &nodes {
+                    p.chunks.push(Some(vec![n.clone()]));
+                    p.results.push(None);
+                }
+            }
+            let slot = |i: usize| nodes[i].0.outputs[0].slot.get().map(Result::is_ok);
+            // Completion handlers may run out of order: nothing is published before chunk 0.
+            shared.complete(1, Ok(()));
+            assert_eq!((slot(0), slot(1)), (None, None));
+            shared.complete(0, Err(Error::Backend("injected".into())));
+            assert_eq!(
+                (slot(0), slot(1), slot(2)),
+                (Some(false), Some(false), None)
+            );
+            // A later chunk that succeeded still derives from failed work.
+            shared.complete(2, Ok(()));
+            assert_eq!(slot(2), Some(false));
+            let Some(Err(err)) = nodes[2].0.outputs[0].slot.get() else {
+                panic!("chunk 2 must fail");
+            };
+            assert!(err.to_string().contains("injected"), "{err}");
         }
     }
 }

@@ -5,12 +5,12 @@ mod buffer;
 mod command;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 
 pub use allocator::MemoryStats;
 use allocator::Pool;
 pub use buffer::Buffer;
-pub use command::{Arg, CommandBuffer, Submitted};
+pub use command::{Arg, CommandBuffer, Pending, Submitted, Timeline};
 use nuvec_kernels::MetallibMode;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -37,6 +37,40 @@ struct Inner {
     library: OnceLock<Result<Library>>,
     pipelines: Mutex<HashMap<String, Pipeline>>,
     pool: Arc<Pool>,
+    in_flight: InFlight,
+}
+
+/// The number of committed command buffers that have not completed yet.
+#[derive(Default)]
+pub(crate) struct InFlight {
+    count: Mutex<usize>,
+    done: Condvar,
+}
+
+impl InFlight {
+    pub(crate) fn begin(&self) {
+        *self.count.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    }
+
+    pub(crate) fn end(&self) {
+        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        *count = count.saturating_sub(1);
+        self.done.notify_all();
+    }
+
+    fn get(&self) -> usize {
+        *self.count.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn wait_below(&self, max: usize) {
+        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        while *count >= max.max(1) {
+            count = self
+                .done
+                .wait(count)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
 }
 
 impl Device {
@@ -67,6 +101,7 @@ impl Device {
                 library: OnceLock::new(),
                 pipelines: Mutex::new(HashMap::new()),
                 pool,
+                in_flight: InFlight::default(),
             }),
         })
     }
@@ -96,6 +131,21 @@ impl Device {
     /// Releases every cached buffer.
     pub fn clear_cache(&self) {
         self.inner.pool.clear_cache();
+    }
+
+    /// Command buffers committed on this device that have not completed yet.
+    pub fn in_flight(&self) -> usize {
+        self.inner.in_flight.get()
+    }
+
+    /// Blocks until fewer than `max` command buffers are in flight (back-pressure for
+    /// callers that submit without waiting).
+    pub fn wait_for_capacity(&self, max: usize) {
+        self.inner.in_flight.wait_below(max);
+    }
+
+    pub(crate) fn flights(&self) -> &InFlight {
+        &self.inner.in_flight
     }
 
     /// Resets the peak to the current active memory.

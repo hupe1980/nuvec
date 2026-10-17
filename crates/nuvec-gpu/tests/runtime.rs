@@ -227,3 +227,71 @@ fn empty_buffers_and_zero_threads() {
     cmd.dispatch(&pipeline, &[], 0).unwrap();
     cmd.commit().wait().unwrap();
 }
+
+#[test]
+fn timeline_orders_command_buffers_committed_without_waiting() {
+    let Some(device) = device() else { return };
+    let n = 1 << 16;
+    let ones = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
+    let mut x = device.buffer_from(&f32s(&vec![0.0; n])).unwrap();
+    let mut y = device.new_buffer(n * 4).unwrap();
+    let mut timeline = device.timeline().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // 200 dependent additions, alternating between two buffers, one per command buffer.
+    for i in 0..200 {
+        let mut cmd = device.command_buffer_on(&mut timeline).unwrap();
+        let (src, dst) = if i % 2 == 0 {
+            (&x, &mut y)
+        } else {
+            (&y, &mut x)
+        };
+        add(&mut cmd, &device, src, &ones, dst, n as u32);
+        let tx = tx.clone();
+        cmd.commit_then(move |r| tx.send(r).unwrap());
+    }
+    for _ in 0..200 {
+        rx.recv().unwrap().unwrap();
+    }
+    assert_eq!(device.in_flight(), 0);
+    assert!(read_f32(&x).iter().all(|&v| v == 200.0));
+}
+
+#[test]
+fn abandoned_command_buffers_keep_the_timeline_moving() {
+    let Some(device) = device() else { return };
+    let ones = device.buffer_from(&f32s(&[1.0; 4])).unwrap();
+    let mut out = device.buffer_from(&f32s(&[5.0; 4])).unwrap();
+    let mut timeline = device.timeline().unwrap();
+    drop(device.command_buffer_on(&mut timeline).unwrap());
+    let mut cmd = device.command_buffer_on(&mut timeline).unwrap();
+    add(&mut cmd, &device, &ones, &ones, &mut out, 4);
+    cmd.commit().wait().unwrap();
+    assert_eq!(read_f32(&out), [2.0; 4]);
+}
+
+#[test]
+fn completion_handlers_report_and_back_pressure_bounds_in_flight_work() {
+    let Some(device) = device() else { return };
+    let n = 1 << 20;
+    let a = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let max_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..40 {
+        device.wait_for_capacity(4);
+        let seen = device.in_flight();
+        max_seen.fetch_max(seen, std::sync::atomic::Ordering::SeqCst);
+        let mut out = device.new_buffer(n * 4).unwrap();
+        let mut cmd = device.command_buffer().unwrap();
+        add(&mut cmd, &device, &a, &a, &mut out, n as u32);
+        // CPU access is refused while the GPU uses the buffer.
+        assert!(matches!(out.contents(), Err(GpuError::BufferInUse)));
+        let tx = tx.clone();
+        cmd.commit_then(move |r| tx.send((r, read_f32(&out)[0])).unwrap());
+    }
+    for _ in 0..40 {
+        let (result, first) = rx.recv().unwrap();
+        result.unwrap();
+        assert_eq!(first, 2.0);
+    }
+    assert!(max_seen.load(std::sync::atomic::Ordering::SeqCst) < 4);
+}

@@ -63,10 +63,10 @@ mod view;
 
 pub use array::Array;
 pub use custom::{CustomCall, CustomFunction, checkpoint, custom_function};
-pub use device::{Device, DeviceKind, Stream, default_stream, set_default_stream};
+pub use device::{Device, DeviceKind, Stream, default_device, default_stream, set_default_stream};
 pub use dtype::{Category, Complex64, DType, Element, at_least_float, bf16, f16, promote_types};
 pub use error::{Error, Result};
-pub use eval::eval;
+pub use eval::{async_eval, eval};
 pub use ops::{
     abs, add, all, any, arange, argmax, argmin, astype, broadcast_to, conjugate, cos, divide,
     equal, exp, expand_dims, greater, greater_equal, less, less_equal, log, matmul, max, maximum,

@@ -34,6 +34,8 @@ fn evaluated(a: Array) -> Result<Array> {
 }
 
 fn main() -> Result<()> {
+    // Rows without a prefix measure the CPU (the default device is the GPU when present).
+    set_default_stream(Stream::default_for(Device::cpu()));
     let one = Array::scalar(1.0f32);
     bench("dispatch_10k", 20, || {
         let mut x = Array::scalar(0.0f32);

@@ -34,7 +34,8 @@
 //! **Status:** pre-alpha. NumPy/MLX semantics (promotion, broadcasting, zero-copy views,
 //! element-wise operations, weak scalar operands, reductions, matmul) and composable
 //! transforms (`grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`,
-//! `checkpoint`), evaluated on the CPU or on the GPU.
+//! `checkpoint`), evaluated on the GPU by default (asynchronously submitted; see
+//! `async_eval`) or on the CPU.
 
 #![forbid(unsafe_code)]
 
@@ -44,11 +45,12 @@ pub use nuvec_core::{
     ArgReduceOp, Array, BinaryOp, Category, Complex64, CustomCall, CustomFunction, DType, Device,
     DeviceKind, Element, Error, Flags, Primitive, ReduceOp, Result, Scalar, ScalarOperand,
     ScalarOrArray, SliceArg, Stream, UnaryOp, abs, add, all, any, arange, argmax, argmin, astype,
-    at_least_float, bf16, broadcast_to, checkpoint, conjugate, cos, custom_function,
-    default_stream, divide, equal, eval, exp, expand_dims, f16, grad, greater, greater_equal, jvp,
-    less, less_equal, log, matmul, max, maximum, mean, min, minimum, multiply, negative, not_equal,
-    ones, prod, promote_types, reshape, set_default_stream, sigmoid, sin, slice, sqrt, squeeze,
-    stop_gradient, subtract, sum, tanh, transpose, value_and_grad, vjp, vmap, where_, zeros,
+    async_eval, at_least_float, bf16, broadcast_to, checkpoint, conjugate, cos, custom_function,
+    default_device, default_stream, divide, equal, eval, exp, expand_dims, f16, grad, greater,
+    greater_equal, jvp, less, less_equal, log, matmul, max, maximum, mean, min, minimum, multiply,
+    negative, not_equal, ones, prod, promote_types, reshape, set_default_stream, sigmoid, sin,
+    slice, sqrt, squeeze, stop_gradient, subtract, sum, tanh, transpose, value_and_grad, vjp, vmap,
+    where_, zeros,
 };
 pub use nuvec_cpu as cpu;
 pub use nuvec_distributed as distributed;

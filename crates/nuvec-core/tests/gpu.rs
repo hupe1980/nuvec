@@ -280,3 +280,114 @@ fn scalars_empty_and_errors() {
         assert!(matches!(bad.eval(), Err(Error::ShapeMismatch { .. })));
     });
 }
+
+#[test]
+fn long_dependent_chains_stay_ordered_across_command_buffers() {
+    if !gpu_available() {
+        return;
+    }
+    on(Device::gpu(0), || {
+        for n in [1usize, 1 << 16, 1 << 20] {
+            let one = Array::full(&[n], 1.0f32).unwrap();
+            let mut x = Array::full(&[n], 0.0f32).unwrap();
+            for _ in 0..3000 {
+                x = &x + &one;
+            }
+            let v = x.to_vec::<f32>().unwrap();
+            assert!(v.iter().all(|&e| e == 3000.0), "n = {n}: {}", v[0]);
+        }
+    });
+}
+
+#[test]
+fn async_eval_results_feed_later_work_on_both_devices() {
+    if !gpu_available() {
+        return;
+    }
+    on(Device::gpu(0), || {
+        let x = arange(0.0, 4096.0, 1.0, DType::F32).unwrap();
+        let mut y = x.clone();
+        for _ in 0..600 {
+            y = &y * 1.0 + 1.0;
+        }
+        async_eval(std::slice::from_ref(&y)).unwrap();
+        // A GPU consumer and a CPU-fallback consumer (float64) of in-flight results.
+        let gpu = sum(&y, &[], false).unwrap();
+        let cpu = y.astype(DType::F64).unwrap() * 2.0;
+        async_eval(&[gpu.clone(), cpu.clone()]).unwrap();
+        let expected: f64 = (0..4096).map(|i| f64::from(i) + 600.0).sum();
+        assert!((f64::from(gpu.item::<f32>().unwrap()) - expected).abs() < expected * 1e-6);
+        let c = cpu.to_vec::<f64>().unwrap();
+        assert_eq!((c[0], c[4095]), (1200.0, 2.0 * 4695.0));
+        assert!(y.is_evaluated());
+    });
+}
+
+#[test]
+fn concurrent_evaluations_from_several_threads() {
+    if !gpu_available() {
+        return;
+    }
+    let shared = on(Device::gpu(0), || {
+        arange(0.0, 1024.0, 1.0, DType::F32).unwrap() * 2.0
+    });
+    let handles: Vec<_> = (0..4)
+        .map(|t| {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                on(Device::gpu(0), || {
+                    let mut y = shared.clone();
+                    for _ in 0..500 {
+                        y = &y + t as f32;
+                    }
+                    if t % 2 == 0 {
+                        async_eval(std::slice::from_ref(&y)).unwrap();
+                    }
+                    y.to_vec::<f32>().unwrap()
+                })
+            })
+        })
+        .collect();
+    for (t, h) in handles.into_iter().enumerate() {
+        let v = h.join().unwrap();
+        assert_eq!(v[3], 6.0 + 500.0 * t as f32, "thread {t}");
+    }
+}
+
+#[test]
+fn async_eval_applies_back_pressure() {
+    if !gpu_available() {
+        return;
+    }
+    let device = nuvec_gpu::Device::shared().unwrap();
+    on(Device::gpu(0), || {
+        let big = Array::full(&[1 << 20], 1.0f32).unwrap();
+        let mut outs = Vec::new();
+        for _ in 0..60 {
+            let y = sum(&(&big * 2.0 + 1.0), &[], false).unwrap();
+            async_eval(std::slice::from_ref(&y)).unwrap();
+            // At most 10 per device, plus one per concurrently submitting test thread.
+            assert!(device.in_flight() <= 16, "{} in flight", device.in_flight());
+            outs.push(y);
+        }
+        for y in outs {
+            assert_eq!(y.item::<f32>().unwrap(), 3.0 * (1 << 20) as f32);
+        }
+    });
+}
+
+#[test]
+fn async_eval_reports_known_errors() {
+    if !gpu_available() {
+        return;
+    }
+    on(Device::gpu(0), || {
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
+        let b = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
+        let bad = &a + &b;
+        assert!(matches!(
+            async_eval(&[bad]),
+            Err(Error::ShapeMismatch { .. })
+        ));
+    });
+}

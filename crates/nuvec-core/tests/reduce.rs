@@ -51,6 +51,7 @@ fn random_axes(rng: &mut Rng, ndim: usize) -> (Vec<isize>, Vec<usize>) {
 
 #[test]
 fn reduce_random_integers() {
+    common::on_cpu();
     let mut rng = Rng::new(0x5E);
     for _ in 0..CASES {
         let shape = rng.shape();
@@ -101,6 +102,7 @@ fn reduce_random_integers() {
 
 #[test]
 fn reduce_random_floats() {
+    common::on_cpu();
     let mut rng = Rng::new(0xF1);
     for _ in 0..CASES {
         let shape = rng.shape();
@@ -152,6 +154,7 @@ fn reduce_random_floats() {
 
 #[test]
 fn reduce_dtypes() {
+    common::on_cpu();
     let cases = [
         (DType::Bool, DType::I32),
         (DType::U8, DType::U32),
@@ -203,6 +206,7 @@ fn reduce_dtypes() {
 
 #[test]
 fn reduce_shapes_and_identities() {
+    common::on_cpu();
     let a = arange(0.0, 24.0, 1.0, DType::F32)
         .unwrap()
         .reshape(&[2, 3, 4])
@@ -239,6 +243,7 @@ fn reduce_shapes_and_identities() {
 
 #[test]
 fn reductions_and_matmul_are_deterministic() {
+    common::on_cpu();
     let x = arange(0.0, 90_000.0, 0.37, DType::F32).unwrap();
     let a = sum(&x, &[], false).unwrap().item::<f32>().unwrap();
     let b = sum(&x, &[], false).unwrap().item::<f32>().unwrap();
@@ -260,6 +265,7 @@ fn reductions_and_matmul_are_deterministic() {
 
 #[test]
 fn reduce_long_sum_is_accurate() {
+    common::on_cpu();
     // 1e6 copies of 0.1f32: naive f32 accumulation drifts by ~1%; f64 accumulation does not.
     if cfg!(miri) {
         return;
@@ -271,6 +277,7 @@ fn reduce_long_sum_is_accurate() {
 
 #[test]
 fn reduce_errors() {
+    common::on_cpu();
     let a = zeros(&[2, 3], DType::F32).unwrap();
     assert!(matches!(
         sum(&a, &[2], false),
@@ -300,6 +307,7 @@ fn reduce_errors() {
 
 #[test]
 fn arg_reduce_random() {
+    common::on_cpu();
     let mut rng = Rng::new(0xA9);
     for _ in 0..CASES {
         let shape: Vec<usize> = rng.shape().into_iter().collect();
@@ -345,6 +353,7 @@ fn arg_reduce_random() {
 
 #[test]
 fn arg_reduce_rules() {
+    common::on_cpu();
     let a = Array::from_slice(&[1i32, 9, 3, 7, 2, 7], &[2, 3]).unwrap();
     assert_eq!(
         argmax(&a, Some(1), false).unwrap().to_vec::<u32>().unwrap(),
@@ -415,6 +424,7 @@ fn check_matmul<T: Element>(
 
 #[test]
 fn matmul_random() {
+    common::on_cpu();
     let mut rng = Rng::new(0x3A);
     check_matmul::<f32>(
         &mut rng,
@@ -444,6 +454,7 @@ fn matmul_random() {
 
 #[test]
 fn matmul_shapes() {
+    common::on_cpu();
     let m = |shape: &[usize]| ones(shape, DType::F32).unwrap();
     assert_eq!(matmul(&m(&[2, 3]), &m(&[3, 4])).unwrap().shape(), &[2, 4]);
     assert_eq!(matmul(&m(&[3]), &m(&[3, 4])).unwrap().shape(), &[4]);
@@ -481,6 +492,7 @@ fn matmul_shapes() {
 
 #[test]
 fn matmul_errors() {
+    common::on_cpu();
     let f = |shape: &[usize]| zeros(shape, DType::F32).unwrap();
     assert!(matches!(
         matmul(&f(&[2, 3]), &f(&[4, 2])),
@@ -507,6 +519,7 @@ fn matmul_errors() {
 #[test]
 #[cfg(not(debug_assertions))]
 fn perf_matmul_512() {
+    common::on_cpu();
     let a = ones(&[512, 512], DType::F32).unwrap();
     let b = ones(&[512, 512], DType::F32).unwrap();
     let start = std::time::Instant::now();

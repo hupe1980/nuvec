@@ -1,5 +1,7 @@
 //! Behaviour of lazy arrays through the public API.
 
+mod common;
+
 use nuvec_core::{
     Array, Complex64, DType, Device, Element, Error, Stream, add, bf16, eval, f16, multiply,
     set_default_stream,
@@ -37,6 +39,7 @@ macro_rules! check_int {
 
 #[test]
 fn all_dtypes_add_mul() {
+    common::on_cpu();
     check_int!(u8, u16, u32, u64, i8, i16, i32, i64);
     check::<bool>(
         (0..N).map(|i| i % 2 == 0).collect(),
@@ -79,6 +82,7 @@ fn all_dtypes_add_mul() {
 
 #[test]
 fn lazy_until_read() {
+    common::on_cpu();
     let a = Array::from_slice(&[1i32, 2, 3], &[3]).unwrap();
     let b = &a * &a;
     let c = &b + &a;
@@ -91,6 +95,7 @@ fn lazy_until_read() {
 
 #[test]
 fn explicit_eval_of_many() {
+    common::on_cpu();
     let a = Array::full(&[2, 2], 3u32).unwrap();
     let outs = [&a + &a, &a * &a];
     eval(&outs).unwrap();
@@ -102,6 +107,7 @@ fn explicit_eval_of_many() {
 
 #[test]
 fn misuse_shape_mismatch() {
+    common::on_cpu();
     let a = Array::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
     let b = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
     let err = add(&a, &b).unwrap_err();
@@ -118,6 +124,7 @@ fn misuse_shape_mismatch() {
 
 #[test]
 fn misuse_dtype_mismatch() {
+    common::on_cpu();
     // Since F-003, mixed dtypes promote (float32 * int32 -> float32) instead of failing.
     let c = multiply(Array::scalar(1.5f32), Array::scalar(2i32)).unwrap();
     assert_eq!(c.dtype(), DType::F32);
@@ -137,6 +144,7 @@ fn misuse_dtype_mismatch() {
 
 #[test]
 fn misuse_size_mismatch() {
+    common::on_cpu();
     let err = Array::from_slice(&[1u8, 2, 3, 4, 5], &[2, 3]).unwrap_err();
     assert_eq!(
         err,
@@ -149,6 +157,7 @@ fn misuse_size_mismatch() {
 
 #[test]
 fn misuse_readback_type() {
+    common::on_cpu();
     let a = Array::scalar(1.0f32);
     assert!(matches!(
         a.to_vec::<i64>(),
@@ -158,6 +167,7 @@ fn misuse_readback_type() {
 
 #[test]
 fn misuse_unsupported_device() {
+    common::on_cpu();
     // GPU 0 is a real device on a Mac; no machine has an eighth GPU.
     let a = Array::scalar(1.0f32);
     set_default_stream(Stream::default_for(Device::gpu(7)));
@@ -174,6 +184,7 @@ fn misuse_unsupported_device() {
 
 #[test]
 fn misuse_operator_is_deferred() {
+    common::on_cpu();
     let a = Array::from_slice(&[1i16, 2], &[2]).unwrap();
     let b = Array::from_slice(&[1i16, 2, 3], &[3]).unwrap();
     let bad = &a + &b; // must not panic
@@ -192,6 +203,7 @@ fn misuse_operator_is_deferred() {
 
 #[test]
 fn deep_chain_eval() {
+    common::on_cpu();
     let one = Array::scalar(1u64);
     let mut x = Array::scalar(0u64);
     for _ in 0..DEEP {
@@ -202,6 +214,7 @@ fn deep_chain_eval() {
 
 #[test]
 fn deep_chain_drop_unevaluated() {
+    common::on_cpu();
     let one = Array::scalar(1u64);
     let mut x = Array::scalar(0u64);
     for _ in 0..DEEP {
@@ -212,6 +225,7 @@ fn deep_chain_drop_unevaluated() {
 
 #[test]
 fn concurrent_reads() {
+    common::on_cpu();
     let a = Array::from_slice(&(0..N as i32).collect::<Vec<_>>(), &[N]).unwrap();
     let c = (&a * &a) + &a;
     let results: Vec<Vec<i32>> = std::thread::scope(|s| {
@@ -231,6 +245,7 @@ fn concurrent_reads() {
 
 #[test]
 fn edge_empty() {
+    common::on_cpu();
     let a = Array::from_slice::<f32>(&[], &[2, 0]).unwrap();
     let c = &a + &a;
     assert_eq!(c.shape(), &[2, 0]);
@@ -240,6 +255,7 @@ fn edge_empty() {
 
 #[test]
 fn edge_scalar() {
+    common::on_cpu();
     let c = Array::scalar(3i64) * Array::scalar(-4i64);
     assert_eq!(c.ndim(), 0);
     assert_eq!(c.item::<i64>().unwrap(), -12);
@@ -247,6 +263,7 @@ fn edge_scalar() {
 
 #[test]
 fn edge_size_overflow() {
+    common::on_cpu();
     assert!(matches!(
         Array::full(&[usize::MAX, 2], 0u8),
         Err(Error::InvalidArgument(_))
@@ -259,6 +276,7 @@ fn edge_size_overflow() {
 
 #[test]
 fn edge_int_wrap() {
+    common::on_cpu();
     assert_eq!(
         (Array::scalar(127i8) + Array::scalar(1i8))
             .item::<i8>()
@@ -275,6 +293,7 @@ fn edge_int_wrap() {
 
 #[test]
 fn edge_bool() {
+    common::on_cpu();
     let a = Array::from_slice(&[true, true, false, false], &[4]).unwrap();
     let b = Array::from_slice(&[true, false, true, false], &[4]).unwrap();
     assert_eq!(
@@ -289,6 +308,7 @@ fn edge_bool() {
 
 #[test]
 fn edge_complex() {
+    common::on_cpu();
     let i = Array::scalar(Complex64::new(0.0, 1.0));
     assert_eq!(
         (&i * &i).item::<Complex64>().unwrap(),
@@ -299,6 +319,7 @@ fn edge_complex() {
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot execute half's hardware f16 conversion")]
 fn edge_half() {
+    common::on_cpu();
     // 2049 is not representable in f16: the sum rounds to the nearest even, 2048.
     let a = Array::scalar(f16::from_f32(2048.0));
     let b = Array::scalar(f16::from_f32(1.0));
@@ -312,6 +333,7 @@ fn edge_half() {
 #[test]
 #[cfg(not(debug_assertions))]
 fn many_small_ops_sanity() {
+    common::on_cpu();
     let start = std::time::Instant::now();
     let one = Array::scalar(1.0f32);
     let mut x = Array::scalar(0.0f32);

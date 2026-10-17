@@ -8,28 +8,62 @@ use crate::kernels::{self, Operand};
 use crate::primitive::Primitive;
 use crate::{Array, DeviceKind, Error, Result, view};
 
-/// Evaluates `arrays` and everything they depend on. Each node runs at most once, even
-/// across threads.
+/// Evaluates `arrays` and everything they depend on, and waits for them. Each node runs at
+/// most once, even across threads.
 ///
 /// Nodes on the GPU stream run as Metal kernels where one exists, and on the CPU (over the
 /// same unified memory) otherwise. Returns the first error among `arrays`. Errors are
 /// sticky: a failed array, and anything computed from it, fails with the same error on
 /// every later evaluation or readback.
 pub fn eval(arrays: &[Array]) -> Result<()> {
-    let mut gpu = GpuEval::new();
-    for node in topological_order(arrays) {
-        evaluate(&node, &mut gpu);
-        // `node` is released here, so intermediates are freed as soon as their last
-        // consumer has run (or, on the GPU, once their command buffer completes).
-    }
-    // GPU errors are published to the nodes they affect; reported through the slots below.
-    let _ = gpu.flush();
+    // Errors are reported through the arrays' slots below.
+    let _ = submit(arrays).flush();
     for array in arrays {
         if let Err(err) = array.out().slot.wait() {
             return Err(err.clone());
         }
     }
     Ok(())
+}
+
+/// Starts evaluating `arrays` and returns without waiting for GPU work: reading the arrays
+/// (or evaluating them) later waits for exactly the work they need. As in MLX, use it to
+/// overlap building the next computation with the GPU running this one.
+///
+/// CPU work runs on the calling thread before this returns. Errors are sticky: an error
+/// already known is returned; a GPU error is reported by the first read or evaluation of
+/// an affected array. Submission blocks while too many command buffers are in flight.
+///
+/// ```
+/// use nuvec_core::{Array, Result, async_eval};
+///
+/// # fn main() -> Result<()> {
+/// let x = Array::from_slice(&[1.0f32, 2.0], &[2])?;
+/// let y = &x * 3.0;
+/// async_eval(std::slice::from_ref(&y))?;
+/// // ... build the next computation here ...
+/// assert_eq!(y.to_vec::<f32>()?, [3.0, 6.0]); // waits for `y` only
+/// # Ok(())
+/// # }
+/// ```
+pub fn async_eval(arrays: &[Array]) -> Result<()> {
+    submit(arrays).commit();
+    match arrays.iter().find_map(Array::error) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Encodes or computes every unevaluated node `arrays` depend on; the caller commits (or
+/// flushes) the GPU work.
+fn submit(arrays: &[Array]) -> GpuEval {
+    let mut gpu = GpuEval::new();
+    for node in topological_order(arrays) {
+        evaluate(&node, &mut gpu);
+        // `node` is released here, so intermediates are freed as soon as their last
+        // consumer has run (or, on the GPU, once their command buffer completes).
+    }
+    gpu
 }
 
 /// Unevaluated nodes reachable from `arrays`, inputs before consumers. Iterative, so graph
@@ -113,9 +147,9 @@ fn compute(
         } else if let Some(result) = input.out().slot.get() {
             data.push(result.clone()?);
         } else {
-            // Produced by another thread's evaluation: finish our own GPU work first, so two
-            // evaluations never wait on each other.
-            gpu.flush()?;
+            // Produced by another evaluation (another thread, or an earlier `async_eval`):
+            // submit our own GPU work first, so two evaluations never wait on each other.
+            gpu.commit();
             data.push(input.out().slot.wait().clone()?);
         }
     }
@@ -253,6 +287,9 @@ mod tests {
 
     #[test]
     fn intermediates_freed() {
+        // The live count is per thread; GPU buffers are released on Metal's completion
+        // thread, so this checks the CPU path.
+        crate::set_default_stream(crate::Stream::default_for(crate::Device::cpu()));
         let before = live::count();
         let mut x = Array::scalar(0i64);
         let one = Array::scalar(1i64);

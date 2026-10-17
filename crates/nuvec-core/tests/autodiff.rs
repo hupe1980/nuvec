@@ -31,6 +31,7 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 ///
 /// The primals passed to `vjp`/`jvp` have random (non-contiguous) layouts.
 fn check(name: &str, f: F, shapes: &[&[usize]], lo: f64, hi: f64) {
+    common::on_cpu();
     let mut rng = Rng::new(name.bytes().map(u64::from).sum());
     let data: Vec<Vec<f64>> = shapes
         .iter()
@@ -444,6 +445,7 @@ fn errors() {
 
 #[test]
 fn deep_chains_do_not_overflow_the_stack() {
+    common::on_cpu();
     let n = if cfg!(miri) { 50 } else { 1_000_000 };
     let one = Array::scalar(1.0f32);
     let g = grad(move |x: &Array| {
@@ -529,6 +531,7 @@ fn pair(c: &[Complex64], y: &[Complex64]) -> f32 {
 ///   by central differences in the real and the imaginary direction;
 /// - `Re⟨c, jvp(t)⟩ = Re Σ⟨vjpᵢ(c), tᵢ⟩`.
 fn check_complex(name: &str, f: F, shapes: &[&[usize]], real: &[bool]) {
+    common::on_cpu();
     let mut rng = Rng::new(name.bytes().map(u64::from).sum());
     let is_real = |k: usize| real.get(k).copied().unwrap_or(false);
     let random = |rng: &mut Rng, n: usize, real: bool| -> Vec<Complex64> {

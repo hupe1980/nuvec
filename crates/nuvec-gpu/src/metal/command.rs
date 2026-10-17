@@ -1,14 +1,15 @@
 //! Command encoding with minimal barriers, and submission.
 
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLComputeCommandEncoder, MTLDispatchType, MTLSize,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLDispatchType, MTLFence, MTLSize,
 };
 
 use super::{Buffer, Device, Pipeline};
@@ -55,10 +56,33 @@ impl<'a> Arg<'a> {
     }
 }
 
+type Fence = Retained<ProtocolObject<dyn MTLFence>>;
+
+/// Orders command buffers that are committed without waiting: each command buffer created
+/// on a timeline starts its work only after the previous one's work has finished. Buffers
+/// are untracked (D-023), so consecutive command buffers would otherwise overlap on the GPU.
+///
+/// Implemented with one fence (as in MLX): a command buffer's compute pass waits for the
+/// fence and updates it at the end. Command buffers without work leave it untouched, so
+/// empty or abandoned ones need no special handling.
+pub struct Timeline {
+    fence: Fence,
+    started: bool,
+}
+
+impl std::fmt::Debug for Timeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Timeline").finish_non_exhaustive()
+    }
+}
+
 /// Work being recorded for the GPU: one concurrent compute encoder, with memory barriers
 /// inserted only where a dispatch depends on an earlier one.
 pub struct CommandBuffer {
+    device: Device,
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    /// The timeline fence, and whether the compute pass must wait for it.
+    fence: Option<(Fence, bool)>,
     encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     /// Buffers read and written since the last barrier.
     reads: Vec<usize>,
@@ -77,7 +101,9 @@ impl Device {
             .commandBuffer()
             .ok_or_else(|| GpuError::CommandBuffer("cannot create a command buffer".into()))?;
         Ok(CommandBuffer {
+            device: self.clone(),
             raw,
+            fence: None,
             encoder: None,
             reads: Vec::new(),
             writes: Vec::new(),
@@ -86,6 +112,41 @@ impl Device {
             retained: Vec::new(),
         })
     }
+}
+
+impl Device {
+    /// A new, empty timeline.
+    pub fn timeline(&self) -> Result<Timeline> {
+        let fence = self
+            .raw()
+            .newFence()
+            .ok_or_else(|| GpuError::CommandBuffer("cannot create a fence".into()))?;
+        Ok(Timeline {
+            fence,
+            started: false,
+        })
+    }
+
+    /// A new command buffer whose work runs after the work of every command buffer created
+    /// earlier on `timeline` (commit them in creation order).
+    pub fn command_buffer_on(&self, timeline: &mut Timeline) -> Result<CommandBuffer> {
+        let mut cmd = self.command_buffer()?;
+        cmd.fence = Some((timeline.fence.clone(), timeline.started));
+        timeline.started = true;
+        Ok(cmd)
+    }
+}
+
+/// Reports a finished command buffer's GPU error, if any.
+fn status(raw: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
+    if raw.status() == MTLCommandBufferStatus::Error {
+        let message = raw.error().map_or_else(
+            || "unknown error".to_owned(),
+            |e| e.localizedDescription().to_string(),
+        );
+        return Err(GpuError::CommandBuffer(message));
+    }
+    Ok(())
 }
 
 impl CommandBuffer {
@@ -194,17 +255,54 @@ impl CommandBuffer {
         self.barriers
     }
 
-    /// Submits the work to the GPU.
-    pub fn commit(mut self) -> Submitted {
+    /// Ends encoding, updating the timeline fence after this command buffer's work.
+    fn close(&mut self) {
         if let Some(encoder) = self.encoder.take() {
+            if let Some((fence, _)) = &self.fence {
+                encoder.updateFence(fence);
+            }
             encoder.endEncoding();
         }
+        self.device.flights().begin();
+    }
+
+    /// Submits the work to the GPU.
+    pub fn commit(mut self) -> Submitted {
+        self.close();
         self.raw.commit();
         Submitted {
+            device: self.device.clone(),
             raw: self.raw.clone(),
             guards: std::mem::take(&mut self.guards),
             _retained: std::mem::take(&mut self.retained),
             done: false,
+        }
+    }
+
+    /// Submits the work and returns at once. `on_complete` runs exactly once with the
+    /// command buffer's result: on a Metal thread when the GPU finishes, or earlier on the
+    /// thread that calls [`Pending::wait`].
+    pub fn commit_then(mut self, on_complete: impl FnOnce(Result<()>) + Send + 'static) -> Pending {
+        self.close();
+        let finish: Finish = Arc::new(Mutex::new(Some(Completion {
+            on_complete: Box::new(on_complete),
+            guards: std::mem::take(&mut self.guards),
+            _retained: std::mem::take(&mut self.retained),
+            device: self.device.clone(),
+        })));
+        let shared = finish.clone();
+        let handler = RcBlock::new(move |raw: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            // SAFETY: Metal passes the completed command buffer, valid for this call.
+            complete(&shared, || status(unsafe { raw.as_ref() }));
+        });
+        // SAFETY: the block is valid, and Metal copies it before this call returns. It is
+        // called at most once, on any thread: its captures are `Send` (the buffers are
+        // only retained or released, and the guards are atomics).
+        unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&handler)) };
+        self.raw.commit();
+        Pending {
+            raw: self.raw.clone(),
+            finish,
         }
     }
 
@@ -223,6 +321,9 @@ impl CommandBuffer {
                 .raw
                 .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
                 .ok_or_else(|| GpuError::CommandBuffer("cannot create a compute encoder".into()))?;
+            if let Some((fence, true)) = &self.fence {
+                encoder.waitForFence(fence);
+            }
             self.encoder = Some(encoder);
         }
         Ok(self.encoder.as_ref().expect("just created"))
@@ -279,8 +380,61 @@ fn validate(args: &[Arg<'_>]) -> Result<()> {
     Ok(())
 }
 
+/// What remains to do when a command buffer committed with
+/// [`CommandBuffer::commit_then`] completes.
+struct Completion {
+    on_complete: Box<dyn FnOnce(Result<()>) + Send>,
+    guards: Vec<Arc<AtomicUsize>>,
+    _retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    device: Device,
+}
+
+// SAFETY: the retained Metal buffers are never accessed, only released (Metal objects may be
+// released from any thread); the guards are atomics, the callback is `Send`, and `Device` is
+// shared across threads by design (`Device::shared`).
+unsafe impl Send for Completion {}
+
+type Finish = Arc<Mutex<Option<Completion>>>;
+
+/// Runs the completion once, whoever gets there first (the waiter or Metal's handler).
+fn complete(finish: &Finish, result: impl FnOnce() -> Result<()>) {
+    let Some(c) = finish.lock().unwrap_or_else(PoisonError::into_inner).take() else {
+        return;
+    };
+    let result = result();
+    for guard in c.guards {
+        guard.fetch_sub(1, Ordering::AcqRel);
+    }
+    drop(c._retained);
+    c.device.flights().end();
+    (c.on_complete)(result);
+}
+
+/// A command buffer committed with [`CommandBuffer::commit_then`]. Dropping it does not
+/// wait; [`wait`](Self::wait) blocks until the GPU has finished and runs the completion on
+/// this thread if Metal's handler has not run it yet.
+pub struct Pending {
+    raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    finish: Finish,
+}
+
+impl Pending {
+    /// Blocks until the GPU has finished; the completion has run when this returns.
+    pub fn wait(&self) {
+        self.raw.waitUntilCompleted();
+        complete(&self.finish, || status(&self.raw));
+    }
+}
+
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pending").finish_non_exhaustive()
+    }
+}
+
 /// Submitted GPU work. [`wait`](Self::wait) for it to finish; dropping it also waits.
 pub struct Submitted {
+    device: Device,
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     guards: Vec<Arc<AtomicUsize>>,
     _retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
@@ -302,14 +456,8 @@ impl Submitted {
         for guard in self.guards.drain(..) {
             guard.fetch_sub(1, Ordering::AcqRel);
         }
-        if self.raw.status() == MTLCommandBufferStatus::Error {
-            let message = self.raw.error().map_or_else(
-                || "unknown error".to_owned(),
-                |e| e.localizedDescription().to_string(),
-            );
-            return Err(GpuError::CommandBuffer(message));
-        }
-        Ok(())
+        self.device.flights().end();
+        status(&self.raw)
     }
 }
 

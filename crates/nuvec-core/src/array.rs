@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(c.nbytes(), 24);
         assert_eq!(c.strides(), &[3, 1]);
         assert!(c.flags().row_contiguous);
-        assert_eq!(c.device(), Device::cpu());
+        assert_eq!(c.device(), crate::default_device());
         assert_eq!(c.primitive(), Some(Primitive::Binary(crate::BinaryOp::Add)));
         assert!(!c.is_evaluated(), "metadata queries must not evaluate");
     }
