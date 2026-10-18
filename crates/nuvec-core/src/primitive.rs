@@ -177,6 +177,16 @@ impl ArgReduceOp {
     }
 }
 
+/// How a scatter combines an update with the value it lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScatterReduce {
+    /// The update replaces the value (with repeated indices, one of the updates wins).
+    None,
+    /// The update is added to the value (repeated indices accumulate).
+    Sum,
+}
+
 /// An operation recorded in the graph, with its parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -228,6 +238,28 @@ pub enum Primitive {
         /// Maximum or minimum.
         op: ArgReduceOp,
         /// The reduced axis.
+        axis: usize,
+    },
+    /// `(src, indices)`: the elements of `src` at `indices` along `axis` (MLX's
+    /// `GatherAxis`, `take_along_axis`). `indices` (integers) has `src`'s shape except
+    /// along `axis` and gives the output's shape. Negative indices count from the end;
+    /// out-of-range indices are clamped.
+    GatherAxis {
+        /// The indexed axis.
+        axis: usize,
+    },
+    /// `(dst, indices, updates)`: a copy of `dst` with `updates` placed at `indices` along
+    /// `axis` (MLX's `ScatterAxis`, `put_along_axis`). `indices` (integers) and `updates`
+    /// share a shape, which is `dst`'s except along `axis`. Indices as in `GatherAxis`.
+    ScatterAxis {
+        /// The indexed axis.
+        axis: usize,
+        /// How updates combine with `dst`.
+        reduce: ScatterReduce,
+    },
+    /// The inputs (one dtype, equal shapes except along `axis`) joined along `axis`.
+    Concatenate {
+        /// The joined axis.
         axis: usize,
     },
     /// Batched matrix product of `[B..., M, K]` and `[B..., K, N]` with equal batch
@@ -321,6 +353,13 @@ impl Primitive {
             Self::SliceUpdate { .. } => "slice_update",
             Self::Reduce { op, .. } => op.name(),
             Self::ArgReduce { op, .. } => op.name(),
+            Self::GatherAxis { .. } => "take_along_axis",
+            Self::ScatterAxis {
+                reduce: ScatterReduce::None,
+                ..
+            } => "put_along_axis",
+            Self::ScatterAxis { .. } => "scatter_add_along_axis",
+            Self::Concatenate { .. } => "concatenate",
             Self::Matmul => "matmul",
             Self::AddMM { .. } => "addmm",
             Self::RandomBits { .. } => "random_bits",
@@ -450,6 +489,66 @@ impl Primitive {
             Self::ArgReduce { axis, .. } => {
                 let [a] = self.arity::<1>(inputs)?;
                 computed(DType::U32, &self.reduced_shape(a.shape(), &[*axis])?)
+            }
+            Self::GatherAxis { axis } => {
+                let [src, indices] = self.arity::<2>(inputs)?;
+                self.indexed(src, indices, *axis)?;
+                computed(src.dtype(), indices.shape())
+            }
+            Self::ScatterAxis { axis, .. } => {
+                let [dst, indices, updates] = self.arity::<3>(inputs)?;
+                self.indexed(dst, indices, *axis)?;
+                if updates.shape() != indices.shape() {
+                    return Err(Error::ShapeMismatch {
+                        op: self.name(),
+                        lhs: indices.shape().to_vec(),
+                        rhs: updates.shape().to_vec(),
+                    });
+                }
+                if updates.dtype() != dst.dtype() {
+                    return Err(Error::DTypeMismatch {
+                        op: self.name(),
+                        lhs: dst.dtype(),
+                        rhs: updates.dtype(),
+                    });
+                }
+                computed(dst.dtype(), dst.shape())
+            }
+            Self::Concatenate { axis } => {
+                let first = inputs.first().ok_or_else(|| {
+                    Error::InvalidArgument("concatenate: no arrays to join".into())
+                })?;
+                if *axis >= first.ndim() {
+                    return Err(Error::InvalidArgument(format!(
+                        "concatenate: axis {axis} out of range for {} dimensions",
+                        first.ndim()
+                    )));
+                }
+                let mut shape: Shape = first.shape().into();
+                for a in &inputs[1..] {
+                    let fits = a.ndim() == first.ndim()
+                        && a.shape()
+                            .iter()
+                            .zip(first.shape())
+                            .enumerate()
+                            .all(|(d, (x, y))| d == *axis || x == y);
+                    if !fits {
+                        return Err(Error::ShapeMismatch {
+                            op: "concatenate",
+                            lhs: first.shape().to_vec(),
+                            rhs: a.shape().to_vec(),
+                        });
+                    }
+                    if a.dtype() != first.dtype() {
+                        return Err(Error::DTypeMismatch {
+                            op: "concatenate",
+                            lhs: first.dtype(),
+                            rhs: a.dtype(),
+                        });
+                    }
+                    shape[*axis] += a.shape()[*axis];
+                }
+                computed(first.dtype(), &shape)
             }
             Self::Matmul | Self::AddMM { .. } => {
                 let (a, b) = match self {
@@ -708,6 +807,44 @@ impl Primitive {
             ));
         }
         Ok(groups)
+    }
+
+    /// Validates an indexing operation's array and indices: integer indices with the
+    /// array's shape except along `axis`.
+    fn indexed(&self, array: &Array, indices: &Array, axis: usize) -> Result<()> {
+        if !matches!(
+            indices.dtype().category(),
+            crate::Category::Signed | crate::Category::Unsigned
+        ) {
+            return Err(Error::InvalidArgument(format!(
+                "{}: indices must be integers, got {}",
+                self.name(),
+                indices.dtype()
+            )));
+        }
+        let fits = indices.ndim() == array.ndim()
+            && axis < array.ndim()
+            && indices
+                .shape()
+                .iter()
+                .zip(array.shape())
+                .enumerate()
+                .all(|(d, (i, a))| d == axis || i == a);
+        if !fits {
+            return Err(Error::InvalidArgument(format!(
+                "{}: indices of shape {:?} do not fit an array of shape {:?} along axis {axis}",
+                self.name(),
+                indices.shape(),
+                array.shape()
+            )));
+        }
+        if array.shape()[axis] == 0 && indices.size() > 0 {
+            return Err(Error::InvalidArgument(format!(
+                "{}: cannot index an empty axis",
+                self.name()
+            )));
+        }
+        Ok(())
     }
 
     /// `shape` with `axes` set to 1, after validating the axes.

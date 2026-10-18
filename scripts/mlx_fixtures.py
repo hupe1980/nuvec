@@ -211,6 +211,21 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
     if op == "arange":
         return mx.arange(float(p["start"]), float(p["stop"]), float(p["step"]),
                          dtype=DTYPES[int(p["dtype"])][1])
+    if op == "take":
+        axis = p.get("axis", "")
+        return mx.take(xs[0], xs[1], axis=int(axis) if axis else None)
+    if op == "take_along_axis":
+        return mx.take_along_axis(xs[0], xs[1], axis=int(p["axis"]))
+    if op == "put_along_axis":
+        a, i, v = (xs[0], xs[2], xs[1]) if p.get("order") == "avi" else xs[:3]
+        return mx.put_along_axis(a, i, v, axis=int(p["axis"]))
+    if op == "concatenate":
+        return mx.concatenate(xs, axis=int(p["axis"]))
+    if op == "stack":
+        return mx.stack(xs, axis=int(p["axis"]))
+    if op == "split":
+        at = p.get("at")
+        return list(mx.split(xs[0], nums(at) if at else int(p["parts"]), axis=int(p["axis"])))
     if op in ("zeros", "ones"):
         fn = mx.zeros if op == "zeros" else mx.ones
         return fn(nums(p["shape"]), dtype=DTYPES[int(p["dtype"])][1])
@@ -650,6 +665,51 @@ derivative("vjp", "vjp-sdpa", "sdpa", [make("float32", (1, 2, 4, 8)), make("floa
                                        make("float32", (1, 2, 5, 8))], scale=0.3, mask="causal")
 derivative("jvp", "jvp-rms_norm", "rms_norm", [make("float32", (2, 8)), make("float32", (8,))],
            eps=1e-5)
+
+# Indexing and joining: negative indices, broadcasting, every element size.
+for dt in ["float32", "float16", "bfloat16", "int64", "bool", "complex64", "uint8"]:
+    case(f"take-{dt}", "take", [make(dt, (5, 4)), ints("int32", (3,), -5, 5)], axis=0)
+case("take-axis1-2d", "take", [make("float32", (3, 6)), ints("uint8", (2, 2), 0, 6)], axis=1)
+case("take-flat", "take", [make("float32", (3, 4)), ints("int64", (5,), -12, 12)])
+case("take-scalar", "take", [make("float32", (4, 3)), mx.array(2, dtype=mx.int32)], axis=0)
+case("take-t", "take", [make("float32", (4, 5)), ints("int16", (3,), 0, 4)], axis=1, pre="t")
+case("take_along_axis", "take_along_axis", [make("float32", (3, 4)), ints("int32", (3, 2), -4, 4)],
+     axis=1)
+case("take_along_axis-bcast", "take_along_axis",
+     [make("float32", (3, 4)), ints("uint32", (1, 2), 0, 4)], axis=1)
+case("take_along_axis-axis0", "take_along_axis",
+     [make("int32", (4, 3)), ints("int64", (2, 3), 0, 4)], axis=0)
+PERM = mx.array(rng.permutation(5)[:3].reshape(3, 1)).astype(mx.int32)  # unique rows
+case("put_along_axis", "put_along_axis", [make("float32", (5, 2)), PERM, make("float32", (3, 2))],
+     axis=0)
+case("put_along_axis-bcast", "put_along_axis",
+     [make("int16", (2, 6)), mx.array([[0, -1, 3]]).astype(mx.int32), make("int16", (3,))], axis=1)
+case("concatenate", "concatenate",
+     [make("float32", (2, 3)), make("float32", (4, 3)), make("float32", (1, 3))], axis=0)
+case("concatenate-promote", "concatenate", [make("int32", (2, 1)), make("float16", (2, 3))],
+     axis=-1)
+case("concatenate-t", "concatenate", [make("float32", (3, 2)), make("float32", (2, 2))], axis=1,
+     pre="t")
+case("stack", "stack", [make("float32", (2, 3)), make("float32", (2, 3))], axis=-1)
+case("split-parts", "split", [make("float32", (2, 6))], axis=1, parts=3)
+case("split-at", "split", [make("int32", (7, 2))], axis=0, at="1,3,3")
+DUP = mx.array([1, 3, 1, 1, 0]).astype(mx.int32)  # repeated rows accumulate gradients
+derivative("vjp", "vjp-take-dup", "take", [make("float32", (4, 3))], consts=[DUP], axis=0)
+derivative("vjp", "vjp-take_along_axis-dup", "take_along_axis", [make("float32", (3, 4))],
+           consts=[mx.array([[0, 0, 2], [3, 3, 3], [1, 2, 1]]).astype(mx.int32)], axis=1)
+derivative("vjp", "vjp-put_along_axis", "put_along_axis",
+           [make("float32", (5, 2)), make("float32", (3, 2))], consts=[PERM], axis=0, order="avi")
+derivative("vjp", "vjp-concatenate", "concatenate", [make("float32", (2, 3)), make("float32", (2, 1))],
+           axis=1)
+derivative("jvp", "jvp-take", "take", [make("float32", (4, 3))], consts=[DUP], axis=0)
+derivative("jvp", "jvp-concatenate", "concatenate",
+           [make("float32", (2, 3)), make("float32", (1, 3))], axis=0)
+batched("vmap-take_along_axis", "take_along_axis",
+        [make("float32", (2, 3, 4)), ints("int32", (2, 3, 2), 0, 4)], "0,0", axis=1)
+batched("vmap-take-shared-table", "take", [make("float32", (5, 3)), ints("int32", (4, 2), 0, 5)],
+        "n,0", axis=0)
+batched("vmap-concatenate", "concatenate", [make("float32", (3, 2, 2)), make("float32", (2, 1))],
+        "0,n", axis=1)
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

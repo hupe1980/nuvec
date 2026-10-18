@@ -10,7 +10,7 @@ use nuvec_cpu::{Gemm, MatView, View, map1, map2, map3};
 use crate::array::{Data, Output};
 use crate::buffer::Buffer;
 use crate::cast::{B8, Canon, Scalar, convert, with_type};
-use crate::primitive::{ArgReduceOp, BinaryOp, ReduceOp, UnaryOp};
+use crate::primitive::{ArgReduceOp, BinaryOp, ReduceOp, ScatterReduce, UnaryOp};
 use crate::shape::{self, Shape, Strides};
 use crate::view::{self, DimSlice};
 use crate::{Category, Complex64, DType, Result, bf16, f16};
@@ -80,6 +80,123 @@ pub(crate) fn slice_update(
         2 => run::<u16>(base, update, slices),
         4 => run::<u32>(base, update, slices),
         _ => run::<u64>(base, update, slices),
+    }
+}
+
+/// Calls `f(i, at)` for every element of `shape` in row-major order: `i` counts elements,
+/// `at` is `offset` plus the element's position in a layout with `strides`.
+fn walk(shape: &[usize], strides: &[isize], offset: isize, mut f: impl FnMut(usize, isize)) {
+    let total: usize = shape.iter().product();
+    let mut index = vec![0usize; shape.len()];
+    let mut at = offset;
+    for i in 0..total {
+        f(i, at);
+        for d in (0..shape.len()).rev() {
+            index[d] += 1;
+            at += strides[d];
+            if index[d] < shape[d] {
+                break;
+            }
+            at -= strides[d] * shape[d] as isize;
+            index[d] = 0;
+        }
+    }
+}
+
+/// Integer indices in row-major order, negative ones counted from the end of an axis of
+/// length `n` and out-of-range ones clamped (as the GPU kernels).
+fn indices(ind: Operand<'_>, n: usize) -> Result<Vec<isize>> {
+    let values = contiguous(ind.0, ind.1)?;
+    let n = n as i128;
+    with_type!(ind.0.dtype, I => Ok(values
+        .typed::<I>()
+        .iter()
+        .map(|&i| match i.to_canon() {
+            Canon::Int(v) => (if v < 0 { v + n } else { v }).clamp(0, (n - 1).max(0)) as isize,
+            _ => 0,
+        })
+        .collect()))
+}
+
+/// `src`'s elements at `ind` along `axis` (the output has `ind`'s shape). Type-agnostic.
+pub(crate) fn gather_axis(src: Operand<'_>, ind: Operand<'_>, axis: usize) -> Result<Buffer> {
+    fn run<T: Pod>(
+        src: Operand<'_>,
+        ind: &[isize],
+        shape: &[usize],
+        axis: usize,
+    ) -> Result<Buffer> {
+        let mut out = output::<T>(ind.len())?;
+        let (meta, data) = src;
+        let mut strides = meta.strides.to_vec();
+        let step = std::mem::replace(&mut strides[axis], 0);
+        let (values, dst) = (data.buffer.typed::<T>(), out.typed_mut::<T>());
+        walk(shape, &strides, data.offset, |i, at| {
+            dst[i] = values[(at + ind[i] * step) as usize];
+        });
+        Ok(out)
+    }
+    let ind_values = indices(ind, src.0.shape[axis])?;
+    let shape = &ind.0.shape;
+    match src.0.dtype.size() {
+        1 => run::<u8>(src, &ind_values, shape, axis),
+        2 => run::<u16>(src, &ind_values, shape, axis),
+        4 => run::<u32>(src, &ind_values, shape, axis),
+        _ => run::<u64>(src, &ind_values, shape, axis),
+    }
+}
+
+/// A row-contiguous copy of `dst` with `updates` placed (or, for `Sum`, added) at `ind`
+/// along `axis`, in row-major order of the updates.
+pub(crate) fn scatter_axis(
+    dst: Operand<'_>,
+    ind: Operand<'_>,
+    updates: Operand<'_>,
+    axis: usize,
+    reduce: ScatterReduce,
+) -> Result<Buffer> {
+    let ind_values = indices(ind, dst.0.shape[axis])?;
+    let mut out = contiguous(dst.0, dst.1)?;
+    let values = contiguous(updates.0, updates.1)?;
+    let mut strides = shape::row_contiguous_strides(&dst.0.shape).to_vec();
+    let step = std::mem::replace(&mut strides[axis], 0);
+    let shape = &ind.0.shape;
+    with_type!(dst.0.dtype, T => {
+        let (src, dst) = (values.typed::<T>(), out.typed_mut::<T>());
+        walk(shape, &strides, 0, |i, at| {
+            let at = (at + ind_values[i] * step) as usize;
+            dst[at] = match reduce {
+                ScatterReduce::None => src[i],
+                ScatterReduce::Sum => dst[at].add_(src[i]),
+            };
+        });
+    });
+    Ok(out)
+}
+
+/// `inputs` joined along `axis` into a row-contiguous buffer of `shape`.
+pub(crate) fn concatenate(inputs: &[Operand<'_>], shape: &[usize], axis: usize) -> Result<Buffer> {
+    fn run<T: Pod>(inputs: &[Operand<'_>], shape: &[usize], axis: usize) -> Result<Buffer> {
+        let size: usize = shape.iter().product();
+        let mut out = output::<T>(size)?;
+        let strides = shape::row_contiguous_strides(shape);
+        let dst = out.typed_mut::<T>();
+        let mut offset = 0isize;
+        for &(meta, data) in inputs {
+            let values = contiguous(meta, data)?;
+            let src = values.typed::<T>();
+            walk(&meta.shape, &strides, offset, |i, at| {
+                dst[at as usize] = src[i]
+            });
+            offset += meta.shape[axis] as isize * strides[axis];
+        }
+        Ok(out)
+    }
+    match inputs[0].0.dtype.size() {
+        1 => run::<u8>(inputs, shape, axis),
+        2 => run::<u16>(inputs, shape, axis),
+        4 => run::<u32>(inputs, shape, axis),
+        _ => run::<u64>(inputs, shape, axis),
     }
 }
 

@@ -240,6 +240,21 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
         Primitive::AsType(dtype) => new(kernels::cast(operands[0], *dtype)?),
         Primitive::Reduce { op, axes } => new(kernels::reduce(*op, operands[0], axes)?),
         Primitive::ArgReduce { op, axis } => new(kernels::arg_reduce(*op, operands[0], *axis)?),
+        Primitive::GatherAxis { axis } => {
+            new(kernels::gather_axis(operands[0], operands[1], *axis)?)
+        }
+        Primitive::ScatterAxis { axis, reduce } => new(kernels::scatter_axis(
+            operands[0],
+            operands[1],
+            operands[2],
+            *axis,
+            *reduce,
+        )?),
+        Primitive::Concatenate { axis } => {
+            let mut shape = operands[0].0.shape.clone();
+            shape[*axis] = operands.iter().map(|(m, _)| m.shape[*axis]).sum();
+            new(kernels::concatenate(operands, &shape, *axis)?)
+        }
         Primitive::Matmul => new(kernels::matmul(operands[0], operands[1])?),
         Primitive::AddMM { .. } => {
             let (alpha, beta) = primitive.addmm_factors();

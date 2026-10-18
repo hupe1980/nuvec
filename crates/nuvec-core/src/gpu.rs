@@ -94,8 +94,10 @@ mod metal {
 
     use crate::fused::Load;
 
-    /// Dispatches per command buffer before it is committed.
+    /// Dispatches per command buffer before it is committed while the GPU is busy.
     const MAX_DISPATCHES: usize = 256;
+    /// Dispatches per command buffer before it is committed while the GPU is idle.
+    const IDLE_DISPATCHES: usize = 8;
     /// Command buffers in flight per device before submission blocks (MLX: 10).
     const MAX_IN_FLIGHT: usize = 10;
 
@@ -624,6 +626,14 @@ mod metal {
                 (Primitive::Quantize { .. }, Some(d)) => is_float(d) && operands[0].0.size > 0,
                 (Primitive::Fast(_), Some(d)) => is_float(d) && operands[0].0.size > 0,
                 (Primitive::Compiled(_), _) => true,
+                (Primitive::GatherAxis { .. } | Primitive::Concatenate { .. }, _) => true,
+                (Primitive::ScatterAxis { reduce, .. }, Some(d)) => {
+                    *reduce == crate::ScatterReduce::None
+                        || matches!(
+                            d,
+                            DType::F32 | DType::F16 | DType::BF16 | DType::I32 | DType::U32
+                        )
+                }
                 (Primitive::Dequantize { .. }, _) => outputs[0].size > 0,
                 (Primitive::QuantizedMatmul { .. }, Some(d)) => is_float(d) && outputs[0].size > 0,
                 _ => false,
@@ -676,6 +686,16 @@ mod metal {
                     self.elementwise(&name, operands, out, &mut buffer)?;
                 }
                 Primitive::Reshape(_) => self.copy(operands[0], &mut buffer)?,
+                Primitive::GatherAxis { axis } => {
+                    self.gather(operands[0], operands[1], *axis, &mut buffer)?
+                }
+                Primitive::ScatterAxis { axis, reduce } => {
+                    self.copy(operands[0], &mut buffer)?;
+                    self.scatter(operands, *axis, *reduce, &mut buffer)?
+                }
+                Primitive::Concatenate { axis } => {
+                    self.concatenate(operands, out, *axis, &mut buffer)?
+                }
                 Primitive::Reduce { op, axes } => {
                     self.reduce(*op, axes, operands[0], &mut buffer)?
                 }
@@ -813,6 +833,116 @@ mod metal {
                 .map_err(backend)?;
             self.counted()?;
             Ok(buffers.into_iter().map(Data::new).collect())
+        }
+
+        /// `take_along_axis`: one thread per output element.
+        fn gather(
+            &mut self,
+            (src, src_data): Operand<'_>,
+            (ind, ind_data): Operand<'_>,
+            axis: usize,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let name = format!(
+                "nuvec_gather_{}_{}",
+                bits(src.dtype.size()),
+                ind.dtype.name()
+            );
+            let consts = [
+                bytes(&(src_data.offset as i64)),
+                bytes(&(ind_data.offset as i64)),
+                shape_bytes(&ind.shape),
+                strides_bytes(&src.strides),
+                strides_bytes(&ind.strides),
+                bytes(&(ind.shape.len() as i32)),
+                bytes(&(axis as i32)),
+                bytes(&(src.shape[axis] as i64)),
+            ];
+            let mut args = vec![
+                Arg::read(src_data.buffer.metal().expect("checked")),
+                Arg::read(ind_data.buffer.metal().expect("checked")),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+            ];
+            args.extend(consts.iter().map(|c| Arg::bytes(c)));
+            self.dispatch(&name, &args, ind.size)
+        }
+
+        /// `put_along_axis` or scatter-add into `buffer`, which already holds the
+        /// destination (row-contiguous): one thread per update.
+        fn scatter(
+            &mut self,
+            operands: &[Operand<'_>],
+            axis: usize,
+            reduce: crate::ScatterReduce,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let ((dst, _), (ind, ind_data), (upd, upd_data)) =
+                (operands[0], operands[1], operands[2]);
+            let name = match reduce {
+                crate::ScatterReduce::None => format!(
+                    "nuvec_scatter_{}_{}",
+                    bits(dst.dtype.size()),
+                    ind.dtype.name()
+                ),
+                _ => format!(
+                    "nuvec_scatter_add_{}_{}",
+                    dst.dtype.name(),
+                    ind.dtype.name()
+                ),
+            };
+            let consts = [
+                bytes(&(upd_data.offset as i64)),
+                bytes(&(ind_data.offset as i64)),
+                shape_bytes(&upd.shape),
+                strides_bytes(&upd.strides),
+                strides_bytes(&ind.strides),
+                strides_bytes(&crate::shape::row_contiguous_strides(&dst.shape)),
+                bytes(&(upd.shape.len() as i32)),
+                bytes(&(axis as i32)),
+                bytes(&(dst.shape[axis] as i64)),
+            ];
+            let mut args = vec![
+                Arg::read(upd_data.buffer.metal().expect("checked")),
+                Arg::read(ind_data.buffer.metal().expect("checked")),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+            ];
+            args.extend(consts.iter().map(|c| Arg::bytes(c)));
+            self.dispatch(&name, &args, upd.size)
+        }
+
+        /// `concatenate`: each input copied into its region of the output.
+        fn concatenate(
+            &mut self,
+            operands: &[Operand<'_>],
+            out: &Output,
+            axis: usize,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let out_strides = crate::shape::row_contiguous_strides(&out.shape);
+            let name = format!("nuvec_copy_into_{}", bits(out.dtype.size()));
+            let mut start = 0isize;
+            for &(meta, data) in operands {
+                let offset = start * out_strides[axis];
+                start += meta.shape[axis] as isize;
+                if meta.size == 0 {
+                    continue;
+                }
+                let consts = [
+                    bytes(&(data.offset as i64)),
+                    bytes(&(offset as i64)),
+                    shape_bytes(&meta.shape),
+                    strides_bytes(&meta.strides),
+                    strides_bytes(&out_strides),
+                    bytes(&(meta.shape.len() as i32)),
+                ];
+                let mut args = vec![
+                    Arg::read(data.buffer.metal().expect("checked")),
+                    Arg::write(buffer.metal_mut().expect("device storage")),
+                ];
+                args.extend(consts.iter().map(|c| Arg::bytes(c)));
+                self.dispatch(&name, &args, meta.size)?;
+            }
+            Ok(())
         }
 
         /// Gathers an operand into contiguous memory, walking its own logical shape (a
@@ -2362,10 +2492,18 @@ mod metal {
             self.counted()
         }
 
-        /// Commits once a command buffer holds enough work.
+        /// Commits once a command buffer holds enough work: a few dispatches while the GPU
+        /// is idle, so it starts while the rest is encoded; many while it is busy, so
+        /// command buffers stay few.
         fn counted(&mut self) -> Result<()> {
             self.dispatches += 1;
-            if self.dispatches >= MAX_DISPATCHES {
+            let busy = self.device().is_some_and(|d| d.in_flight() > 0);
+            let limit = if busy {
+                MAX_DISPATCHES
+            } else {
+                IDLE_DISPATCHES
+            };
+            if self.dispatches >= limit {
                 self.commit();
             }
             Ok(())

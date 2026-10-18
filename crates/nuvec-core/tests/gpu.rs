@@ -7,7 +7,7 @@ mod common;
 #[path = "common/fixture.rs"]
 mod fixture;
 
-use common::{Rng, random_layout};
+use common::{Rng, random_layout, size};
 use nuvec_core::*;
 
 /// Whether the GPU stream works here.
@@ -817,4 +817,146 @@ fn mlx_reduction_kernels_match_the_cpu_on_every_path() {
         max(&x, &[1], false).unwrap().to_vec::<f32>().unwrap()
     });
     assert!(m[0].is_nan() && m[1] == 6.0, "{m:?}");
+}
+
+/// The array as float64 values, evaluated on the device it was recorded on.
+fn f64s(a: &Array) -> Vec<f64> {
+    a.astype(DType::F64).unwrap().to_vec::<f64>().unwrap()
+}
+
+#[test]
+fn indexing_kernels_match_the_cpu() {
+    if !gpu_available() {
+        return;
+    }
+    let mut rng = Rng::new(0x1D3);
+    let index_types = [
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+    ];
+    let dtypes = [
+        DType::F32,
+        DType::F16,
+        DType::BF16,
+        DType::I32,
+        DType::U8,
+        DType::Bool,
+        DType::Complex64,
+    ];
+    for case in 0..80 {
+        let ndim = 1 + rng.below(4);
+        let shape: Vec<usize> = (0..ndim).map(|_| 1 + rng.below(5)).collect();
+        let axis = rng.below(ndim);
+        let dtype = dtypes[case % dtypes.len()];
+        let itype = index_types[case % index_types.len()];
+        let n = shape[axis] as isize;
+        let values: Vec<f32> = (0..size(&shape)).map(|_| rng.f64() as f32).collect();
+        let (a, _) = random_layout(&mut rng, &shape, values);
+        let a = on(Device::cpu(), || a.astype(dtype)).unwrap();
+        let mut ishape = shape.clone();
+        ishape[axis] = 1 + rng.below(6);
+        let signed = itype.category() == Category::Signed;
+        let lo = if signed { -n } else { 0 };
+        let raw: Vec<i64> = (0..size(&ishape))
+            .map(|_| rng.range(lo, n - 1) as i64)
+            .collect();
+        let (ind, _) = random_layout(&mut rng, &ishape, raw);
+        let ind = on(Device::cpu(), || ind.astype(itype)).unwrap();
+        let what = format!("case {case}: {dtype} {shape:?} axis {axis}, {itype} {ishape:?}");
+        // Gather.
+        let f = || take_along_axis(&a, &ind, axis as isize);
+        let (cpu, gpu) = (
+            on(Device::cpu(), f).unwrap(),
+            on(Device::gpu(0), f).unwrap(),
+        );
+        if dtype == DType::Complex64 {
+            let pair = |x: &Array| x.to_vec::<Complex64>().unwrap();
+            assert_eq!(pair(&cpu), pair(&gpu), "take_along_axis {what}");
+        } else {
+            assert_eq!(f64s(&cpu), f64s(&gpu), "take_along_axis {what}");
+        }
+        // Concatenate with a transposed copy along the same axis.
+        let b = a.t().unwrap().t().unwrap();
+        let f = || concatenate(&[a.clone(), b.clone(), a.clone()], axis as isize);
+        let (cpu, gpu) = (
+            on(Device::cpu(), f).unwrap(),
+            on(Device::gpu(0), f).unwrap(),
+        );
+        if dtype != DType::Complex64 {
+            assert_eq!(f64s(&cpu), f64s(&gpu), "concatenate {what}");
+        }
+        // Scatter-add with repeated indices (accumulation order differs: a tolerance for
+        // floats), and a put with unique indices (exact).
+        if matches!(dtype, DType::F32 | DType::F16 | DType::BF16 | DType::I32) {
+            let upd = on(Device::cpu(), || a.astype(dtype)).unwrap();
+            let base = take_along_axis(&upd, &ind, axis as isize).unwrap();
+            let f = || scatter_add_along_axis(&upd, &ind, &base, axis as isize);
+            let (cpu, gpu) = (
+                on(Device::cpu(), f).unwrap(),
+                on(Device::gpu(0), f).unwrap(),
+            );
+            let eps = match dtype {
+                DType::F16 => 4e-3,
+                DType::BF16 => 3e-2,
+                DType::F32 => 1e-6,
+                _ => 0.0,
+            };
+            for (c, g) in f64s(&cpu).iter().zip(f64s(&gpu)) {
+                assert!(
+                    (c - g).abs() <= eps * 8.0 * c.abs().max(1.0),
+                    "scatter_add {what}: cpu {c} gpu {g}"
+                );
+            }
+        }
+        let unique: Vec<i64> = (0..n as i64).rev().collect();
+        let mut ushape = shape.clone();
+        ushape[axis] = n as usize;
+        let mut along = vec![1usize; ndim];
+        along[axis] = n as usize;
+        let uind = broadcast_to(&Array::from_slice(&unique, &along).unwrap(), &ushape).unwrap();
+        let f = || put_along_axis(&a, &uind, &b, axis as isize);
+        let (cpu, gpu) = (
+            on(Device::cpu(), f).unwrap(),
+            on(Device::gpu(0), f).unwrap(),
+        );
+        if dtype != DType::Complex64 {
+            assert_eq!(f64s(&cpu), f64s(&gpu), "put_along_axis {what}");
+        }
+    }
+}
+
+#[test]
+fn embedding_lookup_and_gradient_on_the_gpu() {
+    if !gpu_available() {
+        return;
+    }
+    // A vocabulary of 1000 rows of 64 values, 256 tokens with repeats.
+    let table = on(Device::cpu(), || {
+        random::uniform(-1.0, 1.0, &[1000, 64], DType::F32, Some(&random::key(3)))
+    })
+    .unwrap();
+    let tokens: Vec<u32> = (0..256).map(|i| (i * 37 % 300) as u32).collect();
+    let tokens = Array::from_slice(&tokens, &[8, 32]).unwrap();
+    let run = || {
+        let rows = take(&table, &tokens, Some(0))?;
+        let g = grad(|t: &Array| sum(&multiply(&take(t, &tokens, Some(0))?, 2.0)?, &[], false))(
+            &table,
+        )?;
+        Ok::<_, Error>((rows, g))
+    };
+    let (cpu, cpu_grad) = on(Device::cpu(), run).unwrap();
+    let (gpu, gpu_grad) = on(Device::gpu(0), run).unwrap();
+    assert_eq!(gpu.shape(), [8, 32, 64]);
+    assert_eq!(f64s(&cpu), f64s(&gpu));
+    assert_eq!(
+        f64s(&cpu_grad),
+        f64s(&gpu_grad),
+        "counts of 2.0 add exactly"
+    );
 }

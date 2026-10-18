@@ -383,6 +383,15 @@ pub fn run(case: &Case) -> Result<Vec<Array>> {
             let out_axes = [p("out_axes").parse().unwrap()];
             vmap(|ps: &[Array]| f(ps, &[]), &in_axes, &out_axes)(&xs)
         }
+        "split" => {
+            let axis = p("axis").parse().unwrap();
+            if p("at").is_empty() {
+                split(&xs[0], p("parts").parse().unwrap(), axis)
+            } else {
+                let at: Vec<usize> = p("at").split(',').map(|v| v.parse().unwrap()).collect();
+                split_at(&xs[0], &at, axis)
+            }
+        }
         op => Ok(vec![apply(case, op, xs)?]),
     }
 }
@@ -517,6 +526,17 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "broadcast_to" => broadcast_to(&xs[0], &usizes(p("shape"))),
         "expand_dims" => expand_dims(&xs[0], p("axis").parse().unwrap()),
         "squeeze" => squeeze(&xs[0], &ints(p("axes"))),
+        "take" => {
+            let axis = (!p("axis").is_empty()).then(|| p("axis").parse().unwrap());
+            take(&xs[0], &xs[1], axis)
+        }
+        "take_along_axis" => take_along_axis(&xs[0], &xs[1], p("axis").parse().unwrap()),
+        "put_along_axis" => {
+            let (i, v) = if p("order") == "avi" { (2, 1) } else { (1, 2) };
+            put_along_axis(&xs[0], &xs[i], &xs[v], p("axis").parse().unwrap())
+        }
+        "concatenate" => concatenate(&xs, p("axis").parse().unwrap()),
+        "stack" => stack(&xs, p("axis").parse().unwrap()),
         "argmax" | "argmin" => {
             let axis = if p("axis").is_empty() {
                 None

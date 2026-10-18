@@ -11,7 +11,7 @@ use crate::ops::{
     self, broadcast_to, conjugate, cos, divide, equal, greater, greater_equal, less, less_equal,
     matmul, multiply, negative, reshape, sin, subtract, sum, transpose, where_,
 };
-use crate::primitive::{BinaryOp, Primitive, ReduceOp, UnaryOp};
+use crate::primitive::{BinaryOp, Primitive, ReduceOp, ScatterReduce, UnaryOp};
 use crate::quantized::{dequantize, quantized_matmul};
 use crate::{DType, Error, Result};
 
@@ -286,6 +286,63 @@ impl Primitive {
                 };
                 one(record(update, vec![zeros_like(x)?, g.clone()]))
             }
+            Self::GatherAxis { axis } => {
+                // Repeated indices accumulate their cotangents.
+                let scatter = Self::ScatterAxis {
+                    axis: *axis,
+                    reduce: ScatterReduce::Sum,
+                };
+                let src = match wanted[0] {
+                    true => Some(record(
+                        scatter,
+                        vec![zeros_like(x)?, inputs[1].clone(), g.clone()],
+                    )?),
+                    false => None,
+                };
+                Ok(vec![src, None])
+            }
+            Self::ScatterAxis { axis, reduce } => {
+                let (indices, updates) = (&inputs[1], &inputs[2]);
+                let dst = match (wanted[0], reduce) {
+                    (false, _) => None,
+                    // Overwritten positions get no gradient.
+                    (true, ScatterReduce::None) => Some(record(
+                        self.clone(),
+                        vec![g.clone(), indices.clone(), zeros_like(updates)?],
+                    )?),
+                    (true, _) => Some(g.clone()),
+                };
+                let gathered = match wanted[2] {
+                    true => Some(record(
+                        Self::GatherAxis { axis: *axis },
+                        vec![g.clone(), indices.clone()],
+                    )?),
+                    false => None,
+                };
+                Ok(vec![dst, None, gathered])
+            }
+            Self::Concatenate { axis } => {
+                let mut start = 0;
+                inputs
+                    .iter()
+                    .zip(wanted)
+                    .map(|(a, &w)| {
+                        let first = start;
+                        start += a.shape()[*axis];
+                        if !w {
+                            return Ok(None);
+                        }
+                        let mut begin = vec![0; a.ndim()];
+                        begin[*axis] = first;
+                        let part = Self::Slice {
+                            start: begin,
+                            step: vec![1; a.ndim()],
+                            len: a.shape().to_vec(),
+                        };
+                        Ok(Some(record(part, vec![g.clone()])?))
+                    })
+                    .collect()
+            }
             Self::SliceUpdate { start, step, len } => {
                 let update = &inputs[1];
                 let base = match wanted[0] {
@@ -475,6 +532,17 @@ impl Primitive {
             Self::Transpose(axes) => one(transpose(&tangent(0)?, axes)),
             Self::Slice { .. } | Self::Broadcast(_) => one(record(self.clone(), vec![tangent(0)?])),
             Self::SliceUpdate { .. } => one(record(self.clone(), vec![tangent(0)?, tangent(1)?])),
+            Self::GatherAxis { .. } => {
+                one(record(self.clone(), vec![tangent(0)?, inputs[1].clone()]))
+            }
+            Self::ScatterAxis { .. } => one(record(
+                self.clone(),
+                vec![tangent(0)?, inputs[1].clone(), tangent(2)?],
+            )),
+            Self::Concatenate { .. } => one(record(
+                self.clone(),
+                (0..inputs.len()).map(tangent).collect::<Result<_>>()?,
+            )),
             Self::StopGradient | Self::ArgReduce { .. } | Self::RandomBits { .. } => {
                 one(zeros_like(out))
             }

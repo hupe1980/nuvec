@@ -117,6 +117,29 @@ impl Primitive {
                 op: *op,
                 axis: axis + 1,
             }),
+            // Every operand gets the batch axis first (unbatched ones broadcast).
+            Self::GatherAxis { axis } => {
+                let all = (0..inputs.len())
+                    .map(|i| front_full(&inputs[i], axes[i], b))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((record(Self::GatherAxis { axis: axis + 1 }, all)?, 0))
+            }
+            Self::ScatterAxis { axis, reduce } => {
+                let all = (0..inputs.len())
+                    .map(|i| front_full(&inputs[i], axes[i], b))
+                    .collect::<Result<Vec<_>>>()?;
+                let batched = Self::ScatterAxis {
+                    axis: axis + 1,
+                    reduce: *reduce,
+                };
+                Ok((record(batched, all)?, 0))
+            }
+            Self::Concatenate { axis } => {
+                let all = (0..inputs.len())
+                    .map(|i| front_full(&inputs[i], axes[i], b))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((record(Self::Concatenate { axis: axis + 1 }, all)?, 0))
+            }
             // `matmul` broadcasts the size-1 batch axis of an unbatched operand.
             Self::Matmul => Ok((
                 vec![matmul(&front(x, axes[0])?, &front(&inputs[1], axes[1])?)?],

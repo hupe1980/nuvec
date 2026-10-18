@@ -56,6 +56,7 @@ pub mod fast;
 mod file;
 mod fused;
 mod gpu;
+mod indexing;
 mod kernels;
 mod ops;
 mod primitive;
@@ -74,6 +75,10 @@ pub use error::{Error, Result};
 pub use eval::{async_eval, eval};
 pub use file::MappedFile;
 pub use fused::{Fused, FusedRef};
+pub use indexing::{
+    concatenate, put_along_axis, scatter_add_along_axis, split, split_at, stack, take,
+    take_along_axis,
+};
 pub use ops::{
     abs, add, addmm, all, any, arange, argmax, argmin, astype, broadcast_to, conjugate, cos,
     divide, equal, erfinv, exp, expand_dims, greater, greater_equal, less, less_equal, log,
@@ -81,7 +86,7 @@ pub use ops::{
     reshape, sigmoid, sin, slice, softmax, sqrt, squeeze, stop_gradient, subtract, sum, tanh,
     transpose, where_, zeros,
 };
-pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, UnaryOp};
+pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, ScatterReduce, UnaryOp};
 pub use quantized::{dequantize, quantize, quantized_matmul};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
 pub use shape::Flags;
