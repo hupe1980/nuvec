@@ -52,9 +52,9 @@ pub use nuvec_core::{
     divide, equal, erfinv, eval, exp, expand_dims, f16, grad, greater, greater_equal, jvp, less,
     less_equal, log, logsumexp, matmul, max, maximum, mean, min, minimum, multiply, negative,
     not_equal, ones, prod, promote_types, put_along_axis, quantize, quantized_matmul, reshape,
-    scatter_add_along_axis, set_default_stream, sigmoid, sign, sin, slice, softmax, split,
-    split_at, sqrt, squeeze, stack, stop_gradient, subtract, sum, take, take_along_axis, tanh,
-    transpose, value_and_grad, vjp, vmap, where_, zeros,
+    scatter_add_along_axis, set_default_stream, sigmoid, sign, sin, slice, slice_update, softmax,
+    split, split_at, sqrt, squeeze, stack, stop_gradient, subtract, sum, take, take_along_axis,
+    tanh, transpose, value_and_grad, vjp, vmap, where_, zeros,
 };
 pub use nuvec_core::{fast, random};
 pub use nuvec_cpu as cpu;

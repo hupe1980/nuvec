@@ -1,12 +1,13 @@
 //! Reading and writing arrays: safetensors (MLX's checkpoint format) and NumPy's `.npy`,
-//! loaded without a copy by memory-mapping the file, and the IDX format (MNIST).
+//! loaded without a copy by memory-mapping the file, and the IDX format (MNIST); a
+//! minimal [`json`] parser for model files.
 //!
 //! **Status:** pre-alpha.
 
 #![forbid(unsafe_code)]
 
 mod idx;
-mod json;
+pub mod json;
 mod npy;
 mod safetensors;
 

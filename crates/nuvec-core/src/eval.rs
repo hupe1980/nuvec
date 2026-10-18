@@ -109,7 +109,12 @@ fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
     };
     #[cfg(test)]
     counter::inc();
-    match compute(node, &primitive, &inputs, gpu) {
+    let mut inputs = inputs;
+    let result = match donation(node, &primitive, &mut inputs, gpu) {
+        Some(base) => in_place(node, &primitive, &inputs, base, gpu),
+        None => compute(node, &primitive, &inputs, gpu),
+    };
+    match result {
         Ok((outputs, true)) => gpu.defer(node.clone(), outputs),
         Ok((outputs, false)) => {
             for (output, data) in node.outputs.iter().zip(outputs) {
@@ -130,6 +135,90 @@ fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
     drop(inputs); // detach: release the inputs outside the lock
 }
 
+/// The buffer of a `slice_update`'s base, taken over to be written in place (MLX's
+/// donation): only when the evaluation owns the base outright — its node has no other
+/// handle (so no other array, view or pending work refers to it), it is finished, and its
+/// data is the whole of a writable buffer with no other handle. Ownership proves the
+/// write exclusive, so no reference counting of other users is needed.
+fn donation(
+    node: &Node,
+    primitive: &Primitive,
+    inputs: &mut [Array],
+    gpu: &GpuEval,
+) -> Option<Data> {
+    let device = node.stream.device;
+    if !matches!(primitive, Primitive::SliceUpdate { .. })
+        || node.tracer
+        || device.kind == DeviceKind::Cpu
+        || !gpu.available(device)
+    {
+        return None;
+    }
+    let base = Arc::get_mut(&mut inputs[0].node)?;
+    let [out] = base.outputs.as_mut_slice() else {
+        return None;
+    };
+    let Some(Ok(data)) = out.slot.get() else {
+        return None;
+    };
+    // The slot and (if it was published from in-flight work) the in-flight copy.
+    let handles = 1 + usize::from(out.inflight.get().is_some());
+    if !out.flags.row_contiguous
+        || !crate::gpu::writable(data, out)
+        || Arc::strong_count(&data.buffer) != handles
+    {
+        return None;
+    }
+    out.inflight.take();
+    match out.slot.take() {
+        Some(Ok(data)) => Some(data),
+        _ => None,
+    }
+}
+
+/// A `slice_update` written into its donated base.
+fn in_place(
+    node: &Node,
+    primitive: &Primitive,
+    inputs: &[Array],
+    base: Data,
+    gpu: &mut GpuEval,
+) -> Result<(Vec<Data>, bool)> {
+    let (mut pending, mut foreign) = (false, Vec::new());
+    let update = input_data(&inputs[1], gpu, &mut pending, &mut foreign)?;
+    let slices = primitive.dim_slices(node.outputs[0].shape.len())?;
+    let out = &node.outputs[0];
+    let data = gpu.slice_update_in_place(base, out, (inputs[1].out(), &update), &slices)?;
+    Ok((vec![data], true))
+}
+
+/// An input's data: from this evaluation's GPU work, evaluated, or in flight in another
+/// evaluation (then `pending`, and recorded in `foreign`).
+fn input_data<'a>(
+    input: &'a Array,
+    gpu: &mut GpuEval,
+    pending: &mut bool,
+    foreign: &mut Vec<&'a Array>,
+) -> Result<Data> {
+    if let Some(d) = gpu.lookup(&input.node, input.output) {
+        *pending = true;
+        Ok(d)
+    } else if let Some(result) = input.out().slot.get() {
+        result.clone()
+    } else if let Some(d) = input.out().inflight.get() {
+        // Committed by another evaluation on the device timeline: GPU work encoded now
+        // runs after it, so it may read the data at once.
+        *pending = true;
+        foreign.push(input);
+        Ok(d.clone())
+    } else {
+        // Produced by another evaluation (another thread, or an earlier `async_eval`):
+        // submit our own GPU work first, so two evaluations never wait on each other.
+        gpu.commit();
+        input.out().slot.wait().clone()
+    }
+}
+
 /// Computes a node's outputs. The flag is true if they depend on GPU work that has not
 /// completed yet (and must be deferred until it has).
 fn compute(
@@ -143,23 +232,7 @@ fn compute(
     // Inputs read from another evaluation's in-flight GPU work.
     let mut foreign = Vec::new();
     for input in inputs {
-        if let Some(d) = gpu.lookup(&input.node, input.output) {
-            pending = true;
-            data.push(d);
-        } else if let Some(result) = input.out().slot.get() {
-            data.push(result.clone()?);
-        } else if let Some(d) = input.out().inflight.get() {
-            // Committed by another evaluation on the device timeline: GPU work encoded now
-            // runs after it, so it may read the data at once.
-            pending = true;
-            foreign.push(input);
-            data.push(d.clone());
-        } else {
-            // Produced by another evaluation (another thread, or an earlier `async_eval`):
-            // submit our own GPU work first, so two evaluations never wait on each other.
-            gpu.commit();
-            data.push(input.out().slot.wait().clone()?);
-        }
+        data.push(input_data(input, gpu, &mut pending, &mut foreign)?);
     }
     let operands: Vec<Operand<'_>> = inputs
         .iter()

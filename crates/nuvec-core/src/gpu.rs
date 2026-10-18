@@ -28,6 +28,20 @@ pub(crate) use metal::GpuEval;
 #[cfg(not(all(target_os = "macos", not(miri))))]
 pub(crate) use stub::GpuEval;
 
+/// Whether `data` can be written in place as `meta`'s storage: the whole of a writable
+/// Metal buffer (not a mapped file), from offset 0.
+pub(crate) fn writable(data: &Data, meta: &Output) -> bool {
+    #[cfg(all(target_os = "macos", not(miri)))]
+    return data.offset == 0
+        && data.buffer.len() == meta.size * meta.dtype.size()
+        && data.buffer.metal().is_some_and(|b| !b.is_mapped());
+    #[cfg(not(all(target_os = "macos", not(miri))))]
+    {
+        let _ = (data, meta);
+        false
+    }
+}
+
 /// Shared by both implementations: publish outputs to a node's slots.
 fn publish(node: &Node, outputs: Vec<Data>, result: &Result<()>) {
     for (output, data) in node.outputs.iter().zip(outputs) {
@@ -65,6 +79,15 @@ mod stub {
         }
         pub(crate) fn defer(&mut self, node: Arc<Node>, outputs: Vec<Data>) {
             publish(&node, outputs, &Ok(()));
+        }
+        pub(crate) fn slice_update_in_place(
+            &mut self,
+            _: Data,
+            _: &Output,
+            _: Operand<'_>,
+            _: &[crate::view::DimSlice],
+        ) -> Result<Data> {
+            unreachable!("nothing is writable without Metal")
         }
         pub(crate) fn commit(&mut self) {}
         pub(crate) fn depend_on(&mut self, _: &[&crate::Array]) {}
@@ -626,7 +649,12 @@ mod metal {
                 (Primitive::Quantize { .. }, Some(d)) => is_float(d) && operands[0].0.size > 0,
                 (Primitive::Fast(_), Some(d)) => is_float(d) && operands[0].0.size > 0,
                 (Primitive::Compiled(_), _) => true,
-                (Primitive::GatherAxis { .. } | Primitive::Concatenate { .. }, _) => true,
+                (
+                    Primitive::GatherAxis { .. }
+                    | Primitive::Concatenate { .. }
+                    | Primitive::SliceUpdate { .. },
+                    _,
+                ) => true,
                 (Primitive::ScatterAxis { reduce, .. }, Some(d)) => {
                     *reduce == crate::ScatterReduce::None
                         || matches!(
@@ -695,6 +723,13 @@ mod metal {
                 }
                 Primitive::Concatenate { axis } => {
                     self.concatenate(operands, out, *axis, &mut buffer)?
+                }
+                Primitive::SliceUpdate { .. } => {
+                    self.copy(operands[0], &mut buffer)?;
+                    let slices = primitive.dim_slices(out.shape.len())?;
+                    let strides = crate::shape::row_contiguous_strides(&out.shape);
+                    let (region, delta) = crate::view::slice_geometry(&strides, &slices);
+                    self.copy_into(operands[1], &region, delta, &mut buffer)?;
                 }
                 Primitive::Reduce { op, axes } => {
                     self.reduce(*op, axes, operands[0], &mut buffer)?
@@ -910,6 +945,50 @@ mod metal {
             self.dispatch(&name, &args, upd.size)
         }
 
+        /// `slice_update` written into its base's own buffer (`base`, donated: no other
+        /// handle exists): only the update's region is written.
+        pub(crate) fn slice_update_in_place(
+            &mut self,
+            mut base: Data,
+            out: &Output,
+            update: Operand<'_>,
+            slices: &[crate::view::DimSlice],
+        ) -> Result<Data> {
+            let strides = crate::shape::row_contiguous_strides(&out.shape);
+            let (region, delta) = crate::view::slice_geometry(&strides, slices);
+            let buffer = Arc::get_mut(&mut base.buffer).expect("donated data has one handle");
+            self.copy_into(update, &region, delta, buffer)?;
+            Ok(base)
+        }
+
+        /// Copies an operand into the region of `buffer` at element `offset` with `strides`.
+        fn copy_into(
+            &mut self,
+            (meta, data): Operand<'_>,
+            strides: &[isize],
+            offset: isize,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            if meta.size == 0 {
+                return Ok(());
+            }
+            let consts = [
+                bytes(&(data.offset as i64)),
+                bytes(&(offset as i64)),
+                shape_bytes(&meta.shape),
+                strides_bytes(&meta.strides),
+                strides_bytes(strides),
+                bytes(&(meta.shape.len() as i32)),
+            ];
+            let mut args = vec![
+                Arg::read(data.buffer.metal().expect("checked")),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+            ];
+            args.extend(consts.iter().map(|c| Arg::bytes(c)));
+            let name = format!("nuvec_copy_into_{}", bits(meta.dtype.size()));
+            self.dispatch(&name, &args, meta.size)
+        }
+
         /// `concatenate`: each input copied into its region of the output.
         fn concatenate(
             &mut self,
@@ -919,28 +998,11 @@ mod metal {
             buffer: &mut Buffer,
         ) -> Result<()> {
             let out_strides = crate::shape::row_contiguous_strides(&out.shape);
-            let name = format!("nuvec_copy_into_{}", bits(out.dtype.size()));
             let mut start = 0isize;
-            for &(meta, data) in operands {
+            for &operand in operands {
                 let offset = start * out_strides[axis];
-                start += meta.shape[axis] as isize;
-                if meta.size == 0 {
-                    continue;
-                }
-                let consts = [
-                    bytes(&(data.offset as i64)),
-                    bytes(&(offset as i64)),
-                    shape_bytes(&meta.shape),
-                    strides_bytes(&meta.strides),
-                    strides_bytes(&out_strides),
-                    bytes(&(meta.shape.len() as i32)),
-                ];
-                let mut args = vec![
-                    Arg::read(data.buffer.metal().expect("checked")),
-                    Arg::write(buffer.metal_mut().expect("device storage")),
-                ];
-                args.extend(consts.iter().map(|c| Arg::bytes(c)));
-                self.dispatch(&name, &args, meta.size)?;
+                start += operand.0.shape[axis] as isize;
+                self.copy_into(operand, &out_strides, offset, buffer)?;
             }
             Ok(())
         }
@@ -1109,7 +1171,11 @@ mod metal {
                 Arg::write(buffer.metal_mut().expect("device storage")),
             ];
             args.extend(consts.iter().map(|c| Arg::bytes(c)));
-            self.dispatch(&name, &args, out.size)
+            // One threadgroup per output, up to 1024 threads (a power of two) scanning
+            // at least 4 elements each.
+            let n = meta.shape[axis];
+            let threads = (n / 4).clamp(1, 1024).next_power_of_two().min(1024);
+            self.dispatch_groups(&name, &args, [out.size, 1, 1], [threads, 1, 1])
         }
 
         fn matmul(

@@ -7,7 +7,8 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 
 > **Status: pre-alpha.** Lazy arrays with 14 dtypes, MLX type promotion, broadcasting,
 > zero-copy views, indexing and joining (`take`, `take_along_axis`, `put_along_axis`,
-> `concatenate`, `stack`, `split`), element-wise operations with weak Rust scalars (`&x * 2.0` keeps `x`'s
+> `concatenate`, `stack`, `split`, `slice_update`, written in place on the GPU when nothing
+> else refers to the updated array), element-wise operations with weak Rust scalars (`&x * 2.0` keeps `x`'s
 > dtype), reductions, matmul and composable transforms (`grad`, `value_and_grad`, `vjp`,
 > `jvp`, `vmap`, `custom_function`, `checkpoint`; also through complex numbers), `compile`
 > (traced once per input signature, simplified, element-wise chains fused into generated
@@ -21,7 +22,10 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > building blocks (`nuvec-nn`: modules as named parameter trees loaded by name, `Linear`,
 > `QuantizedLinear`, `Embedding`, `RmsNorm`, `LayerNorm`, `Rope`, LoRA, activations,
 > cross-entropy, SGD, Adam, AdamW, Lion and Muon with learning-rate schedules and gradient
-> clipping; `just mnist` trains MLX's MNIST example model). Arrays are
+> clipping; `just mnist` trains MLX's MNIST example model), and an LLM runtime (`nuvec-lm`:
+> Llama, Mistral, Qwen 2 and Qwen 3 models from Hugging Face or MLX checkpoints, including
+> MLX's 4-bit ones, a byte-level BPE tokenizer read from `tokenizer.json`, a KV cache and
+> greedy or temperature sampling; `cargo run --release -p nuvec-lm --example generate`). Arrays are
 > evaluated on the GPU by default (Metal kernels on unified memory, submitted asynchronously;
 > `async_eval` overlaps host work with GPU work) or on the CPU
 > (`set_default_stream(Stream::default_for(Device::cpu()))`).
@@ -68,7 +72,10 @@ Python is not needed to build or test. With [uv](https://docs.astral.sh/uv/) ins
   matrix products and fused operations, nuvec vs MLX
 - `just bench-compile`: compiled element-wise functions, nuvec vs MLX
 - `just bench-load`: loading a 2 GiB safetensors checkpoint, nuvec vs MLX
+- `just bench-lm`: text generation (prefill and decode) with a model from the local Hugging
+  Face cache, nuvec-lm vs mlx-lm
 - `just io-fixtures`: re-records the safetensors and npy files written by MLX and NumPy
+- `just lm-fixtures`: re-records tiny models of each LLM variant and their outputs with mlx-lm
 - `just nn-fixtures`: re-records the `mlx.nn` and `mlx.optimizers` results `nuvec-nn` is
   tested against
 

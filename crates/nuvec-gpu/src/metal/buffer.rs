@@ -208,7 +208,7 @@ impl Buffer {
     }
 
     /// Whether the buffer is a read-only mapped file.
-    pub(crate) fn is_mapped(&self) -> bool {
+    pub fn is_mapped(&self) -> bool {
         self.mapped
     }
 

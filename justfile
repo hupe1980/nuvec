@@ -52,6 +52,10 @@ metal-check:
 fixtures:
     uv run scripts/mlx_fixtures.py
 
+# Re-records the nuvec-lm fixtures (tiny models and their outputs) with mlx-lm (needs uv).
+lm-fixtures:
+    uv run scripts/lm_fixtures.py
+
 # Re-records the nuvec-nn fixtures from MLX (needs uv).
 nn-fixtures:
     uv run scripts/nn_fixtures.py
@@ -79,6 +83,10 @@ bench-fast:
 # GPU compiled element-wise functions (GELU, SwiGLU gating, Adam step): nuvec vs MLX.
 bench-compile:
     uv run scripts/bench_compile.py
+
+# Text generation (prefill and decode) with a cached model: nuvec-lm vs mlx-lm.
+bench-lm model="mlx-community/Qwen3-8B-4bit" tokens="256":
+    uv run scripts/bench_lm.py {{model}} {{tokens}}
 
 # Checkpoint loading (2 GiB safetensors, warm page cache): nuvec vs MLX.
 bench-load:

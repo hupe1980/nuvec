@@ -156,6 +156,68 @@ impl Module for Embedding {
     }
 }
 
+/// An [`Embedding`] with its table quantized (MLX's `nn.QuantizedEmbedding`): rows are
+/// gathered packed and dequantized; the packed table, scales and biases are frozen.
+#[derive(Debug, Clone)]
+pub struct QuantizedEmbedding {
+    /// The packed table (uint32), `[num_embeddings, dims · bits / 32]`.
+    pub weight: Array,
+    /// One scale per group of values, `[num_embeddings, dims / group_size]`.
+    pub scales: Array,
+    /// One bias per group of values, shaped like `scales`.
+    pub biases: Array,
+    /// Values per scale and bias.
+    pub group_size: usize,
+    /// Bits per value.
+    pub bits: u32,
+}
+
+impl QuantizedEmbedding {
+    /// Quantizes `embedding`'s table in groups of `group_size` values with `bits` bits.
+    pub fn from_embedding(embedding: &Embedding, group_size: usize, bits: u32) -> Result<Self> {
+        let (weight, scales, biases) = quantize(&embedding.weight, group_size, bits)?;
+        Ok(Self {
+            weight,
+            scales,
+            biases,
+            group_size,
+            bits,
+        })
+    }
+
+    /// The rows for the ids in `x`, dequantized: shape `x.shape + [dims]`.
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        dequantize(
+            &take(&self.weight, x, Some(0))?,
+            &take(&self.scales, x, Some(0))?,
+            &take(&self.biases, x, Some(0))?,
+            self.group_size,
+            self.bits,
+        )
+    }
+
+    /// `x Wᵀ` with the quantized table (tied embeddings).
+    pub fn as_linear(&self, x: &Array) -> Result<Array> {
+        quantized_matmul(
+            x,
+            &self.weight,
+            &self.scales,
+            &self.biases,
+            true,
+            self.group_size,
+            self.bits,
+        )
+    }
+}
+
+impl Module for QuantizedEmbedding {
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        p.frozen("weight", &mut self.weight);
+        p.frozen("scales", &mut self.scales);
+        p.frozen("biases", &mut self.biases);
+    }
+}
+
 /// Root-mean-square normalisation over the last axis with a learned scale (MLX's
 /// `nn.RMSNorm`, the fused `fast::rms_norm`).
 #[derive(Debug, Clone)]

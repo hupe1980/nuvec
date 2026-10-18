@@ -316,6 +316,36 @@ pub fn slice(a: &Array, args: &[SliceArg]) -> Result<Array> {
 }
 
 /// `a` unchanged, but no gradient flows through it in [`crate::vjp`], [`crate::jvp`] and
+/// A copy of `a` with the region selected as by [`slice()`] replaced by `update` (MLX's
+/// `slice_update`, `a[...] = update`): `update` broadcasts to the region's shape and takes
+/// `a`'s dtype.
+///
+/// ```
+/// use nuvec_core::{Array, Result, SliceArg, slice_update};
+///
+/// # fn main() -> Result<()> {
+/// let a = Array::from_slice(&[0.0f32; 6], &[2, 3])?;
+/// let u = Array::from_slice(&[1.0f32, 2.0], &[2, 1])?;
+/// let b = slice_update(&a, &u, &[SliceArg::full(), SliceArg::from(1..2)])?;
+/// assert_eq!(b.to_vec::<f32>()?, [0.0, 1.0, 0.0, 0.0, 2.0, 0.0]);
+/// # Ok(())
+/// # }
+/// ```
+pub fn slice_update(a: &Array, update: &Array, args: &[SliceArg]) -> Result<Array> {
+    check_inputs(&[a, update])?;
+    let dims = view::normalize_slice(a.shape(), args)?;
+    let len: Vec<usize> = dims.iter().map(|d| d.len).collect();
+    let update = broadcast_to(&astype(update, a.dtype())?, &len)?;
+    single(
+        Primitive::SliceUpdate {
+            start: dims.iter().map(|d| d.start).collect(),
+            step: dims.iter().map(|d| d.step).collect(),
+            len,
+        },
+        vec![a.clone(), update],
+    )
+}
+
 /// [`crate::grad`]. Shares the data.
 pub fn stop_gradient(a: &Array) -> Result<Array> {
     check_inputs(&[a])?;

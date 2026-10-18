@@ -66,6 +66,9 @@ allow-build-scripts = [
     { crate = "libm" },
     { crate = "paste" },
     { crate = "pulp" },
+    # Via `nuvec-lm`'s tokenizer: compiles its own Unicode category table into a Rust
+    # lookup table (OUT_DIR), no native code.
+    { crate = "unicode-general-category" },
     # Via `gemm-common` -> `sysctl` (CPU feature detection on macOS). `libc` is FFI to the
     # OS's own C library (system API, as allowed by D-001); both scripts are compiler probes.
     { crate = "libc" },

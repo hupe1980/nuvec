@@ -2,7 +2,8 @@
 //!
 //! - [`Module`]: named parameter trees (`layers.0.weight`), trainable or frozen, loaded
 //!   from checkpoints by name ([`Module::load_weights`]).
-//! - Layers ([`layers`]): [`Linear`], [`QuantizedLinear`], [`Embedding`], [`RmsNorm`],
+//! - Layers ([`layers`]): [`Linear`], [`QuantizedLinear`], [`Embedding`],
+//!   [`QuantizedEmbedding`], [`RmsNorm`],
 //!   [`LayerNorm`], [`Rope`] and [`LoraLinear`]; activations [`relu`], [`silu`],
 //!   [`gelu_approx`] and [`gelu_fast_approx`].
 //! - [`losses::cross_entropy`], [`value_and_grad`] for a model's loss, and
@@ -63,7 +64,9 @@ pub mod layers;
 pub mod losses;
 pub mod optim;
 
-pub use layers::{Embedding, LayerNorm, Linear, LoraLinear, QuantizedLinear, RmsNorm, Rope};
+pub use layers::{
+    Embedding, LayerNorm, Linear, LoraLinear, QuantizedEmbedding, QuantizedLinear, RmsNorm, Rope,
+};
 
 /// The version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

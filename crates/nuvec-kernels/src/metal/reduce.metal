@@ -122,8 +122,23 @@ template <typename T, typename A, typename Op>
     }
 }
 
-// Index of the maximum (or minimum) along one axis: first occurrence wins, the first NaN
-// wins over any number.
+// Whether `(x, i)` beats `(best, best_i)` for an arg-reduction: the first NaN wins, then
+// the larger (smaller) value, then the smaller index (MLX's `ArgMax`/`ArgMin`).
+template <typename T, bool IS_MAX>
+inline bool arg_better(T x, uint i, T best, uint best_i) {
+    if (is_nan_(x)) {
+        return !is_nan_(best) || i < best_i;
+    }
+    if (is_nan_(best)) {
+        return false;
+    }
+    bool strictly = IS_MAX ? op_lt(best, x) : op_lt(x, best);
+    return strictly || (op_eq(x, best) && i < best_i);
+}
+
+// Index of the maximum (or minimum) along one axis, one threadgroup per output (as MLX's
+// `arg_reduce_general`): each thread scans a strided share of the axis, then the
+// threadgroup reduces the candidates in shared memory.
 template <typename T, bool IS_MAX>
 [[kernel]] void arg_reduce(
     device const T* in [[buffer(0)]],
@@ -134,19 +149,39 @@ template <typename T, bool IS_MAX>
     constant int& kept_ndim [[buffer(5)]],
     constant uint& n [[buffer(6)]],
     constant long& axis_stride [[buffer(7)]],
-    uint i [[thread_position_in_grid]]) {
-    long base = offset + loc(i, kept_shape, kept_strides, kept_ndim);
-    T best = in[base];
-    uint best_i = 0;
-    for (uint j = 1; j < n && !is_nan_(best); ++j) {
+    uint row [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lsize [[threads_per_threadgroup]]) {
+    threadgroup T vals[1024];
+    threadgroup uint idxs[1024];
+    long base = offset + loc(row, kept_shape, kept_strides, kept_ndim);
+    uint best_i = UINT_MAX;
+    T best = T();
+    for (uint j = lid; j < n; j += lsize) {
         T x = in[base + long(j) * axis_stride];
-        bool better = IS_MAX ? op_lt(best, x) : op_lt(x, best);
-        if (is_nan_(x) || better) {
+        if (best_i == UINT_MAX || arg_better<T, IS_MAX>(x, j, best, best_i)) {
             best = x;
             best_i = j;
         }
     }
-    out[i] = best_i;
+    vals[lid] = best;
+    idxs[lid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = lsize / 2; s > 0; s /= 2) {
+        if (lid < s) {
+            uint j = idxs[lid + s];
+            if (j != UINT_MAX
+                && (idxs[lid] == UINT_MAX
+                    || arg_better<T, IS_MAX>(vals[lid + s], j, vals[lid], idxs[lid]))) {
+                vals[lid] = vals[lid + s];
+                idxs[lid] = j;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) {
+        out[row] = idxs[0] == UINT_MAX ? 0 : idxs[0];
+    }
 }
 
 #define NUVEC_REDUCE(op, Op, name, T, A)                                                        \
@@ -158,10 +193,10 @@ template <typename T, bool IS_MAX>
 #define NUVEC_ARG_REDUCE(name, T)                                                                 \
     template [[host_name("nuvec_argmax_" #name)]] [[kernel]] void arg_reduce<T, true>(            \
         device const T*, device uint*, constant long&, constant int*, constant long*, constant int&, \
-        constant uint&, constant long&, uint);                                                    \
+        constant uint&, constant long&, uint, uint, uint);                                        \
     template [[host_name("nuvec_argmin_" #name)]] [[kernel]] void arg_reduce<T, false>(           \
         device const T*, device uint*, constant long&, constant int*, constant long*, constant int&, \
-        constant uint&, constant long&, uint);
+        constant uint&, constant long&, uint, uint, uint);
 
 #define NUVEC_INT_REDUCE(name, T)                       \
     NUVEC_REDUCE(sum, ISum<T>, name, T, T)              \
