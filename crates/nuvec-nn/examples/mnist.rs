@@ -2,11 +2,12 @@
 //! SGD with learning rate 0.1, batch 256) on the default device (the GPU when available).
 //!
 //! ```text
-//! cargo run --release -p nuvec-nn --example mnist -- <dir with the four MNIST idx files> [--cpu] [--epochs N] [--async]
+//! cargo run --release -p nuvec-nn --example mnist -- <dir with the four MNIST idx files> [--cpu] [--epochs N] [--async] [--compile]
 //! ```
 //!
 //! With `--async`, each step's parameters are submitted with `async_eval`, so the next batch
-//! and graph are built while the GPU runs the step.
+//! and graph are built while the GPU runs the step. With `--compile`, the training step
+//! (forward, gradients and update) is compiled, as MLX's example does with `mx.compile`.
 //!
 //! `just mnist` downloads MNIST and compares with MLX.
 
@@ -105,6 +106,7 @@ fn main() -> Result<()> {
         .and_then(|i| args.get(i + 1))
         .map_or(10, |v| v.parse().expect("--epochs takes a number"));
     let asynchronous = args.iter().any(|a| a == "--async");
+    let compiled = args.iter().any(|a| a == "--compile");
     if args.iter().any(|a| a == "--cpu") {
         set_default_stream(Stream::default_for(Device::cpu()));
     }
@@ -121,6 +123,19 @@ fn main() -> Result<()> {
     let mut model = Mlp::new(&[pixels, 32, 32, 10])?;
     nuvec::eval(&model.parameters())?;
     let mut optimizer = Sgd::new(lr);
+    // The step as a function of the parameters and the batch, returning new parameters.
+    let k = model.parameters().len();
+    let template = model.clone();
+    let step = nuvec::compile(move |xs: &[Array]| {
+        let mut m = template.clone();
+        m.set_parameters(&xs[..k])?;
+        let (x, y) = (&xs[k], &xs[k + 1]);
+        let (_, grads) = value_and_grad(&m, |m: &Mlp| {
+            cross_entropy(&m.forward(x)?, y, Reduction::Mean)
+        })?;
+        Sgd::new(lr).update(&mut m, &grads)?;
+        Ok(m.parameters())
+    });
     let mut shuffle = Shuffle(0);
     let device = nuvec::default_stream().device;
     let mut times = Vec::new();
@@ -136,10 +151,16 @@ fn main() -> Result<()> {
             let yb: Vec<u32> = ids.iter().map(|&i| train_y[i]).collect();
             let x = Array::from_slice(&xb, &[ids.len(), pixels])?;
             let y = Array::from_slice(&yb, &[ids.len()])?;
-            let (_, grads) = value_and_grad(&model, |m: &Mlp| {
-                cross_entropy(&m.forward(&x)?, &y, Reduction::Mean)
-            })?;
-            optimizer.update(&mut model, &grads)?;
+            if compiled {
+                let mut args = model.parameters();
+                args.extend([x, y]);
+                model.set_parameters(&step(&args)?)?;
+            } else {
+                let (_, grads) = value_and_grad(&model, |m: &Mlp| {
+                    cross_entropy(&m.forward(&x)?, &y, Reduction::Mean)
+                })?;
+                optimizer.update(&mut model, &grads)?;
+            }
             if asynchronous {
                 nuvec::async_eval(&model.parameters())?;
             } else {
@@ -157,7 +178,7 @@ fn main() -> Result<()> {
     steady.sort_by(f64::total_cmp);
     let median = steady.get(steady.len() / 2).copied().unwrap_or(times[0]);
     println!(
-        "RESULT device={device} async={asynchronous} accuracy={accuracy:.4} epoch_seconds={median:.4}"
+        "RESULT device={device} async={asynchronous} compiled={compiled} accuracy={accuracy:.4} epoch_seconds={median:.4}"
     );
     Ok(())
 }

@@ -54,6 +54,7 @@ mod error;
 mod eval;
 pub mod fast;
 mod file;
+mod fused;
 mod gpu;
 mod kernels;
 mod ops;
@@ -72,6 +73,7 @@ pub use dtype::{Category, Complex64, DType, Element, at_least_float, bf16, f16, 
 pub use error::{Error, Result};
 pub use eval::{async_eval, eval};
 pub use file::MappedFile;
+pub use fused::{Fused, FusedRef};
 pub use ops::{
     abs, add, addmm, all, any, arange, argmax, argmin, astype, broadcast_to, conjugate, cos,
     divide, equal, erfinv, exp, expand_dims, greater, greater_equal, less, less_equal, log,

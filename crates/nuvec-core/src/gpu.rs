@@ -92,6 +92,8 @@ mod metal {
 
     mod reduce;
 
+    use crate::fused::Load;
+
     /// Dispatches per command buffer before it is committed.
     const MAX_DISPATCHES: usize = 256;
     /// Command buffers in flight per device before submission blocks (MLX: 10).
@@ -621,6 +623,7 @@ mod metal {
                 }
                 (Primitive::Quantize { .. }, Some(d)) => is_float(d) && operands[0].0.size > 0,
                 (Primitive::Fast(_), Some(d)) => is_float(d) && operands[0].0.size > 0,
+                (Primitive::Compiled(_), _) => true,
                 (Primitive::Dequantize { .. }, _) => outputs[0].size > 0,
                 (Primitive::QuantizedMatmul { .. }, Some(d)) => is_float(d) && outputs[0].size > 0,
                 _ => false,
@@ -636,6 +639,9 @@ mod metal {
         ) -> Result<Vec<Data>> {
             if let Primitive::Fast(op) = primitive {
                 return self.fast(op, operands, outputs);
+            }
+            if let Primitive::Compiled(fused) = primitive {
+                return self.fused(fused, operands, outputs);
             }
             if let Primitive::Quantize { group_size, bits } = primitive {
                 return self.quantize(operands[0], outputs, *group_size, usize::from(*bits));
@@ -741,6 +747,72 @@ mod metal {
             args.push(Arg::write(output));
             args.extend(consts.iter().map(|c| Arg::bytes(c)));
             self.dispatch(&name, &args, out.size)
+        }
+
+        /// A fused element-wise graph as one generated kernel: each input is read as a
+        /// scalar, flat or through its (collapsed) strides, and the kernel is compiled once
+        /// per graph and combination of reads. Without strided inputs, a thread computes
+        /// `8 / itemsize` elements of arrays of at least 65,536 (MLX's rule).
+        fn fused(
+            &mut self,
+            fused: &crate::Fused,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+        ) -> Result<Vec<Data>> {
+            let out = &outputs[0];
+            let mut buffers = outputs
+                .iter()
+                .map(|o| Buffer::try_alloc(o.size * o.dtype.size()))
+                .collect::<Result<Vec<_>>>()?;
+            let mut strided: Vec<&[isize]> = Vec::new();
+            let loads: Vec<Load> = operands
+                .iter()
+                .map(|(m, _)| match mode(m, &out.shape) {
+                    Mode::Scalar => Load::Scalar,
+                    Mode::Flat => Load::Flat,
+                    Mode::Strided => {
+                        strided.push(&m.strides);
+                        Load::Strided(strided.len() - 1)
+                    }
+                })
+                .collect();
+            let per_thread = if strided.is_empty() && out.size >= 1 << 16 {
+                (8 / out.dtype.size()).max(1)
+            } else {
+                1
+            };
+            let (shape, strides) = collapse_all(&out.shape, &strided);
+            let offsets: Vec<i64> = operands.iter().map(|(_, d)| d.offset as i64).collect();
+            let strides: Vec<isize> = strides.concat();
+            let consts = [
+                bytemuck::cast_slice(&offsets).to_vec(),
+                shape_bytes(&shape),
+                strides_bytes(&strides),
+                bytes(&(shape.len() as i32)),
+                bytes(&(out.size as u32)),
+            ];
+            let name = fused.kernel_name(&loads, per_thread);
+            let device = self
+                .device()
+                .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+            let pipeline = device
+                .pipeline_from_source(&name, || fused.metal_source(&name, &loads, per_thread))
+                .map_err(backend)?;
+            let mut args: Vec<Arg<'_>> = operands
+                .iter()
+                .map(|(_, d)| Arg::read(d.buffer.metal().expect("checked")))
+                .collect();
+            args.extend(
+                buffers
+                    .iter_mut()
+                    .map(|b| Arg::write(b.metal_mut().expect("device storage"))),
+            );
+            args.extend(consts.iter().map(|c| Arg::bytes(c)));
+            self.command_buffer()?
+                .dispatch(&pipeline, &args, out.size.div_ceil(per_thread))
+                .map_err(backend)?;
+            self.counted()?;
+            Ok(buffers.into_iter().map(Data::new).collect())
         }
 
         /// Gathers an operand into contiguous memory, walking its own logical shape (a
@@ -2402,6 +2474,35 @@ mod metal {
             }
             _ => unreachable!("element-wise kernels take one to three operands"),
         }
+    }
+
+    /// [`collapse`] for any number of operands: drops size-1 dimensions and merges
+    /// neighbours that are contiguous for every operand.
+    fn collapse_all(shape: &[usize], strides: &[&[isize]]) -> (Vec<usize>, Vec<Vec<isize>>) {
+        let mut out_shape: Vec<usize> = Vec::with_capacity(shape.len());
+        let mut out: Vec<Vec<isize>> = vec![Vec::with_capacity(shape.len()); strides.len()];
+        for (d, &n) in shape.iter().enumerate() {
+            if n == 1 {
+                continue;
+            }
+            let merge = !out_shape.is_empty()
+                && strides
+                    .iter()
+                    .zip(&out)
+                    .all(|(s, o)| o.last() == Some(&(s[d] * n as isize)));
+            if merge {
+                *out_shape.last_mut().expect("not empty") *= n;
+                for (s, o) in strides.iter().zip(&mut out) {
+                    *o.last_mut().expect("not empty") = s[d];
+                }
+            } else {
+                out_shape.push(n);
+                for (s, o) in strides.iter().zip(&mut out) {
+                    o.push(s[d]);
+                }
+            }
+        }
+        (out_shape, out)
     }
 
     impl Drop for GpuEval {

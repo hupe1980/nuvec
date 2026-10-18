@@ -8,7 +8,9 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > **Status: pre-alpha.** Lazy arrays with 14 dtypes, MLX type promotion, broadcasting,
 > zero-copy views, element-wise operations with weak Rust scalars (`&x * 2.0` keeps `x`'s
 > dtype), reductions, matmul and composable transforms (`grad`, `value_and_grad`, `vjp`,
-> `jvp`, `vmap`, `custom_function`, `checkpoint`; also through complex numbers), random numbers
+> `jvp`, `vmap`, `custom_function`, `checkpoint`; also through complex numbers), `compile`
+> (traced once per input signature, simplified, element-wise chains fused into generated
+> Metal kernels), random numbers
 > bit-identical to MLX's, MLX's GEMM and GEMV kernels (ported, with split-K and a fused
 > `addmm`), MLX-compatible affine quantization (`quantize`, `dequantize` and
 > `quantized_matmul` with MLX's packing and kernels, 1–8 bits), MLX's fused kernels
@@ -61,6 +63,7 @@ Python is not needed to build or test. With [uv](https://docs.astral.sh/uv/) ins
 - `just bench-mlx`: prints a same-machine benchmark table, nuvec vs MLX
 - `just bench-gemm`, `just bench-quant`, `just bench-fast`: GPU matrix products, quantized
   matrix products and fused operations, nuvec vs MLX
+- `just bench-compile`: compiled element-wise functions, nuvec vs MLX
 - `just bench-load`: loading a 2 GiB safetensors checkpoint, nuvec vs MLX
 - `just io-fixtures`: re-records the safetensors and npy files written by MLX and NumPy
 
@@ -70,7 +73,7 @@ Python is not needed to build or test. With [uv](https://docs.astral.sh/uv/) ins
 |---|---|
 | `nuvec` | Public facade: re-exports the layers below |
 | `nuvec-core` | Lazy array graph, primitives, dtypes, streams and evaluation |
-| `nuvec-compile` | Tracing, graph simplification, fusion and buffer planning |
+| `nuvec-compile` | `compile`: tracing, graph simplification and element-wise kernel fusion |
 | `nuvec-gpu` | Metal runtime: device, kernel pipelines, shared buffers, command encoding with minimal barriers |
 | `nuvec-kernels` | Metal kernel sources and the precompiled `nuvec.metallib` |
 | `nuvec-cpu` | Pure-Rust CPU backend |

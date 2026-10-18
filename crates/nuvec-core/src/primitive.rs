@@ -268,6 +268,9 @@ pub enum Primitive {
     },
     /// A fused operation with a dedicated GPU kernel ([`crate::fast`]).
     Fast(crate::fast::FastOp),
+    /// Element-wise operations fused into one generated kernel ([`crate::Fused`]), as
+    /// `compile` builds them. The inputs share the output's shape.
+    Compiled(crate::fused::Fused),
     /// Random bits from threefry2x32 keys of shape `[..., 2]` (uint32): the output has shape
     /// `keys.shape[..-1] + shape` and `width` bytes per element (MLX's layout).
     RandomBits {
@@ -322,6 +325,7 @@ impl Primitive {
             Self::AddMM { .. } => "addmm",
             Self::RandomBits { .. } => "random_bits",
             Self::Fast(op) => op.name(),
+            Self::Compiled(_) => "compiled",
             Self::Quantize { .. } => "quantize",
             Self::Dequantize { .. } => "dequantize",
             Self::QuantizedMatmul { .. } => "quantized_matmul",
@@ -522,6 +526,28 @@ impl Primitive {
                     .outputs(inputs)?
                     .into_iter()
                     .map(|(dtype, shape)| computed(dtype, &shape))
+                    .collect());
+            }
+            Self::Compiled(fused) => {
+                let dtypes: Vec<DType> = inputs.iter().map(Array::dtype).collect();
+                if dtypes != fused.inputs() {
+                    return Err(Error::InvalidArgument(format!(
+                        "compiled: inputs {dtypes:?}, expected {:?}",
+                        fused.inputs()
+                    )));
+                }
+                let shape = inputs[0].shape();
+                if let Some(other) = inputs.iter().find(|a| a.shape() != shape) {
+                    return Err(Error::ShapeMismatch {
+                        op: "compiled",
+                        lhs: shape.to_vec(),
+                        rhs: other.shape().to_vec(),
+                    });
+                }
+                return Ok(fused
+                    .dtypes()
+                    .into_iter()
+                    .map(|d| computed(d, shape))
                     .collect());
             }
             Self::Quantize { group_size, bits } => {

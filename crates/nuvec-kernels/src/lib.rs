@@ -51,6 +51,10 @@ pub fn kernel_names() -> &'static [&'static str] {
     KERNEL_NAMES
 }
 
+/// `common.h`, the header of nuvec's element types, arithmetic, conversions and strided
+/// indexing, for kernels generated at runtime. Embedded in every mode.
+pub const COMMON_H: &str = include_str!("metal/common.h");
+
 /// The embedded shader sources and headers as `(path relative to src/metal, source)`, if
 /// [`MODE`] is [`MetallibMode::RuntimeSource`]. Empty in other modes.
 pub fn sources() -> &'static [(&'static str, &'static str)] {

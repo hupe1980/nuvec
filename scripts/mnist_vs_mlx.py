@@ -5,8 +5,8 @@
 """Trains MLX's MNIST example and nuvec's port on the same machine and compares them.
 
 Downloads MNIST into `target/mnist` (once), runs the MLX example model (MLP 784-32-32-10,
-ReLU, SGD lr 0.1, batch 256) uncompiled and with `mx.compile`, then runs
-`cargo run --release -p nuvec-nn --example mnist`. Prints test accuracy after the last
+ReLU, SGD lr 0.1, batch 256) and nuvec's port (`cargo run --release -p nuvec-nn --example
+mnist`), each uncompiled and compiled. Prints test accuracy after the last
 epoch and the median epoch time (epochs after the first).
 
 Usage: `just mnist` (or `uv run scripts/mnist_vs_mlx.py [--epochs N]`).
@@ -98,10 +98,12 @@ def train_mlx(compiled: bool, epochs: int, asynchronous: bool = False) -> tuple[
     return accuracy, statistics.median(times[1:] or times)
 
 
-def train_nuvec(epochs: int, asynchronous: bool = False) -> tuple[float, float]:
+def train_nuvec(epochs: int, asynchronous: bool = False,
+                compiled: bool = False) -> tuple[float, float]:
     out = subprocess.run(
         ["cargo", "run", "-q", "--release", "-p", "nuvec-nn", "--example", "mnist", "--",
-         str(DATA), "--epochs", str(epochs)] + (["--async"] if asynchronous else []),
+         str(DATA), "--epochs", str(epochs)] + (["--async"] if asynchronous else [])
+        + (["--compile"] if compiled else []),
         cwd=ROOT, check=True, capture_output=True, text=True).stdout
     m = re.search(r"accuracy=([\d.]+) epoch_seconds=([\d.]+)", out)
     return float(m.group(1)), float(m.group(2))
@@ -117,7 +119,10 @@ def main() -> None:
         ("MLX (GPU, uncompiled, eval per step)", *train_mlx(False, epochs)),
         ("nuvec (GPU, async_eval per step)", *train_nuvec(epochs, True)),
         ("MLX (GPU, uncompiled, async_eval per step)", *train_mlx(False, epochs, True)),
+        ("nuvec (GPU, compiled, eval per step)", *train_nuvec(epochs, compiled=True)),
         ("MLX (GPU, compiled, eval per step)", *train_mlx(True, epochs)),
+        ("nuvec (GPU, compiled, async_eval per step)", *train_nuvec(epochs, True, True)),
+        ("MLX (GPU, compiled, async_eval per step)", *train_mlx(True, epochs, True)),
     ]
     print(f"MNIST MLP 784-32-32-10, SGD lr 0.1, batch 256, {epochs} epochs; MLX {mx.__version__}")
     print("| run | test accuracy | median epoch (s) |\n|---|---:|---:|")

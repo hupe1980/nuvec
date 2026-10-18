@@ -258,6 +258,67 @@ impl Array {
         }
     }
 
+    // ── Graph (for graph transformations such as `compile`) ──────────────────
+
+    /// Records `primitive` applied to `inputs`, with the same validation as the operations,
+    /// and returns one array per output. Inputs that already failed short-circuit with their
+    /// error.
+    pub fn from_primitive(primitive: Primitive, inputs: Vec<Array>) -> Result<Vec<Array>> {
+        Self::from_op(primitive, inputs)
+    }
+
+    /// A placeholder with this dtype and shape, standing for an input while a function is
+    /// traced (as in MLX): operations can be recorded on it, but evaluating anything that
+    /// depends on it fails. Placeholders are tracers.
+    pub fn placeholder(dtype: DType, shape: &[usize]) -> Result<Array> {
+        let failed = Self::failed(
+            Error::InvalidArgument(
+                "arrays cannot be evaluated while a function is traced (compile)".into(),
+            ),
+            dtype,
+            &[],
+        );
+        let primitive = Primitive::Broadcast(shape.to_vec());
+        Ok(Self::record_unchecked(primitive, vec![failed], true)?.swap_remove(0))
+    }
+
+    /// The arrays this one is computed from, until it has been evaluated. Empty for host
+    /// data and evaluated arrays.
+    pub fn inputs(&self) -> Vec<Array> {
+        match &*self.node.lock() {
+            State::Pending { inputs, .. } | State::Retained { inputs, .. } => inputs.clone(),
+            State::Done => Vec::new(),
+        }
+    }
+
+    /// Every output of the operation that produces this array, in order (this array is
+    /// the one at [`Array::output_index`]).
+    pub fn siblings(&self) -> Vec<Array> {
+        (0..self.node.outputs.len() as u32)
+            .map(|output| Self {
+                node: self.node.clone(),
+                output,
+            })
+            .collect()
+    }
+
+    /// Which output of its operation this array is.
+    pub fn output_index(&self) -> usize {
+        self.output as usize
+    }
+
+    /// Identifies the operation that produces this array (shared by its siblings) for as
+    /// long as the array is alive.
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.node) as usize
+    }
+
+    /// Whether the array depends on a transform's tracer or a placeholder, that is, it is
+    /// being traced by `grad`, `vjp`, `jvp`, `vmap` or `compile`.
+    pub fn is_tracer(&self) -> bool {
+        self.node.tracer
+    }
+
     pub(crate) fn out(&self) -> &Output {
         &self.node.outputs[self.output as usize]
     }
@@ -433,6 +494,29 @@ fn take_inputs(node: &mut Node) -> Vec<Array> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_accessors_describe_pending_nodes() {
+        let a = Array::from_slice(&[1i32, 2], &[2]).unwrap();
+        let b = Array::from_slice(&[5i32, 7], &[2]).unwrap();
+        let outs = Array::from_primitive(Primitive::AddMultiply, vec![a.clone(), b]).unwrap();
+        let (sum, product) = (&outs[0], &outs[1]);
+        assert_eq!(sum.id(), product.id(), "siblings share their operation");
+        assert_ne!(sum.id(), a.id());
+        assert_eq!((sum.output_index(), product.output_index()), (0, 1));
+        assert_eq!(product.siblings().len(), 2);
+        assert_eq!(sum.inputs()[0].id(), a.id());
+        assert!(a.inputs().is_empty(), "host data has no inputs");
+        assert!(!sum.is_tracer());
+        product.eval().unwrap();
+        assert!(sum.inputs().is_empty(), "evaluated: detached");
+
+        let p = Array::placeholder(DType::F32, &[3]).unwrap();
+        let q = &p + 1.0f32;
+        assert!(p.is_tracer() && q.is_tracer());
+        assert_eq!(q.shape(), [3]);
+        assert!(q.eval().is_err(), "placeholders cannot be evaluated");
+    }
 
     #[test]
     fn node_hasher_spreads_aligned_addresses() {

@@ -41,6 +41,7 @@
 #![forbid(unsafe_code)]
 
 pub use nuvec_compile as compile;
+pub use nuvec_compile::compile;
 pub use nuvec_core as core;
 pub use nuvec_core::{
     ArgReduceOp, Array, BinaryOp, Category, Complex64, CustomCall, CustomFunction, DType, Device,

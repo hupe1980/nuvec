@@ -72,6 +72,10 @@ bench-quant:
 bench-fast:
     uv run scripts/bench_fast.py
 
+# GPU compiled element-wise functions (GELU, SwiGLU gating, Adam step): nuvec vs MLX.
+bench-compile:
+    uv run scripts/bench_compile.py
+
 # Checkpoint loading (2 GiB safetensors, warm page cache): nuvec vs MLX.
 bench-load:
     uv run scripts/bench_load.py

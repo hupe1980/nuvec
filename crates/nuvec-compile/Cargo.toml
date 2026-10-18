@@ -1,6 +1,6 @@
 [package]
 name = "nuvec-compile"
-description = "Tracing, graph simplification, fusion planning and buffer planning for nuvec"
+description = "Function compilation for nuvec: tracing, graph simplification and kernel fusion"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,3 +17,7 @@ nuvec-core.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "compile"
+harness = false

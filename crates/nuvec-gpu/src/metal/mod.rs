@@ -263,6 +263,51 @@ impl Device {
         Ok(pipeline)
     }
 
+    /// The pipeline for kernel `name` from Metal source that `source` generates, compiled
+    /// at runtime on first use and cached by name (so a name must always mean the same
+    /// source). The source may include nuvec's headers (`#include "common.h"`); it is
+    /// compiled with IEEE-conformant math, as nuvec's own kernels are.
+    pub fn pipeline_from_source(
+        &self,
+        name: &str,
+        source: impl FnOnce() -> String,
+    ) -> Result<Pipeline> {
+        let mut cache = self
+            .inner
+            .pipelines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(p) = cache.get(name) {
+            return Ok(p.clone());
+        }
+        let failed = |message: String| GpuError::Pipeline {
+            name: name.to_owned(),
+            message,
+        };
+        let source = inline_sources(&[("generated.metal", &source())]);
+        let options = objc2_metal::MTLCompileOptions::new();
+        options.setMathMode(objc2_metal::MTLMathMode::Safe);
+        let library = self
+            .inner
+            .device
+            .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
+            .map_err(|e| failed(e.localizedDescription().to_string()))?;
+        let function = library
+            .newFunctionWithName(&NSString::from_str(name))
+            .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))?;
+        let state = self
+            .inner
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|e| failed(e.localizedDescription().to_string()))?;
+        let pipeline = Pipeline {
+            state,
+            name: name.into(),
+        };
+        cache.insert(name.to_owned(), pipeline.clone());
+        Ok(pipeline)
+    }
+
     /// nuvec's kernel library, loaded once.
     fn library(&self) -> Result<&Library> {
         self.inner
@@ -315,12 +360,14 @@ fn load_library(device: &ProtocolObject<dyn MTLDevice>) -> Result<Library> {
     }
 }
 
-/// All `.metal` sources as one translation unit, each `#include "header.h"` of an embedded
-/// header replaced by the header's text on first use.
+/// All `.metal` sources as one translation unit, each `#include "header.h"` of one of
+/// nuvec's headers replaced by the header's text on first use.
 fn inline_sources(sources: &[(&str, &str)]) -> String {
-    let headers: HashMap<&str, &str> = sources
+    let headers: HashMap<&str, &str> = nuvec_kernels::sources()
         .iter()
+        .chain(sources)
         .copied()
+        .chain([("common.h", nuvec_kernels::COMMON_H)])
         .filter(|(p, _)| p.ends_with(".h"))
         .collect();
     let mut included = HashSet::new();
