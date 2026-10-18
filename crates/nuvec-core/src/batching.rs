@@ -117,6 +117,19 @@ impl Primitive {
                 op: *op,
                 axis: axis + 1,
             }),
+            Self::Sort { axis } => at_front(Self::Sort { axis: axis + 1 }),
+            Self::ArgSort { axis } => at_front(Self::ArgSort { axis: axis + 1 }),
+            Self::Scan {
+                op,
+                axis,
+                reverse,
+                inclusive,
+            } => at_front(Self::Scan {
+                op: *op,
+                axis: axis + 1,
+                reverse: *reverse,
+                inclusive: *inclusive,
+            }),
             // Every operand gets the batch axis first (unbatched ones broadcast).
             Self::GatherAxis { axis } => {
                 let all = (0..inputs.len())

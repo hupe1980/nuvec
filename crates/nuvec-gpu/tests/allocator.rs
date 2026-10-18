@@ -135,37 +135,56 @@ fn memory_limit_is_enforced() {
 }
 
 #[test]
-fn buffers_in_use_are_not_reused() {
+fn memory_in_use_is_reused_only_by_gpu_work_ordered_after_it() {
     let Some(device) = device() else { return };
     let n = 1 << 20;
     let a = device.buffer_from(&vec![0u8; n * 4]).unwrap();
-    let mut out = device.new_buffer(n * 4).unwrap();
     let add = device.pipeline("nuvec_add_f32").unwrap();
-    let mut cmd = device.command_buffer().unwrap();
-    cmd.dispatch(
-        &add,
-        &[
-            Arg::read(&a),
-            Arg::read(&a),
-            Arg::write(&mut out),
-            Arg::bytes(&(n as u32).to_le_bytes()),
-        ],
-        n,
-    )
-    .unwrap();
-    let submitted = cmd.commit();
-    drop(out); // dropped while the GPU may still write it
+    let encode = |out: &mut nuvec_gpu::Buffer| {
+        let mut cmd = device.ordered_command_buffer().unwrap();
+        cmd.dispatch(
+            &add,
+            &[
+                Arg::read(&a),
+                Arg::read(&a),
+                Arg::write(out),
+                Arg::bytes(&(n as u32).to_le_bytes()),
+            ],
+            n,
+        )
+        .unwrap();
+        cmd
+    };
+    device.clear_cache();
+    let mut out = device.new_buffer(n * 4).unwrap();
+    let cmd = encode(&mut out);
+    drop(out); // dropped while encoded GPU work uses it: cached at once
     let stats = device.memory();
+    assert_eq!((stats.active, stats.cache), (a.len(), a.len()));
+    let allocations = stats.system_allocations;
+    // Not committed yet: no fence orders other work after it, so nobody gets it.
+    drop((
+        device.new_buffer(n * 4).unwrap(),
+        device.new_gpu_buffer(n * 4).unwrap(),
+    ));
+    assert_eq!(device.memory().system_allocations, allocations + 2);
+    // Committed (complete or not): GPU work gets it, ordered after it by its fence.
+    device.clear_cache();
+    let mut out = device.new_buffer(n * 4).unwrap();
+    drop(cmd); // abandoned: never submitted
+    let pending = encode(&mut out).commit_then(|r| r.unwrap());
+    drop(out);
+    let allocations = device.memory().system_allocations;
+    let reused = device.new_gpu_buffer(n * 4).unwrap();
     assert_eq!(
-        stats.active,
-        2 * a.len(),
-        "still held while the GPU may write it"
+        device.memory().system_allocations,
+        allocations,
+        "reused by GPU work"
     );
-    assert_eq!(stats.cache, 0, "and not reusable yet");
-    submitted.wait().unwrap();
-    let stats = device.memory();
-    assert_eq!(stats.active, a.len(), "released once the work completed");
-    assert_eq!(stats.cache, a.len(), "into the cache, for reuse");
+    // The CPU waits for the previous owner's work before touching the memory.
+    assert_eq!(reused.contents().unwrap().len(), n * 4);
+    drop(reused);
+    pending.wait();
 }
 
 #[test]

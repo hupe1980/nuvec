@@ -211,6 +211,16 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
     if op == "arange":
         return mx.arange(float(p["start"]), float(p["stop"]), float(p["step"]),
                          dtype=DTYPES[int(p["dtype"])][1])
+    if op in ("sort", "argsort"):
+        return (mx.sort if op == "sort" else mx.argsort)(xs[0], axis=int(p["axis"]))
+    if op == "topk":
+        # MLX leaves the order of the k elements unspecified: compare them sorted.
+        return mx.sort(mx.topk(xs[0], int(p["k"]), axis=int(p["axis"])), axis=int(p["axis"]))
+    if op in ("cumsum", "cumprod", "cummax", "cummin", "logcumsumexp"):
+        fn = getattr(mx, op)
+        axis = p.get("axis", "")
+        return fn(xs[0], axis=int(axis) if axis else None, reverse=p.get("reverse") == "1",
+                  inclusive=p.get("inclusive", "1") == "1")
     if op == "take":
         axis = p.get("axis", "")
         return mx.take(xs[0], xs[1], axis=int(axis) if axis else None)
@@ -710,6 +720,42 @@ batched("vmap-take-shared-table", "take", [make("float32", (5, 3)), ints("int32"
         "n,0", axis=0)
 batched("vmap-concatenate", "concatenate", [make("float32", (3, 2, 2)), make("float32", (2, 1))],
         "0,n", axis=1)
+
+# Sorting and scans: NaN last, ties stable, every direction and inclusiveness.
+SORTABLE = make("float32", (4, 9), edge=True)
+for op in ["sort", "argsort"]:
+    case(f"{op}-f32-nan", op, [SORTABLE], axis=1)
+    case(f"{op}-ties", op, [ints("int32", (3, 10), 0, 4)], axis=1)
+    case(f"{op}-axis0-t", op, [make("float16", (5, 3))], axis=0, pre="t")
+    case(f"{op}-u8", op, [make("uint8", (2, 7))], axis=-1)
+    case(f"{op}-bf16", op, [make("bfloat16", (6,))], axis=0)
+case("topk", "topk", [make("float32", (3, 8))], axis=1, k=3)
+for op in ["cumsum", "cumprod", "cummax", "cummin", "logcumsumexp"]:
+    for rev in ["0", "1"]:
+        for inc in ["1", "0"]:
+            case(f"{op}-r{rev}-i{inc}", op, [make("float32", (3, 5))], axis=1, reverse=rev, inclusive=inc)
+    case(f"{op}-axis0", op, [make("float32", (4, 3))], axis=0)
+    case(f"{op}-flat", op, [make("float32", (2, 3))])
+case("cumsum-int", "cumsum", [ints("int32", (2, 6), -5, 5)], axis=1)
+case("cumsum-bool", "cumsum", [make("bool", (3, 4))], axis=1)
+case("cumprod-int", "cumprod", [ints("int16", (2, 5), -3, 3)], axis=1)
+case("cummax-nan", "cummax", [make("float32", (2, 6), edge=True)], axis=1)
+case("cummin-u8", "cummin", [make("uint8", (2, 6))], axis=1)
+case("cumsum-f16", "cumsum", [make("float16", (2, 40))], axis=1)
+case("logcumsumexp-int", "logcumsumexp", [ints("int32", (2, 4), -3, 3)], axis=1)
+derivative("vjp", "vjp-sort", "sort", [make("float32", (3, 5))], axis=1)
+derivative("jvp", "jvp-sort", "sort", [make("float32", (3, 5))], axis=0)
+for rev in ["0", "1"]:
+    for inc in ["1", "0"]:
+        derivative("vjp", f"vjp-cumsum-r{rev}-i{inc}", "cumsum", [make("float32", (2, 5))], axis=1, reverse=rev, inclusive=inc)
+        derivative("vjp", f"vjp-cumprod-zeros-r{rev}-i{inc}", "cumprod", [ints("float32", (3, 6), -1, 2)], axis=1, reverse=rev, inclusive=inc)
+        derivative("vjp", f"vjp-cummax-ties-r{rev}-i{inc}", "cummax", [ints("float32", (3, 6), 0, 3)], axis=1, reverse=rev, inclusive=inc)
+        derivative("vjp", f"vjp-cummin-r{rev}-i{inc}", "cummin", [make("float32", (2, 5))], axis=1, reverse=rev, inclusive=inc)
+        derivative("vjp", f"vjp-logcumsumexp-r{rev}-i{inc}", "logcumsumexp", [make("float32", (2, 5))], axis=1, reverse=rev, inclusive=inc)
+derivative("jvp", "jvp-cumsum", "cumsum", [make("float32", (2, 5))], axis=1, reverse=1)
+derivative("jvp", "jvp-logcumsumexp", "logcumsumexp", [make("float32", (2, 5))], axis=1)
+batched("vmap-sort", "sort", [make("float32", (3, 2, 5))], "1", axis=1)
+batched("vmap-cumsum", "cumsum", [make("float32", (2, 4, 3))], "2", axis=0, reverse=1)
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

@@ -8,16 +8,200 @@
 use crate::array::Array;
 use crate::cast::Canon;
 use crate::ops::{
-    self, broadcast_to, conjugate, cos, divide, equal, greater, greater_equal, less, less_equal,
-    matmul, multiply, negative, reshape, sin, subtract, sum, transpose, where_,
+    self, broadcast_to, conjugate, cos, divide, equal, exp, greater, greater_equal, less,
+    less_equal, log, matmul, multiply, negative, not_equal, reshape, sin, stop_gradient, subtract,
+    sum, transpose, where_,
 };
-use crate::primitive::{BinaryOp, Primitive, ReduceOp, ScatterReduce, UnaryOp};
+use crate::primitive::{BinaryOp, Primitive, ReduceOp, ScanOp, ScatterReduce, UnaryOp};
 use crate::quantized::{dequantize, quantized_matmul};
+use crate::sorting::{argsort, cummax, cummin, cumprod, cumsum, logcumsumexp};
 use crate::{DType, Error, Result};
+use crate::{put_along_axis, take_along_axis};
 
 /// Records `primitive` on `inputs` (single output).
 fn record(primitive: Primitive, inputs: Vec<Array>) -> Result<Array> {
     Ok(Array::from_op(primitive, inputs)?.swap_remove(0))
+}
+
+/// The most negative finite value of a float dtype (MLX's `finfo(dtype).min`).
+fn lowest(dtype: DType) -> f64 {
+    match dtype {
+        DType::F16 => -65504.0,
+        DType::BF16 => f64::from(crate::bf16::MIN),
+        DType::F64 => f64::MIN,
+        _ => f64::from(f32::MIN),
+    }
+}
+
+/// The two halves of a signed value in the log domain: `log|v|` where `v > 0` (else the
+/// lowest value), and the same where `v < 0` (MLX's logcumsumexp derivatives).
+fn log_halves(v: &Array) -> Result<(Array, Array)> {
+    let low = lowest(v.dtype());
+    let log_abs = log(&ops::abs(v)?)?;
+    Ok((
+        where_(&greater(v, 0.0)?, &log_abs, low)?,
+        where_(&less(v, 0.0)?, &log_abs, low)?,
+    ))
+}
+
+/// Positions `start..stop` along `axis`, as a view.
+fn window(a: &Array, axis: usize, start: usize, stop: usize) -> Result<Array> {
+    let mut args = vec![crate::SliceArg::full(); a.ndim()];
+    args[axis] = crate::SliceArg::new(Some(start as isize), Some(stop as isize), 1);
+    ops::slice(a, &args)
+}
+
+/// For a cumulative maximum or minimum: per output position (exclusive scans skip the
+/// one without elements before it) the index of the input element holding its running
+/// extreme, ties going to the latest in scan order (MLX's `Scan::vjp`), and the range of
+/// output positions it covers.
+fn scan_owner(
+    x: &Array,
+    out: &Array,
+    axis: usize,
+    reverse: bool,
+    inclusive: bool,
+) -> Result<(Array, (usize, usize))> {
+    let n = x.shape()[axis];
+    let (in_window, extreme_window, out_range, (first, last)) = if inclusive {
+        (x.clone(), out.clone(), (0, n), (0, n))
+    } else if reverse {
+        let (i, e) = (window(x, axis, 1, n)?, window(out, axis, 0, n - 1)?);
+        (i, e, (0, n - 1), (1, n))
+    } else {
+        let (i, e) = (window(x, axis, 0, n - 1)?, window(out, axis, 1, n)?);
+        (i, e, (1, n), (0, n - 1))
+    };
+    let mut index_shape = vec![1isize; x.ndim()];
+    index_shape[axis] = (last - first) as isize;
+    let iota = reshape(
+        &ops::arange(first as f64, last as f64, 1.0, DType::I32)?,
+        &index_shape,
+    )?;
+    let fill = if reverse { n as f64 } else { -1.0 };
+    let masked = where_(&equal(&in_window, &extreme_window)?, &iota, fill)?;
+    let a = Some(axis as isize);
+    let owner = if reverse {
+        cummin(&masked, a, true, true)?
+    } else {
+        cummax(&masked, a, false, true)?
+    };
+    Ok((stop_gradient(&owner.astype(DType::U32)?)?, out_range))
+}
+
+/// For a cumulative product: the mask of each lane's first zero (in scan order), the
+/// product with that zero replaced by one, and where the output is zero (MLX's
+/// `Scan::vjp`).
+fn first_zero(
+    x: &Array,
+    out: &Array,
+    axis: usize,
+    reverse: bool,
+    inclusive: bool,
+) -> Result<(Array, Array, Array)> {
+    let a = Some(axis as isize);
+    let (mut exclusive, mut inclusive_prod) = (cumprod(x, a, reverse, !inclusive)?, out.clone());
+    if !inclusive {
+        std::mem::swap(&mut exclusive, &mut inclusive_prod);
+    }
+    // Booleans multiply as AND.
+    let first = multiply(equal(&inclusive_prod, 0.0)?, not_equal(&exclusive, 0.0)?)?;
+    let with_one = cumprod(&where_(&first, 1.0, x)?, a, reverse, inclusive)?;
+    Ok((first, with_one, equal(out, 0.0)?))
+}
+
+/// The vjp of a cumulative scan (MLX's `Scan::vjp`).
+fn scan_vjp(
+    op: ScanOp,
+    x: &Array,
+    out: &Array,
+    g: &Array,
+    axis: usize,
+    reverse: bool,
+    inclusive: bool,
+) -> Result<Array> {
+    let a = Some(axis as isize);
+    match op {
+        ScanOp::Sum => cumsum(g, a, !reverse, inclusive),
+        ScanOp::LogAddExp => {
+            let (pos, neg) = log_halves(g)?;
+            let half = |h: &Array| -> Result<Array> {
+                exp(&ops::add(
+                    logcumsumexp(&subtract(h, out)?, a, !reverse, inclusive)?,
+                    x,
+                )?)
+            };
+            subtract(half(&pos)?, half(&neg)?)
+        }
+        ScanOp::Prod => {
+            let (first, with_one, zero) = first_zero(x, out, axis, reverse, inclusive)?;
+            let partial = |p: &Array| cumsum(&multiply(p, g)?, a, !reverse, inclusive);
+            let regular = divide(partial(out)?, x)?;
+            where_(&first, &partial(&with_one)?, &where_(&zero, 0.0, &regular)?)
+        }
+        ScanOp::Max | ScanOp::Min => {
+            let (owner, (start, stop)) = scan_owner(x, out, axis, reverse, inclusive)?;
+            let g = if inclusive {
+                g.clone()
+            } else {
+                window(g, axis, start, stop)?
+            };
+            crate::scatter_add_along_axis(&zeros_like(x)?, &owner, &g, axis as isize)
+        }
+    }
+}
+
+/// The jvp of a cumulative scan: MLX's for sums and log-sum-exp; for maxima and minima
+/// the tangent of each extreme's owner; for products the derivative of the running
+/// product with the first-zero handling of MLX's vjp.
+fn scan_jvp(
+    op: ScanOp,
+    x: &Array,
+    out: &Array,
+    t: &Array,
+    axis: usize,
+    reverse: bool,
+    inclusive: bool,
+) -> Result<Array> {
+    let a = Some(axis as isize);
+    match op {
+        ScanOp::Sum => cumsum(t, a, reverse, inclusive),
+        ScanOp::LogAddExp => {
+            let (pos, neg) = log_halves(t)?;
+            let half = |h: &Array| -> Result<Array> {
+                exp(&subtract(
+                    logcumsumexp(&ops::add(h, x)?, a, reverse, inclusive)?,
+                    out,
+                )?)
+            };
+            let neg_inf = equal(out, f64::NEG_INFINITY)?;
+            where_(&neg_inf, 0.0, &subtract(half(&pos)?, half(&neg)?)?)
+        }
+        ScanOp::Prod => {
+            let (first, with_one, zero) = first_zero(x, out, axis, reverse, inclusive)?;
+            // Before the first zero: y · Σ t/x. From it on: the zero's tangent times the
+            // product with the zero replaced by one.
+            let safe = where_(&equal(x, 0.0)?, 1.0, x)?;
+            let regular = multiply(out, cumsum(&divide(t, &safe)?, a, reverse, inclusive)?)?;
+            let t_zero = sum(&where_(&first, t, 0.0)?, &[axis as isize], true)?;
+            where_(&zero, &multiply(&with_one, &t_zero)?, &regular)
+        }
+        ScanOp::Max | ScanOp::Min => {
+            let (owner, (start, _)) = scan_owner(x, out, axis, reverse, inclusive)?;
+            let moved = take_along_axis(t, &owner, axis as isize)?;
+            if inclusive {
+                return Ok(moved);
+            }
+            // The position without elements before it (in scan order) has no tangent.
+            let edge = zeros_like(&window(out, axis, 0, 1)?)?;
+            let parts = if start == 0 {
+                [moved, edge]
+            } else {
+                [edge, moved]
+            };
+            crate::concatenate(&parts, axis as isize)
+        }
+    }
 }
 
 /// Zeros shaped like `a`, as a broadcast scalar (no allocation).
@@ -286,6 +470,26 @@ impl Primitive {
                 };
                 one(record(update, vec![zeros_like(x)?, g.clone()]))
             }
+            Self::Sort { axis } => {
+                // Sorting permutes: scatter the cotangent back through the permutation.
+                let idx = stop_gradient(&argsort(x, Some(*axis as isize))?)?;
+                one(put_along_axis(&zeros_like(x)?, &idx, g, *axis as isize))
+            }
+            Self::ArgSort { .. } => Ok(vec![None]),
+            Self::Scan {
+                op,
+                axis,
+                reverse,
+                inclusive,
+            } => one(scan_vjp(
+                *op,
+                x,
+                &outputs[0],
+                g,
+                *axis,
+                *reverse,
+                *inclusive,
+            )),
             Self::GatherAxis { axis } => {
                 // Repeated indices accumulate their cotangents.
                 let scatter = Self::ScatterAxis {
@@ -535,6 +739,25 @@ impl Primitive {
             Self::GatherAxis { .. } => {
                 one(record(self.clone(), vec![tangent(0)?, inputs[1].clone()]))
             }
+            Self::Sort { axis } => {
+                let idx = stop_gradient(&argsort(x, Some(*axis as isize))?)?;
+                one(take_along_axis(&tangent(0)?, &idx, *axis as isize))
+            }
+            Self::ArgSort { .. } => one(zeros_like(out)),
+            Self::Scan {
+                op,
+                axis,
+                reverse,
+                inclusive,
+            } => one(scan_jvp(
+                *op,
+                x,
+                out,
+                &tangent(0)?,
+                *axis,
+                *reverse,
+                *inclusive,
+            )),
             Self::ScatterAxis { .. } => one(record(
                 self.clone(),
                 vec![tangent(0)?, inputs[1].clone(), tangent(2)?],

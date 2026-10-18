@@ -33,6 +33,22 @@ fn device() -> Option<&'static nuvec_gpu::Device> {
 }
 
 impl Buffer {
+    /// Storage for GPU work to write (an output of a kernel): as [`try_alloc`](Self::try_alloc),
+    /// but it may reuse memory that committed GPU work still uses (as MLX does); GPU work is
+    /// ordered after those uses, and CPU access waits for them.
+    #[cfg(all(target_os = "macos", not(miri)))]
+    pub(crate) fn try_alloc_gpu(len: usize) -> Result<Self> {
+        match device() {
+            Some(device) => {
+                let buffer = device
+                    .new_gpu_buffer(len)
+                    .map_err(|_| Error::OutOfMemory(len))?;
+                Ok(Self::new(Storage::Metal(buffer), len))
+            }
+            None => Self::try_alloc(len),
+        }
+    }
+
     /// A buffer of `len` bytes with unspecified contents (a reused allocation holds stale
     /// bytes). For outputs that are overwritten entirely.
     pub(crate) fn try_alloc(len: usize) -> Result<Self> {

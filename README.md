@@ -9,7 +9,9 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > zero-copy views, indexing and joining (`take`, `take_along_axis`, `put_along_axis`,
 > `concatenate`, `stack`, `split`, `slice_update`, written in place on the GPU when nothing
 > else refers to the updated array), element-wise operations with weak Rust scalars (`&x * 2.0` keeps `x`'s
-> dtype), reductions, matmul and composable transforms (`grad`, `value_and_grad`, `vjp`,
+> dtype), reductions, sorting and cumulative scans (`sort`, `argsort`, `partition`,
+> `argpartition`, `topk`, `cumsum`, `cumprod`, `cummax`, `cummin`, `logcumsumexp`; MLX's
+> Metal kernels), matmul and composable transforms (`grad`, `value_and_grad`, `vjp`,
 > `jvp`, `vmap`, `custom_function`, `checkpoint`; also through complex numbers), `compile`
 > (traced once per input signature, simplified, element-wise chains fused into generated
 > Metal kernels), random numbers
@@ -17,17 +19,20 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > `addmm`), MLX-compatible affine quantization (`quantize`, `dequantize` and
 > `quantized_matmul` with MLX's packing and kernels, 1–8 bits), MLX's fused kernels
 > (`fast::rms_norm`, `fast::layer_norm`, `fast::rope`, `fast::cross_entropy`,
-> `fast::scaled_dot_product_attention`, last-axis `softmax` and `logsumexp`), checkpoint I/O
+> `fast::scaled_dot_product_attention`, last-axis `softmax` and `logsumexp`; mlx-lm's
+> Gated DeltaNet kernels as `fast::gated_delta`), checkpoint I/O
 > (`nuvec-io`: safetensors and npy, memory-mapped without a copy), and neural-network
 > building blocks (`nuvec-nn`: modules as named parameter trees loaded by name, `Linear`,
 > `QuantizedLinear`, `Embedding`, `RmsNorm`, `LayerNorm`, `Rope`, LoRA, activations,
 > cross-entropy, SGD, Adam, AdamW, Lion and Muon with learning-rate schedules and gradient
 > clipping; `just mnist` trains MLX's MNIST example model), and an LLM runtime (`nuvec-lm`:
-> Llama, Mistral, Qwen 2 and Qwen 3 models from Hugging Face or MLX checkpoints, including
+> Llama, Mistral, Qwen 2, Qwen 3 and Qwen 3.5 (hybrid Gated DeltaNet and attention) models
+> from Hugging Face or MLX checkpoints, including
 > MLX's 4-bit ones, a byte-level BPE tokenizer read from `tokenizer.json`, a KV cache and
-> greedy or temperature sampling; `cargo run --release -p nuvec-lm --example generate`). Arrays are
+> mlx-lm's sampler (greedy, temperature, top-p, min-p, top-k); `cargo run --release -p nuvec-lm --example generate`). Arrays are
 > evaluated on the GPU by default (Metal kernels on unified memory, submitted asynchronously;
-> `async_eval` overlaps host work with GPU work) or on the CPU
+> `async_eval` overlaps host work with GPU work, and `schedule` orders a graph ahead of
+> starting it) or on the CPU
 > (`set_default_stream(Stream::default_for(Device::cpu()))`).
 
 ## Platforms

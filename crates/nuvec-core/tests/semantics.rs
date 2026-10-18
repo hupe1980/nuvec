@@ -625,6 +625,8 @@ fn errors_are_typed_and_deferred() {
 fn perf_add_1m() {
     let a = ones(&[1_000_000], DType::F32).unwrap();
     let b = ones(&[1_000_000], DType::F32).unwrap();
+    // The inputs and the device's start-up (library, pipelines) are not what is timed.
+    eval(&[a.clone(), b.clone(), &a * &b]).unwrap();
     let start = std::time::Instant::now();
     (&a + &b).eval().unwrap();
     let elapsed = start.elapsed();

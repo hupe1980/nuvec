@@ -177,6 +177,34 @@ impl ArgReduceOp {
     }
 }
 
+/// The combination a cumulative scan applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScanOp {
+    /// Running sum (`cumsum`).
+    Sum,
+    /// Running product (`cumprod`).
+    Prod,
+    /// Running maximum (`cummax`); NaN propagates.
+    Max,
+    /// Running minimum (`cummin`); NaN propagates.
+    Min,
+    /// Running `log(Σ exp)` (`logcumsumexp`).
+    LogAddExp,
+}
+
+impl ScanOp {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Sum => "cumsum",
+            Self::Prod => "cumprod",
+            Self::Max => "cummax",
+            Self::Min => "cummin",
+            Self::LogAddExp => "logcumsumexp",
+        }
+    }
+}
+
 /// How a scatter combines an update with the value it lands on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -256,6 +284,28 @@ pub enum Primitive {
         axis: usize,
         /// How updates combine with `dst`.
         reduce: ScatterReduce,
+    },
+    /// The input sorted along `axis` (ascending, stable, NaN last).
+    Sort {
+        /// The sorted axis.
+        axis: usize,
+    },
+    /// The indices (uint32) that sort the input along `axis`, as [`Primitive::Sort`].
+    ArgSort {
+        /// The sorted axis.
+        axis: usize,
+    },
+    /// A cumulative scan along `axis`.
+    Scan {
+        /// The combination.
+        op: ScanOp,
+        /// The scanned axis.
+        axis: usize,
+        /// Scan from the end of the axis.
+        reverse: bool,
+        /// Whether each output includes its own element (else it holds the elements
+        /// before it, starting from the combination's identity).
+        inclusive: bool,
     },
     /// The inputs (one dtype, equal shapes except along `axis`) joined along `axis`.
     Concatenate {
@@ -360,6 +410,9 @@ impl Primitive {
             } => "put_along_axis",
             Self::ScatterAxis { .. } => "scatter_add_along_axis",
             Self::Concatenate { .. } => "concatenate",
+            Self::Sort { .. } => "sort",
+            Self::ArgSort { .. } => "argsort",
+            Self::Scan { op, .. } => op.name(),
             Self::Matmul => "matmul",
             Self::AddMM { .. } => "addmm",
             Self::RandomBits { .. } => "random_bits",
@@ -513,6 +566,46 @@ impl Primitive {
                     });
                 }
                 computed(dst.dtype(), dst.shape())
+            }
+            Self::Sort { axis } | Self::ArgSort { axis } | Self::Scan { axis, .. } => {
+                let [a] = self.arity::<1>(inputs)?;
+                if *axis >= a.ndim() {
+                    return Err(Error::InvalidArgument(format!(
+                        "{}: axis {axis} out of range for {} dimensions",
+                        self.name(),
+                        a.ndim()
+                    )));
+                }
+                let ordered = matches!(
+                    self,
+                    Self::Sort { .. }
+                        | Self::ArgSort { .. }
+                        | Self::Scan {
+                            op: ScanOp::Max | ScanOp::Min,
+                            ..
+                        }
+                );
+                let float_only = matches!(
+                    self,
+                    Self::Scan {
+                        op: ScanOp::LogAddExp,
+                        ..
+                    }
+                );
+                let category = a.dtype().category();
+                if (ordered && category == crate::Category::Complex)
+                    || (float_only && category != crate::Category::Float)
+                {
+                    return Err(Error::UnsupportedDType {
+                        op: self.name(),
+                        dtype: a.dtype(),
+                    });
+                }
+                let dtype = match self {
+                    Self::ArgSort { .. } => DType::U32,
+                    _ => a.dtype(),
+                };
+                computed(dtype, a.shape())
             }
             Self::Concatenate { axis } => {
                 let first = inputs.first().ok_or_else(|| {

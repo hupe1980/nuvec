@@ -89,6 +89,57 @@ fn quantized_qwen2_with_biases_matches_mlx_lm() {
     check("qwen2_q4", 1e-2);
 }
 
+/// The prompt's logits from a fixture's model.
+fn logits(name: &str) -> (Vec<f32>, Vec<f32>) {
+    let (dir, prompt, expected, _, _) = fixture(name);
+    let model = load_model(&dir).unwrap();
+    let tokens = Array::from_slice(&prompt, &[1, prompt.len()]).unwrap();
+    let got = model.forward(&tokens, &mut model.new_cache()).unwrap();
+    (
+        got.astype(DType::F32).unwrap().to_vec::<f32>().unwrap(),
+        expected,
+    )
+}
+
+#[test]
+fn hybrid_qwen3_5_matches_mlx_lm() {
+    check("qwen3_5_f32", 1e-4);
+}
+
+/// In half precision the hybrid's recurrence amplifies rounding differences: nuvec's
+/// element-wise kernels round once in float32 where MLX's bfloat16 ones round after each
+/// step, and MLX's convolution kernel sums in its own order. The logits stay close
+/// (measured against the float32 computation, nuvec's error is MLX's), but greedy tokens
+/// may part.
+#[test]
+fn half_precision_qwen3_5_stays_close_to_mlx_lm() {
+    if !gpu() {
+        return;
+    }
+    for name in ["qwen3_5_bf16", "qwen3_5_q4"] {
+        let (got, want) = logits(name);
+        let scale = want.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+        let diffs: Vec<f32> = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).collect();
+        let max = diffs.iter().fold(0.0f32, |m, &d| m.max(d));
+        let mean = diffs.iter().sum::<f32>() / diffs.len() as f32;
+        assert!(
+            max <= 0.2 * scale,
+            "{name}: max difference {max} (scale {scale})"
+        );
+        assert!(
+            mean <= 0.02 * scale,
+            "{name}: mean difference {mean} (scale {scale})"
+        );
+    }
+}
+
+/// The same model as `qwen3_5_f32` in Hugging Face's layout (prefixes, `[C, 1, K]`
+/// convolutions, zero-centred norms).
+#[test]
+fn hugging_face_qwen3_5_checkpoints_are_sanitized() {
+    check("qwen3_5_hf", 1e-4);
+}
+
 #[test]
 fn the_cache_grows_past_its_first_capacity() {
     if !gpu() {
@@ -147,4 +198,74 @@ fn qwen3_tokenizer_matches_hugging_face() {
     let ids = tokenizer.encode(text);
     assert_eq!(ids, expected);
     assert_eq!(tokenizer.decode(&ids), text);
+}
+
+/// Each sampler filter keeps exactly the tokens mlx-lm's keeps, with unchanged values.
+#[test]
+fn sampler_filters_match_mlx_lm() {
+    use nuvec_lm::sample::{apply_min_p, apply_top_k, apply_top_p};
+    if !gpu() {
+        return;
+    }
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/samplers.safetensors");
+    let fixtures = nuvec::io::load_safetensors(path).unwrap().tensors;
+    let logprobs = &fixtures["logprobs"];
+    let cases: [(&str, Array); 6] = [
+        ("top_p_0.9", apply_top_p(logprobs, 0.9).unwrap()),
+        ("top_p_0.3", apply_top_p(logprobs, 0.3).unwrap()),
+        ("min_p_0.1", apply_min_p(logprobs, 0.1, 1).unwrap()),
+        ("min_p_0.5_keep_4", apply_min_p(logprobs, 0.5, 4).unwrap()),
+        ("top_k_1", apply_top_k(logprobs, 1).unwrap()),
+        ("top_k_7", apply_top_k(logprobs, 7).unwrap()),
+    ];
+    for (name, got) in cases {
+        let want = fixtures[name].to_vec::<f32>().unwrap();
+        let got = got.to_vec::<f32>().unwrap();
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(g == w || (g - w).abs() <= 1e-6, "{name}[{i}]: {g} != {w}");
+        }
+    }
+}
+
+/// Sampling draws only kept tokens, and top-k 1 at any temperature is greedy.
+#[test]
+fn sampling_draws_only_kept_tokens() {
+    use nuvec_lm::Sampler;
+    if !gpu() {
+        return;
+    }
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/samplers.safetensors");
+    let fixtures = nuvec::io::load_safetensors(path).unwrap().tensors;
+    let logprobs = &fixtures["logprobs"];
+    let greedy = Sampler::default()
+        .sample(logprobs)
+        .unwrap()
+        .to_vec::<u32>()
+        .unwrap();
+    let top1 = Sampler {
+        temperature: 2.0,
+        top_k: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        top1.sample(logprobs).unwrap().to_vec::<u32>().unwrap(),
+        greedy
+    );
+    let nucleus = fixtures["top_p_0.3"].to_vec::<f32>().unwrap();
+    let sampler = Sampler {
+        temperature: 1.0,
+        top_p: 0.3,
+        ..Default::default()
+    };
+    for _ in 0..50 {
+        let tokens = sampler.sample(logprobs).unwrap().to_vec::<u32>().unwrap();
+        for (row, &t) in tokens.iter().enumerate() {
+            assert!(
+                nucleus[row * 128 + t as usize].is_finite(),
+                "row {row} drew {t}"
+            );
+        }
+    }
 }

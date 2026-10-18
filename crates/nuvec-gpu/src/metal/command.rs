@@ -267,7 +267,7 @@ impl CommandBuffer {
         if let Some(own) = &self.own {
             let own = Retained::as_ptr(own) as usize;
             for (buffer, _, write) in args.iter().filter_map(Arg::buffer) {
-                for fence in buffer.guard().pending_fences(write) {
+                for fence in buffer.pending_fences(write) {
                     let key = Retained::as_ptr(&fence) as usize;
                     if key != own && !self.waited.contains(&key) {
                         encoder.waitForFence(&fence);
@@ -339,9 +339,11 @@ impl CommandBuffer {
     pub fn commit(mut self) -> Submitted {
         self.close();
         self.raw.commit();
+        self.mark_committed();
         Submitted {
             device: self.device.clone(),
             raw: self.raw.clone(),
+            unfenced: self.own.is_none(),
             guards: std::mem::take(&mut self.guards),
             _retained: std::mem::take(&mut self.retained),
             done: false,
@@ -353,8 +355,14 @@ impl CommandBuffer {
     /// thread that calls [`Pending::wait`].
     pub fn commit_then(mut self, on_complete: impl FnOnce(Result<()>) + Send + 'static) -> Pending {
         self.close();
+        // Without a timeline fence, nothing orders other work after these uses.
+        let guards: Vec<Arc<Guard>> = match self.own {
+            Some(_) => self.guards.iter().map(|(g, _)| g.clone()).collect(),
+            None => Vec::new(),
+        };
         let finish: Finish = Arc::new(Mutex::new(Some(Completion {
             on_complete: Box::new(on_complete),
+            unfenced: self.own.is_none(),
             guards: std::mem::take(&mut self.guards),
             _retained: std::mem::take(&mut self.retained),
             device: self.device.clone(),
@@ -369,9 +377,22 @@ impl CommandBuffer {
         // only retained or released, and the guards are atomics).
         unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&handler)) };
         self.raw.commit();
+        for guard in guards {
+            guard.committed();
+        }
         Pending {
             raw: self.raw.clone(),
             finish,
+        }
+    }
+
+    /// The buffers' uses in this command buffer are committed: their fences now order work
+    /// committed later (only with a timeline fence; otherwise they count once complete).
+    fn mark_committed(&self) {
+        if self.own.is_some() {
+            for (guard, _) in &self.guards {
+                guard.committed();
+            }
         }
     }
 
@@ -406,6 +427,7 @@ impl Drop for CommandBuffer {
             encoder.endEncoding();
         }
         for (guard, write) in self.guards.drain(..) {
+            guard.committed();
             guard.release(write);
         }
     }
@@ -455,6 +477,8 @@ fn validate(args: &[Arg<'_>]) -> Result<()> {
 struct Completion {
     on_complete: Box<dyn FnOnce(Result<()>) + Send>,
     guards: Vec<(Arc<Guard>, bool)>,
+    /// The command buffer had no timeline fence: its uses count as committed only now.
+    unfenced: bool,
     _retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     device: Device,
 }
@@ -473,6 +497,9 @@ fn complete(finish: &Finish, result: impl FnOnce() -> Result<()>) {
     };
     let result = result();
     for (guard, write) in c.guards {
+        if c.unfenced {
+            guard.committed();
+        }
         guard.release(write);
     }
     drop(c._retained);
@@ -506,6 +533,9 @@ impl std::fmt::Debug for Pending {
 pub struct Submitted {
     device: Device,
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    /// The command buffer had no timeline fence: its uses count as committed only once
+    /// complete.
+    unfenced: bool,
     guards: Vec<(Arc<Guard>, bool)>,
     _retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     done: bool,
@@ -524,6 +554,9 @@ impl Submitted {
         self.raw.waitUntilCompleted();
         self.done = true;
         for (guard, write) in self.guards.drain(..) {
+            if self.unfenced {
+                guard.committed();
+            }
             guard.release(write);
         }
         self.device.flights().end();

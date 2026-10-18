@@ -1,6 +1,7 @@
 //! LLM runtime: Llama-family models (Llama, Mistral, Qwen 2, Qwen 3) loaded from Hugging
 //! Face or MLX checkpoints (including MLX's quantized ones), a byte-level BPE tokenizer,
-//! a key-value cache and token generation, as mlx-lm.
+//! a key-value cache, token generation and sampling (temperature, top-p, min-p, top-k), as
+//! mlx-lm.
 //!
 //! ```no_run
 //! use nuvec_lm::{GenerateOptions, generate, load};
@@ -28,11 +29,13 @@ use nuvec_nn::Module;
 pub mod config;
 pub mod generate;
 pub mod model;
+pub mod sample;
 pub mod tokenizer;
 
 pub use config::Config;
 pub use generate::{GenerateOptions, Generation, generate};
 pub use model::{KvCache, Model};
+pub use sample::Sampler;
 pub use tokenizer::{StreamDecoder, Tokenizer};
 
 /// The version of this crate.
@@ -73,8 +76,53 @@ pub fn load(model: &str) -> Result<(Model, Tokenizer)> {
     Ok((load_model(dir)?, tokenizer))
 }
 
+/// mlx-lm's `sanitize` of hybrid and multimodal checkpoints: the language model's weights
+/// under their text-model names (vision and multi-token-prediction weights dropped) and, in
+/// Hugging Face checkpoints (convolutions stored `[C, 1, K]`), the convolutions as
+/// `[C, K, 1]` and the zero-centred norm weights plus one.
+fn sanitize(weights: BTreeMap<String, Array>) -> Result<BTreeMap<String, Array>> {
+    let mut weights: BTreeMap<String, Array> = weights
+        .into_iter()
+        .filter(|(k, _)| {
+            !(k.starts_with("vision_tower") || k.starts_with("model.visual") || k.contains("mtp."))
+        })
+        .map(|(k, v)| {
+            let k = match (
+                k.strip_prefix("model.language_model."),
+                k.strip_prefix("language_model."),
+            ) {
+                (Some(rest), _) => format!("model.{rest}"),
+                (_, Some(rest)) => rest.to_owned(),
+                _ => k,
+            };
+            (k, v)
+        })
+        .collect();
+    let unsanitized = weights
+        .iter()
+        .any(|(k, v)| k.contains("conv1d.weight") && v.shape().last() != Some(&1));
+    if unsanitized {
+        const NORMS: [&str; 5] = [
+            ".input_layernorm.weight",
+            ".post_attention_layernorm.weight",
+            "model.norm.weight",
+            ".q_norm.weight",
+            ".k_norm.weight",
+        ];
+        for (k, v) in &mut weights {
+            if k.contains("conv1d.weight") && v.shape().last() != Some(&1) {
+                *v = nuvec::transpose(v, &[0, 2, 1])?;
+            } else if v.ndim() == 1 && NORMS.iter().any(|n| k.ends_with(n)) {
+                *v = nuvec::add(&*v, 1.0)?;
+            }
+        }
+    }
+    Ok(weights)
+}
+
 /// Loads a model (without its tokenizer) from a directory with `config.json` and
-/// `model*.safetensors` files, as [`load`].
+/// `model*.safetensors` files, as [`load`]. The weights are memory-mapped; the model is
+/// then warmed up ([`Model::warm_up`]), as mlx-lm evaluates its weights when it loads.
 pub fn load_model(dir: impl AsRef<Path>) -> Result<Model> {
     let dir = dir.as_ref();
     let config = Config::from_file(dir.join("config.json"))?;
@@ -99,6 +147,7 @@ pub fn load_model(dir: impl AsRef<Path>) -> Result<Model> {
     for file in &files {
         weights.extend(nuvec::io::load_safetensors(file)?.tensors);
     }
+    let mut weights = sanitize(weights)?;
     // mlx-lm's `sanitize`: drop precomputed rotary frequencies and tied heads.
     weights.retain(|name, _| !name.contains("rotary_emb.inv_freq"));
     if config.tie_word_embeddings {
@@ -113,5 +162,6 @@ pub fn load_model(dir: impl AsRef<Path>) -> Result<Model> {
     };
     let mut model = Model::new(&config, &quantized)?;
     model.load_weights(weights, true)?;
+    model.warm_up()?;
     Ok(model)
 }

@@ -30,28 +30,37 @@ enum Pattern {
     Gpt4 {
         /// The longest digit run (`\p{N}` is 1, `\p{N}{1,3}` is 3).
         digits: usize,
+        /// Words also take combining marks, which are not punctuation (`[\p{L}\p{M}]+`,
+        /// Qwen 3.5).
+        marks: bool,
     },
 }
 
 const GPT2: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 const GPT4_PREFIX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}";
 const GPT4_SUFFIX: &str = r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+const MARKS_PREFIX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}";
+const MARKS_SUFFIX: &str = r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 impl Pattern {
     fn parse(regex: &str) -> Result<Self> {
         if regex == GPT2 {
             return Ok(Self::Gpt2);
         }
-        let digits = regex
-            .strip_prefix(GPT4_PREFIX)
-            .and_then(|rest| rest.strip_suffix(GPT4_SUFFIX))
-            .and_then(|quantifier| match quantifier {
-                "" => Some(1),
-                "{1,3}" => Some(3),
-                _ => None,
-            });
-        digits
-            .map(|digits| Self::Gpt4 { digits })
+        let quantified = |prefix: &str, suffix: &str| {
+            regex
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+                .and_then(|quantifier| match quantifier {
+                    "" => Some(1),
+                    "{1,3}" => Some(3),
+                    _ => None,
+                })
+        };
+        let gpt4 = quantified(GPT4_PREFIX, GPT4_SUFFIX).map(|digits| (digits, false));
+        let marks = quantified(MARKS_PREFIX, MARKS_SUFFIX).map(|digits| (digits, true));
+        gpt4.or(marks)
+            .map(|(digits, marks)| Self::Gpt4 { digits, marks })
             .ok_or_else(|| invalid(format!("unsupported pre-tokenizer pattern {regex:?}")))
     }
 
@@ -63,7 +72,7 @@ impl Pattern {
         while i < chars.len() {
             let n = match self {
                 Self::Gpt2 => gpt2_match(&chars, i),
-                Self::Gpt4 { digits } => gpt4_match(&chars, i, digits),
+                Self::Gpt4 { digits, marks } => gpt4_match(&chars, i, digits, marks),
             }
             .max(1);
             let start = chars[i].0;
@@ -84,6 +93,15 @@ fn is_letter(c: char) -> bool {
             | G::TitlecaseLetter
             | G::ModifierLetter
             | G::OtherLetter
+    )
+}
+
+/// `\p{M}`: combining marks.
+fn is_mark(c: char) -> bool {
+    use GeneralCategory as G;
+    matches!(
+        get_general_category(c),
+        G::NonspacingMark | G::SpacingMark | G::EnclosingMark
     )
 }
 
@@ -149,20 +167,22 @@ fn gpt2_match(chars: &[(usize, char)], i: usize) -> usize {
     spaces(chars, i)
 }
 
-fn gpt4_match(chars: &[(usize, char)], i: usize, digits: usize) -> usize {
+fn gpt4_match(chars: &[(usize, char)], i: usize, digits: usize, marks: bool) -> usize {
     let c = chars[i].1;
     let n = contraction(chars, i, true);
     if n > 0 {
         return n;
     }
+    // `\p{L}`, or `[\p{L}\p{M}]` with marks.
+    let word = |c: char| is_letter(c) || (marks && is_mark(c));
     // `[^\r\n\p{L}\p{N}]?\p{L}+`
     if !matches!(c, '\r' | '\n') && !is_letter(c) && !is_number(c) {
-        let n = run(chars, i + 1, is_letter);
+        let n = run(chars, i + 1, word);
         if n > 0 {
             return 1 + n;
         }
     }
-    let n = run(chars, i, is_letter);
+    let n = run(chars, i, word);
     if n > 0 {
         return n;
     }
@@ -171,9 +191,9 @@ fn gpt4_match(chars: &[(usize, char)], i: usize, digits: usize) -> usize {
     if n > 0 {
         return n.min(digits);
     }
-    // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+    // ` ?[^\s\p{L}\p{N}]+[\r\n]*` (and not `\p{M}`, with marks)
     let space = usize::from(c == ' ');
-    let n = run(chars, i + space, is_other);
+    let n = run(chars, i + space, |c| is_other(c) && !(marks && is_mark(c)));
     if n > 0 {
         let end = i + space + n;
         return space + n + run(chars, end, |c| matches!(c, '\r' | '\n'));
@@ -522,7 +542,10 @@ mod tests {
 
     #[test]
     fn gpt4_pattern_splits_like_the_regex() {
-        let qwen = Pattern::Gpt4 { digits: 1 };
+        let qwen = Pattern::Gpt4 {
+            digits: 1,
+            marks: false,
+        };
         assert_eq!(
             pieces(qwen, "Hello world, it's 2024!\n\n  ok  "),
             [
@@ -530,7 +553,10 @@ mod tests {
                 "  "
             ]
         );
-        let llama3 = Pattern::Gpt4 { digits: 3 };
+        let llama3 = Pattern::Gpt4 {
+            digits: 3,
+            marks: false,
+        };
         assert_eq!(pieces(llama3, "12345 x"), ["123", "45", " x"]);
         // Case-insensitive contractions; a leading non-letter joins a word.
         assert_eq!(pieces(qwen, "I'LL (go)"), ["I", "'LL", " (", "go", ")"]);
@@ -547,10 +573,55 @@ mod tests {
         );
     }
 
+    /// Qwen 3.5's pattern, against Hugging Face `tokenizers` (`Split`, isolated).
+    #[test]
+    fn marks_pattern_splits_like_the_regex() {
+        let qwen35 = Pattern::Gpt4 {
+            digits: 1,
+            marks: true,
+        };
+        let cases: [(&str, &[&str]); 5] = [
+            (
+                "cafe\u{301} ete\u{301}!",
+                &["cafe\u{301}", " ete\u{301}", "!"],
+            ),
+            ("नमस्ते दुनिया", &["नमस्ते", " दुनिया"]),
+            ("x\u{301}?\u{301} a", &["x\u{301}", "?\u{301}", " a"]),
+            (
+                "\u{301}\u{301}b 12.5%",
+                &["\u{301}\u{301}b", " ", "1", "2", ".", "5", "%"],
+            ),
+            (
+                "Hello world, it's 2024!\n\n  ok  ",
+                &[
+                    "Hello", " world", ",", " it", "'s", " ", "2", "0", "2", "4", "!\n\n", " ",
+                    " ok", "  ",
+                ],
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(pieces(qwen35, text), want, "{text:?}");
+        }
+    }
+
     #[test]
     fn patterns_are_recognised() {
         let qwen = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-        assert_eq!(Pattern::parse(qwen).unwrap(), Pattern::Gpt4 { digits: 1 });
+        assert_eq!(
+            Pattern::parse(qwen).unwrap(),
+            Pattern::Gpt4 {
+                digits: 1,
+                marks: false
+            }
+        );
+        let qwen35 = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        assert_eq!(
+            Pattern::parse(qwen35).unwrap(),
+            Pattern::Gpt4 {
+                digits: 1,
+                marks: true
+            }
+        );
         assert!(Pattern::parse(r"\w+").is_err());
     }
 

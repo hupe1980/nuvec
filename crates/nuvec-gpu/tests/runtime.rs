@@ -429,6 +429,38 @@ fn ordered_writes_wait_for_in_flight_readers() {
 }
 
 #[test]
+fn reused_memory_is_written_after_in_flight_readers() {
+    let Some(device) = device() else { return };
+    // A slow chain reads `a`; `a` is dropped while the chain is in flight, and its memory
+    // reused for a buffer later work overwrites. The chain must still see `a`'s values.
+    let n = 1 << 14;
+    let a = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
+    let zeros = device.buffer_from(&f32s(&vec![0.0; n])).unwrap();
+    let mut acc = device.buffer_from(&f32s(&vec![0.0; n])).unwrap();
+    let mut pending = Vec::new();
+    for _ in 0..200 {
+        let mut next = device.new_buffer(n * 4).unwrap();
+        let mut cmd = device.ordered_command_buffer().unwrap();
+        add(&mut cmd, &device, &acc, &a, &mut next, n as u32);
+        pending.push(cmd.commit_then(|r| r.unwrap()));
+        acc = next;
+    }
+    let before = device.memory().system_allocations;
+    drop(a);
+    let mut reused = device.new_gpu_buffer(n * 4).unwrap();
+    let reused_a = device.memory().system_allocations == before;
+    let mut cmd = device.ordered_command_buffer().unwrap();
+    add(&mut cmd, &device, &zeros, &zeros, &mut reused, n as u32);
+    cmd.commit_then(|r| r.unwrap()).wait();
+    for p in pending {
+        p.wait();
+    }
+    assert!(reused_a, "`a`'s memory is reused");
+    assert!(read_f32(&reused).iter().all(|&v| v == 0.0));
+    assert!(read_f32(&acc).iter().all(|&v| v == 200.0));
+}
+
+#[test]
 fn mapped_files_are_read_without_a_copy_and_never_written() {
     let Some(device) = device() else { return };
     let path = std::env::temp_dir().join(format!("nuvec-gpu-map-{}", std::process::id()));

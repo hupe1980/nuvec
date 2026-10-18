@@ -104,7 +104,7 @@ mod stub {
 mod metal {
     use crate::array::NodeMap;
 
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Mutex, PoisonError, Weak};
 
     use nuvec_gpu::{Arg, CommandBuffer, Device as MetalDevice, Pending};
 
@@ -117,9 +117,10 @@ mod metal {
 
     use crate::fused::Load;
 
-    /// Dispatches per command buffer before it is committed while the GPU is busy.
+    /// The most dispatches per command buffer.
     const MAX_DISPATCHES: usize = 256;
-    /// Dispatches per command buffer before it is committed while the GPU is idle.
+    /// Dispatches in an evaluation's first command buffer, and in the next one whenever
+    /// the GPU is idle.
     const IDLE_DISPATCHES: usize = 8;
     /// Command buffers in flight per device before submission blocks (MLX: 10).
     const MAX_IN_FLIGHT: usize = 10;
@@ -195,10 +196,13 @@ mod metal {
         device: Option<&'static MetalDevice>,
         cmd: Option<CommandBuffer>,
         dispatches: usize,
+        /// Dispatches at which the open command buffer is committed (chosen at the first
+        /// dispatch).
+        limit: Option<usize>,
         /// Outputs encoded into the open command buffer.
         chunk: Chunk,
         /// Every pending output of this evaluation, for consumers encoded later.
-        index: NodeMap<*const Node, Vec<Data>>,
+        index: NodeMap<*const Node, (Weak<Node>, Vec<Data>)>,
         shared: Arc<Shared>,
         /// This evaluation's committed command buffers.
         submitted: Vec<Pending>,
@@ -487,6 +491,170 @@ mod metal {
         strides: Vec<isize>,
     }
 
+    /// Metal's name of a kernel dtype.
+    fn msl_type(dtype: DType) -> &'static str {
+        match dtype {
+            DType::F16 => "half",
+            DType::BF16 => "bfloat",
+            _ => "float",
+        }
+    }
+
+    /// mlx-lm's generic gated delta kernel (`_make_gated_delta_kernel`, scalar gates, no
+    /// mask; MIT, Apple): one SIMD-group per value row, `Dk / 32` state values per lane.
+    const GATED_DELTA: &str = r#"
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+        if (dv_idx >= Dv) {
+          return;
+        }
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * static_cast<float>(g_[hv_idx]);
+            kv_mem += state[i] * static_cast<float>(k_[s_idx]);
+          }
+          kv_mem = simd_sum(kv_mem);
+
+          auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+            out += state[i] * static_cast<float>(q_[s_idx]);
+          }
+          out = simd_sum(out);
+          if (thread_index_in_simdgroup == 0) {
+            y[dv_idx] = static_cast<InT>(out);
+          }
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y += Hv * Dv;
+          g_ += Hv;
+          beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+"#;
+
+    /// mlx-lm's packed gated delta kernel (`_make_gated_delta_packed_kernel`, `Dk = 128`,
+    /// float32 gates and state; MIT, Apple): four lanes per value row, eight rows per
+    /// SIMD-group, the same reduction tree as the generic kernel.
+    const GATED_DELTA_PACKED: &str = r#"
+        constexpr int lanes_per_row = 4;
+        constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+        constexpr int values_per_lane = Dk / lanes_per_row;
+        constexpr int partials_per_lane = values_per_lane / 4;
+
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+
+        auto lane = thread_index_in_simdgroup;
+        auto row_in_simdgroup = lane / lanes_per_row;
+        auto lane_in_row = lane & (lanes_per_row - 1);
+        auto row_group = thread_position_in_grid.y;
+        auto dv_idx = row_group * rows_per_simdgroup + row_in_simdgroup;
+
+        auto q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+        auto k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+        auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
+        y += (b_idx * T * Hv + hv_idx) * Dv;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+
+        float state[values_per_lane];
+        for (int i = 0; i < values_per_lane; ++i) {
+          state[i] = static_cast<float>(i_state[i]);
+        }
+
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+          float gt = static_cast<float>(g_[hv_idx]);
+          float part[partials_per_lane];
+          for (int pb = 0; pb < partials_per_lane; ++pb) {
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              int e = pb * 4 + i;
+              state[e] = state[e] * gt;
+              acc += state[e] * static_cast<float>(k_[e]);
+            }
+            part[pb] = acc;
+          }
+          float kv_mem =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          kv_mem += simd_shuffle_xor(kv_mem, 1);
+          kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+          auto delta =
+              (static_cast<float>(v_[dv_idx]) - kv_mem) *
+              static_cast<float>(beta_[hv_idx]);
+
+          for (int pb = 0; pb < partials_per_lane; ++pb) {
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              int e = pb * 4 + i;
+              state[e] = state[e] + static_cast<float>(k_[e]) * delta;
+              acc += state[e] * static_cast<float>(q_[e]);
+            }
+            part[pb] = acc;
+          }
+          float out =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          out += simd_shuffle_xor(out, 1);
+          out += simd_shuffle_xor(out, 2);
+          if (lane_in_row == 0) {
+            y[dv_idx] = static_cast<InT>(out);
+          }
+
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y += Hv * Dv;
+          g_ += Hv;
+          beta_ += Hv;
+        }
+
+        for (int i = 0; i < values_per_lane; ++i) {
+          o_state[i] = static_cast<StT>(state[i]);
+        }
+"#;
+
     impl Packed<'_> {
         fn arg(&self) -> Arg<'_> {
             match &self.buffer {
@@ -576,6 +744,7 @@ mod metal {
                 device: None,
                 cmd: None,
                 dispatches: 0,
+                limit: None,
                 chunk: Vec::new(),
                 index: NodeMap::default(),
                 shared: Arc::default(),
@@ -655,6 +824,15 @@ mod metal {
                     | Primitive::SliceUpdate { .. },
                     _,
                 ) => true,
+                (Primitive::Sort { .. } | Primitive::ArgSort { .. }, Some(d)) => {
+                    // MLX's kernels: integers and the GPU's floats (no bool, f64, complex).
+                    !matches!(d, DType::Bool | DType::F64 | DType::Complex64)
+                        && operands[0].0.size < i32::MAX as usize
+                }
+                (Primitive::Scan { op, .. }, Some(d)) => match op {
+                    crate::ScanOp::LogAddExp => is_float(d),
+                    _ => !matches!(d, DType::Bool | DType::F64 | DType::Complex64),
+                },
                 (Primitive::ScatterAxis { reduce, .. }, Some(d)) => {
                     *reduce == crate::ScatterReduce::None
                         || matches!(
@@ -685,7 +863,7 @@ mod metal {
                 return self.quantize(operands[0], outputs, *group_size, usize::from(*bits));
             }
             let out = &outputs[0];
-            let mut buffer = Buffer::try_alloc(out.size * out.dtype.size())?;
+            let mut buffer = Buffer::try_alloc_gpu(out.size * out.dtype.size())?;
             match primitive {
                 Primitive::Unary(op) => {
                     let dt = operands[0].0.dtype;
@@ -724,6 +902,14 @@ mod metal {
                 Primitive::Concatenate { axis } => {
                     self.concatenate(operands, out, *axis, &mut buffer)?
                 }
+                Primitive::Sort { axis } => self.sort(operands[0], *axis, false, &mut buffer)?,
+                Primitive::ArgSort { axis } => self.sort(operands[0], *axis, true, &mut buffer)?,
+                Primitive::Scan {
+                    op,
+                    axis,
+                    reverse,
+                    inclusive,
+                } => self.scan(*op, operands[0], *axis, (*reverse, *inclusive), &mut buffer)?,
                 Primitive::SliceUpdate { .. } => {
                     self.copy(operands[0], &mut buffer)?;
                     let slices = primitive.dim_slices(out.shape.len())?;
@@ -817,7 +1003,7 @@ mod metal {
             let out = &outputs[0];
             let mut buffers = outputs
                 .iter()
-                .map(|o| Buffer::try_alloc(o.size * o.dtype.size()))
+                .map(|o| Buffer::try_alloc_gpu(o.size * o.dtype.size()))
                 .collect::<Result<Vec<_>>>()?;
             let mut strided: Vec<&[isize]> = Vec::new();
             let loads: Vec<Load> = operands
@@ -961,6 +1147,232 @@ mod metal {
             Ok(base)
         }
 
+        /// MLX's merge sort (`gpu_merge_sort`): one threadgroup per lane for axes that fit a
+        /// block, else block sorts and merge passes in temporary buffers. With `arg`, the
+        /// output is the sorting indices (uint32).
+        fn sort(
+            &mut self,
+            (meta, data): Operand<'_>,
+            axis: usize,
+            arg: bool,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            if meta.size == 0 {
+                return Ok(());
+            }
+            let n = meta.shape[axis];
+            let rows = meta.size / n;
+            let tn = 4;
+            let mut bn = match n.div_ceil(tn) {
+                p if p > 256 => 512,
+                p if p > 128 => 256,
+                p if p > 64 => 128,
+                p if p > 32 => 64,
+                _ => 32,
+            };
+            if bn == 512 && meta.dtype.size() > 4 {
+                bn = 256;
+            }
+            let blocks = n.div_ceil(bn * tn);
+            let dtype = meta.dtype.name();
+            let i32b = |v: usize| bytes(&(v as i32));
+            let mut nc_shape: Vec<usize> = meta.shape.to_vec();
+            let mut nc_strides: Vec<isize> = meta.strides.to_vec();
+            nc_shape.remove(axis);
+            nc_strides.remove(axis);
+            let input = Arg::Read(
+                data.buffer.metal().expect("checked"),
+                data.offset as usize * meta.dtype.size(),
+            );
+            if blocks == 1 {
+                let out_strides = crate::shape::row_contiguous_strides(&meta.shape);
+                let mut out_nc: Vec<isize> = out_strides.to_vec();
+                out_nc.remove(axis);
+                let name = if arg {
+                    format!("nuvec_ncarg_block_sort_{dtype}_uint32_bn{bn}_tn{tn}")
+                } else {
+                    format!("nuvec_nc_block_sort_{dtype}_{dtype}_bn{bn}_tn{tn}")
+                };
+                let consts = [
+                    i32b(n),
+                    i32b(meta.strides[axis] as usize),
+                    i32b(out_strides[axis] as usize),
+                    i32b(nc_shape.len()),
+                    shape_bytes(&nc_shape),
+                    strides_bytes(&nc_strides),
+                    strides_bytes(&out_nc),
+                ];
+                let mut args = vec![
+                    input,
+                    Arg::write(buffer.metal_mut().expect("device storage")),
+                ];
+                args.extend(consts.iter().map(|c| Arg::bytes(c)));
+                return self.dispatch_groups(&name, &args, [1, rows, 1], [bn, 1, 1]);
+            }
+            // Multi-block: sorted lanes as `[rows, n]` values and indices, ping-ponged.
+            let lane = rows * n;
+            let mut vals = [
+                Buffer::try_alloc_gpu(lane * meta.dtype.size())?,
+                Buffer::try_alloc_gpu(lane * meta.dtype.size())?,
+            ];
+            let mut idxs = [
+                Buffer::try_alloc_gpu(lane * 4)?,
+                Buffer::try_alloc_gpu(lane * 4)?,
+            ];
+            let mut partitions = Buffer::try_alloc_gpu(rows * (blocks + 1) * 4)?;
+            let suffix = format!("{dtype}_uint32_bn{bn}_tn{tn}");
+            {
+                let consts = [
+                    i32b(n),
+                    i32b(meta.strides[axis] as usize),
+                    i32b(nc_shape.len().max(1)),
+                    shape_bytes(if nc_shape.is_empty() { &[0] } else { &nc_shape }),
+                    strides_bytes(if nc_strides.is_empty() {
+                        &[1]
+                    } else {
+                        &nc_strides
+                    }),
+                ];
+                let [v0, _] = &mut vals;
+                let [i0, _] = &mut idxs;
+                let mut args = vec![
+                    input,
+                    Arg::write(v0.metal_mut().expect("device storage")),
+                    Arg::write(i0.metal_mut().expect("device storage")),
+                ];
+                args.extend(consts.iter().map(|c| Arg::bytes(c)));
+                let name = format!("nuvec_sort_mbsort_{suffix}");
+                self.dispatch_groups(&name, &args, [blocks, rows, 1], [bn, 1, 1])?;
+            }
+            let threads = (blocks + 1).min(1024);
+            let mut current = 0;
+            let mut merge_tiles = 2;
+            while merge_tiles / 2 < blocks {
+                let (from, to) = (current, 1 - current);
+                let [v0, v1] = &mut vals;
+                let [i0, i1] = &mut idxs;
+                let (vin, vout) = if from == 0 { (v0, v1) } else { (v1, v0) };
+                let (iin, iout) = if from == 0 { (i0, i1) } else { (i1, i0) };
+                let consts = [i32b(n), i32b(merge_tiles), i32b(blocks)];
+                {
+                    let mut args = vec![
+                        Arg::write(partitions.metal_mut().expect("device storage")),
+                        Arg::read(vin.metal().expect("device storage")),
+                        Arg::read(iin.metal().expect("device storage")),
+                    ];
+                    args.extend(consts.iter().map(|c| Arg::bytes(c)));
+                    let name = format!("nuvec_partition_mbsort_{suffix}");
+                    self.dispatch_groups(&name, &args, [1, rows, 1], [threads, 1, 1])?;
+                }
+                let mut args = vec![
+                    Arg::read(partitions.metal().expect("device storage")),
+                    Arg::read(vin.metal().expect("device storage")),
+                    Arg::read(iin.metal().expect("device storage")),
+                    Arg::write(vout.metal_mut().expect("device storage")),
+                    Arg::write(iout.metal_mut().expect("device storage")),
+                ];
+                args.extend(consts.iter().map(|c| Arg::bytes(c)));
+                let name = format!("nuvec_merge_mbsort_{suffix}");
+                self.dispatch_groups(&name, &args, [blocks, rows, 1], [bn, 1, 1])?;
+                current = to;
+                merge_tiles *= 2;
+            }
+            // `[rows, n]` (the sorted axis innermost) into the output's layout.
+            let [v0, v1] = vals;
+            let [i0, i1] = idxs;
+            let (result, dtype) = match (arg, current) {
+                (true, 0) => (i0, DType::U32),
+                (true, _) => (i1, DType::U32),
+                (false, 0) => (v0, meta.dtype),
+                (false, _) => (v1, meta.dtype),
+            };
+            let mut src_strides = vec![0isize; meta.shape.len()];
+            let mut step = n as isize;
+            for d in (0..meta.shape.len()).rev() {
+                if d == axis {
+                    src_strides[d] = 1;
+                } else {
+                    src_strides[d] = step;
+                    step *= meta.shape[d] as isize;
+                }
+            }
+            let src_meta = crate::kernels::strided(dtype, &meta.shape, &src_strides);
+            let src = Data::new(result);
+            let out_strides = crate::shape::row_contiguous_strides(&meta.shape);
+            self.copy_into((&src_meta, &src), &out_strides, 0, buffer)
+        }
+
+        /// MLX's scans (`scan_gpu_inplace`): the contiguous kernel when the axis is
+        /// innermost, else the strided one, over a row-contiguous input (copied first if
+        /// needed).
+        fn scan(
+            &mut self,
+            op: crate::ScanOp,
+            operand: Operand<'_>,
+            axis: usize,
+            (reverse, inclusive): (bool, bool),
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let (meta, data) = operand;
+            if meta.size == 0 {
+                return Ok(());
+            }
+            let packed;
+            let (in_buffer, offset) = if meta.flags.row_contiguous {
+                (data.buffer.metal().expect("checked"), data.offset as usize)
+            } else {
+                let mut copy = Buffer::try_alloc_gpu(meta.size * meta.dtype.size())?;
+                self.copy(operand, &mut copy)?;
+                packed = copy;
+                (packed.metal().expect("device storage"), 0)
+            };
+            let n = meta.shape[axis];
+            let strides = crate::shape::row_contiguous_strides(&meta.shape);
+            let stride = strides[axis] as usize;
+            let op_name = match op {
+                crate::ScanOp::Sum => "sum",
+                crate::ScanOp::Prod => "prod",
+                crate::ScanOp::Max => "max",
+                crate::ScanOp::Min => "min",
+                crate::ScanOp::LogAddExp => "logaddexp",
+            };
+            let variant = format!(
+                "{}{}_{op_name}_{}",
+                if reverse { "reverse_" } else { "" },
+                if inclusive { "inclusive" } else { "exclusive" },
+                meta.dtype.name()
+            );
+            let n_reads = if meta.dtype.size() <= 4 { 4 } else { 2 };
+            let size = bytes(&(n as u64));
+            let mut args = vec![
+                Arg::Read(in_buffer, offset * meta.dtype.size()),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&size),
+            ];
+            if stride == 1 {
+                let per_simd = n_reads * 32;
+                let max = 1024;
+                let threads = if n <= n_reads * 1024 {
+                    n.div_ceil(per_simd) * 32
+                } else if n <= n_reads * 2048 {
+                    (n / 2).div_ceil(per_simd) * 32
+                } else {
+                    max
+                }
+                .min(max);
+                let name = format!("nuvec_contig_scan_{variant}");
+                self.dispatch_groups(&name, &args, [1, meta.size / n, 1], [threads, 1, 1])
+            } else {
+                let blocks = stride.div_ceil(32);
+                let (stride_b, blocks_b) = (bytes(&(stride as u64)), bytes(&(blocks as u64)));
+                args.extend([Arg::bytes(&stride_b), Arg::bytes(&blocks_b)]);
+                let threads = (32 / n_reads) * 32;
+                let groups = meta.size / (n * stride) * blocks;
+                let name = format!("nuvec_strided_scan_{variant}");
+                self.dispatch_groups(&name, &args, [1, groups, 1], [threads, 1, 1])
+            }
+        }
+
         /// Copies an operand into the region of `buffer` at element `offset` with `strides`.
         fn copy_into(
             &mut self,
@@ -1078,7 +1490,7 @@ mod metal {
             }
             // Pass 1 folds slices of each output's range into partial results; pass 2 folds
             // the partial results (contiguous, `slices` per output).
-            let mut partial = Buffer::try_alloc(groups * slices * meta.dtype.size())?;
+            let mut partial = Buffer::try_alloc_gpu(groups * slices * meta.dtype.size())?;
             let layout = Layout {
                 offset: data.offset,
                 ks: &ks,
@@ -1348,7 +1760,7 @@ mod metal {
             let tiles = m.div_ceil(32) * n.div_ceil(32);
             let partitions = ((k / 16) / tiles).next_power_of_two().clamp(2, 32);
             let iterations = (k / bk) / partitions;
-            let mut partial = Buffer::try_alloc(partitions * m * n * 4)?;
+            let mut partial = Buffer::try_alloc_gpu(partitions * m * n * 4)?;
             let name = format!(
                 "nuvec_gemm_splitk_{}{}_{}_bm{bm}_bn{bn}_MN_{}_K_{}",
                 if ga.transposed { 't' } else { 'n' },
@@ -1601,7 +2013,7 @@ mod metal {
                     strides: st.to_vec(),
                 });
             }
-            let mut copy = Buffer::try_alloc(meta.size * meta.dtype.size())?;
+            let mut copy = Buffer::try_alloc_gpu(meta.size * meta.dtype.size())?;
             self.copy(operand, &mut copy)?;
             Ok(Packed {
                 buffer: GemmBuffer::Copy(copy),
@@ -1656,7 +2068,7 @@ mod metal {
             outputs: &[Output],
         ) -> Result<Vec<Data>> {
             use crate::fast::FastOp;
-            let alloc = |o: &Output| Buffer::try_alloc(o.size * o.dtype.size());
+            let alloc = |o: &Output| Buffer::try_alloc_gpu(o.size * o.dtype.size());
             if let FastOp::Attention {
                 scale,
                 causal,
@@ -1668,6 +2080,9 @@ mod metal {
                 let flags = (f32::from_bits(*scale), *causal, *mask, *sinks);
                 self.attention(operands, &outputs[0], flags, &mut out)?;
                 return Ok(vec![Data::new(out)]);
+            }
+            if *op == FastOp::GatedDelta {
+                return self.gated_delta(operands, outputs);
             }
             let mut out = alloc(&outputs[0])?;
             let x = self.packed(operands[0], true)?;
@@ -1764,7 +2179,7 @@ mod metal {
                     } else {
                         row_threads(axis, reads)
                     };
-                    let mut temp = Buffer::try_alloc(if has_w {
+                    let mut temp = Buffer::try_alloc_gpu(if has_w {
                         groups * axis * dt.size()
                     } else {
                         dt.size()
@@ -1878,7 +2293,7 @@ mod metal {
                         .map_err(backend)?;
                     self.counted()?;
                 }
-                FastOp::Attention { .. } => unreachable!("handled above"),
+                FastOp::Attention { .. } | FastOp::GatedDelta => unreachable!("handled above"),
                 FastOp::CrossEntropy | FastOp::CrossEntropyVjp => {
                     let vjp = *op == FastOp::CrossEntropyVjp;
                     let name =
@@ -1902,6 +2317,90 @@ mod metal {
             let mut data = vec![Data::new(out)];
             data.extend(extra.into_iter().map(Data::new));
             Ok(data)
+        }
+
+        /// mlx-lm's gated delta kernels (`gated_delta.py`), generated for the head sizes and
+        /// dtypes as its `metal_kernel`s are: `(q, k, v, g, beta, state)` to `(y, state)`.
+        /// One SIMD-group per value row, or, for `Dk = 128` with float32 gates and state,
+        /// the packed kernel (eight rows per SIMD-group).
+        fn gated_delta(
+            &mut self,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+        ) -> Result<Vec<Data>> {
+            let ins = operands
+                .iter()
+                .map(|&o| self.packed(o, true))
+                .collect::<Result<Vec<_>>>()?;
+            let (q, v, g, state) = (operands[0].0, operands[2].0, operands[3].0, operands[5].0);
+            let (b, t, hk, dk) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
+            let (hv, dv) = (v.shape[2], v.shape[3]);
+            let mut y = Buffer::try_alloc_gpu(outputs[0].size * outputs[0].dtype.size())?;
+            let mut s = Buffer::try_alloc_gpu(outputs[1].size * outputs[1].dtype.size())?;
+            if t == 0 {
+                self.copy(operands[5], &mut s)?;
+                return Ok(vec![Data::new(y), Data::new(s)]);
+            }
+            let packed =
+                dk == 128 && dv % 8 == 0 && g.dtype == DType::F32 && state.dtype == DType::F32;
+            let types: Vec<&str> = operands.iter().map(|o| msl_type(o.0.dtype)).collect();
+            let name = format!(
+                "nuvec_gated_delta{}_{}_{}_{}_{}_dk{dk}_dv{dv}_hk{hk}_hv{hv}",
+                if packed { "_packed" } else { "" },
+                types[0],
+                types[3],
+                types[4],
+                types[5],
+            );
+            let device = self
+                .device()
+                .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+            let source = || {
+                let body = if packed {
+                    GATED_DELTA_PACKED
+                } else {
+                    GATED_DELTA
+                };
+                format!(
+                    "#include <metal_stdlib>\nusing namespace metal;\n\
+                     [[kernel]] void {name}(\n\
+                     const device {in_t}* q [[buffer(0)]], const device {in_t}* k [[buffer(1)]],\n\
+                     const device {in_t}* v [[buffer(2)]], const device {g_t}* g [[buffer(3)]],\n\
+                     const device {b_t}* beta [[buffer(4)]], const device {st_t}* state_in [[buffer(5)]],\n\
+                     device {in_t}* y [[buffer(6)]], device {st_t}* state_out [[buffer(7)]],\n\
+                     constant int& T [[buffer(8)]],\n\
+                     uint3 thread_position_in_grid [[thread_position_in_grid]],\n\
+                     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],\n\
+                     uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {{\n\
+                     typedef {in_t} InT;\ntypedef {st_t} StT;\n\
+                     constexpr int Dk = {dk};\nconstexpr int Dv = {dv};\n\
+                     constexpr int Hk = {hk};\nconstexpr int Hv = {hv};\n{body}\n}}\n",
+                    in_t = types[0],
+                    g_t = types[3],
+                    b_t = types[4],
+                    st_t = types[5],
+                )
+            };
+            let pipeline = device
+                .pipeline_from_source(&name, source)
+                .map_err(backend)?;
+            let steps = (t as i32).to_le_bytes();
+            let mut args: Vec<Arg<'_>> = ins.iter().map(Packed::arg).collect();
+            args.extend([
+                Arg::write(y.metal_mut().expect("device storage")),
+                Arg::write(s.metal_mut().expect("device storage")),
+                Arg::bytes(&steps),
+            ]);
+            let (grid, group) = if packed {
+                ([32, dv / 8, b * hv], [32, 2, 1])
+            } else {
+                ([32, dv, b * hv], [32, 4, 1])
+            };
+            self.command_buffer()?
+                .dispatch_threads(&pipeline, &args, grid, group)
+                .map_err(backend)?;
+            self.counted()?;
+            Ok(vec![Data::new(y), Data::new(s)])
         }
 
         /// The operand as it is if `ok` (and its strides are non-negative), else a
@@ -2109,9 +2608,9 @@ mod metal {
                         .map_err(backend)?;
                 }
                 let rows = b * hq * lq;
-                let mut partial = Buffer::try_alloc(rows * blocks * dv * qm.dtype.size())?;
-                let mut sums = Buffer::try_alloc(rows * blocks * 4)?;
-                let mut maxs = Buffer::try_alloc(rows * blocks * 4)?;
+                let mut partial = Buffer::try_alloc_gpu(rows * blocks * dv * qm.dtype.size())?;
+                let mut sums = Buffer::try_alloc_gpu(rows * blocks * 4)?;
+                let mut maxs = Buffer::try_alloc_gpu(rows * blocks * 4)?;
                 {
                     let mut args = vec![
                         q.arg(),
@@ -2248,8 +2747,8 @@ mod metal {
         ) -> Result<Vec<Data>> {
             let w = self.packed(w, true)?;
             let n = w.shape.iter().product::<usize>();
-            let alloc = |o: &Output| Buffer::try_alloc(o.size * o.dtype.size());
-            let mut packed = Buffer::try_alloc(n * bits / 8)?;
+            let alloc = |o: &Output| Buffer::try_alloc_gpu(o.size * o.dtype.size());
+            let mut packed = Buffer::try_alloc_gpu(n * bits / 8)?;
             let (mut scales, mut biases) = (alloc(&outputs[1])?, alloc(&outputs[2])?);
             let name = format!(
                 "nuvec_affine_quantize_{}_gs{group_size}_b{bits}",
@@ -2435,7 +2934,7 @@ mod metal {
                 let name = format!("nuvec_affine_qmm_t_{base}_al{aligned}_batch0");
                 return self.dispatch_groups(&name, &args, [n_tiles, m_tiles, 1], [32, 2, 2]);
             }
-            let mut partial = Buffer::try_alloc(split * m * n * 4)?;
+            let mut partial = Buffer::try_alloc_gpu(split * m * n * 4)?;
             let (size, stride) = (ints(k / split), ints(m * n));
             let args = [
                 w.arg(),
@@ -2470,7 +2969,7 @@ mod metal {
         /// A contiguous copy of an operand (encoded now), row-major.
         fn gemmand_copy<'a>(&mut self, operand: Operand<'_>) -> Result<Gemmand<'a>> {
             let (meta, _) = operand;
-            let mut copy = Buffer::try_alloc(meta.size * meta.dtype.size())?;
+            let mut copy = Buffer::try_alloc_gpu(meta.size * meta.dtype.size())?;
             self.copy(operand, &mut copy)?;
             let strides = crate::shape::row_contiguous_strides(&meta.shape);
             let nd = strides.len();
@@ -2495,7 +2994,7 @@ mod metal {
                 return Ok(g);
             }
             let (meta, _) = operand;
-            let mut copy = Buffer::try_alloc(meta.size * meta.dtype.size())?;
+            let mut copy = Buffer::try_alloc_gpu(meta.size * meta.dtype.size())?;
             self.copy(operand, &mut copy)?;
             let strides = crate::shape::row_contiguous_strides(&meta.shape);
             let nd = strides.len();
@@ -2558,19 +3057,27 @@ mod metal {
             self.counted()
         }
 
-        /// Commits once a command buffer holds enough work: a few dispatches while the GPU
-        /// is idle, so it starts while the rest is encoded; many while it is busy, so
-        /// command buffers stay few.
+        /// Commits once a command buffer holds enough work. If the GPU is idle when an
+        /// evaluation starts, its first command buffer holds a few dispatches, so the GPU
+        /// starts while the rest is encoded, and each next one twice as many while the GPU
+        /// is still busy (up to [`MAX_DISPATCHES`]), so it is ready before the GPU runs out
+        /// of work; a few again whenever the GPU is idle. If earlier work keeps the GPU
+        /// busy, buffers are full-size from the start, so they stay few.
         fn counted(&mut self) -> Result<()> {
             self.dispatches += 1;
             let busy = self.device().is_some_and(|d| d.in_flight() > 0);
-            let limit = if busy {
+            let limit = *self.limit.get_or_insert(if busy {
                 MAX_DISPATCHES
             } else {
                 IDLE_DISPATCHES
-            };
+            });
             if self.dispatches >= limit {
                 self.commit();
+                self.limit = Some(if busy {
+                    (limit * 2).min(MAX_DISPATCHES)
+                } else {
+                    IDLE_DISPATCHES
+                });
             }
             Ok(())
         }
@@ -2579,6 +3086,7 @@ mod metal {
         /// published when it completes. Blocks while too many command buffers are in flight.
         pub(crate) fn commit(&mut self) {
             self.dispatches = 0;
+            self.release_unreferenced();
             let Some(cmd) = self.cmd.take() else {
                 // Outputs deferred without GPU work (views of pending data) still need a
                 // chunk, published after the work they view.
@@ -2628,10 +3136,34 @@ mod metal {
             self.foreign.extend(outputs.iter().map(|&a| a.clone()));
         }
 
-        /// Holds `outputs` of `node` until the GPU work producing them has completed.
+        /// Holds `outputs` of `node` until the GPU work producing them has completed (or
+        /// nothing refers to `node` any more).
         pub(crate) fn defer(&mut self, node: Arc<Node>, outputs: Vec<Data>) {
-            self.index.insert(Arc::as_ptr(&node), outputs.clone());
+            // The weak reference also keeps the node's address from being reused while the
+            // entry exists.
+            self.index
+                .insert(Arc::as_ptr(&node), (Arc::downgrade(&node), outputs.clone()));
             self.chunk.push((node, outputs));
+        }
+
+        /// Drops the pending outputs of nodes nothing else refers to (intermediates whose
+        /// consumers are all encoded): nobody can read them, and their memory returns to the
+        /// allocator at once, for later GPU work to reuse (ordered after its uses, as MLX
+        /// reuses memory).
+        fn release_unreferenced(&mut self) {
+            self.chunk.retain(|(node, _)| Arc::strong_count(node) > 1);
+            {
+                let mut p = self
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let next = p.next;
+                for chunk in p.chunks[next..].iter_mut().flatten() {
+                    chunk.retain(|(node, _)| Arc::strong_count(node) > 1);
+                }
+            }
+            self.index.retain(|_, (node, _)| node.strong_count() > 0);
         }
 
         /// The pending output `output` of `node`, if it was encoded in this evaluation.
@@ -2640,6 +3172,7 @@ mod metal {
         pub(crate) fn lookup(&self, node: &Arc<Node>, output: u32) -> Option<Data> {
             self.index
                 .get(&Arc::as_ptr(node))?
+                .1
                 .get(output as usize)
                 .cloned()
         }

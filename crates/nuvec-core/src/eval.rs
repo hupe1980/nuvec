@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::array::{Data, Node, NodeSet, State};
+use crate::array::{Data, Node, NodeMap, NodeSet, State};
 use crate::gpu::GpuEval;
 use crate::kernels::{self, Operand};
 use crate::primitive::Primitive;
@@ -16,14 +16,7 @@ use crate::{Array, DeviceKind, Error, Result, view};
 /// sticky: a failed array, and anything computed from it, fails with the same error on
 /// every later evaluation or readback.
 pub fn eval(arrays: &[Array]) -> Result<()> {
-    // Errors are reported through the arrays' slots below.
-    let _ = submit(arrays).flush();
-    for array in arrays {
-        if let Err(err) = array.out().slot.wait() {
-            return Err(err.clone());
-        }
-    }
-    Ok(())
+    schedule(arrays).eval()
 }
 
 /// Starts evaluating `arrays` and returns without waiting for GPU work: reading the arrays
@@ -47,53 +40,177 @@ pub fn eval(arrays: &[Array]) -> Result<()> {
 /// # }
 /// ```
 pub fn async_eval(arrays: &[Array]) -> Result<()> {
-    submit(arrays).commit();
-    match arrays.iter().find_map(Array::error) {
-        Some(err) => Err(err),
-        None => Ok(()),
+    schedule(arrays).async_eval()
+}
+
+/// `arrays` with the work they need put in order, to be started later by
+/// [`Scheduled::async_eval`] or [`Scheduled::eval`] with less delay: ordering a large
+/// graph takes a while, which can then overlap other work, such as the GPU running the
+/// previous step while the next one waits for its result.
+///
+/// The arrays are evaluated as [`async_eval`] or [`eval`] would at the time they are
+/// started; nodes evaluated in between (by another evaluation) are skipped.
+///
+/// ```
+/// use nuvec_core::{Array, Result, schedule};
+///
+/// # fn main() -> Result<()> {
+/// let x = Array::from_slice(&[1.0f32, 2.0], &[2])?;
+/// let y = &(&x * 3.0) + 1.0;
+/// let scheduled = schedule(std::slice::from_ref(&y));
+/// // ... wait for something else here ...
+/// scheduled.async_eval()?;
+/// assert_eq!(y.to_vec::<f32>()?, [4.0, 7.0]);
+/// # Ok(())
+/// # }
+/// ```
+pub fn schedule(arrays: &[Array]) -> Scheduled {
+    Scheduled {
+        arrays: arrays.to_vec(),
+        order: topological_order(arrays),
     }
 }
 
-/// Encodes or computes every unevaluated node `arrays` depend on; the caller commits (or
-/// flushes) the GPU work.
-fn submit(arrays: &[Array]) -> GpuEval {
-    let mut gpu = GpuEval::new();
-    for node in topological_order(arrays) {
-        evaluate(&node, &mut gpu);
-        // `node` is released here, so intermediates are freed as soon as their last
-        // consumer has run (or, on the GPU, once their command buffer completes).
-    }
-    gpu
+/// Arrays whose evaluation is put in order but not started ([`schedule`]).
+pub struct Scheduled {
+    arrays: Vec<Array>,
+    order: Vec<Arc<Node>>,
 }
+
+impl std::fmt::Debug for Scheduled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scheduled")
+            .field("arrays", &self.arrays)
+            .field("nodes", &self.order.len())
+            .finish()
+    }
+}
+
+impl Scheduled {
+    /// The scheduled arrays.
+    pub fn arrays(&self) -> &[Array] {
+        &self.arrays
+    }
+
+    /// Starts evaluating the arrays without waiting for GPU work, as [`async_eval`].
+    pub fn async_eval(self) -> Result<()> {
+        let arrays = self.arrays.clone();
+        self.submit().commit();
+        match arrays.iter().find_map(Array::error) {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Evaluates the arrays and waits for them, as [`eval`].
+    pub fn eval(self) -> Result<()> {
+        let arrays = self.arrays.clone();
+        // Errors are reported through the arrays' slots below.
+        let _ = self.submit().flush();
+        wait(&arrays)
+    }
+
+    /// Encodes or computes every node in order; the caller commits (or flushes) the GPU
+    /// work.
+    fn submit(self) -> GpuEval {
+        let mut gpu = GpuEval::new();
+        for node in self.order {
+            evaluate(&node, &mut gpu);
+            // `node` is released here, so intermediates are freed as soon as their last
+            // consumer has run (or, on the GPU, once their command buffer completes).
+        }
+        gpu
+    }
+}
+
+/// Waits for `arrays`; the first error among them.
+fn wait(arrays: &[Array]) -> Result<()> {
+    for array in arrays {
+        if let Err(err) = array.out().slot.wait() {
+            return Err(err.clone());
+        }
+    }
+    Ok(())
+}
+
+/// The widest breadth-first frontier when ordering a graph (MLX's `MLX_BFS_MAX_WIDTH`).
+const BFS_MAX_WIDTH: usize = 20;
 
 /// Unevaluated nodes reachable from `arrays`, inputs before consumers. Iterative, so graph
 /// depth is limited only by memory.
+///
+/// As MLX's `eval_impl`: a tape is built breadth-first back from the outputs, a node
+/// joining once all its consumers have, and run in reverse. Independent work (the query,
+/// key and value projections of a layer, say) is then encoded side by side, so the GPU
+/// runs it concurrently without barriers between. Past [`BFS_MAX_WIDTH`] pending nodes the
+/// walk goes depth-first, which bounds how many intermediates are alive at once.
 fn topological_order(arrays: &[Array]) -> Vec<Arc<Node>> {
-    let mut visited = NodeSet::default();
-    let mut order = Vec::new();
-    let mut stack: Vec<(Arc<Node>, bool)> =
-        arrays.iter().map(|a| (a.node.clone(), false)).collect();
-    while let Some((node, expanded)) = stack.pop() {
-        if expanded {
-            order.push(node);
+    // Unevaluated nodes with their unevaluated inputs, depth-first.
+    let mut inputs: NodeMap<*const Node, Vec<Arc<Node>>> = NodeMap::default();
+    let mut done = NodeSet::default();
+    let mut stack: Vec<Arc<Node>> = arrays.iter().map(|a| a.node.clone()).collect();
+    while let Some(node) = stack.pop() {
+        let key = Arc::as_ptr(&node);
+        if inputs.contains_key(&key) || done.contains(&key) {
             continue;
         }
-        if !visited.insert(Arc::as_ptr(&node)) {
-            continue;
-        }
-        let inputs: Vec<Arc<Node>> = match &*node.lock() {
+        let pending: Vec<Arc<Node>> = match &*node.lock() {
             State::Pending { inputs, .. } => inputs.iter().map(|a| a.node.clone()).collect(),
-            State::Retained { .. } | State::Done => continue,
+            State::Retained { .. } | State::Done => {
+                done.insert(key);
+                continue;
+            }
         };
-        stack.push((node, true));
-        stack.extend(
-            inputs
-                .into_iter()
-                .filter(|n| !visited.contains(&Arc::as_ptr(n)))
-                .map(|n| (n, false)),
-        );
+        stack.extend(pending.iter().cloned());
+        inputs.insert(key, pending);
     }
-    order
+    for list in inputs.values_mut() {
+        list.retain(|n| !done.contains(&Arc::as_ptr(n)));
+    }
+    let roots: Vec<Arc<Node>> = arrays
+        .iter()
+        .map(|a| a.node.clone())
+        .filter(|n| inputs.contains_key(&Arc::as_ptr(n)))
+        .collect();
+    // Consumers of each node (an input used twice counts twice; the outputs count once
+    // each for the caller).
+    let mut consumers: NodeMap<*const Node, usize> = NodeMap::default();
+    for n in inputs.values().flatten().chain(&roots) {
+        *consumers.entry(Arc::as_ptr(n)).or_default() += 1;
+    }
+    // The tape: `None` stands for the caller, whose inputs are `roots`.
+    let mut tape: Vec<Option<Arc<Node>>> = vec![None];
+    let mut deferred: Vec<(Option<Arc<Node>>, usize)> = Vec::new();
+    let mut next = 0;
+    while !consumers.is_empty() && (next < tape.len() || !deferred.is_empty()) {
+        let (node, mut j) = if next < tape.len() {
+            next += 1;
+            (tape[next - 1].clone(), 0)
+        } else {
+            deferred.pop().expect("checked above")
+        };
+        let list = match &node {
+            Some(n) => &inputs[&Arc::as_ptr(n)],
+            None => &roots,
+        };
+        while j < list.len() {
+            let key = Arc::as_ptr(&list[j]);
+            if consumers.contains_key(&key) {
+                if tape.len() - next >= BFS_MAX_WIDTH {
+                    deferred.push((node.clone(), j));
+                    break;
+                }
+                let left = consumers.get_mut(&key).expect("checked above");
+                *left -= 1;
+                if *left == 0 {
+                    consumers.remove(&key);
+                    tape.push(Some(list[j].clone()));
+                }
+            }
+            j += 1;
+        }
+    }
+    tape.into_iter().rev().flatten().collect()
 }
 
 /// Runs one node whose inputs are all evaluated, stores (or, for GPU work, defers) its
@@ -328,6 +445,20 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
             shape[*axis] = operands.iter().map(|(m, _)| m.shape[*axis]).sum();
             new(kernels::concatenate(operands, &shape, *axis)?)
         }
+        Primitive::Sort { axis } => new(kernels::sort(operands[0], *axis, false)?),
+        Primitive::ArgSort { axis } => new(kernels::sort(operands[0], *axis, true)?),
+        Primitive::Scan {
+            op,
+            axis,
+            reverse,
+            inclusive,
+        } => new(kernels::scan(
+            *op,
+            operands[0],
+            *axis,
+            *reverse,
+            *inclusive,
+        )?),
         Primitive::Matmul => new(kernels::matmul(operands[0], operands[1])?),
         Primitive::AddMM { .. } => {
             let (alpha, beta) = primitive.addmm_factors();
@@ -542,5 +673,80 @@ mod tests {
         c.eval().unwrap();
         assert_eq!(c.primitive(), None);
         assert_eq!(Arc::strong_count(&a.node), 1, "c no longer references a");
+    }
+
+    /// Positions of nodes in the evaluation order of `arrays`, checked to be topological.
+    fn positions(arrays: &[Array]) -> NodeMap<*const Node, usize> {
+        let order = topological_order(arrays);
+        let at: NodeMap<*const Node, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (Arc::as_ptr(n), i))
+            .collect();
+        assert_eq!(at.len(), order.len(), "each node once");
+        for (i, node) in order.iter().enumerate() {
+            if let State::Pending { inputs, .. } = &*node.lock() {
+                for input in inputs {
+                    if let Some(&j) = at.get(&Arc::as_ptr(&input.node)) {
+                        assert!(j < i, "inputs come first");
+                    }
+                }
+            }
+        }
+        at
+    }
+
+    #[test]
+    fn independent_work_is_ordered_side_by_side() {
+        let x = Array::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
+        let (a1, b1) = (&x + 1.0, &x + 3.0);
+        let (a2, b2) = (&a1 * 2.0, &b1 * 4.0);
+        let top = &a2 + &b2;
+        let at = positions(std::slice::from_ref(&top));
+        let p = |a: &Array| at[&Arc::as_ptr(&a.node)];
+        assert!(
+            p(&a1).max(p(&b1)) < p(&a2).min(p(&b2)),
+            "both chains advance together"
+        );
+        assert_eq!(top.to_vec::<f32>().unwrap(), [20.0, 26.0]);
+    }
+
+    #[test]
+    fn wide_and_shared_graphs_are_ordered() {
+        let x = Array::from_slice(&[1i32], &[1]).unwrap();
+        let one = Array::from_slice(&[1i32], &[1]).unwrap();
+        let shared = &x + &x;
+        // 100 chains of different depths (wider than the breadth-first limit), joined.
+        let mut joined = shared.clone();
+        for i in 0..100 {
+            let mut c = &shared + &Array::from_slice(&[i], &[1]).unwrap();
+            for _ in 0..i % 7 {
+                c = &c * &one;
+            }
+            joined = &joined + &c;
+        }
+        positions(&[joined.clone(), shared.clone(), joined.clone()]);
+        counter::take();
+        eval(&[joined.clone(), shared.clone()]).unwrap();
+        let nodes = 1 + 100 * 2 + (0..100).map(|i| i % 7).sum::<usize>();
+        assert_eq!(counter::take(), nodes, "every node once");
+        assert_eq!(
+            joined.item::<i32>().unwrap(),
+            2 + 100 * 2 + (0..100).sum::<i32>()
+        );
+    }
+
+    #[test]
+    fn scheduled_evaluation_skips_work_done_meanwhile() {
+        let x = Array::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
+        let shared = &x * &x;
+        let top = &shared + &x;
+        let scheduled = schedule(std::slice::from_ref(&top));
+        assert_eq!(scheduled.arrays().len(), 1);
+        counter::take();
+        shared.eval().unwrap();
+        scheduled.eval().unwrap();
+        assert_eq!(counter::take(), 2, "shared once, then top");
+        assert_eq!(top.to_vec::<f32>().unwrap(), [2.0, 6.0]);
     }
 }

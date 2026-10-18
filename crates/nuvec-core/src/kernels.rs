@@ -10,7 +10,7 @@ use nuvec_cpu::{Gemm, MatView, View, map1, map2, map3};
 use crate::array::{Data, Output};
 use crate::buffer::Buffer;
 use crate::cast::{B8, Canon, Scalar, convert, with_type};
-use crate::primitive::{ArgReduceOp, BinaryOp, ReduceOp, ScatterReduce, UnaryOp};
+use crate::primitive::{ArgReduceOp, BinaryOp, ReduceOp, ScanOp, ScatterReduce, UnaryOp};
 use crate::shape::{self, Shape, Strides};
 use crate::view::{self, DimSlice};
 use crate::{Category, Complex64, DType, Result, bf16, f16};
@@ -198,6 +198,128 @@ pub(crate) fn concatenate(inputs: &[Operand<'_>], shape: &[usize], axis: usize) 
         4 => run::<u32>(inputs, shape, axis),
         _ => run::<u64>(inputs, shape, axis),
     }
+}
+
+/// The element offsets of the start of every lane along `axis`, in row-major order of the
+/// other axes, for a layout with `strides` (from `offset`).
+fn lanes(shape: &[usize], strides: &[isize], axis: usize, offset: isize) -> Vec<isize> {
+    let mut outer_shape = shape.to_vec();
+    let mut outer_strides = strides.to_vec();
+    outer_shape.remove(axis);
+    outer_strides.remove(axis);
+    let mut starts = Vec::with_capacity(outer_shape.iter().product());
+    walk(&outer_shape, &outer_strides, offset, |_, at| {
+        starts.push(at)
+    });
+    starts
+}
+
+/// Each lane along `axis` sorted (or, with `arg`, the uint32 indices that sort it):
+/// ascending, stable, NaN last (MLX's order).
+pub(crate) fn sort(a: Operand<'_>, axis: usize, arg: bool) -> Result<Buffer> {
+    let (meta, data) = a;
+    let n = meta.shape[axis];
+    let out_strides = shape::row_contiguous_strides(&meta.shape);
+    let inputs = lanes(&meta.shape, &meta.strides, axis, data.offset);
+    let outputs = lanes(&meta.shape, &out_strides, axis, 0);
+    let (step, out_step) = (meta.strides[axis], out_strides[axis]);
+    with_type!(meta.dtype, T => {
+        let values = data.buffer.typed::<T>();
+        let less = |x: T, y: T| match (x.is_nan_(), y.is_nan_()) {
+            (false, false) => x.lt_(y),
+            (xn, yn) => !xn && yn,
+        };
+        let mut out = if arg { output::<u32>(meta.size)? } else { output::<T>(meta.size)? };
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        for (&start, &dst) in inputs.iter().zip(&outputs) {
+            let lane: Vec<T> = (0..n).map(|i| values[(start + i as isize * step) as usize]).collect();
+            order.clear();
+            order.extend(0..n);
+            order.sort_by(|&i, &j| {
+                if less(lane[i], lane[j]) {
+                    std::cmp::Ordering::Less
+                } else if less(lane[j], lane[i]) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            });
+            for (k, &i) in order.iter().enumerate() {
+                let at = (dst + k as isize * out_step) as usize;
+                if arg {
+                    out.typed_mut::<u32>()[at] = i as u32;
+                } else {
+                    out.typed_mut::<T>()[at] = lane[i];
+                }
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// `log(e^a + e^b)`, as MLX's `LogAddExp` (computed in f64, rounded once).
+fn log_add_exp<T: Scalar>(a: T, b: T) -> T {
+    let f = |x: T| match x.to_canon() {
+        Canon::Float(f) => f,
+        Canon::Int(i) => i as f64,
+        Canon::Complex(z) => f64::from(z.re),
+    };
+    let (x, y) = (f(a), f(b));
+    let r = if x.is_nan() || y.is_nan() {
+        f64::NAN
+    } else {
+        let (hi, lo) = (x.max(y), x.min(y));
+        if lo == f64::NEG_INFINITY || hi == f64::INFINITY {
+            hi
+        } else {
+            hi + (lo - hi).exp().ln_1p()
+        }
+    };
+    T::from_canon(Canon::Float(r))
+}
+
+/// A cumulative scan of each lane along `axis` (row-contiguous output).
+pub(crate) fn scan(
+    op: ScanOp,
+    a: Operand<'_>,
+    axis: usize,
+    reverse: bool,
+    inclusive: bool,
+) -> Result<Buffer> {
+    let (meta, data) = a;
+    let n = meta.shape[axis];
+    let out_strides = shape::row_contiguous_strides(&meta.shape);
+    let inputs = lanes(&meta.shape, &meta.strides, axis, data.offset);
+    let outputs = lanes(&meta.shape, &out_strides, axis, 0);
+    let (step, out_step) = (meta.strides[axis], out_strides[axis]);
+    with_type!(meta.dtype, T => {
+        let values = data.buffer.typed::<T>();
+        let (combine, init): (fn(T, T) -> T, T) = match op {
+            ScanOp::Sum => (T::add_, T::from_canon(Canon::Int(0))),
+            ScanOp::Prod => (T::mul_, T::from_canon(Canon::Int(1))),
+            ScanOp::Max => (T::max_, T::from_canon(Canon::Float(f64::NEG_INFINITY))),
+            ScanOp::Min => (T::min_, T::from_canon(Canon::Float(f64::INFINITY))),
+            ScanOp::LogAddExp => (log_add_exp::<T>, T::from_canon(Canon::Float(f64::NEG_INFINITY))),
+        };
+        let mut out = output::<T>(meta.size)?;
+        let dst = out.typed_mut::<T>();
+        for (&start, &first) in inputs.iter().zip(&outputs) {
+            let mut acc = init;
+            for k in 0..n {
+                let i = if reverse { n - 1 - k } else { k } as isize;
+                let x = values[(start + i * step) as usize];
+                let at = (first + i * out_step) as usize;
+                if inclusive {
+                    acc = if k == 0 { x } else { combine(acc, x) };
+                    dst[at] = acc;
+                } else {
+                    dst[at] = acc;
+                    acc = if k == 0 { x } else { combine(acc, x) };
+                }
+            }
+        }
+        Ok(out)
+    })
 }
 
 /// `alpha · (a @ b) + beta · c` (`c` has the output's shape), computed in f64 and rounded

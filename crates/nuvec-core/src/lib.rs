@@ -64,6 +64,7 @@ mod quantized;
 pub mod random;
 mod scalar;
 mod shape;
+mod sorting;
 mod transforms;
 mod view;
 
@@ -72,7 +73,7 @@ pub use custom::{CustomCall, CustomFunction, checkpoint, custom_function};
 pub use device::{Device, DeviceKind, Stream, default_device, default_stream, set_default_stream};
 pub use dtype::{Category, Complex64, DType, Element, at_least_float, bf16, f16, promote_types};
 pub use error::{Error, Result};
-pub use eval::{async_eval, eval};
+pub use eval::{Scheduled, async_eval, eval, schedule};
 pub use file::MappedFile;
 pub use fused::{Fused, FusedRef};
 pub use indexing::{
@@ -86,10 +87,13 @@ pub use ops::{
     reshape, sigmoid, sign, sin, slice, slice_update, softmax, sqrt, squeeze, stop_gradient,
     subtract, sum, tanh, transpose, where_, zeros,
 };
-pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, ScatterReduce, UnaryOp};
+pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, ScanOp, ScatterReduce, UnaryOp};
 pub use quantized::{dequantize, quantize, quantized_matmul};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
 pub use shape::Flags;
+pub use sorting::{
+    argpartition, argsort, cummax, cummin, cumprod, cumsum, logcumsumexp, partition, sort, topk,
+};
 pub use transforms::{grad, jvp, value_and_grad, vjp, vmap};
 pub use view::SliceArg;
 

@@ -1,20 +1,34 @@
-//! The Llama-family transformer, as mlx-lm's `llama`, `qwen2` and `qwen3` models, with
-//! parameter names matching Hugging Face checkpoints.
+//! The Llama-family transformer, as mlx-lm's `llama`, `qwen2` and `qwen3` models, and its
+//! hybrid with Gated DeltaNet layers, as mlx-lm's `qwen3_5`, with parameter names matching
+//! Hugging Face checkpoints.
+
+use std::sync::LazyLock;
 
 use nuvec::fast::{self, AttentionMask};
 use nuvec::{
-    Array, DType, Result, SliceArg, add, broadcast_to, concatenate, multiply, slice, slice_update,
-    transpose,
+    Array, DType, Result, SliceArg, abs, add, broadcast_to, concatenate, exp, log, maximum,
+    multiply, negative, sigmoid, slice, slice_update, split_at, transpose,
 };
 use nuvec_nn::{
     Embedding, Linear, Module, Parameters, QuantizedEmbedding, QuantizedLinear, RmsNorm, silu,
 };
 
-use crate::config::{Config, RopeScaling};
+use crate::config::{Config, LayerType, LinearAttention, RopeScaling};
 
 /// A zero-cost stand-in of `shape` (a broadcast scalar), replaced when weights load.
 fn placeholder(shape: &[usize], dtype: DType) -> Result<Array> {
     broadcast_to(&Array::scalar(0u8).astype(dtype)?, shape)
+}
+
+/// `silu(gate) · x` in one kernel, as mlx-lm's compiled `swiglu`.
+fn swiglu(gate: &Array, x: &Array) -> Result<Array> {
+    type Compiled = Box<dyn Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync>;
+    static SWIGLU: LazyLock<Compiled> = LazyLock::new(|| {
+        Box::new(nuvec::compile(|a: &[Array]| {
+            Ok(vec![multiply(silu(&a[0])?, &a[1])?])
+        }))
+    });
+    Ok(SWIGLU(&[gate.clone(), x.clone()])?.swap_remove(0))
 }
 
 /// A linear layer, full precision or quantized.
@@ -205,14 +219,19 @@ impl Rope {
     }
 }
 
-/// One layer's keys and values, `[B, kv_heads, capacity, head_dim]`, as mlx-lm's
-/// `KVCache`: the capacity grows in steps of 256 positions and each step's keys and
-/// values are written into it (`slice_update`), so buffers keep their size between
-/// growths.
+/// One layer's cache. Attention layers keep keys and values, `[B, kv_heads, capacity,
+/// head_dim]`, as mlx-lm's `KVCache`: the capacity grows in steps of 256 positions and
+/// each step's keys and values are written into it (`slice_update`), so buffers keep their
+/// size between growths. Gated DeltaNet layers keep the convolution's last inputs and the
+/// recurrent state instead, as mlx-lm's `ArraysCache`.
 #[derive(Debug, Clone, Default)]
 pub struct KvCache {
     keys: Option<Array>,
     values: Option<Array>,
+    /// The convolution's last `kernel - 1` inputs, `[B, kernel - 1, channels]`.
+    conv: Option<Array>,
+    /// The recurrent state, `[B, value_heads, value_head_dim, key_head_dim]` (float32).
+    recurrent: Option<Array>,
     offset: usize,
 }
 
@@ -263,7 +282,11 @@ impl KvCache {
 
     /// The cached arrays (to evaluate them).
     pub fn state(&self) -> Vec<Array> {
-        self.keys.iter().chain(&self.values).cloned().collect()
+        [&self.keys, &self.values, &self.conv, &self.recurrent]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
     }
 }
 
@@ -295,6 +318,8 @@ struct Attention {
     kv_heads: usize,
     scale: f32,
     rope: Rope,
+    /// The query projection also yields a gate of the output (`o · sigmoid(gate)`).
+    gate: bool,
 }
 
 impl Attention {
@@ -307,8 +332,9 @@ impl Attention {
                 .then(|| Builder::norm(hd, c.rms_norm_eps))
                 .transpose()
         };
+        let gate = c.attn_output_gate;
         Ok(Self {
-            q_proj: b.projection(&p("q_proj"), d, q, c.qkv_bias)?,
+            q_proj: b.projection(&p("q_proj"), d, q * (1 + usize::from(gate)), c.qkv_bias)?,
             k_proj: b.projection(&p("k_proj"), d, kv, c.qkv_bias)?,
             v_proj: b.projection(&p("v_proj"), d, kv, c.qkv_bias)?,
             o_proj: b.projection(&p("o_proj"), q, d, c.o_bias)?,
@@ -317,14 +343,15 @@ impl Attention {
             heads: c.num_attention_heads,
             kv_heads: c.num_key_value_heads,
             scale: (hd as f32).powf(-0.5),
-            rope: Rope::new(hd, c)?,
+            rope: Rope::new(c.rope_dims, c)?,
+            gate,
         })
     }
 
     fn forward(&self, x: &Array, mask: AttentionMask<'_>, cache: &mut KvCache) -> Result<Array> {
         let (b, l) = (x.shape()[0] as isize, x.shape()[1] as isize);
-        let heads = |proj: &Projection, n: usize, norm: &Option<RmsNorm>| -> Result<Array> {
-            let h = proj.forward(x)?.reshape(&[b, l, n as isize, -1])?;
+        let heads = |h: Array, n: usize, norm: &Option<RmsNorm>| -> Result<Array> {
+            let h = h.reshape(&[b, l, n as isize, -1])?;
             let h = match norm {
                 Some(norm) => norm.forward(&h)?,
                 None => h,
@@ -332,17 +359,35 @@ impl Attention {
             transpose(&h, &[0, 2, 1, 3])
         };
         let offset = cache.offset();
+        // With an output gate, each head's projection is its query, then its gate.
+        let (q, gate) = match self.gate {
+            false => (self.q_proj.forward(x)?, None),
+            true => {
+                let qg = self
+                    .q_proj
+                    .forward(x)?
+                    .reshape(&[b, l, self.heads as isize, -1])?;
+                let half = qg.shape()[3] / 2;
+                let mut parts = split_at(&qg, &[half], -1)?;
+                let g = parts.pop().expect("two parts").reshape(&[b, l, -1])?;
+                (parts.pop().expect("two parts"), Some(g))
+            }
+        };
         let q = self
             .rope
-            .forward(&heads(&self.q_proj, self.heads, &self.q_norm)?, offset)?;
-        let k = self
-            .rope
-            .forward(&heads(&self.k_proj, self.kv_heads, &self.k_norm)?, offset)?;
-        let v = heads(&self.v_proj, self.kv_heads, &None)?;
+            .forward(&heads(q, self.heads, &self.q_norm)?, offset)?;
+        let k = self.rope.forward(
+            &heads(self.k_proj.forward(x)?, self.kv_heads, &self.k_norm)?,
+            offset,
+        )?;
+        let v = heads(self.v_proj.forward(x)?, self.kv_heads, &None)?;
         let (k, v) = cache.update(k, v)?;
         let o = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None)?;
         let o = transpose(&o, &[0, 2, 1, 3])?.reshape(&[b, l, -1])?;
-        self.o_proj.forward(&o)
+        match gate {
+            Some(g) => self.o_proj.forward(&multiply(&o, sigmoid(&g)?)?),
+            None => self.o_proj.forward(&o),
+        }
     }
 }
 
@@ -359,6 +404,173 @@ impl Module for Attention {
             p.module("k_norm", n);
         }
     }
+}
+
+/// `log(1 + exp(x))`, stably (MLX's `nn.softplus`, `logaddexp(x, 0)`): in float32,
+/// rounded once to `x`'s dtype, as MLX's kernel.
+fn softplus(x: &Array) -> Result<Array> {
+    let xf = x.astype(DType::F32)?;
+    let y = add(
+        maximum(&xf, 0.0)?,
+        log(&add(exp(&negative(&abs(&xf)?)?)?, 1.0)?)?,
+    )?;
+    y.astype(x.dtype())
+}
+
+/// The gated RMS normalisation of Gated DeltaNet's output (mlx-lm's
+/// `Qwen3NextRMSNormGated` with `precise_swiglu`): `silu(z) · rms_norm(x)`, in float32.
+fn gated_norm(x: &Array, z: &Array, norm: &RmsNorm) -> Result<Array> {
+    let n = norm.forward(x)?.astype(DType::F32)?;
+    multiply(silu(&z.astype(DType::F32)?)?, &n)?.astype(x.dtype())
+}
+
+/// A Gated DeltaNet layer (mlx-lm's `qwen3_5.GatedDeltaNet`): a causal depthwise
+/// convolution over the query, key and value projections, then the gated delta rule
+/// ([`nuvec::fast::gated_delta`]) with per-head decays and write strengths, and a gated
+/// normalisation of the output.
+#[derive(Debug, Clone)]
+struct GatedDeltaNet {
+    in_proj_qkv: Projection,
+    in_proj_z: Projection,
+    in_proj_b: Projection,
+    in_proj_a: Projection,
+    /// The depthwise convolution's weights, `[channels, kernel, 1]`.
+    conv1d: Array,
+    dt_bias: Array,
+    a_log: Array,
+    norm: RmsNorm,
+    out_proj: Projection,
+    sizes: LinearAttention,
+}
+
+impl GatedDeltaNet {
+    fn new(b: &Builder<'_>, path: &str, c: &Config, sizes: LinearAttention) -> Result<Self> {
+        let d = c.hidden_size;
+        let key_dim = sizes.key_heads * sizes.key_head_dim;
+        let value_dim = sizes.value_heads * sizes.value_head_dim;
+        let conv_dim = 2 * key_dim + value_dim;
+        let p = |name: &str| format!("{path}.{name}");
+        let hv = sizes.value_heads;
+        Ok(Self {
+            in_proj_qkv: b.projection(&p("in_proj_qkv"), d, conv_dim, false)?,
+            in_proj_z: b.projection(&p("in_proj_z"), d, value_dim, false)?,
+            in_proj_b: b.projection(&p("in_proj_b"), d, hv, false)?,
+            in_proj_a: b.projection(&p("in_proj_a"), d, hv, false)?,
+            conv1d: placeholder(&[conv_dim, sizes.conv_kernel, 1], DType::F32)?,
+            dt_bias: placeholder(&[hv], DType::F32)?,
+            a_log: placeholder(&[hv], DType::F32)?,
+            norm: Builder::norm(sizes.value_head_dim, c.rms_norm_eps)?,
+            out_proj: b.projection(&p("out_proj"), value_dim, d, false)?,
+            sizes,
+        })
+    }
+
+    fn forward(&self, x: &Array, cache: &mut KvCache) -> Result<Array> {
+        let LinearAttention {
+            key_heads: hk,
+            value_heads: hv,
+            key_head_dim: dk,
+            value_head_dim: dv,
+            conv_kernel: kernel,
+        } = self.sizes;
+        let (b, l) = (x.shape()[0], x.shape()[1]);
+        let qkv = self.in_proj_qkv.forward(x)?;
+        let channels = qkv.shape()[2];
+        let z = self.in_proj_z.forward(x)?;
+        let (beta, a) = (self.in_proj_b.forward(x)?, self.in_proj_a.forward(x)?);
+        // The causal convolution sees the previous step's last `kernel - 1` inputs.
+        let state = match cache.conv.take() {
+            Some(c) => c,
+            None => nuvec::zeros(&[b, kernel - 1, channels], qkv.dtype())?,
+        };
+        let input = concatenate(&[state, qkv], 1)?;
+        let rows = |start: usize, len: usize| {
+            slice(
+                &input,
+                &[
+                    SliceArg::full(),
+                    SliceArg::new(Some(start as isize), Some((start + len) as isize), 1),
+                    SliceArg::full(),
+                ],
+            )
+        };
+        let kept = rows(l, kernel - 1)?;
+        // After a prompt, a copy: the view would keep the whole input alive.
+        cache.conv = Some(if l > 1 { multiply(&kept, 1.0)? } else { kept });
+        // Accumulated in float32 and rounded once, as MLX's convolution kernels.
+        let w = self
+            .conv1d
+            .reshape(&[channels as isize, kernel as isize])?
+            .astype(DType::F32)?;
+        let mut conv = None;
+        for j in 0..kernel {
+            let wj = slice(
+                &w,
+                &[
+                    SliceArg::full(),
+                    SliceArg::new(Some(j as isize), Some(j as isize + 1), 1),
+                ],
+            )?
+            .reshape(&[channels as isize])?;
+            let term = multiply(&rows(j, l)?, &wj)?;
+            conv = Some(match conv {
+                Some(acc) => add(&acc, &term)?,
+                None => term,
+            });
+        }
+        let conv = silu(&conv.expect("kernel is at least 1").astype(input.dtype())?)?;
+        let mut parts = split_at(&conv, &[hk * dk, 2 * hk * dk], -1)?;
+        let shaped = |a: Array, h: usize, d: usize| {
+            a.reshape(&[b as isize, l as isize, h as isize, d as isize])
+        };
+        let v = shaped(parts.pop().expect("three parts"), hv, dv)?;
+        let k = shaped(parts.pop().expect("three parts"), hk, dk)?;
+        let q = shaped(parts.pop().expect("three parts"), hk, dk)?;
+        // mlx-lm's `normalize_qk`: unit queries and keys, the 1/sqrt(Dk) scale in the query.
+        let inv = (dk as f32).powf(-0.5);
+        let eps = 1e-6 * inv * inv;
+        let q = multiply(&nuvec::fast::rms_norm(&q, None, eps)?, f64::from(inv * inv))?;
+        let k = multiply(&nuvec::fast::rms_norm(&k, None, eps)?, f64::from(inv))?;
+        // Per-head decay and write strength (mlx-lm's `compute_g`, in float32).
+        let decay = multiply(
+            negative(&exp(&self.a_log.astype(DType::F32)?)?)?,
+            softplus(&add(&a, &self.dt_bias)?)?,
+        )?;
+        let g = exp(&decay)?;
+        let beta = sigmoid(&beta)?;
+        let state = match cache.recurrent.take() {
+            Some(s) => s,
+            None => nuvec::zeros(&[b, hv, dv, dk], DType::F32)?,
+        };
+        let (out, state) = nuvec::fast::gated_delta(&q, &k, &v, &g, &beta, &state)?;
+        cache.recurrent = Some(state);
+        cache.offset += l;
+        let z = z.reshape(&[b as isize, l as isize, hv as isize, dv as isize])?;
+        let out = gated_norm(&out, &z, &self.norm)?;
+        self.out_proj
+            .forward(&out.reshape(&[b as isize, l as isize, -1])?)
+    }
+}
+
+impl Module for GatedDeltaNet {
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        p.module("in_proj_qkv", &mut self.in_proj_qkv);
+        p.module("in_proj_z", &mut self.in_proj_z);
+        p.module("in_proj_b", &mut self.in_proj_b);
+        p.module("in_proj_a", &mut self.in_proj_a);
+        p.param("conv1d.weight", &mut self.conv1d);
+        p.param("dt_bias", &mut self.dt_bias);
+        p.param("A_log", &mut self.a_log);
+        p.module("norm", &mut self.norm);
+        p.module("out_proj", &mut self.out_proj);
+    }
+}
+
+/// A layer's token mixer.
+#[derive(Debug, Clone)]
+enum Mixer {
+    Attention(Attention),
+    Linear(GatedDeltaNet),
 }
 
 #[derive(Debug, Clone)]
@@ -378,7 +590,7 @@ impl Module for Mlp {
 
 #[derive(Debug, Clone)]
 struct Block {
-    self_attn: Attention,
+    mixer: Mixer,
     mlp: Mlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
@@ -386,21 +598,25 @@ struct Block {
 
 impl Block {
     fn forward(&self, x: &Array, mask: AttentionMask<'_>, cache: &mut KvCache) -> Result<Array> {
-        let h = add(
-            x,
-            self.self_attn
-                .forward(&self.input_layernorm.forward(x)?, mask, cache)?,
-        )?;
+        let n = self.input_layernorm.forward(x)?;
+        let mixed = match &self.mixer {
+            Mixer::Attention(a) => a.forward(&n, mask, cache)?,
+            Mixer::Linear(l) => l.forward(&n, cache)?,
+        };
+        let h = add(x, &mixed)?;
         let n = self.post_attention_layernorm.forward(&h)?;
         let m = &self.mlp;
-        let gated = multiply(silu(&m.gate_proj.forward(&n)?)?, m.up_proj.forward(&n)?)?;
+        let gated = swiglu(&m.gate_proj.forward(&n)?, &m.up_proj.forward(&n)?)?;
         add(&h, m.down_proj.forward(&gated)?)
     }
 }
 
 impl Module for Block {
     fn visit(&mut self, p: &mut Parameters<'_>) {
-        p.module("self_attn", &mut self.self_attn);
+        match &mut self.mixer {
+            Mixer::Attention(a) => p.module("self_attn", a),
+            Mixer::Linear(l) => p.module("linear_attn", l),
+        }
         p.module("mlp", &mut self.mlp);
         p.module("input_layernorm", &mut self.input_layernorm);
         p.module(
@@ -444,8 +660,14 @@ impl Model {
         let layers = (0..c.num_hidden_layers)
             .map(|i| {
                 let path = |s: &str| format!("model.layers.{i}.{s}");
+                let mixer = match (c.layer_types[i], c.linear_attention) {
+                    (LayerType::Linear, Some(sizes)) => {
+                        Mixer::Linear(GatedDeltaNet::new(&b, &path("linear_attn"), c, sizes)?)
+                    }
+                    _ => Mixer::Attention(Attention::new(&b, &path("self_attn"), c)?),
+                };
                 Ok(Block {
-                    self_attn: Attention::new(&b, &path("self_attn"), c)?,
+                    mixer,
                     mlp: Mlp {
                         gate_proj: b.projection(
                             &path("mlp.gate_proj"),
@@ -482,6 +704,15 @@ impl Model {
                 .then(|| b.projection("lm_head", c.hidden_size, c.vocab_size, false))
                 .transpose()?,
         })
+    }
+
+    /// Runs one token through the model (and discards the result), so that the first
+    /// prompt does not pay for first use: on the GPU, memory-mapped weights are made
+    /// resident when a command buffer first reads them, and kernels are compiled when
+    /// first dispatched. [`load_model`](crate::load_model) calls it.
+    pub fn warm_up(&self) -> Result<()> {
+        let token = Array::from_slice(&[0u32], &[1, 1])?;
+        nuvec::eval(&[self.forward(&token, &mut self.new_cache())?])
     }
 
     /// An empty cache per layer.

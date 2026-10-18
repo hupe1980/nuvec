@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! cargo run --release -p nuvec-lm --example generate -- --model mlx-community/Qwen3-8B-4bit \
-//!     --prompt "Write a story" [--max-tokens 256] [--temp 0] [--chat]
+//!     --prompt "Write a story" [--max-tokens 256] [--temp 0] [--top-p 0] [--min-p 0] \
+//!     [--top-k 0] [--chat]
 //! ```
 //!
 //! `--model` is a directory or a Hugging Face repository in the local cache. `--chat` wraps
@@ -12,7 +13,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use nuvec_lm::{GenerateOptions, StreamDecoder, generate, load};
+use nuvec_lm::{GenerateOptions, Sampler, StreamDecoder, generate, load};
 
 fn main() -> nuvec::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -27,9 +28,17 @@ fn main() -> nuvec::Result<()> {
     if args.iter().any(|a| a == "--chat") {
         prompt = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
     }
+    let number =
+        |flag: &str, default: f32| value(flag).map_or(default, |v| v.parse().expect("a number"));
     let options = GenerateOptions {
         max_tokens: value("--max-tokens").map_or(256, |v| v.parse().expect("a number")),
-        temperature: value("--temp").map_or(0.0, |v| v.parse().expect("a number")),
+        sampler: Sampler {
+            temperature: number("--temp", 0.0),
+            top_p: number("--top-p", 0.0),
+            min_p: number("--min-p", 0.0),
+            top_k: value("--top-k").map_or(0, |v| v.parse().expect("a number")),
+            ..Default::default()
+        },
         ..Default::default()
     };
 

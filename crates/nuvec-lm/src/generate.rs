@@ -2,18 +2,18 @@
 //! each step is built while the GPU runs the previous one and submitted once its token is
 //! read, so the KV cache is updated in place (the evaluator owns it then).
 
-use nuvec::{Array, DType, Result, argmax, async_eval, eval, log, multiply, negative, random};
+use nuvec::{Array, Result, async_eval, eval, logsumexp, schedule, subtract};
 
 use crate::model::{KvCache, Model};
+use crate::sample::Sampler;
 
 /// How tokens are chosen.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GenerateOptions {
     /// Tokens to generate at most.
     pub max_tokens: usize,
-    /// 0 picks the most likely token; otherwise logits are divided by the temperature
-    /// and a token is drawn (MLX's `categorical`).
-    pub temperature: f32,
+    /// How each token is chosen (greedy by default).
+    pub sampler: Sampler,
     /// Prompt tokens per prefill step (mlx-lm's 2048).
     pub prefill_step: usize,
 }
@@ -22,7 +22,7 @@ impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
             max_tokens: 256,
-            temperature: 0.0,
+            sampler: Sampler::default(),
             prefill_step: 2048,
         }
     }
@@ -92,15 +92,13 @@ impl Generation<'_> {
             ],
         )?
         .reshape(&[1, -1])?;
-        let t = self.options.temperature;
-        if t == 0.0 {
-            return argmax(&last, Some(-1), false);
+        let sampler = &self.options.sampler;
+        if sampler.temperature == 0.0 {
+            return sampler.sample(&last);
         }
-        // Gumbel-max sampling of `logits / t` (MLX's `random.categorical`).
-        let u = random::uniform(1e-30, 1.0, last.shape(), DType::F32, None)?;
-        let gumbel = negative(&log(&negative(&log(&u)?)?)?)?;
-        let scaled = multiply(last.astype(DType::F32)?, 1.0 / f64::from(t))?;
-        argmax(&nuvec::add(&scaled, &gumbel)?, Some(-1), false)
+        // Log-probabilities, as mlx-lm samples from.
+        let logprobs = subtract(&last, logsumexp(&last, &[-1], true)?)?;
+        sampler.sample(&logprobs)
     }
 
     /// The cache (one per layer), for instance to continue a conversation.
@@ -116,16 +114,18 @@ impl Iterator for Generation<'_> {
         let y = self.next.take()?;
         self.produced += 1;
         if self.produced < self.options.max_tokens {
-            // Build the following step, wait for this token, then submit: the cache the
-            // step writes is then finished and owned by the step alone, so it is updated
-            // in place. The GPU starts on the first dispatches while the rest is encoded.
+            // Build and order the following step, wait for this token, then submit: the
+            // cache the step writes is then finished and owned by the step alone, so it is
+            // updated in place. The GPU starts on the first dispatches while the rest is
+            // encoded.
             let next = match self.step(&y) {
                 Ok(next) => next,
                 Err(e) => return Some(Err(e)),
             };
+            let scheduled = schedule(std::slice::from_ref(&next));
             let id = y.item::<u32>();
             drop(y);
-            if let Err(e) = async_eval(std::slice::from_ref(&next)) {
+            if let Err(e) = scheduled.async_eval() {
                 return Some(Err(e));
             }
             self.next = Some(next);

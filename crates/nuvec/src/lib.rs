@@ -46,15 +46,16 @@ pub use nuvec_core as core;
 pub use nuvec_core::{
     ArgReduceOp, Array, BinaryOp, Category, Complex64, CustomCall, CustomFunction, DType, Device,
     DeviceKind, Element, Error, Flags, Primitive, ReduceOp, Result, Scalar, ScalarOperand,
-    ScalarOrArray, ScatterReduce, SliceArg, Stream, UnaryOp, abs, add, addmm, all, any, arange,
-    argmax, argmin, astype, async_eval, at_least_float, bf16, broadcast_to, checkpoint,
-    concatenate, conjugate, cos, custom_function, default_device, default_stream, dequantize,
-    divide, equal, erfinv, eval, exp, expand_dims, f16, grad, greater, greater_equal, jvp, less,
-    less_equal, log, logsumexp, matmul, max, maximum, mean, min, minimum, multiply, negative,
-    not_equal, ones, prod, promote_types, put_along_axis, quantize, quantized_matmul, reshape,
-    scatter_add_along_axis, set_default_stream, sigmoid, sign, sin, slice, slice_update, softmax,
-    split, split_at, sqrt, squeeze, stack, stop_gradient, subtract, sum, take, take_along_axis,
-    tanh, transpose, value_and_grad, vjp, vmap, where_, zeros,
+    ScalarOrArray, ScanOp, ScatterReduce, Scheduled, SliceArg, Stream, UnaryOp, abs, add, addmm,
+    all, any, arange, argmax, argmin, argpartition, argsort, astype, async_eval, at_least_float,
+    bf16, broadcast_to, checkpoint, concatenate, conjugate, cos, cummax, cummin, cumprod, cumsum,
+    custom_function, default_device, default_stream, dequantize, divide, equal, erfinv, eval, exp,
+    expand_dims, f16, grad, greater, greater_equal, jvp, less, less_equal, log, logcumsumexp,
+    logsumexp, matmul, max, maximum, mean, min, minimum, multiply, negative, not_equal, ones,
+    partition, prod, promote_types, put_along_axis, quantize, quantized_matmul, reshape,
+    scatter_add_along_axis, schedule, set_default_stream, sigmoid, sign, sin, slice, slice_update,
+    softmax, sort, split, split_at, sqrt, squeeze, stack, stop_gradient, subtract, sum, take,
+    take_along_axis, tanh, topk, transpose, value_and_grad, vjp, vmap, where_, zeros,
 };
 pub use nuvec_core::{fast, random};
 pub use nuvec_cpu as cpu;

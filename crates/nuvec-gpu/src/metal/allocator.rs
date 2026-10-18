@@ -3,14 +3,19 @@
 //! Freed buffers are cached and handed back for similar sizes, so steady-state loops make
 //! almost no system allocations. The cache is bounded (least-recently-used eviction), and
 //! allocations beyond the memory limit fail instead of exhausting shared system RAM.
+//!
+//! As in MLX, a buffer freed while submitted GPU work still uses it is cached at once: GPU
+//! work encoded later may reuse it, ordered after those uses by the buffer's fences (its
+//! [`Guard`] goes with it). CPU access waits until the buffer is idle.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
+use super::buffer::Guard;
 use crate::{GpuError, Result};
 
 /// The virtual-memory page size on Apple silicon.
@@ -22,8 +27,36 @@ const SMALL_CLASSES: usize = PAGE / SMALL + 1;
 
 pub(crate) type Raw = Retained<ProtocolObject<dyn MTLBuffer>>;
 
+/// An allocation: the buffer, its accounted size and the hazard state of GPU work that
+/// still uses reused memory.
+pub(crate) type Allocation = (Raw, usize, Option<Arc<Guard>>);
+
 /// A cached buffer. Cached buffers are never accessed, only retained and released.
 struct Cached(Raw);
+
+/// A cached buffer and, while submitted GPU work still uses it, that work's hazard state.
+struct Entry {
+    raw: Cached,
+    busy: Option<Arc<Guard>>,
+}
+
+impl Entry {
+    /// Whether an allocation may take it: GPU work may take a buffer whose pending uses are
+    /// all committed (their fences order the new use after them); the CPU only an idle one.
+    fn takeable(&self, gpu: bool) -> bool {
+        match &self.busy {
+            None => true,
+            Some(g) if g.idle() => true,
+            Some(g) => gpu && g.committed_uses(),
+        }
+    }
+
+    /// The buffer and its pending hazard state (`None` once idle).
+    fn into_parts(self) -> (Raw, Option<Arc<Guard>>) {
+        let busy = self.busy.filter(|g| !g.idle());
+        (self.raw.0, busy)
+    }
+}
 
 // SAFETY: retaining and releasing Metal buffer objects is thread-safe; a cached buffer's
 // memory is not touched until it is handed out again, under the pool's lock.
@@ -68,9 +101,9 @@ pub(crate) struct Pool {
 struct State {
     /// Cached buffers up to one page, by size class (`size / 256`), most recent last: O(1)
     /// reuse for the many small outputs of a computation.
-    small: Vec<Vec<(u64, Cached)>>,
+    small: Vec<Vec<(u64, Entry)>>,
     /// Cached larger buffers by `(size, stamp)`: best fit is the first key at or above a size.
-    large: BTreeMap<(usize, u64), Cached>,
+    large: BTreeMap<(usize, u64), Entry>,
     /// Stamps order cached buffers by age, for least-recently-used eviction.
     next_stamp: u64,
     cached: usize,
@@ -84,34 +117,47 @@ struct State {
 
 impl State {
     /// A cached buffer of at least `size` bytes within MLX's slack (smaller than
-    /// `min(2·size, size + 2 pages)`), and its size.
-    fn take(&mut self, size: usize) -> Option<(Raw, usize)> {
+    /// `min(2·size, size + 2 pages)`) that an allocation for the GPU (or the CPU) may take,
+    /// its size and its pending hazard state.
+    fn take(&mut self, size: usize, gpu: bool) -> Option<Allocation> {
         let limit = (2 * size).min(size + 2 * PAGE);
         let found = if size <= PAGE {
             let last = ((limit - 1) / SMALL).min(SMALL_CLASSES - 1);
-            (size / SMALL..=last)
-                .find_map(|c| self.small[c].pop().map(|(_, Cached(raw))| (raw, c * SMALL)))
+            (size / SMALL..=last).find_map(|c| {
+                let class = &mut self.small[c];
+                // The most recently freed first.
+                let i = class.iter().rposition(|(_, e)| e.takeable(gpu))?;
+                let (raw, busy) = class.remove(i).1.into_parts();
+                Some((raw, c * SMALL, busy))
+            })
         } else {
             let key = self
                 .large
                 .range((size, 0)..(limit, 0))
-                .next()
+                .find(|(_, e)| e.takeable(gpu))
                 .map(|(k, _)| *k);
-            key.and_then(|k| self.large.remove(&k).map(|Cached(raw)| (raw, k.0)))
+            key.and_then(|k| {
+                let (raw, busy) = self.large.remove(&k)?.into_parts();
+                Some((raw, k.0, busy))
+            })
         };
-        if let Some((_, bucket)) = &found {
+        if let Some((_, bucket, _)) = &found {
             self.cached -= bucket;
         }
         found
     }
 
-    fn put(&mut self, raw: Raw, size: usize) {
+    fn put(&mut self, raw: Raw, size: usize, busy: Option<Arc<Guard>>) {
         let stamp = self.next_stamp;
         self.next_stamp += 1;
+        let entry = Entry {
+            raw: Cached(raw),
+            busy,
+        };
         if size <= PAGE {
-            self.small[size / SMALL].push((stamp, Cached(raw)));
+            self.small[size / SMALL].push((stamp, entry));
         } else {
-            self.large.insert((size, stamp), Cached(raw));
+            self.large.insert((size, stamp), entry);
         }
         self.cached += size;
     }
@@ -186,13 +232,15 @@ impl Pool {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A buffer of at least `len` bytes and its accounted size; `None` for zero bytes.
-    /// Reused buffers hold stale contents.
+    /// A buffer of at least `len` bytes, its accounted size and, for a buffer that
+    /// submitted GPU work still uses (only handed out with `gpu`), that work's hazard state;
+    /// `None` for zero bytes. Reused buffers hold stale contents.
     pub(crate) fn alloc(
         &self,
         device: &ProtocolObject<dyn MTLDevice>,
         len: usize,
-    ) -> Result<Option<(Raw, usize)>> {
+        gpu: bool,
+    ) -> Result<Option<Allocation>> {
         let size = rounded(len);
         if size == 0 {
             return Ok(None);
@@ -202,10 +250,10 @@ impl Pool {
             s.evict_to(0);
             return Err(GpuError::OutOfMemory(len));
         }
-        if let Some((raw, bucket)) = s.take(size) {
+        if let Some((raw, bucket, busy)) = s.take(size, gpu) {
             s.active += bucket;
             s.peak = s.peak.max(s.active);
-            return Ok(Some((raw, bucket)));
+            return Ok(Some((raw, bucket, busy)));
         }
         let gc = s.gc_limit();
         if s.active + s.cached + size >= gc {
@@ -221,7 +269,7 @@ impl Pool {
         match device.newBufferWithLength_options(size, options) {
             Some(raw) => {
                 self.lock().system_allocations += 1;
-                Ok(Some((raw, size)))
+                Ok(Some((raw, size, None)))
             }
             None => {
                 self.lock().active -= size;
@@ -230,16 +278,14 @@ impl Pool {
         }
     }
 
-    /// Returns a buffer of accounted `size`. It is cached for reuse if `reusable` (no GPU
-    /// work still uses it), otherwise released.
-    pub(crate) fn free(&self, raw: Raw, size: usize, reusable: bool) {
+    /// Returns a buffer of accounted `size` to the cache, with the hazard state of the
+    /// submitted GPU work that still uses it (if any).
+    pub(crate) fn free(&self, raw: Raw, size: usize, busy: Option<Arc<Guard>>) {
         let mut s = self.lock();
         s.active -= size;
-        if reusable {
-            s.put(raw, size);
-            let limit = s.cache_limit;
-            s.evict_to(limit);
-        }
+        s.put(raw, size, busy);
+        let limit = s.cache_limit;
+        s.evict_to(limit);
     }
 
     pub(crate) fn stats(&self) -> MemoryStats {

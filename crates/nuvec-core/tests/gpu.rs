@@ -960,3 +960,102 @@ fn embedding_lookup_and_gradient_on_the_gpu() {
         "counts of 2.0 add exactly"
     );
 }
+
+/// A cumulative op: `(a, axis, reverse, inclusive)`.
+type ScanFn = fn(&Array, Option<isize>, bool, bool) -> Result<Array>;
+#[test]
+fn sort_and_scan_kernels_match_the_cpu() {
+    if !gpu_available() {
+        return;
+    }
+    let mut rng = Rng::new(0x5027);
+    // (shape, axis): one block, several blocks (merge passes), a non-innermost axis.
+    let cases: [(&[usize], usize); 6] = [
+        (&[3, 100], 1),
+        (&[2, 3000], 1),
+        (&[70_000], 0),
+        (&[5000, 3], 0),
+        (&[4, 600, 5], 1),
+        (&[7], 0),
+    ];
+    let dtypes = [
+        DType::F32,
+        DType::F16,
+        DType::BF16,
+        DType::I32,
+        DType::U8,
+        DType::I64,
+    ];
+    for (case, &(shape, axis)) in cases.iter().enumerate() {
+        for &dtype in &dtypes {
+            // Few distinct values: many ties, so stability shows.
+            let values: Vec<f32> = (0..size(shape))
+                .map(|_| (rng.below(50) as f32 - 20.0) / 4.0)
+                .collect();
+            let (a, _) = random_layout(&mut rng, shape, values);
+            let a = on(Device::cpu(), || a.astype(dtype)).unwrap();
+            let what = format!("case {case} {dtype} {shape:?} axis {axis}");
+            let ax = Some(axis as isize);
+            for (name, f) in [
+                (
+                    "sort",
+                    Box::new(|| sort(&a, ax)) as Box<dyn Fn() -> Result<Array>>,
+                ),
+                ("argsort", Box::new(|| argsort(&a, ax))),
+            ] {
+                let (cpu, gpu) = (
+                    on(Device::cpu(), &f).unwrap(),
+                    on(Device::gpu(0), &f).unwrap(),
+                );
+                assert_eq!(f64s(&cpu), f64s(&gpu), "{name} {what}");
+            }
+            let exact = !matches!(dtype, DType::F32 | DType::F16 | DType::BF16);
+            let ops: [(&str, ScanFn); 4] = [
+                ("cumsum", cumsum),
+                ("cumprod", cumprod),
+                ("cummax", cummax),
+                ("cummin", cummin),
+            ];
+            // Float products of near-one factors on short axes, so neither order of
+            // multiplication overflows (where the parallel scan's inf · 0 would differ).
+            let near_one = on(Device::cpu(), || {
+                add(multiply(&a.astype(DType::F32)?, 0.01)?, 1.0)?.astype(dtype)
+            })
+            .unwrap();
+            for (name, op) in ops {
+                let float_prod = name == "cumprod" && !exact;
+                // Half-precision running sums over long axes stall (sequentially) or
+                // overflow (in parallel): only short axes compare meaningfully.
+                let half_sum = name == "cumsum" && matches!(dtype, DType::F16 | DType::BF16);
+                if (float_prod || half_sum) && shape[axis] > 600 {
+                    continue;
+                }
+                let input = if float_prod { &near_one } else { &a };
+                for (reverse, inclusive) in [(false, true), (true, false)] {
+                    let f = || op(input, ax, reverse, inclusive);
+                    let (cpu, gpu) = (
+                        on(Device::cpu(), f).unwrap(),
+                        on(Device::gpu(0), f).unwrap(),
+                    );
+                    let (c, g) = (f64s(&cpu), f64s(&gpu));
+                    if exact || matches!(name, "cummax" | "cummin") {
+                        assert_eq!(c, g, "{name} r{reverse} i{inclusive} {what}");
+                        continue;
+                    }
+                    // Products of many factors overflow alike; sums round in another order.
+                    let eps = match dtype {
+                        DType::F16 => 1e-3,
+                        DType::BF16 => 8e-3,
+                        _ => 1e-6,
+                    } * shape[axis] as f64;
+                    for (x, y) in c.iter().zip(&g) {
+                        let ok = (x - y).abs() <= eps * x.abs().max(1.0)
+                            || (x.is_nan() && y.is_nan())
+                            || (x.is_infinite() && x == y);
+                        assert!(ok, "{name} r{reverse} i{inclusive} {what}: cpu {x} gpu {y}");
+                    }
+                }
+            }
+        }
+    }
+}

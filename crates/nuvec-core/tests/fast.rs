@@ -402,6 +402,133 @@ fn attention_fallback_matches_a_direct_formula() {
     );
 }
 
+/// The gated delta rule computed directly in float64: `(y, state)` as flat vectors.
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_reference(
+    (b, t, hk, hv, dk, dv): (usize, usize, usize, usize, usize, usize),
+    q: &[f64],
+    k: &[f64],
+    v: &[f64],
+    g: &[f64],
+    beta: &[f64],
+    state: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let mut s = state.to_vec();
+    let mut y = vec![0.0; b * t * hv * dv];
+    for bi in 0..b {
+        for h in 0..hv {
+            let kh = h / (hv / hk);
+            let st = &mut s[(bi * hv + h) * dv * dk..(bi * hv + h + 1) * dv * dk];
+            for ti in 0..t {
+                let qk = |a: &[f64], c: usize| a[((bi * t + ti) * hk + kh) * dk + c];
+                let gb = (bi * t + ti) * hv + h;
+                for r in 0..dv {
+                    let row = &mut st[r * dk..(r + 1) * dk];
+                    row.iter_mut().for_each(|x| *x *= g[gb]);
+                    let mem: f64 = (0..dk).map(|c| row[c] * qk(k, c)).sum();
+                    let delta = (v[((bi * t + ti) * hv + h) * dv + r] - mem) * beta[gb];
+                    (0..dk).for_each(|c| row[c] += qk(k, c) * delta);
+                    y[((bi * t + ti) * hv + h) * dv + r] = (0..dk).map(|c| row[c] * qk(q, c)).sum();
+                }
+            }
+        }
+    }
+    (y, s)
+}
+
+#[test]
+fn gated_delta_fallback_matches_a_direct_formula() {
+    let mut rng = Rng::new(0x67);
+    let dims @ (b, t, hk, hv, dk, dv) = (2, 4, 1, 2, 3, 2);
+    let q = random(&mut rng, &[b, t, hk, dk], DType::F64);
+    let k = random(&mut rng, &[b, t, hk, dk], DType::F64);
+    let v = random(&mut rng, &[b, t, hv, dv], DType::F64);
+    let g = add(random(&mut rng, &[b, t, hv], DType::F64), 0.75).unwrap();
+    let beta = add(random(&mut rng, &[b, t, hv], DType::F64), 0.5).unwrap();
+    let state = random(&mut rng, &[b, hv, dv, dk], DType::F64);
+    let (y, s) = fast::gated_delta(&q, &k, &v, &g, &beta, &state).unwrap();
+    let all = [&q, &k, &v, &g, &beta, &state].map(values);
+    let (wy, ws) =
+        gated_delta_reference(dims, &all[0], &all[1], &all[2], &all[3], &all[4], &all[5]);
+    for (i, (a, w)) in values(&y).iter().zip(&wy).enumerate() {
+        assert!((a - w).abs() < 1e-12, "y[{i}]: {a} vs {w}");
+    }
+    for (i, (a, w)) in values(&s).iter().zip(&ws).enumerate() {
+        assert!((a - w).abs() < 1e-12, "state[{i}]: {a} vs {w}");
+    }
+    // Gradients of every input against central differences (float64).
+    let inputs = [q, k, v, g, beta, state];
+    let loss = |xs: &[Array]| -> Array {
+        let (y, s) = fast::gated_delta(&xs[0], &xs[1], &xs[2], &xs[3], &xs[4], &xs[5]).unwrap();
+        add(
+            sum(&multiply(&y, &y).unwrap(), &[], false).unwrap(),
+            sum(&s, &[], false).unwrap(),
+        )
+        .unwrap()
+    };
+    let f = |xs: &[Array]| Ok(vec![loss(xs)]);
+    let (_, grads) = vjp(f, &inputs, &[Array::scalar(1.0f64)]).unwrap();
+    let h = 1e-6;
+    for (i, grad) in grads.iter().enumerate() {
+        let gv = values(grad);
+        let base = values(&inputs[i]);
+        for j in [0, base.len() / 2, base.len() - 1] {
+            let shifted = |d: f64| {
+                let mut xs = inputs.to_vec();
+                let mut p = base.clone();
+                p[j] += d;
+                xs[i] = Array::from_slice(&p, inputs[i].shape()).unwrap();
+                loss(&xs).item::<f64>().unwrap()
+            };
+            let numeric = (shifted(h) - shifted(-h)) / (2.0 * h);
+            assert!(
+                (gv[j] - numeric).abs() < 1e-5 * numeric.abs().max(1.0),
+                "input {i}[{j}]: {} vs {numeric}",
+                gv[j]
+            );
+        }
+    }
+    // Batching over a leading axis matches a loop.
+    let qs = random(&mut rng, &[3, b, t, hk, dk], DType::F64);
+    let f = |xs: &[Array]| {
+        let (y, s) = fast::gated_delta(
+            &xs[0], &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
+        )?;
+        Ok(vec![y, s])
+    };
+    let batched = vmap(f, &[Some(0)], &[0, 0])(std::slice::from_ref(&qs)).unwrap();
+    for i in 0..3 {
+        let qi = take(&qs, &Array::scalar(i), Some(0)).unwrap();
+        let one = f(&[qi]).unwrap();
+        for (o, w) in batched.iter().zip(&one) {
+            let oi = take(o, &Array::scalar(i), Some(0)).unwrap();
+            assert_close(&format!("vmap {i}"), &oi, w, 1e-12);
+        }
+    }
+    // Errors: head grouping, gate shapes, state shape.
+    let bad_v = random(&mut rng, &[b, t, 3, dv], DType::F64);
+    assert!(
+        fast::gated_delta(
+            &inputs[0], &inputs[1], &bad_v, &inputs[3], &inputs[4], &inputs[5]
+        )
+        .is_err()
+    );
+    let bad_g = random(&mut rng, &[b, t, hv, 1], DType::F64);
+    assert!(
+        fast::gated_delta(
+            &inputs[0], &inputs[1], &inputs[2], &bad_g, &inputs[4], &inputs[5]
+        )
+        .is_err()
+    );
+    let bad_s = random(&mut rng, &[b, hv, dk, dv], DType::F64);
+    assert!(
+        fast::gated_delta(
+            &inputs[0], &inputs[1], &inputs[2], &inputs[3], &inputs[4], &bad_s
+        )
+        .is_err()
+    );
+}
+
 #[cfg(target_os = "macos")]
 mod attention_gpu {
     use super::*;
@@ -544,6 +671,101 @@ mod attention_gpu {
         let (gpu, cpu) = (on(Device::gpu(0), grads), on(Device::cpu(), grads));
         for (i, (a, c)) in gpu.iter().zip(&cpu).enumerate() {
             assert_close(&format!("attention vjp #{i}"), a, c, 1e-4);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod gated_delta_gpu {
+    use super::*;
+
+    fn on<R>(device: Device, f: impl FnOnce() -> R) -> R {
+        let previous = default_stream();
+        set_default_stream(Stream::default_for(device));
+        let r = f();
+        set_default_stream(previous);
+        r
+    }
+
+    /// `x` normalised over its last axis, in `dtype`.
+    fn unit(x: &Array, dtype: DType) -> Array {
+        let norm = sqrt(&sum(&multiply(x, x).unwrap(), &[-1], true).unwrap()).unwrap();
+        divide(x, &norm).unwrap().astype(dtype).unwrap()
+    }
+
+    #[test]
+    fn gated_delta_kernels_match_the_fallback() {
+        if cfg!(miri) || on(Device::gpu(0), || (Array::scalar(1.0f32) * 2.0).eval()).is_err() {
+            return;
+        }
+        let mut rng = Rng::new(0x68);
+        // (B, T, Hk, Hv, Dk, Dv): packed (decode, prefill, Qwen3.5's heads) and generic.
+        let shapes: &[(usize, usize, usize, usize, usize, usize)] = &[
+            (1, 1, 2, 4, 128, 128),
+            (1, 9, 2, 4, 128, 64),
+            (1, 3, 16, 32, 128, 128),
+            (2, 5, 1, 2, 64, 48),
+            (1, 4, 4, 4, 32, 17),
+        ];
+        for &(b, t, hk, hv, dk, dv) in shapes {
+            for (dtype, gate) in [
+                (DType::F32, DType::F32),
+                (DType::BF16, DType::F32),
+                (DType::F16, DType::F32),
+                (DType::BF16, DType::BF16),
+            ] {
+                // q as a transposed view, as projections reshape to it. Unit keys, as models
+                // normalise them: the recurrence is stable for β‖k‖² ≤ 2.
+                let q =
+                    transpose(&random(&mut rng, &[b, hk, t, dk], dtype), &[0, 2, 1, 3]).unwrap();
+                let k = unit(&random(&mut rng, &[b, t, hk, dk], DType::F32), dtype);
+                let v = random(&mut rng, &[b, t, hv, dv], dtype);
+                let g = add(random(&mut rng, &[b, t, hv], DType::F32), 0.75)
+                    .unwrap()
+                    .astype(gate)
+                    .unwrap();
+                let beta = add(random(&mut rng, &[b, t, hv], dtype), 0.5).unwrap();
+                let state = random(&mut rng, &[b, hv, dv, dk], gate);
+                let run = || fast::gated_delta(&q, &k, &v, &g, &beta, &state).unwrap();
+                let fused = on(Device::gpu(0), || {
+                    matches!(
+                        run().0.primitive(),
+                        Some(Primitive::Fast(fast::FastOp::GatedDelta))
+                    )
+                });
+                assert!(fused, "{:?} should use a kernel", (b, t, hk, hv, dk, dv));
+                let ((gy, gs), (cy, cs)) = (on(Device::gpu(0), run), on(Device::cpu(), run));
+                let name = format!("{dtype}/{gate} {:?}", (b, t, hk, hv, dk, dv));
+                // The kernels sum each row's Dk products as a tree, the fallback in order.
+                let tol = |d: DType| if d == DType::F32 { 2e-4 } else { tolerance(d) };
+                assert_close(&format!("{name} y"), &gy, &cy, tol(dtype));
+                assert_close(&format!("{name} state"), &gs, &cs, tol(gate));
+            }
+        }
+        // Gradients through the fused forward match the CPU.
+        let (b, t, hk, hv, dk, dv) = (1, 3, 1, 2, 32, 8);
+        let xs = vec![
+            random(&mut rng, &[b, t, hk, dk], DType::F32),
+            unit(&random(&mut rng, &[b, t, hk, dk], DType::F32), DType::F32),
+            random(&mut rng, &[b, t, hv, dv], DType::F32),
+            add(random(&mut rng, &[b, t, hv], DType::F32), 0.75).unwrap(),
+            add(random(&mut rng, &[b, t, hv], DType::F32), 0.5).unwrap(),
+            random(&mut rng, &[b, hv, dv, dk], DType::F32),
+        ];
+        let cot = [
+            random(&mut rng, &[b, t, hv, dv], DType::F32),
+            random(&mut rng, &[b, hv, dv, dk], DType::F32),
+        ];
+        let grads = || {
+            let f = |xs: &[Array]| {
+                let (y, s) = fast::gated_delta(&xs[0], &xs[1], &xs[2], &xs[3], &xs[4], &xs[5])?;
+                Ok(vec![y, s])
+            };
+            vjp(f, &xs, &cot).unwrap().1
+        };
+        let (gpu, cpu) = (on(Device::gpu(0), grads), on(Device::cpu(), grads));
+        for (i, (a, c)) in gpu.iter().zip(&cpu).enumerate() {
+            assert_close(&format!("gated delta vjp #{i}"), a, c, 1e-4);
         }
     }
 }

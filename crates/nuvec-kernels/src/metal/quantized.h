@@ -1884,6 +1884,8 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
     device T* biases [[buffer(3)]],
     uint2 index [[thread_position_in_grid]],
     uint2 grid_dim [[threads_per_grid]]) {
+  // Exact, as MLX's CPU: no fused multiply-add (the file is compiled with contraction).
+#pragma clang fp contract(off)
   constexpr float eps = 1e-7;
   constexpr int simd_size = 32;
   constexpr float n_bins = (1 << bits) - 1;
@@ -2000,6 +2002,8 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
     device T* out [[buffer(3)]],
     uint2 index [[thread_position_in_grid]],
     uint2 grid_dim [[threads_per_grid]]) {
+  // Exact, as MLX's CPU: no fused multiply-add (the file is compiled with contraction).
+#pragma clang fp contract(off)
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 

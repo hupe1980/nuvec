@@ -526,6 +526,27 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "broadcast_to" => broadcast_to(&xs[0], &usizes(p("shape"))),
         "expand_dims" => expand_dims(&xs[0], p("axis").parse().unwrap()),
         "squeeze" => squeeze(&xs[0], &ints(p("axes"))),
+        "sort" => sort(&xs[0], Some(p("axis").parse().unwrap())),
+        "argsort" => argsort(&xs[0], Some(p("axis").parse().unwrap())),
+        "topk" => {
+            let axis = p("axis").parse().unwrap();
+            sort(
+                &topk(&xs[0], p("k").parse().unwrap(), Some(axis))?,
+                Some(axis),
+            )
+        }
+        "cumsum" | "cumprod" | "cummax" | "cummin" | "logcumsumexp" => {
+            let axis = (!p("axis").is_empty()).then(|| p("axis").parse().unwrap());
+            let (reverse, inclusive) = (p("reverse") == "1", p("inclusive") != "0");
+            let f = match op {
+                "cumsum" => cumsum,
+                "cumprod" => cumprod,
+                "cummax" => cummax,
+                "cummin" => cummin,
+                _ => logcumsumexp,
+            };
+            f(&xs[0], axis, reverse, inclusive)
+        }
         "take" => {
             let axis = (!p("axis").is_empty()).then(|| p("axis").parse().unwrap());
             take(&xs[0], &xs[1], axis)
@@ -607,6 +628,18 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
                 .map(|t| t.shape.iter().product::<usize>())
                 .max();
             (n.unwrap_or(1) as f64 + 8.0) * eps * e.abs().max(1.0)
+        }
+        // Each step rounds in MLX (float32), once in nuvec (f64): the error grows with
+        // the scanned length.
+        // Parallel prefix scans (GPU) round in another order than MLX's sequential CPU
+        // scan: as reductions, the error grows with the scanned length.
+        "cumsum" | "cumprod" => {
+            let n = case.inputs[0].shape.iter().product::<usize>() as f64;
+            (n + 1.0) * eps * e.abs().max(1.0)
+        }
+        "logcumsumexp" => {
+            let n = case.inputs[0].shape.iter().max().copied().unwrap_or(1) as f64;
+            4.0 * (n + 1.0) * eps * e.abs().max(1.0)
         }
         "exp" | "log" | "sqrt" | "sin" | "cos" | "tanh" | "sigmoid" => {
             4.0 * eps * e.abs().max(f64::MIN_POSITIVE)

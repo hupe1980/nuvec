@@ -8,7 +8,8 @@ as test fixtures for nuvec-lm.
 Each case is a directory under `crates/nuvec-lm/tests/fixtures/` with `config.json` and
 `model.safetensors` (as a Hugging Face or MLX checkpoint) and `expected.safetensors`: the
 logits of a fixed prompt (run at once) and 12 greedy tokens generated after it
-(`generate_step`, with the KV cache). Runs on MLX's GPU, as nuvec's tests do.
+(`generate_step`, with the KV cache). `samplers.safetensors` holds log-probabilities and
+mlx-lm's top-p, min-p and top-k filters of them. Runs on MLX's GPU, as nuvec's tests do.
 
 Usage: `just lm-fixtures` (or `uv run scripts/lm_fixtures.py`).
 """
@@ -22,7 +23,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 from mlx_lm.generate import generate_step
-from mlx_lm.models import llama, qwen2, qwen3
+from mlx_lm.models import llama, qwen2, qwen3, qwen3_5
+from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
 
 OUT = Path(__file__).resolve().parent.parent / "crates/nuvec-lm/tests/fixtures"
 PROMPT = [3, 17, 92, 5, 64, 33, 101, 8, 77, 2, 45, 120, 9, 56]
@@ -30,6 +32,13 @@ PROMPT = [3, 17, 92, 5, 64, 33, 101, 8, 77, 2, 45, 120, 9, 56]
 BASE = dict(hidden_size=64, num_hidden_layers=2, intermediate_size=128, num_attention_heads=4,
             num_key_value_heads=2, rms_norm_eps=1e-6, vocab_size=128,
             max_position_embeddings=512)
+QWEN35 = dict(model_type="qwen3_5_text", hidden_size=64, num_hidden_layers=4,
+              intermediate_size=128, num_attention_heads=4, num_key_value_heads=2,
+              head_dim=32, rms_norm_eps=1e-6, vocab_size=128, max_position_embeddings=512,
+              linear_num_key_heads=2, linear_num_value_heads=4, linear_value_head_dim=16,
+              linear_conv_kernel_dim=4, full_attention_interval=4, attn_output_gate=True,
+              rope_parameters=dict(rope_type="default", rope_theta=1e7,
+                                   partial_rotary_factor=0.25, mrope_section=[2, 1, 1]))
 CASES = {
     # Qwen 3: per-head q/k norms, separate output head, float32.
     "qwen3_f32": (qwen3, dict(BASE, model_type="qwen3", head_dim=16, rope_theta=1e6,
@@ -44,6 +53,19 @@ CASES = {
     # Qwen 2: q/k/v biases, tied (quantized) embeddings, 4-bit weights.
     "qwen2_q4": (qwen2, dict(BASE, model_type="qwen2", rope_theta=1e6,
                              tie_word_embeddings=True), mx.float16, (32, 4)),
+    # Qwen 3.5 in float32 (tight tolerances).
+    "qwen3_5_f32": (qwen3_5, dict(model_type="qwen3_5", tie_word_embeddings=False,
+                                  text_config=dict(QWEN35, linear_key_head_dim=32)),
+                    None, None),
+    # Qwen 3.5: Gated DeltaNet and gated attention layers (3:1), partial RoPE, bfloat16,
+    # 32-feature keys (the generic kernel).
+    "qwen3_5_bf16": (qwen3_5, dict(model_type="qwen3_5", tie_word_embeddings=False,
+                                   text_config=dict(QWEN35, linear_key_head_dim=32)),
+                     mx.bfloat16, None),
+    # Qwen 3.5 with 128-feature keys (the packed kernel), 4-bit weights.
+    "qwen3_5_q4": (qwen3_5, dict(model_type="qwen3_5", tie_word_embeddings=False,
+                                 text_config=dict(QWEN35, linear_key_head_dim=128)),
+                   mx.bfloat16, (32, 4)),
 }
 
 
@@ -72,6 +94,47 @@ def main() -> None:
         mx.save_safetensors(str(out / "expected.safetensors"), {
             "prompt": prompt, "logits": logits, "greedy": mx.array(tokens, dtype=mx.uint32)})
         print(f"{name}: {len(tree_flatten(model.parameters()))} tensors, greedy {tokens}")
+        if name == "qwen3_5_f32":
+            hugging_face_layout(out, config, dict(tree_flatten(model.parameters())))
+    samplers()
+
+
+def samplers() -> None:
+    """Each filter of mlx-lm's sampler on random log-probabilities [3, 128]."""
+    logits = mx.random.normal((3, 128)) * 2.0
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    filtered = {
+        "top_p_0.9": apply_top_p(logprobs, 0.9),
+        "top_p_0.3": apply_top_p(logprobs, 0.3),
+        "min_p_0.1": apply_min_p(logprobs, 0.1),
+        "min_p_0.5_keep_4": apply_min_p(logprobs, 0.5, 4),
+        "top_k_1": apply_top_k(logprobs, 1),
+        "top_k_7": apply_top_k(logprobs, 7),
+    }
+    mx.save_safetensors(str(OUT / "samplers.safetensors"), {"logprobs": logprobs, **filtered})
+    kept = {k: int(mx.sum(v > -mx.inf).item()) for k, v in filtered.items()}
+    print(f"samplers: tokens kept {kept}")
+
+
+def hugging_face_layout(src: Path, config: dict, params: dict) -> None:
+    """The same Qwen 3.5 model as a Hugging Face checkpoint (`qwen3_5_hf`): text weights
+    under `model.language_model.`, convolutions as `[C, 1, K]`, zero-centred norms."""
+    out = OUT / "qwen3_5_hf"
+    out.mkdir(parents=True, exist_ok=True)
+    norms = (".input_layernorm.weight", ".post_attention_layernorm.weight", "model.norm.weight",
+             ".q_norm.weight", ".k_norm.weight")
+    hf = {}
+    for k, v in params.items():
+        if "conv1d.weight" in k:
+            v = v.moveaxis(2, 1)
+        elif v.ndim == 1 and k.endswith(norms):
+            v = v - 1.0
+        k = k.replace("language_model.model.", "model.language_model.")
+        hf[k.replace("language_model.lm_head", "lm_head")] = v
+    (out / "config.json").write_text(json.dumps(config, indent=2))
+    mx.save_safetensors(str(out / "model.safetensors"), hf)
+    (out / "expected.safetensors").write_bytes((src / "expected.safetensors").read_bytes())
+    print("qwen3_5_hf: the same model in Hugging Face's layout")
 
 
 def tree_map_random(params):

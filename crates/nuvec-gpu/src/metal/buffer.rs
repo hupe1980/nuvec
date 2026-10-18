@@ -30,6 +30,10 @@ pub struct Buffer {
     pool: Arc<Pool>,
     /// Submitted-but-unfinished GPU uses of this buffer.
     in_flight: Arc<Guard>,
+    /// For memory reused while the previous owner's committed GPU work still used it: that
+    /// work's uses. GPU work on this buffer waits for their fences; CPU access waits until
+    /// they complete.
+    previous: Option<Arc<Guard>>,
     /// Memory of a mapped file (not the allocator's): released with the Metal buffer.
     mapped: bool,
 }
@@ -48,10 +52,22 @@ impl Device {
     /// (a reused buffer holds stale bytes); fails with [`GpuError::OutOfMemory`] beyond the
     /// memory limit.
     pub fn new_buffer(&self, len: usize) -> Result<Buffer> {
+        self.alloc_buffer(len, false)
+    }
+
+    /// A buffer of `len` bytes for GPU work to write: as [`new_buffer`](Self::new_buffer),
+    /// but it may be memory that committed GPU work still uses (as MLX reuses memory). GPU
+    /// work encoded with it is ordered after those uses; the CPU cannot access it until
+    /// they complete ([`Buffer::in_use`]).
+    pub fn new_gpu_buffer(&self, len: usize) -> Result<Buffer> {
+        self.alloc_buffer(len, true)
+    }
+
+    fn alloc_buffer(&self, len: usize, gpu: bool) -> Result<Buffer> {
         let pool = self.pool().clone();
-        let (raw, size) = match pool.alloc(self.raw(), len)? {
-            Some((raw, size)) => (Some(raw), size),
-            None => (None, 0),
+        let (raw, size, busy) = match pool.alloc(self.raw(), len, gpu)? {
+            Some((raw, size, busy)) => (Some(raw), size, busy),
+            None => (None, 0, None),
         };
         let ptr = raw
             .as_ref()
@@ -63,6 +79,7 @@ impl Device {
             size,
             pool,
             in_flight: Arc::default(),
+            previous: busy,
             mapped: false,
         })
     }
@@ -133,6 +150,7 @@ impl Device {
             size: 0,
             pool: self.pool().clone(),
             in_flight: Arc::default(),
+            previous: None,
             mapped: true,
         })
     }
@@ -161,8 +179,19 @@ impl Buffer {
         self.in_flight.users.load(Ordering::Acquire) != 0
     }
 
+    /// Waits until the previous owner's GPU work on reused memory has completed (it is
+    /// committed, so it does).
+    fn wait_for_previous(&self) {
+        if let Some(previous) = &self.previous {
+            while !previous.idle() {
+                std::thread::yield_now();
+            }
+        }
+    }
+
     /// The bytes, if no submitted GPU work writes the buffer (concurrent GPU reads are fine).
     pub fn contents(&self) -> Result<&[u8]> {
+        self.wait_for_previous();
         if self.in_flight.writers.load(Ordering::Acquire) != 0 {
             return Err(GpuError::BufferInUse);
         }
@@ -186,6 +215,8 @@ impl Buffer {
         if self.in_use() {
             return Err(GpuError::BufferInUse);
         }
+        self.wait_for_previous();
+        self.previous = None;
         if self.raw.is_none() {
             return Ok(&mut []);
         }
@@ -216,22 +247,33 @@ impl Buffer {
         self.in_flight.clone()
     }
 
+    /// The fences GPU work using the buffer waits for: its own pending uses' and, for reused
+    /// memory, the previous owner's.
+    pub(crate) fn pending_fences(&self, write: bool) -> Vec<Fence> {
+        let mut fences = self.in_flight.pending_fences(write);
+        if let Some(previous) = &self.previous {
+            fences.extend(previous.pending_fences(true));
+        }
+        fences
+    }
+
     /// Identity for hazard tracking (unique per live buffer, including empty ones).
     pub(crate) fn id(&self) -> usize {
         Arc::as_ptr(&self.in_flight) as usize
     }
 }
 
-/// Counts submitted GPU uses of a buffer: all uses, and the writing ones; and the fences of
-/// the ordered command buffers using it.
+/// Counts submitted GPU uses of a buffer: all uses, the writing ones and those not yet
+/// committed; and the fences of the ordered command buffers using it. While uses are
+/// pending it stays with the memory, also when the memory is cached and reused.
 #[derive(Default)]
 pub(crate) struct Guard {
     users: AtomicUsize,
     writers: AtomicUsize,
+    /// Uses encoded in command buffers not committed yet: their fences cannot order other
+    /// work yet.
+    uncommitted: AtomicUsize,
     fences: Mutex<Fences>,
-    /// The memory of a buffer dropped while GPU work still used it: returned to the
-    /// allocator's cache when that work completes (as MLX does), not released.
-    orphan: Mutex<Option<(Raw, usize, Arc<Pool>)>>,
 }
 
 impl std::fmt::Debug for Guard {
@@ -278,7 +320,23 @@ impl Guard {
         fences.users.push(fence.clone());
     }
 
+    /// Whether no submitted GPU work uses the buffer.
+    pub(crate) fn idle(&self) -> bool {
+        self.users.load(Ordering::Acquire) == 0
+    }
+
+    /// Whether every pending use is committed (so its fence orders later work after it).
+    pub(crate) fn committed_uses(&self) -> bool {
+        self.uncommitted.load(Ordering::Acquire) == 0
+    }
+
+    /// A use's command buffer was committed (or abandoned).
+    pub(crate) fn committed(&self) {
+        self.uncommitted.fetch_sub(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn acquire(&self, write: bool) {
+        self.uncommitted.fetch_add(1, Ordering::AcqRel);
         self.users.fetch_add(1, Ordering::AcqRel);
         if write {
             self.writers.fetch_add(1, Ordering::AcqRel);
@@ -297,21 +355,13 @@ impl Guard {
                 *fences = Fences::default();
             }
             drop(fences);
-            // A buffer dropped while this work ran: its memory goes to the cache now.
-            let mut orphan = self.orphan.lock().unwrap_or_else(PoisonError::into_inner);
-            if self.users.load(Ordering::Acquire) == 0
-                && let Some((raw, size, pool)) = orphan.take()
-            {
-                drop(orphan);
-                pool.free(raw, size, true);
-            }
         }
     }
 }
 
 impl Drop for Buffer {
-    /// Returns the memory to the allocator's cache, at once or, if GPU work still uses it,
-    /// when that work completes (never reused early).
+    /// Returns the memory to the allocator's cache at once, with the hazard state of GPU
+    /// work that still uses it (only GPU work reuses it before that work completes).
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
             if self.mapped {
@@ -320,19 +370,14 @@ impl Drop for Buffer {
                 drop(raw);
                 return;
             }
-            // Under the lock `Guard::release` takes: either the work is done and the memory
-            // is cached here, or the last completing use caches it.
-            let mut orphan = self
-                .in_flight
-                .orphan
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if self.in_use() {
-                *orphan = Some((raw, self.size, self.pool.clone()));
+            // Its own GPU work runs after the previous owner's: while that is pending, it
+            // orders reuse; otherwise the previous owner's (if pending) does.
+            let busy = if self.in_use() {
+                Some(self.in_flight.clone())
             } else {
-                drop(orphan);
-                self.pool.free(raw, self.size, true);
-            }
+                self.previous.take().filter(|p| !p.idle())
+            };
+            self.pool.free(raw, self.size, busy);
         }
     }
 }

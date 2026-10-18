@@ -1,5 +1,6 @@
 //! Fused operations with dedicated GPU kernels, as MLX's `mx.fast`: [`rms_norm`],
-//! [`layer_norm`], [`rope`], [`cross_entropy`] and [`scaled_dot_product_attention`] (and,
+//! [`layer_norm`], [`rope`], [`cross_entropy`], [`scaled_dot_product_attention`] and
+//! [`gated_delta`] (mlx-lm's Gated DeltaNet kernels) (and,
 //! through [`crate::softmax`] and
 //! [`crate::logsumexp`] over the last axis, MLX's softmax and log-sum-exp kernels).
 //!
@@ -32,6 +33,7 @@ use crate::{
     Array, Category, DType, Device, DeviceKind, Error, Result, SliceArg, Stream, default_stream,
     set_default_stream,
 };
+use crate::{stack, zeros};
 
 /// A fused operation (see the [module documentation](self)).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -91,6 +93,9 @@ pub enum FastOp {
         /// Whether per-head attention sinks (`[Hq]`) are the last input.
         sinks: bool,
     },
+    /// `(q, k, v, g, beta, state)`: the gated delta rule (see [`gated_delta`]), with the
+    /// outputs and the final state.
+    GatedDelta,
 }
 
 /// The mask of [`scaled_dot_product_attention`].
@@ -398,6 +403,7 @@ impl FastOp {
             Self::CrossEntropy => "cross_entropy",
             Self::CrossEntropyVjp => "cross_entropy_vjp",
             Self::Attention { .. } => "scaled_dot_product_attention",
+            Self::GatedDelta => "gated_delta",
         }
     }
 
@@ -410,6 +416,7 @@ impl FastOp {
             Self::LayerNormVjp { .. } | Self::CrossEntropyVjp => 4,
             Self::Rope { .. } => inputs.len().clamp(2, 3),
             Self::Attention { mask, sinks, .. } => 3 + usize::from(*mask) + usize::from(*sinks),
+            Self::GatedDelta => 6,
         };
         if inputs.len() != arity || inputs[0].ndim() == 0 {
             return Err(Error::InvalidArgument(format!(
@@ -438,6 +445,7 @@ impl FastOp {
                 shape[3] = inputs[2].shape()[3];
                 vec![(x.dtype(), shape)]
             }
+            Self::GatedDelta => vec![(x.dtype(), inputs[2].shape().to_vec()), like(&inputs[5])],
         })
     }
 
@@ -530,6 +538,7 @@ impl FastOp {
                 *forward,
             )?],
             Self::Softmax => vec![softmax_graph(x)?],
+            Self::GatedDelta => gated_delta_graph(inputs)?,
             Self::LogSumExp => vec![logsumexp_graph(x)?],
             Self::CrossEntropy => {
                 let classes = x.shape()[x.ndim() - 1];
@@ -640,7 +649,8 @@ impl FastOp {
             Self::RmsNormVjp { .. }
             | Self::LayerNormVjp { .. }
             | Self::CrossEntropyVjp
-            | Self::Attention { .. } => self.fallback_vjp(inputs, cotangents, wanted),
+            | Self::Attention { .. }
+            | Self::GatedDelta => self.fallback_vjp(inputs, cotangents, wanted),
         }
     }
 
@@ -1020,4 +1030,146 @@ fn attention_graph(
     } else {
         Ok(out)
     }
+}
+
+/// The gated delta rule, Gated DeltaNet's recurrence (as mlx-lm's `gated_delta_update`
+/// once its gates are computed). For each step `t` and value head, with `S` its state
+/// (`[Dv, Dk]`):
+///
+/// `S ← g_t · S`, then `S ← S + β_t (v_t − S k_t) k_tᵀ`, and `y_t = S q_t`.
+///
+/// Shapes: `q` and `k` are `[B, T, Hk, Dk]`, `v` is `[B, T, Hv, Dv]` (value head `h` reads
+/// key head `h / (Hv / Hk)`), `g` and `beta` are `[B, T, Hv]` and `state` is
+/// `[B, Hv, Dv, Dk]`. Returns `y` (`[B, T, Hv, Dv]`, in `q`'s dtype) and the final state
+/// (in `state`'s dtype); the recurrence runs in float32. On the GPU it is one kernel
+/// (mlx-lm's, for `Dk` a multiple of 32), else the steps as ordinary operations, which also
+/// define the derivatives.
+///
+/// ```
+/// use nuvec_core::{Array, DType, Result, fast, ones, zeros};
+///
+/// # fn main() -> Result<()> {
+/// let q = ones(&[1, 2, 1, 32], DType::F32)?;
+/// let v = ones(&[1, 2, 1, 4], DType::F32)?;
+/// let (g, beta) = (ones(&[1, 2, 1], DType::F32)?, ones(&[1, 2, 1], DType::F32)?);
+/// let state = zeros(&[1, 1, 4, 32], DType::F32)?;
+/// let (y, s) = fast::gated_delta(&(&q * 0.25), &(&q * 0.125), &v, &g, &(&beta * 0.5), &state)?;
+/// // k · k = 0.5 and k · q = 1. Step 1: S = 0.5 · v kᵀ, so y = 0.5. Step 2: S k = 0.25,
+/// // so S gains (1 − 0.25) · 0.5 · v kᵀ, and y = 0.875.
+/// assert_eq!(y.to_vec::<f32>()?, [0.5, 0.5, 0.5, 0.5, 0.875, 0.875, 0.875, 0.875]);
+/// assert_eq!(s.shape(), [1, 1, 4, 32]);
+/// # Ok(())
+/// # }
+/// ```
+pub fn gated_delta(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+) -> Result<(Array, Array)> {
+    check_inputs(&[q, k, v, g, beta, state])?;
+    let op = "gated_delta";
+    for a in [q, k, v, g, beta, state] {
+        floating(op, a.dtype())?;
+    }
+    let invalid = |msg: String| Err(Error::InvalidArgument(format!("{op}: {msg}")));
+    if q.ndim() != 4 || q.shape() != k.shape() || v.ndim() != 4 {
+        return invalid(format!(
+            "q and k must be [B, T, Hk, Dk] and v [B, T, Hv, Dv], got {:?}, {:?}, {:?}",
+            q.shape(),
+            k.shape(),
+            v.shape()
+        ));
+    }
+    let (b, t, hk, dk) = (q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]);
+    let (hv, dv) = (v.shape()[2], v.shape()[3]);
+    if v.shape()[..2] != [b, t] || hk == 0 || hv % hk != 0 {
+        return invalid(format!(
+            "v must be [{b}, {t}, Hv, Dv] with Hv a multiple of {hk}, got {:?}",
+            v.shape()
+        ));
+    }
+    if g.shape() != [b, t, hv] || beta.shape() != [b, t, hv] {
+        return invalid(format!(
+            "g and beta must be [{b}, {t}, {hv}], got {:?} and {:?}",
+            g.shape(),
+            beta.shape()
+        ));
+    }
+    if state.shape() != [b, hv, dv, dk] {
+        return invalid(format!(
+            "state must be [{b}, {hv}, {dv}, {dk}], got {:?}",
+            state.shape()
+        ));
+    }
+    let inputs = vec![
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        g.clone(),
+        beta.clone(),
+        state.clone(),
+    ];
+    let kernel = on_gpu(q.dtype(), q.size())
+        && q.dtype() == v.dtype()
+        && dk % 32 == 0
+        && [g, beta, state]
+            .iter()
+            .all(|a| matches!(a.dtype(), DType::F16 | DType::BF16 | DType::F32));
+    let mut out = if kernel {
+        Array::from_op(Primitive::Fast(FastOp::GatedDelta), inputs)?
+    } else {
+        FastOp::GatedDelta.fallback(&inputs)?
+    };
+    let s = out.pop().expect("two outputs");
+    Ok((out.pop().expect("two outputs"), s))
+}
+
+/// The gated delta rule step by step from ordinary operations (mlx-lm's
+/// `gated_delta_ops`).
+fn gated_delta_graph(inputs: &[Array]) -> Result<Vec<Array>> {
+    let [q, k, v, g, beta, state] = inputs else {
+        unreachable!("six inputs")
+    };
+    let (b, t, hk, dk) = (q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]);
+    let (hv, dv) = (v.shape()[2], v.shape()[3]);
+    // Each key head serves `Hv / Hk` consecutive value heads.
+    let heads = |x: &Array| -> Result<Array> {
+        if hv == hk {
+            return Ok(x.clone());
+        }
+        let wide = broadcast_to(&expand_dims(x, 3)?, &[b, t, hk, hv / hk, dk])?;
+        reshape(&wide, &[b as isize, t as isize, hv as isize, dk as isize])
+    };
+    // In float32 at least, as the kernels.
+    let wide = |x: &Array| match x.dtype() {
+        DType::F64 => Ok(x.clone()),
+        _ => astype(x, DType::F32),
+    };
+    let (qh, kh) = (heads(&wide(q)?)?, heads(&wide(k)?)?);
+    let (v, g, beta) = (&wide(v)?, &wide(g)?, &wide(beta)?);
+    let at = |x: &Array, i: usize| -> Result<Array> {
+        let mut args = vec![SliceArg::full(); x.ndim()];
+        args[1] = SliceArg::new(Some(i as isize), Some(i as isize + 1), 1);
+        squeeze(&slice(x, &args)?, &[1])
+    };
+    let mut s = wide(state)?;
+    let mut ys = Vec::with_capacity(t);
+    for i in 0..t {
+        let (qt, kt, vt) = (at(&qh, i)?, expand_dims(&at(&kh, i)?, 2)?, at(v, i)?);
+        let decay = reshape(&at(g, i)?, &[b as isize, hv as isize, 1, 1])?;
+        s = multiply(&s, &decay)?;
+        let kv_mem = sum(&multiply(&s, &kt)?, &[-1], false)?;
+        let delta = multiply(subtract(&vt, &kv_mem)?, expand_dims(&at(beta, i)?, -1)?)?;
+        s = add(&s, multiply(&kt, expand_dims(&delta, -1)?)?)?;
+        let y = sum(&multiply(&s, expand_dims(&qt, 2)?)?, &[-1], false)?;
+        ys.push(astype(&y, q.dtype())?);
+    }
+    let y = match ys.is_empty() {
+        true => zeros(&[b, 0, hv, dv], q.dtype())?,
+        false => stack(&ys, 1)?,
+    };
+    Ok(vec![y, astype(&s, state.dtype())?])
 }
