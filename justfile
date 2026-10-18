@@ -52,6 +52,10 @@ metal-check:
 fixtures:
     uv run scripts/mlx_fixtures.py
 
+# Re-records the nuvec-nn fixtures from MLX (needs uv).
+nn-fixtures:
+    uv run scripts/nn_fixtures.py
+
 # Re-records the safetensors and npy files written by MLX and NumPy for nuvec-io's tests.
 io-fixtures:
     uv run scripts/io_fixtures.py

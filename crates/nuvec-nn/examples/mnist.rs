@@ -19,7 +19,7 @@ use nuvec::{
 };
 use nuvec_nn::losses::{Reduction, cross_entropy};
 use nuvec_nn::optim::{Optimizer, Sgd};
-use nuvec_nn::{Linear, Module, relu, value_and_grad};
+use nuvec_nn::{Linear, Module, Parameters, relu, value_and_grad};
 
 #[derive(Clone)]
 struct Mlp {
@@ -46,12 +46,17 @@ impl Mlp {
 }
 
 impl Module for Mlp {
-    fn parameters(&self) -> Vec<Array> {
-        self.layers.parameters()
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        p.module("layers", &mut self.layers);
     }
-    fn set_parameters(&mut self, parameters: &[Array]) -> Result<()> {
-        self.layers.set_parameters(parameters)
-    }
+}
+
+/// The model's trainable parameters, without names.
+fn arrays(m: &Mlp) -> Vec<Array> {
+    m.trainable_parameters()
+        .into_iter()
+        .map(|(_, a)| a)
+        .collect()
 }
 
 /// Images as float32 rows in `[0, 1]` and labels as uint32, as in MLX's example.
@@ -121,20 +126,20 @@ fn main() -> Result<()> {
     let (batch, lr) = (256, 0.1);
     random::seed(0);
     let mut model = Mlp::new(&[pixels, 32, 32, 10])?;
-    nuvec::eval(&model.parameters())?;
+    nuvec::eval(&arrays(&model))?;
     let mut optimizer = Sgd::new(lr);
     // The step as a function of the parameters and the batch, returning new parameters.
-    let k = model.parameters().len();
+    let k = arrays(&model).len();
     let template = model.clone();
     let step = nuvec::compile(move |xs: &[Array]| {
         let mut m = template.clone();
-        m.set_parameters(&xs[..k])?;
+        m.update_trainable(&xs[..k])?;
         let (x, y) = (&xs[k], &xs[k + 1]);
         let (_, grads) = value_and_grad(&m, |m: &Mlp| {
             cross_entropy(&m.forward(x)?, y, Reduction::Mean)
         })?;
         Sgd::new(lr).update(&mut m, &grads)?;
-        Ok(m.parameters())
+        Ok(arrays(&m))
     });
     let mut shuffle = Shuffle(0);
     let device = nuvec::default_stream().device;
@@ -152,9 +157,9 @@ fn main() -> Result<()> {
             let x = Array::from_slice(&xb, &[ids.len(), pixels])?;
             let y = Array::from_slice(&yb, &[ids.len()])?;
             if compiled {
-                let mut args = model.parameters();
+                let mut args = arrays(&model);
                 args.extend([x, y]);
-                model.set_parameters(&step(&args)?)?;
+                model.update_trainable(&step(&args)?)?;
             } else {
                 let (_, grads) = value_and_grad(&model, |m: &Mlp| {
                     cross_entropy(&m.forward(&x)?, &y, Reduction::Mean)
@@ -162,9 +167,9 @@ fn main() -> Result<()> {
                 optimizer.update(&mut model, &grads)?;
             }
             if asynchronous {
-                nuvec::async_eval(&model.parameters())?;
+                nuvec::async_eval(&arrays(&model))?;
             } else {
-                nuvec::eval(&model.parameters())?;
+                nuvec::eval(&arrays(&model))?;
             }
         }
         let predictions = argmax(&model.forward(&test_x)?, Some(1), false)?;

@@ -3,7 +3,7 @@
 use nuvec::{Array, Result, random};
 use nuvec_nn::losses::{Reduction, cross_entropy};
 use nuvec_nn::optim::{Adam, Optimizer, Sgd};
-use nuvec_nn::{Linear, Module, QuantizedLinear, relu, value_and_grad};
+use nuvec_nn::{Linear, Module, Parameters, QuantizedLinear, relu, value_and_grad};
 
 fn values(a: &Array) -> Vec<f32> {
     a.to_vec::<f32>().unwrap()
@@ -134,12 +134,17 @@ fn optimizers_equal_mlx() {
 struct Mlp(Vec<Linear>);
 
 impl Module for Mlp {
-    fn parameters(&self) -> Vec<Array> {
-        self.0.parameters()
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        p.module("layers", &mut self.0);
     }
-    fn set_parameters(&mut self, parameters: &[Array]) -> Result<()> {
-        self.0.set_parameters(parameters)
-    }
+}
+
+/// The trainable parameters, without names.
+fn arrays(m: &impl Module) -> Vec<Array> {
+    m.trainable_parameters()
+        .into_iter()
+        .map(|(_, a)| a)
+        .collect()
 }
 
 impl Mlp {
@@ -176,10 +181,10 @@ fn value_and_grad_matches_the_core_transform_and_training_learns() {
 
     let (value, grads) = value_and_grad(&model, loss).unwrap();
     assert_eq!(grads.len(), 4);
-    let params = model.parameters();
+    let params = arrays(&model);
     let f = |ps: &[Array]| {
         let mut m = model.clone();
-        m.set_parameters(ps)?;
+        m.update_trainable(ps)?;
         loss(&m)
     };
     let (core_value, core_grads) = nuvec::value_and_grad(f, &[0, 1, 2, 3])(&params).unwrap();
@@ -193,11 +198,11 @@ fn value_and_grad_matches_the_core_transform_and_training_learns() {
     for _ in 0..60 {
         let (_, grads) = value_and_grad(&model, loss).unwrap();
         opt.update(&mut model, &grads).unwrap();
-        nuvec::eval(&model.parameters()).unwrap();
+        nuvec::eval(&arrays(&model)).unwrap();
     }
     let end = values(&value_and_grad(&model, loss).unwrap().0)[0];
     assert!(end < 0.3 * start, "loss {start} -> {end}");
-    assert!(model.set_parameters(&params[..2]).is_err());
+    assert!(model.update_trainable(&params[..2]).is_err());
 }
 
 #[test]
@@ -224,7 +229,12 @@ fn quantized_linear_equals_mlx() {
         "QuantizedLinear",
     );
     // Only the bias trains (as MLX's from_linear); gradients reach it through the layer.
-    assert_eq!(q.parameters().len(), 1);
+    let names = |ps: Vec<(String, Array)>| ps.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+    assert_eq!(
+        names(q.parameters()),
+        ["weight", "scales", "biases", "bias"]
+    );
+    assert_eq!(names(q.trainable_parameters()), ["bias"]);
     let (_, grads) = value_and_grad(&q, |m: &QuantizedLinear| {
         nuvec::sum(&m.forward(&x)?, &[], false)
     })

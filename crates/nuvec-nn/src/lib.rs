@@ -1,21 +1,45 @@
-//! Neural-network building blocks on nuvec, following MLX's `mlx.nn` and `mlx.optimizers`:
-//! a [`Module`] trait (parameters out, parameters in), the [`Linear`] and [`QuantizedLinear`]
-//! layers, [`relu`],
-//! [`losses::cross_entropy`], the [`optim::Sgd`] and [`optim::Adam`] optimizers, and
-//! [`value_and_grad`] for a model's loss.
+//! Neural-network building blocks on nuvec, following MLX's `mlx.nn` and `mlx.optimizers`.
+//!
+//! - [`Module`]: named parameter trees (`layers.0.weight`), trainable or frozen, loaded
+//!   from checkpoints by name ([`Module::load_weights`]).
+//! - Layers ([`layers`]): [`Linear`], [`QuantizedLinear`], [`Embedding`], [`RmsNorm`],
+//!   [`LayerNorm`], [`Rope`] and [`LoraLinear`]; activations [`relu`], [`silu`],
+//!   [`gelu_approx`] and [`gelu_fast_approx`].
+//! - [`losses::cross_entropy`], [`value_and_grad`] for a model's loss, and
+//!   [`optim`]: SGD, Adam, AdamW, Lion and Muon with learning-rate schedules and gradient
+//!   clipping.
 //!
 //! ```
 //! use nuvec::{Array, Result, random};
 //! use nuvec_nn::optim::{Optimizer, Sgd};
-//! use nuvec_nn::{Linear, Module, losses, value_and_grad};
+//! use nuvec_nn::{Linear, Module, Parameters, losses, relu, value_and_grad};
+//!
+//! #[derive(Clone)]
+//! struct Mlp {
+//!     hidden: Linear,
+//!     out: Linear,
+//! }
+//!
+//! impl Module for Mlp {
+//!     fn visit(&mut self, p: &mut Parameters<'_>) {
+//!         p.module("hidden", &mut self.hidden);
+//!         p.module("out", &mut self.out);
+//!     }
+//! }
 //!
 //! # fn main() -> Result<()> {
 //! random::seed(0);
-//! let mut model = Linear::new(2, 2, true)?;
+//! let mut model = Mlp { hidden: Linear::new(2, 8, true)?, out: Linear::new(8, 2, true)? };
+//! let names: Vec<String> = model.parameters().into_iter().map(|(n, _)| n).collect();
+//! assert_eq!(names, ["hidden.weight", "hidden.bias", "out.weight", "out.bias"]);
+//!
 //! let x = Array::from_slice(&[1.0f32, -1.0, 0.5, 2.0], &[2, 2])?;
 //! let y = Array::from_slice(&[0u32, 1], &[2])?;
+//! let loss = |m: &Mlp| {
+//!     let logits = m.out.forward(&relu(&m.hidden.forward(&x)?)?)?;
+//!     losses::cross_entropy(&logits, &y, losses::Reduction::Mean)
+//! };
 //! let mut opt = Sgd::new(0.5);
-//! let loss = |m: &Linear| losses::cross_entropy(&m.forward(&x)?, &y, losses::Reduction::Mean);
 //! let (before, _) = value_and_grad(&model, loss)?;
 //! for _ in 0..20 {
 //!     let (_, grads) = value_and_grad(&model, loss)?;
@@ -27,71 +51,216 @@
 //! # }
 //! ```
 //!
-//! **Status:** pre-alpha. The API covers what an MLP needs; parameter trees, more layers
-//! and schedulers follow.
+//! **Status:** pre-alpha.
 
 #![forbid(unsafe_code)]
 
-use nuvec::{Array, Error, Result, add, matmul, maximum, quantize, quantized_matmul, random};
+use std::collections::{HashMap, HashSet};
 
+use nuvec::{Array, Error, Result, add, maximum, multiply, sigmoid, tanh};
+
+pub mod layers;
 pub mod losses;
 pub mod optim;
+
+pub use layers::{Embedding, LayerNorm, Linear, LoraLinear, QuantizedLinear, RmsNorm, Rope};
 
 /// The version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// A model with trainable parameters.
+/// A model: a tree of named parameters, as MLX's `nn.Module`.
 ///
-/// Parameters are flat, in a fixed order. Composite models concatenate their parts'
-/// parameters, and [`Module::set_parameters`] takes them back in the same order. Models
-/// are cheap to clone (arrays are shared).
+/// A module implements [`Module::visit`], reporting each parameter and submodule by name
+/// in a fixed order; everything else (named parameters, trainable parameters, updates,
+/// loading weights) is built on it. Models are cheap to clone: arrays are shared.
 pub trait Module: Clone {
-    /// The trainable parameters.
-    fn parameters(&self) -> Vec<Array>;
+    /// Reports every parameter and submodule to `p`, frozen ones included.
+    fn visit(&mut self, p: &mut Parameters<'_>);
 
-    /// Replaces the parameters, given in the order of [`Module::parameters`].
-    fn set_parameters(&mut self, parameters: &[Array]) -> Result<()>;
-}
-
-/// A sequence of modules is a module (its parts' parameters, in order).
-impl<M: Module> Module for Vec<M> {
-    fn parameters(&self) -> Vec<Array> {
-        self.iter().flat_map(Module::parameters).collect()
+    /// Every parameter with its path (`layers.0.weight`), in visiting order.
+    fn parameters(&self) -> Vec<(String, Array)> {
+        let mut out = Vec::new();
+        self.clone().visit(&mut Parameters::new(&mut |name, a, _| {
+            out.push((name.to_owned(), a.clone()));
+        }));
+        out
     }
 
-    fn set_parameters(&mut self, parameters: &[Array]) -> Result<()> {
-        let total: usize = self.iter().map(|m| m.parameters().len()).sum();
-        if parameters.len() != total {
-            return Err(count_mismatch(parameters.len(), total));
+    /// The parameters that are trained (not frozen), with their paths.
+    fn trainable_parameters(&self) -> Vec<(String, Array)> {
+        let mut out = Vec::new();
+        self.clone()
+            .visit(&mut Parameters::new(&mut |name, a, trainable| {
+                if trainable {
+                    out.push((name.to_owned(), a.clone()));
+                }
+            }));
+        out
+    }
+
+    /// Replaces the trainable parameters, given in the order of
+    /// [`Module::trainable_parameters`] (as optimizers return them).
+    fn update_trainable(&mut self, values: &[Array]) -> Result<()> {
+        let expected = self.trainable_parameters().len();
+        if values.len() != expected {
+            return Err(Error::InvalidArgument(format!(
+                "{} values for {expected} trainable parameters",
+                values.len()
+            )));
         }
-        let mut rest = parameters;
-        for module in self {
-            let n = module.parameters().len();
-            module.set_parameters(&rest[..n])?;
-            rest = &rest[n..];
+        let mut next = values.iter();
+        self.visit(&mut Parameters::new(&mut |_, a, trainable| {
+            if trainable {
+                *a = next.next().expect("counted").clone();
+            }
+        }));
+        Ok(())
+    }
+
+    /// Replaces parameters by path, as MLX's `load_weights`: each weight must have its
+    /// parameter's shape (the dtype is kept as loaded). With `strict`, every parameter
+    /// must be given and no unknown names are allowed.
+    fn load_weights(
+        &mut self,
+        weights: impl IntoIterator<Item = (String, Array)>,
+        strict: bool,
+    ) -> Result<()> {
+        let mut weights: HashMap<String, Array> = weights.into_iter().collect();
+        let mut problem: Option<String> = None;
+        let mut seen = HashSet::new();
+        self.visit(&mut Parameters::new(&mut |name, a, _| {
+            seen.insert(name.to_owned());
+            match weights.remove(name) {
+                Some(w) if w.shape() == a.shape() => *a = w,
+                Some(w) => {
+                    problem.get_or_insert(format!(
+                        "{name}: shape {:?}, expected {:?}",
+                        w.shape(),
+                        a.shape()
+                    ));
+                }
+                None if strict => {
+                    problem.get_or_insert(format!("{name}: missing"));
+                }
+                None => {}
+            }
+        }));
+        if let Some(p) = problem {
+            return Err(Error::InvalidArgument(format!("load_weights: {p}")));
+        }
+        if strict && !weights.is_empty() {
+            let mut unknown: Vec<&String> = weights.keys().collect();
+            unknown.sort();
+            return Err(Error::InvalidArgument(format!(
+                "load_weights: unknown parameters {unknown:?}"
+            )));
         }
         Ok(())
     }
 }
 
-fn count_mismatch(got: usize, expected: usize) -> Error {
-    Error::InvalidArgument(format!("{got} parameters for a module with {expected}"))
+/// Receives a module's parameters during [`Module::visit`], with their paths.
+pub struct Parameters<'a> {
+    prefix: String,
+    frozen: bool,
+    f: &'a mut dyn FnMut(&str, &mut Array, bool),
 }
 
-/// The loss of `model` and its gradient with respect to every parameter (in the order of
-/// [`Module::parameters`]), as MLX's `nn.value_and_grad`.
+impl<'a> Parameters<'a> {
+    /// A visitor calling `f(path, parameter, trainable)` for each parameter.
+    pub fn new(f: &'a mut dyn FnMut(&str, &mut Array, bool)) -> Self {
+        Self {
+            prefix: String::new(),
+            frozen: false,
+            f,
+        }
+    }
+
+    fn path(&self, name: &str) -> String {
+        if self.prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}.{name}", self.prefix)
+        }
+    }
+
+    /// A trainable parameter.
+    pub fn param(&mut self, name: &str, a: &mut Array) {
+        let path = self.path(name);
+        (self.f)(&path, a, !self.frozen);
+    }
+
+    /// A trainable parameter that may be absent (an optional bias).
+    pub fn optional(&mut self, name: &str, a: &mut Option<Array>) {
+        if let Some(a) = a {
+            self.param(name, a);
+        }
+    }
+
+    /// A parameter that is never trained (a quantized weight, a LoRA base).
+    pub fn frozen(&mut self, name: &str, a: &mut Array) {
+        let path = self.path(name);
+        (self.f)(&path, a, false);
+    }
+
+    /// A submodule, whose parameters are named `name.…`.
+    pub fn module<M: Module>(&mut self, name: &str, m: &mut M) {
+        let outer = std::mem::take(&mut self.prefix);
+        self.prefix = if outer.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{outer}.{name}")
+        };
+        m.visit(self);
+        self.prefix = outer;
+    }
+
+    /// Visits `f`'s parameters as frozen.
+    pub fn freeze(&mut self, f: impl FnOnce(&mut Self)) {
+        let was = std::mem::replace(&mut self.frozen, true);
+        f(self);
+        self.frozen = was;
+    }
+}
+
+/// A sequence of modules is a module; its parts are named `0`, `1`, … (MLX's lists).
+impl<M: Module> Module for Vec<M> {
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        for (i, m) in self.iter_mut().enumerate() {
+            p.module(&i.to_string(), m);
+        }
+    }
+}
+
+/// A module whose parameters are all frozen (MLX's `freeze`).
+#[derive(Debug, Clone)]
+pub struct Frozen<M>(pub M);
+
+impl<M: Module> Module for Frozen<M> {
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        let inner = &mut self.0;
+        p.freeze(|p| inner.visit(p));
+    }
+}
+
+/// The loss of `model` and its gradient with respect to every trainable parameter (in the
+/// order of [`Module::trainable_parameters`]), as MLX's `nn.value_and_grad`.
 ///
-/// `loss` receives a copy of the model whose parameters are being differentiated and must
-/// return a 0-D array.
+/// `loss` receives a copy of the model whose trainable parameters are being
+/// differentiated and must return a 0-D array.
 pub fn value_and_grad<M: Module>(
     model: &M,
     loss: impl Fn(&M) -> Result<Array>,
 ) -> Result<(Array, Vec<Array>)> {
-    let parameters = model.parameters();
+    let parameters: Vec<Array> = model
+        .trainable_parameters()
+        .into_iter()
+        .map(|(_, a)| a)
+        .collect();
     let argnums: Vec<usize> = (0..parameters.len()).collect();
     let f = |ps: &[Array]| {
         let mut m = model.clone();
-        m.set_parameters(ps)?;
+        m.update_trainable(ps)?;
         loss(&m)
     };
     nuvec::value_and_grad(f, &argnums)(&parameters)
@@ -102,129 +271,23 @@ pub fn relu(x: &Array) -> Result<Array> {
     maximum(x, 0.0)
 }
 
-/// An affine layer `y = x Wᵀ + b`, with `W` of shape `[output, input]` and `b` of shape
-/// `[output]`.
-#[derive(Debug, Clone)]
-pub struct Linear {
-    /// The weight, `[output_dims, input_dims]`.
-    pub weight: Array,
-    /// The bias, `[output_dims]`.
-    pub bias: Option<Array>,
+/// `x · sigmoid(x)`, as MLX's `nn.silu`.
+pub fn silu(x: &Array) -> Result<Array> {
+    multiply(x, sigmoid(x)?)
 }
 
-impl Linear {
-    /// A layer initialised as MLX's `nn.Linear`: weight, then bias, drawn uniformly from
-    /// `[-1/√input, 1/√input)` with this thread's key sequence (so the same seed gives
-    /// MLX's values).
-    pub fn new(input_dims: usize, output_dims: usize, bias: bool) -> Result<Self> {
-        let scale = (1.0 / input_dims as f64).sqrt();
-        let draw = |shape: &[usize]| random::uniform(-scale, scale, shape, nuvec::DType::F32, None);
-        let weight = draw(&[output_dims, input_dims])?;
-        let bias = if bias {
-            Some(draw(&[output_dims])?)
-        } else {
-            None
-        };
-        Ok(Self { weight, bias })
-    }
-
-    /// `x Wᵀ + b` over the last axis of `x`; with a bias it is one fused `addmm`, as in
-    /// MLX.
-    pub fn forward(&self, x: &Array) -> Result<Array> {
-        match &self.bias {
-            Some(b) => nuvec::addmm(b, x, &self.weight.t()?, 1.0, 1.0),
-            None => matmul(x, &self.weight.t()?),
-        }
-    }
+/// GELU with the tanh approximation, as MLX's `nn.gelu_approx`:
+/// `0.5 x (1 + tanh(√(2/π) (x + 0.044715 x³)))`.
+pub fn gelu_approx(x: &Array) -> Result<Array> {
+    let cube = multiply(multiply(x, x)?, x)?;
+    let inner = multiply(
+        add(x, multiply(cube, 0.044715)?)?,
+        (2.0 / std::f64::consts::PI).sqrt(),
+    )?;
+    multiply(multiply(x, 0.5)?, add(tanh(&inner)?, 1.0)?)
 }
 
-impl Module for Linear {
-    fn parameters(&self) -> Vec<Array> {
-        std::iter::once(self.weight.clone())
-            .chain(self.bias.clone())
-            .collect()
-    }
-
-    fn set_parameters(&mut self, parameters: &[Array]) -> Result<()> {
-        let expected = 1 + usize::from(self.bias.is_some());
-        if parameters.len() != expected {
-            return Err(count_mismatch(parameters.len(), expected));
-        }
-        self.weight = parameters[0].clone();
-        if self.bias.is_some() {
-            self.bias = Some(parameters[1].clone());
-        }
-        Ok(())
-    }
-}
-
-/// A [`Linear`] layer with its weight quantized (MLX's `nn.QuantizedLinear`): `x Wᵀ + b`
-/// computed by `quantized_matmul` from the packed weight, its scales and biases.
-///
-/// The quantized weight, scales and biases are frozen; as with MLX's `from_linear`, the bias
-/// stays trainable ([`Module::parameters`] is the bias, if any). Gradients flow to the input.
-#[derive(Debug, Clone)]
-pub struct QuantizedLinear {
-    /// The packed weight (uint32), `[output_dims, input_dims · bits / 32]`.
-    pub weight: Array,
-    /// One scale per group of input values, `[output_dims, input_dims / group_size]`.
-    pub scales: Array,
-    /// One bias per group of input values, shaped like `scales`.
-    pub biases: Array,
-    /// The layer's bias, `[output_dims]`.
-    pub bias: Option<Array>,
-    /// Input values per scale and bias.
-    pub group_size: usize,
-    /// Bits per weight.
-    pub bits: u32,
-}
-
-impl QuantizedLinear {
-    /// Quantizes `linear`'s weight in groups of `group_size` (32, 64 or 128) input values
-    /// with `bits` (1–6 or 8) bits each; the bias is kept. MLX's defaults are 64 and 4.
-    pub fn from_linear(linear: &Linear, group_size: usize, bits: u32) -> Result<Self> {
-        let (weight, scales, biases) = quantize(&linear.weight, group_size, bits)?;
-        Ok(Self {
-            weight,
-            scales,
-            biases,
-            bias: linear.bias.clone(),
-            group_size,
-            bits,
-        })
-    }
-
-    /// `x Wᵀ + b` over the last axis of `x`.
-    pub fn forward(&self, x: &Array) -> Result<Array> {
-        let y = quantized_matmul(
-            x,
-            &self.weight,
-            &self.scales,
-            &self.biases,
-            true,
-            self.group_size,
-            self.bits,
-        )?;
-        match &self.bias {
-            Some(b) => add(&y, b),
-            None => Ok(y),
-        }
-    }
-}
-
-impl Module for QuantizedLinear {
-    fn parameters(&self) -> Vec<Array> {
-        self.bias.iter().cloned().collect()
-    }
-
-    fn set_parameters(&mut self, parameters: &[Array]) -> Result<()> {
-        let expected = usize::from(self.bias.is_some());
-        if parameters.len() != expected {
-            return Err(count_mismatch(parameters.len(), expected));
-        }
-        if let Some(b) = parameters.first() {
-            self.bias = Some(b.clone());
-        }
-        Ok(())
-    }
+/// `x · sigmoid(1.702 x)`, as MLX's `nn.gelu_fast_approx`.
+pub fn gelu_fast_approx(x: &Array) -> Result<Array> {
+    multiply(x, sigmoid(&multiply(x, 1.702)?)?)
 }

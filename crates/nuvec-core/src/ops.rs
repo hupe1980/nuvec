@@ -134,6 +134,22 @@ pub fn conjugate(a: &Array) -> Result<Array> {
     unary(UnaryOp::Conjugate, a)
 }
 
+/// Element-wise sign: `-1`, `0` or `1` in `a`'s dtype, as MLX's `sign` (`(a > 0) - (a < 0)`,
+/// so NaN gives 0). Unsigned integers and booleans give `a != 0`. Complex numbers are not
+/// supported.
+pub fn sign(a: &Array) -> Result<Array> {
+    check_inputs(&[a])?;
+    let dtype = a.dtype();
+    match dtype.category() {
+        Category::Complex => Err(Error::UnsupportedDType { op: "sign", dtype }),
+        Category::Bool | Category::Unsigned => astype(&greater(a, 0)?, dtype),
+        _ => subtract(
+            astype(&greater(a, 0)?, dtype)?,
+            astype(&less(a, 0)?, dtype)?,
+        ),
+    }
+}
+
 macro_rules! unary_fn {
     ($($(#[$doc:meta])* $name:ident => $op:ident;)*) => {$(
         $(#[$doc])*
