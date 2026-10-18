@@ -52,6 +52,10 @@ metal-check:
 fixtures:
     uv run scripts/mlx_fixtures.py
 
+# Re-records the safetensors and npy files written by MLX and NumPy for nuvec-io's tests.
+io-fixtures:
+    uv run scripts/io_fixtures.py
+
 # Same-machine benchmark table: nuvec vs MLX (CPU device).
 bench-mlx:
     uv run scripts/bench_vs_mlx.py
@@ -67,6 +71,10 @@ bench-quant:
 # GPU fused operations (norms, RoPE, softmax, log-sum-exp, cross entropy): nuvec vs MLX.
 bench-fast:
     uv run scripts/bench_fast.py
+
+# Checkpoint loading (2 GiB safetensors, warm page cache): nuvec vs MLX.
+bench-load:
+    uv run scripts/bench_load.py
 
 # Downloads MNIST and trains MLX's example model with nuvec and MLX (M1 exit criterion).
 mnist:

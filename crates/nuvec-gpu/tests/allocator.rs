@@ -156,9 +156,16 @@ fn buffers_in_use_are_not_reused() {
     let submitted = cmd.commit();
     drop(out); // dropped while the GPU may still write it
     let stats = device.memory();
-    assert_eq!(stats.active, a.len(), "released from accounting");
-    assert_eq!(stats.cache, 0, "but not cached: the GPU may still write it");
+    assert_eq!(
+        stats.active,
+        2 * a.len(),
+        "still held while the GPU may write it"
+    );
+    assert_eq!(stats.cache, 0, "and not reusable yet");
     submitted.wait().unwrap();
+    let stats = device.memory();
+    assert_eq!(stats.active, a.len(), "released once the work completed");
+    assert_eq!(stats.cache, a.len(), "into the cache, for reuse");
 }
 
 #[test]

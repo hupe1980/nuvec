@@ -434,6 +434,7 @@ fn validate(args: &[Arg<'_>]) -> Result<()> {
                     bytes.len()
                 )));
             }
+            Arg::Write(b, _) if b.is_mapped() => return Err(GpuError::ReadOnly),
             Arg::Read(..) | Arg::Write(..)
                 if arg.buffer().is_some_and(|(b, offset, _)| offset > b.len()) =>
             {

@@ -53,6 +53,7 @@ mod dtype;
 mod error;
 mod eval;
 pub mod fast;
+mod file;
 mod gpu;
 mod kernels;
 mod ops;
@@ -70,6 +71,7 @@ pub use device::{Device, DeviceKind, Stream, default_device, default_stream, set
 pub use dtype::{Category, Complex64, DType, Element, at_least_float, bf16, f16, promote_types};
 pub use error::{Error, Result};
 pub use eval::{async_eval, eval};
+pub use file::MappedFile;
 pub use ops::{
     abs, add, addmm, all, any, arange, argmax, argmin, astype, broadcast_to, conjugate, cos,
     divide, equal, erfinv, exp, expand_dims, greater, greater_equal, less, less_equal, log,

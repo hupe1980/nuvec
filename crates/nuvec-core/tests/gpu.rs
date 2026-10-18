@@ -702,3 +702,119 @@ fn gemv_matches_the_cpu_for_vector_shapes() {
     let (a, y, bias_m) = (random(&[40, 128]), random(&[128, 1]), random(&[40, 1]));
     check("addmm N=1", &|| addmm(&bias_m, &a, &y, 1.0, 1.0), 128, 1e-6);
 }
+
+#[test]
+fn mlx_reduction_kernels_match_the_cpu_on_every_path() {
+    if !gpu_available() {
+        return;
+    }
+    let mut rng = Rng::new(0x7E);
+    // (shape, axes, layout): all-reduce (one and two passes), row reductions (small rows,
+    // simple contiguous rows, looped with other reduced axes), column reductions (small,
+    // long columns of short rows, two passes, looped), and general layouts.
+    let cases: &[(&[usize], &[isize], &str)] = &[
+        (&[3000], &[], "contiguous"),
+        (&[700, 300], &[], "contiguous"),
+        (&[64, 7], &[1], "contiguous"),
+        (&[96, 600], &[1], "contiguous"),
+        (&[6, 9, 600], &[0, 2], "contiguous"),
+        (&[5, 3, 4], &[1, 2], "contiguous"),
+        (&[4, 5], &[0], "contiguous"),
+        (&[3000, 6], &[0], "contiguous"),
+        (&[600, 64], &[0], "contiguous"),
+        (&[300, 4096], &[0], "contiguous"),
+        (&[7, 300, 40], &[0, 1], "contiguous"),
+        (&[40, 30], &[1], "transposed"),
+        (&[40, 30], &[0], "transposed"),
+        (&[3, 40, 50], &[0, 2], "transposed"),
+        (&[8, 128], &[0], "broadcast"),
+        (&[9, 80], &[1], "sliced"),
+        // Several reduced axes that do not merge: 2- and 5-dimensional kernel variants.
+        (&[3, 2, 4, 2, 40], &[0, 2, 4], "contiguous"),
+        (&[3, 2, 4, 2, 100], &[0, 2, 4], "contiguous"),
+        (&[3, 2, 4, 2, 5, 2, 40], &[0, 2, 4, 6], "contiguous"),
+        (&[3, 2, 4, 2, 40], &[0, 2], "contiguous"),
+        (&[3, 2, 4, 2, 5, 2, 40], &[0, 2, 4], "contiguous"),
+    ];
+    for &(shape, axes, layout) in cases {
+        for dtype in [
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::I32,
+            DType::U8,
+            DType::I64,
+            DType::Bool,
+        ] {
+            let n: usize = shape.iter().product();
+            let raw: Vec<f32> = (0..n)
+                .map(|_| (rng.f64() * 4.0).round() as f32 / 4.0)
+                .collect();
+            let base = Array::from_slice(&raw, shape)
+                .unwrap()
+                .astype(dtype)
+                .unwrap();
+            let x = match layout {
+                "transposed" => {
+                    let rev: Vec<usize> = (0..shape.len()).rev().collect();
+                    let t =
+                        Array::from_slice(&raw, &shape.iter().rev().copied().collect::<Vec<_>>())
+                            .unwrap()
+                            .astype(dtype)
+                            .unwrap();
+                    transpose(&t, &rev).unwrap()
+                }
+                "broadcast" => {
+                    let row = slice(
+                        &base,
+                        &[SliceArg::new(Some(0), Some(1), 1), SliceArg::full()],
+                    )
+                    .unwrap();
+                    broadcast_to(&row, shape).unwrap()
+                }
+                "sliced" => {
+                    slice(&base, &[SliceArg::full(), SliceArg::new(None, None, 2)]).unwrap()
+                }
+                _ => base,
+            };
+            type R = fn(&Array, &[isize], bool) -> Result<Array>;
+            let ops: Vec<(&str, R)> = if dtype == DType::Bool {
+                vec![("all", all), ("any", any), ("max", max), ("min", min)]
+            } else {
+                vec![("sum", sum), ("max", max), ("min", min), ("prod", prod)]
+            };
+            for (name, op) in ops {
+                if name == "prod" && (n > 64 || dtype == DType::F16 || dtype == DType::BF16) {
+                    continue; // products of many values overflow or underflow
+                }
+                let run = || {
+                    op(&x, axes, false)
+                        .unwrap()
+                        .astype(DType::F64)
+                        .unwrap()
+                        .to_vec::<f64>()
+                        .unwrap()
+                };
+                let (cpu, gpu) = (on(Device::cpu(), run), on(Device::gpu(0), run));
+                let tol = match dtype {
+                    DType::F16 => 2e-2,
+                    DType::BF16 => 1e-1,
+                    DType::F32 => 1e-4,
+                    _ => 0.0,
+                };
+                for (i, (c, g)) in cpu.iter().zip(&gpu).enumerate() {
+                    assert!(
+                        (c - g).abs() <= tol * c.abs().max(1.0),
+                        "{name} {dtype} {shape:?} axes {axes:?} {layout}: element {i}: cpu {c} gpu {g}"
+                    );
+                }
+            }
+        }
+    }
+    // NaN propagates through max and min.
+    let x = Array::from_slice(&[1.0f32, f32::NAN, 3.0, 4.0, 5.0, 6.0], &[2, 3]).unwrap();
+    let m = on(Device::gpu(0), || {
+        max(&x, &[1], false).unwrap().to_vec::<f32>().unwrap()
+    });
+    assert!(m[0].is_nan() && m[1] == 6.0, "{m:?}");
+}

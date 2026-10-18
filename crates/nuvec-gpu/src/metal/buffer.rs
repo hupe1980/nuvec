@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLBuffer;
+use objc2_metal::{MTLBuffer, MTLDevice};
 
 use super::Device;
 use super::allocator::{Pool, Raw};
@@ -30,6 +30,8 @@ pub struct Buffer {
     pool: Arc<Pool>,
     /// Submitted-but-unfinished GPU uses of this buffer.
     in_flight: Arc<Guard>,
+    /// Memory of a mapped file (not the allocator's): released with the Metal buffer.
+    mapped: bool,
 }
 
 // SAFETY: Metal buffer objects may be retained, released and bound from any thread. The only
@@ -61,6 +63,77 @@ impl Device {
             size,
             pool,
             in_flight: Arc::default(),
+            mapped: false,
+        })
+    }
+
+    /// The file at `path`, memory-mapped read-only and wrapped without a copy
+    /// (`newBufferWithBytesNoCopy`): its pages are the page cache's, read from disk when
+    /// first touched by the CPU or the GPU. The buffer cannot be written (CPU writes and GPU
+    /// writes are refused). The mapping is released when the buffer and every GPU use of
+    /// it are gone.
+    ///
+    /// A shared read-only mapping is used because a private (copy-on-write) one costs
+    /// about 4× more to fault in on first use.
+    pub fn map_file(&self, path: &std::path::Path) -> Result<Buffer> {
+        use std::os::fd::AsRawFd;
+        let io = |e: std::io::Error| GpuError::Io(format!("{}: {e}", path.display()));
+        let file = std::fs::File::open(path).map_err(io)?;
+        let len = usize::try_from(file.metadata().map_err(io)?.len())
+            .map_err(|_| GpuError::Io(format!("{}: too large", path.display())))?;
+        if len == 0 {
+            return self.new_buffer(0);
+        }
+        // SAFETY: `sysconf` has no preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(16384);
+        let map_len = len.div_ceil(page) * page;
+        // SAFETY: a fresh read-only mapping of an open file descriptor; the result is
+        // checked below. The descriptor may be closed afterwards (the mapping keeps the file).
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io(std::io::Error::last_os_error()));
+        }
+        let start = NonNull::new(ptr.cast::<u8>()).expect("mmap returned a non-null address");
+        let unmap = block2::RcBlock::new(move |p: NonNull<std::ffi::c_void>, n: usize| {
+            // SAFETY: Metal calls this once, with the mapping created above, after the
+            // buffer is released (so neither the CPU nor the GPU uses it any more).
+            unsafe { libc::munmap(p.as_ptr(), n) };
+        });
+        let options = objc2_metal::MTLResourceOptions::StorageModeShared
+            | objc2_metal::MTLResourceOptions::HazardTrackingModeUntracked;
+        // SAFETY: the pointer is page-aligned (from `mmap`), valid for `map_len` bytes, and
+        // owned by the buffer from now on: the deallocator unmaps it exactly once.
+        let raw = unsafe {
+            self.raw()
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    start.cast(),
+                    map_len,
+                    options,
+                    Some(&unmap),
+                )
+        };
+        let Some(raw) = raw else {
+            // SAFETY: Metal did not take the mapping, so it is still ours to release.
+            unsafe { libc::munmap(ptr, map_len) };
+            return Err(GpuError::OutOfMemory(len));
+        };
+        Ok(Buffer {
+            raw: Some(raw),
+            ptr: start,
+            len,
+            size: 0,
+            pool: self.pool().clone(),
+            in_flight: Arc::default(),
+            mapped: true,
         })
     }
 
@@ -104,8 +177,12 @@ impl Buffer {
         Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) })
     }
 
-    /// The bytes, mutably, if no submitted GPU work uses (reads or writes) the buffer.
+    /// The bytes, mutably, if no submitted GPU work uses (reads or writes) the buffer and
+    /// it is not a read-only mapped file.
     pub fn contents_mut(&mut self) -> Result<&mut [u8]> {
+        if self.mapped {
+            return Err(GpuError::ReadOnly);
+        }
         if self.in_use() {
             return Err(GpuError::BufferInUse);
         }
@@ -130,6 +207,11 @@ impl Buffer {
             .or_else(|| self.pool.placeholder().cloned())
     }
 
+    /// Whether the buffer is a read-only mapped file.
+    pub(crate) fn is_mapped(&self) -> bool {
+        self.mapped
+    }
+
     pub(crate) fn guard(&self) -> Arc<Guard> {
         self.in_flight.clone()
     }
@@ -142,11 +224,23 @@ impl Buffer {
 
 /// Counts submitted GPU uses of a buffer: all uses, and the writing ones; and the fences of
 /// the ordered command buffers using it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Guard {
     users: AtomicUsize,
     writers: AtomicUsize,
     fences: Mutex<Fences>,
+    /// The memory of a buffer dropped while GPU work still used it: returned to the
+    /// allocator's cache when that work completes (as MLX does), not released.
+    orphan: Mutex<Option<(Raw, usize, Arc<Pool>)>>,
+}
+
+impl std::fmt::Debug for Guard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guard")
+            .field("users", &self.users)
+            .field("writers", &self.writers)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The fences of ordered command buffers that use a buffer, while any use is pending.
@@ -202,17 +296,43 @@ impl Guard {
             if self.users.load(Ordering::Acquire) == 0 {
                 *fences = Fences::default();
             }
+            drop(fences);
+            // A buffer dropped while this work ran: its memory goes to the cache now.
+            let mut orphan = self.orphan.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.users.load(Ordering::Acquire) == 0
+                && let Some((raw, size, pool)) = orphan.take()
+            {
+                drop(orphan);
+                pool.free(raw, size, true);
+            }
         }
     }
 }
 
 impl Drop for Buffer {
-    /// Returns the memory to the allocator's cache, unless GPU work still uses it (then it
-    /// is released when the GPU finishes, never reused early).
+    /// Returns the memory to the allocator's cache, at once or, if GPU work still uses it,
+    /// when that work completes (never reused early).
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
-            let reusable = !self.in_use();
-            self.pool.free(raw, self.size, reusable);
+            if self.mapped {
+                // Metal unmaps the file once the last reference (ours or a command
+                // buffer's) is released.
+                drop(raw);
+                return;
+            }
+            // Under the lock `Guard::release` takes: either the work is done and the memory
+            // is cached here, or the last completing use caches it.
+            let mut orphan = self
+                .in_flight
+                .orphan
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if self.in_use() {
+                *orphan = Some((raw, self.size, self.pool.clone()));
+            } else {
+                drop(orphan);
+                self.pool.free(raw, self.size, true);
+            }
         }
     }
 }

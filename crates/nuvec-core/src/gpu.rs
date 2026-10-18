@@ -90,6 +90,8 @@ mod metal {
     use crate::primitive::{ArgReduceOp, BinaryOp, ReduceOp, UnaryOp};
     use crate::{Category, DType, DeviceKind, Error};
 
+    mod reduce;
+
     /// Dispatches per command buffer before it is committed.
     const MAX_DISPATCHES: usize = 256;
     /// Command buffers in flight per device before submission blocks (MLX: 10).
@@ -374,7 +376,8 @@ mod metal {
     }
 
     fn mode(meta: &Output, out_shape: &[usize]) -> Mode {
-        if meta.size == 1 {
+        // A broadcast scalar has the output's size but only zero strides: one element.
+        if meta.size == 1 || meta.strides.iter().all(|&s| s == 0) {
             Mode::Scalar
         } else if meta.flags.row_contiguous && meta.shape.as_slice() == out_shape {
             Mode::Flat
@@ -767,6 +770,9 @@ mod metal {
             (meta, data): Operand<'_>,
             buffer: &mut Buffer,
         ) -> Result<()> {
+            if self.reduce_mlx(op, axes, (meta, data), buffer)? {
+                return Ok(());
+            }
             let (kept, reduced): (Vec<usize>, Vec<usize>) =
                 (0..meta.shape.len()).partition(|d| !axes.contains(d));
             let pick = |dims: &[usize]| -> (Vec<usize>, Vec<isize>) {

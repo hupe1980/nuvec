@@ -27,6 +27,10 @@ pub enum GpuError {
     OutOfMemory(usize),
     /// The command buffer failed on the GPU.
     CommandBuffer(String),
+    /// A file could not be opened or mapped.
+    Io(String),
+    /// The buffer is a read-only mapped file.
+    ReadOnly,
 }
 
 /// `Result` with [`GpuError`].
@@ -47,6 +51,8 @@ impl fmt::Display for GpuError {
             }
             Self::OutOfMemory(n) => write!(f, "Metal could not allocate {n} bytes"),
             Self::CommandBuffer(msg) => write!(f, "GPU command buffer failed: {msg}"),
+            Self::Io(msg) => write!(f, "I/O error: {msg}"),
+            Self::ReadOnly => f.write_str("the buffer is a read-only mapped file"),
         }
     }
 }

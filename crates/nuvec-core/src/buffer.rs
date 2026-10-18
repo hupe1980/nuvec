@@ -51,6 +51,24 @@ impl Buffer {
         Ok(Self::new(Storage::Host(blocks), len))
     }
 
+    /// The bytes of the file at `path`: memory-mapped without a copy where arrays live in
+    /// Metal memory, read into host memory elsewhere.
+    pub(crate) fn map_file(path: &std::path::Path) -> Result<Self> {
+        #[cfg(all(target_os = "macos", not(miri)))]
+        if let Some(device) = device() {
+            let buffer = device
+                .map_file(path)
+                .map_err(|e| Error::Io(e.to_string()))?;
+            let len = buffer.len();
+            return Ok(Self::new(Storage::Metal(buffer), len));
+        }
+        let bytes =
+            std::fs::read(path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+        let mut buffer = Self::try_alloc(bytes.len())?;
+        buffer.bytes_mut().copy_from_slice(&bytes);
+        Ok(buffer)
+    }
+
     /// A buffer of `len` zero bytes.
     pub(crate) fn try_zeroed(len: usize) -> Result<Self> {
         let mut buffer = Self::try_alloc(len)?;
@@ -64,6 +82,11 @@ impl Buffer {
         #[cfg(test)]
         live::inc();
         Self { storage, len }
+    }
+
+    /// Size in bytes.
+    pub(crate) fn len(&self) -> usize {
+        self.len
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -86,22 +109,24 @@ impl Buffer {
         }
     }
 
-    /// The contents as `T`s. `len` must be a multiple of `size_of::<T>()`.
+    /// The contents as `T`s: every whole `T` (a mapped file may end with a partial one).
     pub(crate) fn typed<T: Pod>(&self) -> &[T] {
+        let whole = self.len - self.len % size_of::<T>();
         // An empty slice may carry an unaligned dangling pointer; never cast it.
-        if self.len == 0 {
+        if whole == 0 {
             &[]
         } else {
-            bytemuck::cast_slice(self.bytes())
+            bytemuck::cast_slice(&self.bytes()[..whole])
         }
     }
 
-    /// The contents as mutable `T`s. `len` must be a multiple of `size_of::<T>()`.
+    /// The contents as mutable `T`s: every whole `T`.
     pub(crate) fn typed_mut<T: Pod>(&mut self) -> &mut [T] {
-        if self.len == 0 {
+        let whole = self.len - self.len % size_of::<T>();
+        if whole == 0 {
             &mut []
         } else {
-            bytemuck::cast_slice_mut(self.bytes_mut())
+            bytemuck::cast_slice_mut(&mut self.bytes_mut()[..whole])
         }
     }
 

@@ -352,6 +352,7 @@ version = "0.0.1"
 dependencies = [
  "block2",
  "dispatch2",
+ "libc",
  "nuvec-kernels",
  "objc2",
  "objc2-foundation",
@@ -363,6 +364,7 @@ name = "nuvec-io"
 version = "0.0.1"
 dependencies = [
  "nuvec-core",
+ "nuvec-gpu",
 ]
 
 [[package]]

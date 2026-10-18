@@ -5,7 +5,7 @@
 //! disabled with `NUVEC_METALLIB=off`, the sources are embedded instead so they can
 //! be compiled at runtime. [`MODE`] reports which of these happened.
 //!
-//! The kernels: element-wise operations, casts, copies, reductions, MLX's GEMM (steel,
+//! The kernels: element-wise operations, casts, copies, MLX's reductions, MLX's GEMM (steel,
 //! split-K) and GEMV, MLX's affine quantization kernels (quantize, dequantize and the
 //! quantized matrix products), and MLX's fused kernels (softmax, log-sum-exp, RMS and layer
 //! normalisation, RoPE, cross entropy, scaled dot-product attention).

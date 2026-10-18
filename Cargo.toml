@@ -28,6 +28,7 @@ nuvec-nn = { path = "crates/nuvec-nn", version = "0.0.1" }
 
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2", "block2"] }
+libc = "0.2"
 gemm = { version = "0.19", default-features = false, features = ["std", "f16", "rayon"] }
 objc2 = "0.6"
 block2 = "0.6"

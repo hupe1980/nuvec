@@ -1,6 +1,6 @@
 [package]
 name = "nuvec-io"
-description = "Zero-copy safetensors, GGUF and npy loading for nuvec"
+description = "Zero-copy safetensors and npy loading for nuvec"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,5 +15,12 @@ categories.workspace = true
 [dependencies]
 nuvec-core.workspace = true
 
+[dev-dependencies]
+nuvec-gpu.workspace = true
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "load"
+harness = false

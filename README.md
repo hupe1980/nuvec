@@ -13,7 +13,8 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > `addmm`), MLX-compatible affine quantization (`quantize`, `dequantize` and
 > `quantized_matmul` with MLX's packing and kernels, 1–8 bits), MLX's fused kernels
 > (`fast::rms_norm`, `fast::layer_norm`, `fast::rope`, `fast::cross_entropy`,
-> `fast::scaled_dot_product_attention`, last-axis `softmax` and `logsumexp`), and first
+> `fast::scaled_dot_product_attention`, last-axis `softmax` and `logsumexp`), checkpoint I/O
+> (`nuvec-io`: safetensors and npy, memory-mapped without a copy), and first
 > neural-network pieces (`nuvec-nn`: `Linear`, `QuantizedLinear`,
 > cross-entropy, SGD, Adam; `just mnist` trains MLX's MNIST example model). Arrays are
 > evaluated on the GPU by default (Metal kernels on unified memory, submitted asynchronously;
@@ -60,6 +61,8 @@ Python is not needed to build or test. With [uv](https://docs.astral.sh/uv/) ins
 - `just bench-mlx`: prints a same-machine benchmark table, nuvec vs MLX
 - `just bench-gemm`, `just bench-quant`, `just bench-fast`: GPU matrix products, quantized
   matrix products and fused operations, nuvec vs MLX
+- `just bench-load`: loading a 2 GiB safetensors checkpoint, nuvec vs MLX
+- `just io-fixtures`: re-records the safetensors and npy files written by MLX and NumPy
 
 ## Crates
 
@@ -71,7 +74,7 @@ Python is not needed to build or test. With [uv](https://docs.astral.sh/uv/) ins
 | `nuvec-gpu` | Metal runtime: device, kernel pipelines, shared buffers, command encoding with minimal barriers |
 | `nuvec-kernels` | Metal kernel sources and the precompiled `nuvec.metallib` |
 | `nuvec-cpu` | Pure-Rust CPU backend |
-| `nuvec-io` | Zero-copy safetensors, GGUF and npy loading |
+| `nuvec-io` | Zero-copy safetensors and npy loading, IDX |
 | `nuvec-distributed` | Collectives over TCP rings and Thunderbolt RDMA |
 | `nuvec-nn` | Neural-network modules, layers and optimizers |
 | `nuvec-lm` | LLM runtime: model loading, KV caches, sampling |

@@ -50,3 +50,7 @@ rustc-ice-*.txt
 
 # Python placeholder package build output
 /python/dist/
+
+# Python bytecode (from running scripts/)
+__pycache__/
+*.pyc

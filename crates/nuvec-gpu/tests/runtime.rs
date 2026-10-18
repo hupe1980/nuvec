@@ -427,3 +427,34 @@ fn ordered_writes_wait_for_in_flight_readers() {
     assert!(read_f32(&a).iter().all(|&v| v == 0.0));
     assert!(read_f32(&acc).iter().all(|&v| v == 200.0));
 }
+
+#[test]
+fn mapped_files_are_read_without_a_copy_and_never_written() {
+    let Some(device) = device() else { return };
+    let path = std::env::temp_dir().join(format!("nuvec-gpu-map-{}", std::process::id()));
+    let n = 5000; // not a whole number of pages
+    std::fs::write(&path, f32s(&(0..n).map(|i| i as f32).collect::<Vec<_>>())).unwrap();
+    let mut mapped = device.map_file(&path).unwrap();
+    assert_eq!(mapped.len(), n * 4);
+    assert_eq!(read_f32(&mapped)[4999], 4999.0);
+    assert_eq!(mapped.contents_mut().unwrap_err(), GpuError::ReadOnly);
+    // The GPU reads it in place.
+    let ones = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
+    let mut out = device.new_buffer(n * 4).unwrap();
+    let mut cmd = device.command_buffer().unwrap();
+    add(&mut cmd, &device, &mapped, &ones, &mut out, n as u32);
+    cmd.commit().wait().unwrap();
+    assert_eq!(read_f32(&out)[10], 11.0);
+    // GPU writes are refused.
+    let mut cmd = device.command_buffer().unwrap();
+    let pipeline = device.pipeline("nuvec_add_f32").unwrap();
+    let err = cmd.dispatch(
+        &pipeline,
+        &[Arg::read(&ones), Arg::read(&ones), Arg::write(&mut mapped)],
+        n,
+    );
+    assert_eq!(err.unwrap_err(), GpuError::ReadOnly);
+    drop(mapped);
+    std::fs::remove_file(&path).unwrap();
+    assert!(device.map_file(&path).is_err());
+}
