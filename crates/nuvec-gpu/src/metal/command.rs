@@ -61,7 +61,8 @@ pub(crate) type Fence = Retained<ProtocolObject<dyn MTLFence>>;
 
 /// Orders command buffers that are committed without waiting: each command buffer created
 /// on a timeline starts its work only after the previous one's work has finished. Buffers
-/// are untracked (D-023), so consecutive command buffers would otherwise overlap on the GPU.
+/// are untracked, so consecutive command buffers would otherwise overlap on the GPU (as
+/// [`Device::ordered_command_buffer`]s do when they are independent).
 ///
 /// Implemented with one fence (as in MLX): a command buffer's compute pass waits for the
 /// fence and updates it at the end. Command buffers without work leave it untouched, so
@@ -84,6 +85,10 @@ pub struct CommandBuffer {
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     /// The timeline fence, and whether the compute pass must wait for it.
     fence: Option<(Fence, bool)>,
+    /// For ordered command buffers: this command buffer's fence (updated at the end of its
+    /// work and recorded on the buffers it writes), and the fences already waited for.
+    own: Option<Fence>,
+    waited: Vec<usize>,
     encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     /// Buffers read and written since the last barrier.
     reads: Vec<usize>,
@@ -105,6 +110,8 @@ impl Device {
             device: self.clone(),
             raw,
             fence: None,
+            own: None,
+            waited: Vec::new(),
             encoder: None,
             reads: Vec::new(),
             writes: Vec::new(),
@@ -128,19 +135,21 @@ impl Device {
         })
     }
 
-    /// A new command buffer whose work runs after the work of every *ordered* command
-    /// buffer committed before it on this device, from any thread: a device-wide timeline.
-    /// Work can therefore read the outputs of earlier ordered work that is still in flight.
+    /// A new command buffer whose work reads the outputs of earlier *ordered* command
+    /// buffers (committed on this device from any thread) safely while they are in flight:
+    /// before a dispatch reads or writes a buffer with a pending GPU write, it waits for the
+    /// writing command buffer's fence. Independent command buffers overlap on the GPU, as
+    /// in MLX.
+    ///
+    /// Reads wait for the pending writer; writes wait for every pending user (writing a
+    /// buffer that earlier work still reads). Other command buffers do not wait.
     pub fn ordered_command_buffer(&self) -> Result<CommandBuffer> {
         let fence = self
-            .inner
-            .queue_fence
-            .get_or_init(|| self.raw().newFence())
-            .clone()
+            .raw()
+            .newFence()
             .ok_or_else(|| GpuError::CommandBuffer("cannot create a fence".into()))?;
         let mut cmd = self.command_buffer()?;
-        // Waiting for a fence nothing has updated yet does not wait.
-        cmd.fence = Some((fence, true));
+        cmd.own = Some(fence);
         Ok(cmd)
     }
 
@@ -255,6 +264,18 @@ impl CommandBuffer {
             self.writes.clear();
         }
         let encoder = self.encoder()?.clone();
+        if let Some(own) = &self.own {
+            let own = Retained::as_ptr(own) as usize;
+            for (buffer, _, write) in args.iter().filter_map(Arg::buffer) {
+                for fence in buffer.guard().pending_fences(write) {
+                    let key = Retained::as_ptr(&fence) as usize;
+                    if key != own && !self.waited.contains(&key) {
+                        encoder.waitForFence(&fence);
+                        self.waited.push(key);
+                    }
+                }
+            }
+        }
         encoder.setComputePipelineState(pipeline.raw());
         for (index, arg) in args.iter().enumerate() {
             match arg {
@@ -302,6 +323,12 @@ impl CommandBuffer {
         if let Some(encoder) = self.encoder.take() {
             if let Some((fence, _)) = &self.fence {
                 encoder.updateFence(fence);
+            }
+            if let Some(own) = &self.own {
+                encoder.updateFence(own);
+                for (guard, write) in &self.guards {
+                    guard.record(own, *write);
+                }
             }
             encoder.endEncoding();
         }

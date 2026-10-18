@@ -1,14 +1,15 @@
 //! Shared-memory buffers.
 
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
 use super::Device;
 use super::allocator::{Pool, Raw};
+use super::command::Fence;
 use crate::{GpuError, Result};
 
 /// GPU memory in unified (shared) storage: the CPU reads and writes it in place.
@@ -139,14 +140,50 @@ impl Buffer {
     }
 }
 
-/// Counts submitted GPU uses of a buffer: all uses, and the writing ones.
+/// Counts submitted GPU uses of a buffer: all uses, and the writing ones; and the fences of
+/// the ordered command buffers using it.
 #[derive(Debug, Default)]
 pub(crate) struct Guard {
     users: AtomicUsize,
     writers: AtomicUsize,
+    fences: Mutex<Fences>,
+}
+
+/// The fences of ordered command buffers that use a buffer, while any use is pending.
+#[derive(Debug, Default)]
+struct Fences {
+    /// The last writer's.
+    writer: Option<Fence>,
+    /// Every user's since the buffer was last idle.
+    users: Vec<Fence>,
 }
 
 impl Guard {
+    /// The fences to wait for before using the buffer: the pending writer's for a read, and
+    /// every pending user's for a write.
+    pub(crate) fn pending_fences(&self, write: bool) -> Vec<Fence> {
+        if self.users.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let fences = self.fences.lock().unwrap_or_else(PoisonError::into_inner);
+        if write {
+            fences.users.clone()
+        } else if self.writers.load(Ordering::Acquire) != 0 {
+            fences.writer.iter().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Records the fence of a command buffer that uses the buffer (before it is committed).
+    pub(crate) fn record(&self, fence: &Fence, write: bool) {
+        let mut fences = self.fences.lock().unwrap_or_else(PoisonError::into_inner);
+        if write {
+            fences.writer = Some(fence.clone());
+        }
+        fences.users.push(fence.clone());
+    }
+
     pub(crate) fn acquire(&self, write: bool) {
         self.users.fetch_add(1, Ordering::AcqRel);
         if write {
@@ -158,7 +195,14 @@ impl Guard {
         if write {
             self.writers.fetch_sub(1, Ordering::AcqRel);
         }
-        self.users.fetch_sub(1, Ordering::AcqRel);
+        if self.users.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Idle: forget the fences, unless a new use began meanwhile (checked under the
+            // lock that `record` takes, so a new user's fence is never dropped).
+            let mut fences = self.fences.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.users.load(Ordering::Acquire) == 0 {
+                *fences = Fences::default();
+            }
+        }
     }
 }
 

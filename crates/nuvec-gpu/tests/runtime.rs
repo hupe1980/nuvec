@@ -365,3 +365,65 @@ fn function_constants_specialise_and_cache_pipelines() {
         assert_eq!(read_f32(&out), [expected; 4]);
     }
 }
+
+#[test]
+fn ordered_command_buffers_wait_only_for_their_writers_and_overlap_otherwise() {
+    let Some(device) = device() else { return };
+    // Two interleaved chains (`x += 1`, `y += 2`), one command buffer per step, all committed
+    // without waiting; a final command buffer reads both chains (a wait on two writers).
+    let n = 1 << 22;
+    let ones = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
+    let twos = device.buffer_from(&f32s(&vec![2.0; n])).unwrap();
+    let mut x = device.buffer_from(&f32s(&vec![0.0; n])).unwrap();
+    let mut y = device.buffer_from(&f32s(&vec![0.0; n])).unwrap();
+    let mut pending = Vec::new();
+    let steps = 48;
+    for _ in 0..steps {
+        for (acc, step) in [(&mut x, &ones), (&mut y, &twos)] {
+            let mut next = device.new_buffer(n * 4).unwrap();
+            let mut cmd = device.ordered_command_buffer().unwrap();
+            add(&mut cmd, &device, acc, step, &mut next, n as u32);
+            pending.push(cmd.commit_then(|r| r.unwrap()));
+            *acc = next;
+        }
+    }
+    let mut sum = device.new_buffer(n * 4).unwrap();
+    let mut cmd = device.ordered_command_buffer().unwrap();
+    add(&mut cmd, &device, &x, &y, &mut sum, n as u32);
+    cmd.commit_then(|r| r.unwrap()).wait();
+    for p in pending {
+        p.wait();
+    }
+    let want = 3.0 * steps as f32;
+    assert!(read_f32(&sum).iter().all(|&v| v == want));
+    assert!(read_f32(&x).iter().all(|&v| v == steps as f32));
+}
+
+#[test]
+fn ordered_writes_wait_for_in_flight_readers() {
+    let Some(device) = device() else { return };
+    // A slow chain reads `a`; a later command buffer overwrites `a`. The chain must see the
+    // old values (write after read across command buffers).
+    // Small kernels, so that independent command buffers overlap on the GPU.
+    let n = 1 << 14;
+    let mut a = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
+    let zeros = device.buffer_from(&f32s(&vec![0.0; n])).unwrap();
+    let mut acc = device.buffer_from(&f32s(&vec![0.0; n])).unwrap();
+    let mut pending = Vec::new();
+    for _ in 0..200 {
+        let mut next = device.new_buffer(n * 4).unwrap();
+        let mut cmd = device.ordered_command_buffer().unwrap();
+        add(&mut cmd, &device, &acc, &a, &mut next, n as u32);
+        pending.push(cmd.commit_then(|r| r.unwrap()));
+        acc = next;
+    }
+    // Overwrite `a` with zeros while the chain may still be reading it.
+    let mut cmd = device.ordered_command_buffer().unwrap();
+    add(&mut cmd, &device, &zeros, &zeros, &mut a, n as u32);
+    cmd.commit_then(|r| r.unwrap()).wait();
+    for p in pending {
+        p.wait();
+    }
+    assert!(read_f32(&a).iter().all(|&v| v == 0.0));
+    assert!(read_f32(&acc).iter().all(|&v| v == 200.0));
+}

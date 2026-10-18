@@ -49,8 +49,6 @@ struct Inner {
     pipelines: Mutex<HashMap<String, Pipeline>>,
     pool: Arc<Pool>,
     in_flight: InFlight,
-    /// The fence ordering [`Device::ordered_command_buffer`]s.
-    queue_fence: OnceLock<Option<command::Fence>>,
 }
 
 /// The number of committed command buffers that have not completed yet.
@@ -115,7 +113,6 @@ impl Device {
                 pipelines: Mutex::new(HashMap::new()),
                 pool,
                 in_flight: InFlight::default(),
-                queue_fence: OnceLock::new(),
             }),
         })
     }
