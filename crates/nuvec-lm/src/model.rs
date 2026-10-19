@@ -7,8 +7,8 @@ use std::sync::LazyLock;
 use nuvec::fast::{self, AttentionMask};
 use nuvec::{
     Array, DType, Result, SliceArg, abs, add, argpartition, argsort, broadcast_to, concatenate,
-    exp, expand_dims, gather_qmm, log, matmul, maximum, multiply, negative, sigmoid, slice,
-    slice_update, softmax, split_at, squeeze, take, take_along_axis, transpose,
+    exp, expand_dims, gather_mm, gather_qmm, log, matmul, maximum, multiply, negative, sigmoid,
+    slice, slice_update, softmax, split_at, squeeze, take, take_along_axis, transpose,
 };
 use nuvec_nn::{
     Embedding, Linear, Module, Parameters, QuantizedEmbedding, QuantizedLinear, RmsNorm, silu,
@@ -667,7 +667,7 @@ impl Module for Mlp {
 /// expert (mlx-lm's `SwitchLinear` and `QuantizedSwitchLinear`).
 #[derive(Debug, Clone)]
 enum SwitchProjection {
-    /// Full precision: the chosen experts' weights are gathered.
+    /// Full precision: [`gather_mm`].
     Dense { weight: Array },
     /// MLX's affine quantization: [`gather_qmm`].
     Quantized {
@@ -685,11 +685,10 @@ impl SwitchProjection {
     fn forward(&self, x: &Array, indices: &Array, sorted: bool) -> Result<Array> {
         match self {
             Self::Dense { weight } => {
-                let w = take(weight, indices, Some(0))?;
-                let nd = w.ndim();
+                let nd = weight.ndim();
                 let mut axes: Vec<usize> = (0..nd).collect();
                 axes.swap(nd - 1, nd - 2);
-                matmul(x, &transpose(&w, &axes)?)
+                gather_mm(x, &transpose(weight, &axes)?, None, Some(indices), sorted)
             }
             Self::Quantized {
                 weight,

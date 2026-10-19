@@ -77,22 +77,22 @@ mod tests {
     }
 
     #[test]
-    fn precompiled_library_contains_placeholder() {
+    fn precompiled_library_contains_the_kernels() {
         if MODE != MetallibMode::Precompiled {
             return;
         }
         let lib = metallib().expect("precompiled mode has a library");
         assert!(lib.starts_with(b"MTLB"), "not a metallib");
-        assert!(kernel_names().contains(&"nuvec_placeholder"));
+        assert!(kernel_names().contains(&"nuvec_binary_add_float32_c"));
     }
 
     #[test]
-    fn runtime_sources_include_placeholder_and_headers() {
+    fn runtime_sources_include_kernels_and_headers() {
         if MODE != MetallibMode::RuntimeSource {
             return;
         }
         let paths: Vec<_> = sources().iter().map(|(p, _)| *p).collect();
-        assert!(paths.contains(&"placeholder.metal"));
+        assert!(paths.contains(&"elementwise.metal"));
         assert!(paths.contains(&"common.h"));
     }
 

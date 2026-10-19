@@ -567,6 +567,71 @@ fn gather_qmm_selects_batches() {
     assert!(gather_qmm(&x, &wq, &s, &b, Some(&lhs), Some(&two), true, 32, 4, false).is_err());
 }
 
+/// `gather_mm` against `matmul` of the selected batches (CPU), with explicit and default
+/// indices, gradients for both operands, batching, and errors.
+#[test]
+fn gather_mm_selects_batches() {
+    let mut rng = Rng::new(0x73);
+    let (e, n, k) = (3, 5, 7);
+    let w = random(&mut rng, &[e, k, n], DType::F32);
+    let x = random(&mut rng, &[4, 2, k], DType::F32);
+    let lhs = Array::from_slice(&[3u32, 0, 2], &[3]).unwrap();
+    let rhs = Array::from_slice(&[1u32, 2, 0], &[3]).unwrap();
+    let got = gather_mm(&x, &w, Some(&lhs), Some(&rhs), false).unwrap();
+    assert_eq!(got.shape(), &[3, 2, n]);
+    let pick = |a: &Array, i: u32| take(a, &Array::scalar(i), Some(0)).unwrap();
+    for (j, (&l, &r)) in [3u32, 0, 2].iter().zip(&[1u32, 2, 0]).enumerate() {
+        let want = matmul(&pick(&x, l), &pick(&w, r)).unwrap();
+        assert_close(&format!("batch {j}"), &pick(&got, j as u32), &want, 1e-6);
+    }
+    // Default indices: every batch in order (equal to a batched matmul).
+    let x3 = random(&mut rng, &[3, 2, k], DType::F32);
+    let all = gather_mm(&x3, &w, None, None, false).unwrap();
+    assert_close("defaults", &all, &matmul(&x3, &w).unwrap(), 1e-6);
+    // Gradients: a row used by two batches, a weight batch used by none.
+    let rows = Array::from_slice(&[1u32, 1], &[2]).unwrap();
+    let experts = Array::from_slice(&[0u32, 2], &[2]).unwrap();
+    let x2 = random(&mut rng, &[2, 1, k], DType::F32);
+    let f = |xs: &[Array]| {
+        let y = gather_mm(&xs[0], &xs[1], Some(&rows), Some(&experts), false)?;
+        Ok(vec![y.reshape(&[-1])?])
+    };
+    let ones = Array::full(&[2 * n], 1.0f32).unwrap();
+    let (_, grads) = vjp(f, &[x2.clone(), w.clone()], std::slice::from_ref(&ones)).unwrap();
+    let row_sums = |i: u32| sum(&pick(&w, i), &[1], false).unwrap();
+    let row = |i: u32| pick(&grads[0], i).reshape(&[-1]).unwrap();
+    assert_close("dx row 0", &row(0), &zeros(&[k], DType::F32).unwrap(), 1e-6);
+    assert_close(
+        "dx row 1",
+        &row(1),
+        &add(row_sums(0), row_sums(2)).unwrap(),
+        1e-5,
+    );
+    let xr = pick(&x2, 1).reshape(&[k as isize, 1]).unwrap();
+    let outer = broadcast_to(&xr, &[k, n]).unwrap();
+    assert_close("dw 0", &pick(&grads[1], 0), &outer, 1e-6);
+    assert_close(
+        "dw 1",
+        &pick(&grads[1], 1),
+        &zeros(&[k, n], DType::F32).unwrap(),
+        1e-6,
+    );
+    // Batching over a leading axis of x matches a loop.
+    let xs = random(&mut rng, &[2, 4, 2, k], DType::F32);
+    let f = |a: &[Array]| Ok(vec![gather_mm(&a[0], &w, Some(&lhs), Some(&rhs), false)?]);
+    let batched = vmap(f, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+    for i in 0..2u32 {
+        let one = f(&[pick(&xs, i)]).unwrap();
+        assert_close(&format!("vmap {i}"), &pick(&batched[0], i), &one[0], 1e-6);
+    }
+    // Errors: float indices, mismatched inner dimensions, integer operands.
+    let bad = Array::from_slice(&[0.0f32], &[1]).unwrap();
+    assert!(gather_mm(&x, &w, Some(&bad), None, false).is_err());
+    assert!(gather_mm(&x, &x, None, None, false).is_err());
+    let int = Array::from_slice(&[1i32; 4], &[1, 2, 2]).unwrap();
+    assert!(gather_mm(&int, &int, None, None, false).is_err());
+}
+
 #[cfg(target_os = "macos")]
 mod gather_gpu {
     use super::*;
@@ -629,6 +694,54 @@ mod gather_gpu {
         let rhs = Array::from_slice(&[3u32, 1], &[1, 2]).unwrap();
         let run =
             || gather_qmm(&x, &wq, &s, &b, Some(&lhs), Some(&rhs), true, 32, 4, false).unwrap();
+        let (gpu, cpu) = (on(Device::gpu(0), run), on(Device::cpu(), run));
+        assert_close("broadcast indices", &gpu, &cpu, 1e-5);
+    }
+
+    /// Both gather GEMM kernels (tiled over any indices, grouped over sorted rows), with
+    /// transposed and unaligned operands, against the CPU.
+    #[test]
+    fn gather_mm_kernels_match_the_cpu() {
+        if cfg!(miri) || on(Device::gpu(0), || (Array::scalar(1.0f32) * 2.0).eval()).is_err() {
+            return;
+        }
+        let mut rng = Rng::new(0x74);
+        // (experts, N, K, rows M per batch, batches, sorted, b transposed)
+        let cases: &[(usize, usize, usize, usize, usize, bool, bool)] = &[
+            (4, 64, 128, 64, 3, false, false), // aligned
+            (4, 40, 72, 33, 2, false, true),   // unaligned, b transposed
+            (8, 24, 40, 1, 5, false, false),   // single rows, unsorted
+            (8, 64, 256, 1, 100, true, false), // grouped, sorted rows
+            (16, 48, 200, 1, 70, true, true),  // grouped, unaligned, b transposed
+        ];
+        for &(e, n, k, m, batches, sorted, t) in cases {
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                let w = match t {
+                    true => transpose(&random(&mut rng, &[e, n, k], dtype), &[0, 2, 1]).unwrap(),
+                    false => random(&mut rng, &[e, k, n], dtype),
+                };
+                let x = random(&mut rng, &[batches, m, k], dtype);
+                let mut ids: Vec<u32> = (0..batches).map(|i| ((i * 7 + 3) % e) as u32).collect();
+                if sorted {
+                    ids.sort_unstable();
+                }
+                let rhs = Array::from_slice(&ids, &[batches]).unwrap();
+                let run = || gather_mm(&x, &w, None, Some(&rhs), sorted).unwrap();
+                let (gpu, cpu) = (on(Device::gpu(0), run), on(Device::cpu(), run));
+                let tol = match dtype {
+                    DType::F32 => 1e-5,
+                    _ => 1e-2,
+                };
+                let name = format!("{dtype} {:?}", (e, n, k, m, batches, sorted, t));
+                assert_close(&name, &gpu, &cpu, tol);
+            }
+        }
+        // Explicit row indices with a broadcast batch shape, and a transposed `a`.
+        let w = random(&mut rng, &[4, 96, 32], DType::F32);
+        let x = transpose(&random(&mut rng, &[3, 96, 8], DType::F32), &[0, 2, 1]).unwrap();
+        let lhs = Array::from_slice(&[2u32, 0, 1, 1], &[2, 2]).unwrap();
+        let rhs = Array::from_slice(&[3u32, 1], &[1, 2]).unwrap();
+        let run = || gather_mm(&x, &w, Some(&lhs), Some(&rhs), false).unwrap();
         let (gpu, cpu) = (on(Device::gpu(0), run), on(Device::cpu(), run));
         assert_close("broadcast indices", &gpu, &cpu, 1e-5);
     }

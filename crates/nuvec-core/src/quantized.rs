@@ -204,39 +204,10 @@ pub fn gather_qmm(
         astype(scales, dtype)?,
         astype(biases, dtype)?,
     );
-    // Default indices: every batch of the operand, in order.
-    let indices = |a: &Array, given: Option<&Array>| -> Result<Array> {
-        let batch = &a.shape()[..a.ndim() - 2];
-        match given {
-            Some(i)
-                if i.dtype().category() == Category::Float || i.dtype() == crate::DType::Bool =>
-            {
-                Err(Error::InvalidArgument(
-                    "gather_qmm: indices must be integers".into(),
-                ))
-            }
-            Some(i) => astype(i, crate::DType::U32),
-            None => {
-                let n: usize = batch.iter().product();
-                let all = crate::arange(0.0, n as f64, 1.0, crate::DType::U32)?;
-                all.reshape(&batch.iter().map(|&d| d as isize).collect::<Vec<_>>())
-            }
-        }
-    };
-    let (lhs, rhs) = (indices(&x, lhs_indices)?, indices(w, rhs_indices)?);
-    let batch = view::broadcast_shapes("gather_qmm", lhs.shape(), rhs.shape())?;
-    let (lhs, rhs) = (broadcast_to(&lhs, &batch)?, broadcast_to(&rhs, &batch)?);
+    let (lhs, rhs) = gather_indices("gather_qmm", &x, w, lhs_indices, rhs_indices)?;
     let mut inputs = vec![x.clone(), w.clone(), scales, biases, lhs, rhs.clone()];
-    let m = x.shape()[x.ndim() - 2];
-    let experts: usize = w.shape()[..w.ndim() - 2].iter().product();
-    // Rows sorted by expert, one per output batch: each expert's rows start at the number of
-    // indices below it (MLX's grouped kernel walks every expert's weights once).
-    if sorted_indices && lhs_indices.is_none() && m == 1 && x.ndim() == 3 && batch.len() == 1 {
-        // Rows per expert (scatter-added ones), then their exclusive running sum.
-        let ones = crate::ones(rhs.shape(), crate::DType::I32)?;
-        let zeros = crate::zeros(&[experts], crate::DType::I32)?;
-        let counts = crate::scatter_add_along_axis(&zeros, &rhs, &ones, 0)?;
-        inputs.push(crate::cumsum(&counts, Some(0), false, false)?);
+    if let Some(offsets) = sorted_offsets(&x, w, &rhs, lhs_indices.is_none() && sorted_indices)? {
+        inputs.push(offsets);
     }
     let op = crate::fast::FastOp::GatherQmm {
         group_size,
@@ -250,4 +221,101 @@ pub fn gather_qmm(
         op.fallback(&inputs)?.swap_remove(0)
     };
     Ok(out)
+}
+
+/// The batch indices of a gathered product, broadcast together; either defaults to every
+/// batch of its operand, in order.
+fn gather_indices(
+    op: &'static str,
+    a: &Array,
+    b: &Array,
+    lhs: Option<&Array>,
+    rhs: Option<&Array>,
+) -> Result<(Array, Array)> {
+    let indices = |x: &Array, given: Option<&Array>| -> Result<Array> {
+        let batch = &x.shape()[..x.ndim() - 2];
+        match given {
+            Some(i)
+                if i.dtype().category() == Category::Float || i.dtype() == crate::DType::Bool =>
+            {
+                Err(Error::InvalidArgument(format!(
+                    "{op}: indices must be integers"
+                )))
+            }
+            Some(i) => astype(i, crate::DType::U32),
+            None => {
+                let n: usize = batch.iter().product();
+                let all = crate::arange(0.0, n as f64, 1.0, crate::DType::U32)?;
+                all.reshape(&batch.iter().map(|&d| d as isize).collect::<Vec<_>>())
+            }
+        }
+    };
+    let (l, r) = (indices(a, lhs)?, indices(b, rhs)?);
+    let batch = view::broadcast_shapes(op, l.shape(), r.shape())?;
+    Ok((broadcast_to(&l, &batch)?, broadcast_to(&r, &batch)?))
+}
+
+/// For rows sorted by weight batch (`a` is `[rows, 1, K]`, one row per output batch), where
+/// each batch's rows start: the rows per batch (scatter-added ones), then their exclusive
+/// running sum (MLX's grouped kernels walk every weight batch once).
+fn sorted_offsets(a: &Array, b: &Array, rhs: &Array, sorted: bool) -> Result<Option<Array>> {
+    let m = a.shape()[a.ndim() - 2];
+    if !(sorted && m == 1 && a.ndim() == 3 && rhs.ndim() == 1) {
+        return Ok(None);
+    }
+    let experts: usize = b.shape()[..b.ndim() - 2].iter().product();
+    let ones = crate::ones(rhs.shape(), crate::DType::I32)?;
+    let zeros = crate::zeros(&[experts], crate::DType::I32)?;
+    let counts = crate::scatter_add_along_axis(&zeros, rhs, &ones, 0)?;
+    Ok(Some(crate::cumsum(&counts, Some(0), false, false)?))
+}
+
+/// Matrix products of gathered batches, as MLX's `gather_mm` (mixture-of-experts layers in
+/// full precision): output batch `i` is `a[lhs_indices[i]] · b[rhs_indices[i]]` over the
+/// flattened batch dimensions of `a` (`[..., M, K]`) and `b` (`[..., K, N]`), with the
+/// indices broadcast together and either defaulting to every batch. `sorted_indices`
+/// promises sorted `rhs_indices`, which lets one kernel walk each batch of `b` once.
+///
+/// ```
+/// use nuvec_core::{Array, Result, gather_mm};
+///
+/// # fn main() -> Result<()> {
+/// // Two 2×2 "experts": the identity and twice the identity.
+/// let b = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0], &[2, 2, 2])?;
+/// let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 1, 2])?; // two rows
+/// let experts = Array::from_slice(&[1u32, 0], &[2])?;
+/// let y = gather_mm(&a, &b, None, Some(&experts), false)?;
+/// assert_eq!(y.to_vec::<f32>()?, [2.0, 4.0, 3.0, 4.0]);
+/// # Ok(())
+/// # }
+/// ```
+pub fn gather_mm(
+    a: &Array,
+    b: &Array,
+    lhs_indices: Option<&Array>,
+    rhs_indices: Option<&Array>,
+    sorted_indices: bool,
+) -> Result<Array> {
+    check_inputs(&[a, b])?;
+    let dtype = promote_types(a.dtype(), b.dtype());
+    if dtype.category() != Category::Float {
+        return Err(Error::UnsupportedDType {
+            op: "gather_mm",
+            dtype,
+        });
+    }
+    if a.ndim() < 2 || b.ndim() < 2 || a.shape()[a.ndim() - 1] != b.shape()[b.ndim() - 2] {
+        return Err(Error::InvalidArgument(format!(
+            "gather_mm: a must be [..., M, K] and b [..., K, N], got {:?} and {:?}",
+            a.shape(),
+            b.shape()
+        )));
+    }
+    let (a, b) = (astype(a, dtype)?, astype(b, dtype)?);
+    let (lhs, rhs) = gather_indices("gather_mm", &a, &b, lhs_indices, rhs_indices)?;
+    let mut inputs = vec![a.clone(), b.clone(), lhs, rhs.clone()];
+    if let Some(offsets) = sorted_offsets(&a, &b, &rhs, lhs_indices.is_none() && sorted_indices)? {
+        inputs.push(offsets);
+    }
+    Ok(crate::fast::record_or_fallback(crate::fast::FastOp::GatherMm, inputs)?.swap_remove(0))
 }

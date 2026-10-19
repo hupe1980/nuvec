@@ -17,7 +17,8 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > Metal kernels), custom Metal kernels from source (`fast::MetalKernel`, as MLX's
 > `metal_kernel`), random numbers (uniform, normal, Gumbel, categorical, integers, Bernoulli)
 > bit-identical to MLX's, MLX's GEMM and GEMV kernels (ported, with split-K and a fused
-> `addmm`), MLX-compatible affine quantization (`quantize`, `dequantize` and
+> `addmm`; `gather_mm` with MLX's gather kernels for mixture-of-experts layers), `conv1d`
+> (stride, padding, dilation, groups), MLX-compatible affine quantization (`quantize`, `dequantize` and
 > `quantized_matmul` with MLX's packing and kernels, 1–8 bits, and `gather_qmm` for
 > mixture-of-experts layers), MLX's fused kernels
 > (`fast::rms_norm`, `fast::layer_norm`, `fast::rope`, `fast::cross_entropy`,

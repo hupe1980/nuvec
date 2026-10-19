@@ -539,6 +539,28 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "slice" => slice(&xs[0], &slice_args(p("args"))),
         "broadcast_to" => broadcast_to(&xs[0], &usizes(p("shape"))),
         "expand_dims" => expand_dims(&xs[0], p("axis").parse().unwrap()),
+        "conv1d" => {
+            let n = |k: &str| p(k).parse::<usize>().unwrap();
+            conv1d(
+                &xs[0],
+                &xs[1],
+                n("stride"),
+                n("padding"),
+                n("dilation"),
+                n("groups"),
+            )
+        }
+        "gather_mm" => {
+            // Inputs: a, b, then the indices that `idx` names ("l" lhs, "r" rhs).
+            let mut rest = xs[2..].iter();
+            let lhs = p("idx").contains('l').then(|| rest.next().unwrap());
+            let rhs = p("idx").contains('r').then(|| rest.next().unwrap());
+            let b = match p("tb") {
+                "1" => transpose(&xs[1], &[0, 2, 1])?,
+                _ => xs[1].clone(),
+            };
+            gather_mm(&xs[0], &b, lhs, rhs, p("sorted") == "1")
+        }
         "repeat" => {
             let axis = (!p("axis").is_empty()).then(|| p("axis").parse().unwrap());
             repeat(&xs[0], p("repeats").parse().unwrap(), axis)
@@ -643,14 +665,28 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
         // A float32 loss that MLX's fallback computes in the logits' (half) type.
         "cross_entropy" => 16.0 * epsilon(case.inputs[0].dtype) * e.abs().max(1.0),
         // Derivatives chain several rounded operations, accumulated over at most every
-        // input element.
+        // input element; logcumsumexp's subtracts nearly equal exponentials.
         "vjp" | "jvp" => {
             let n = case
                 .inputs
                 .iter()
                 .map(|t| t.shape.iter().product::<usize>())
                 .max();
-            (n.unwrap_or(1) as f64 + 8.0) * eps * e.abs().max(1.0)
+            // Quantized products carry codes up to 2^bits − 1 into the scales' derivative.
+            let cancels = match case.params["fn"].as_str() {
+                "logcumsumexp" => 16.0,
+                f if f.starts_with("quantized_matmul") => {
+                    let bits: i32 = case.params["bits"].parse().unwrap();
+                    f64::from((1 << bits) - 1)
+                }
+                _ => 1.0,
+            };
+            cancels * (n.unwrap_or(1) as f64 + 8.0) * eps * e.abs().max(1.0)
+        }
+        // Sums of `K · C_in` products, in another order than MLX's kernels.
+        "conv1d" => {
+            let w = &case.inputs[1].shape;
+            (w[1] * w[2]) as f64 * 2.0 * eps * e.abs().max(1.0)
         }
         // Each step rounds in MLX (float32), once in nuvec (f64): the error grows with
         // the scanned length.
@@ -685,7 +721,7 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
             let w = bound(&case.inputs[2]) * f64::from((1 << bits) - 1) + bound(&case.inputs[3]);
             4.0 * (k + 1.0) * eps * bound(&case.inputs[0]) * w
         }
-        "matmul" | "addmm" => {
+        "matmul" | "addmm" | "gather_mm" => {
             let bound = |t: &Tensor| {
                 values(t)
                     .iter()

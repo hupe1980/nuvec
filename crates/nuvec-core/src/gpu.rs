@@ -2170,6 +2170,11 @@ mod metal {
                 self.gather_qmm(operands, &outputs[0], (group_size, bits), &mut out)?;
                 return Ok(vec![Data::new(out)]);
             }
+            if *op == FastOp::GatherMm {
+                let mut out = alloc(&outputs[0])?;
+                self.gather_mm(operands, &outputs[0], &mut out)?;
+                return Ok(vec![Data::new(out)]);
+            }
             let mut out = alloc(&outputs[0])?;
             let x = self.packed(operands[0], true)?;
             let dt = operands[0].0.dtype;
@@ -2379,7 +2384,10 @@ mod metal {
                         .map_err(backend)?;
                     self.counted()?;
                 }
-                FastOp::Attention { .. } | FastOp::GatedDelta | FastOp::GatherQmm { .. } => {
+                FastOp::Attention { .. }
+                | FastOp::GatedDelta
+                | FastOp::GatherQmm { .. }
+                | FastOp::GatherMm => {
                     unreachable!("handled above")
                 }
                 FastOp::CrossEntropy | FastOp::CrossEntropyVjp => {
@@ -3163,6 +3171,140 @@ mod metal {
                 false => format!("nuvec_affine_gather_qmv_{base}"),
             };
             self.dispatch_groups(&name, &args, [m, n.div_ceil(8), batch], [32, 2, 1])
+        }
+
+        /// MLX's `GatherMM::eval_gpu` (without the matrix-vector kernels): rows sorted by
+        /// weight batch take `gather_mm_rhs`, which walks each batch of `b` once; anything
+        /// else `gather_mm`, one output batch per threadgroup slice.
+        fn gather_mm(
+            &mut self,
+            operands: &[Operand<'_>],
+            out: &Output,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            if out.size == 0 {
+                return Ok(());
+            }
+            let nd = operands[0].0.shape.len();
+            let (m, k) = (operands[0].0.shape[nd - 2], operands[0].0.shape[nd - 1]);
+            let n = out.shape[out.shape.len() - 1];
+            let batch = out.size / m / n;
+            // The kernels read `a` row-major only.
+            let mut ga = self.gemmand(operands[0], m, k)?;
+            if ga.transposed {
+                ga = self.gemmand_copy(operands[0])?;
+            }
+            let mut gb = self.gemmand(operands[1], k, n)?;
+            let name = |kind: &str, gb: &Gemmand<'_>| {
+                let tb = if gb.transposed { 't' } else { 'n' };
+                format!("nuvec_gather_mm{kind}_{}_n{tb}", out.dtype.name())
+            };
+            let first = |strides: &[isize]| strides.first().map_or(0, |&s| s as i64);
+            let ints = |v: usize| (v as i32).to_le_bytes();
+            if let Some(&offsets) = operands.get(4) {
+                // `a` is `[rows, 1, K]`, sorted by weight batch: one stride walks the batches.
+                if gb.batch_strides.len() != 1 {
+                    gb = self.gemmand_copy(operands[1])?;
+                }
+                let groups = offsets.0.size;
+                let offsets = self.packed(offsets, true)?;
+                let params = GemmParams {
+                    m: batch as i32,
+                    n: n as i32,
+                    k: k as i32,
+                    lda: first(&ga.batch_strides) as i32,
+                    ldb: gb.ld,
+                    ldd: n as i32,
+                    tiles_n: n.div_ceil(64) as i32,
+                    tiles_m: batch.div_ceil(16) as i32,
+                    batch_stride_a: 0,
+                    batch_stride_b: gb.batch_strides.last().map_or(0, |&s| s as i64),
+                    batch_stride_d: 0,
+                    swizzle_log: 0,
+                    gemm_k_iterations_aligned: (k / 16) as i32,
+                    batch_ndim: 0,
+                    _pad: 0,
+                };
+                let constants = [
+                    (200, batch.is_multiple_of(16)),
+                    (201, n.is_multiple_of(64)),
+                    (202, k.is_multiple_of(16)),
+                ];
+                let pipeline = self.pipeline_with(&name("_rhs", &gb), &constants)?;
+                let groups_b = ints(groups);
+                let args = [
+                    ga.arg(),
+                    gb.arg(),
+                    offsets.arg(),
+                    Arg::write(buffer.metal_mut().expect("device storage")),
+                    Arg::bytes(bytemuck::bytes_of(&params)),
+                    Arg::bytes(&groups_b),
+                ];
+                // Every batch of `b` adds at most one partial row tile.
+                let tiles = batch.div_ceil(16) + groups;
+                self.command_buffer()?
+                    .dispatch_groups(&pipeline, &args, [n.div_ceil(64), tiles, 1], [32, 2, 1])
+                    .map_err(backend)?;
+                return self.counted();
+            }
+            let lhs = self.view_if(operands[2], true)?;
+            let rhs = self.view_if(operands[3], true)?;
+            let batch_shape = &out.shape[..out.shape.len() - 2];
+            let has_batch = batch_shape.len() > 1;
+            let params = GemmParams {
+                m: m as i32,
+                n: n as i32,
+                k: k as i32,
+                lda: ga.ld,
+                ldb: gb.ld,
+                ldd: n as i32,
+                tiles_n: n.div_ceil(64) as i32,
+                tiles_m: m.div_ceil(64) as i32,
+                batch_stride_a: first(&lhs.strides),
+                batch_stride_b: first(&rhs.strides),
+                batch_stride_d: (m * n) as i64,
+                swizzle_log: 0,
+                gemm_k_iterations_aligned: (k / 16) as i32,
+                batch_ndim: batch_shape.len() as i32,
+                _pad: 0,
+            };
+            let constants = [
+                (10, has_batch),
+                (200, m.is_multiple_of(64)),
+                (201, n.is_multiple_of(64)),
+                (202, k.is_multiple_of(16)),
+            ];
+            let pipeline = self.pipeline_with(&name("", &gb), &constants)?;
+            let (a_shape, b_shape) = (&operands[0].0.shape, &operands[1].0.shape);
+            let layout = [
+                shape_bytes(batch_shape),
+                strides_bytes(&lhs.strides),
+                strides_bytes(&rhs.strides),
+                ints(nd - 2).to_vec(),
+                shape_bytes(&a_shape[..nd - 2]),
+                strides_bytes(&ga.batch_strides),
+                ints(b_shape.len() - 2).to_vec(),
+                shape_bytes(&b_shape[..b_shape.len() - 2]),
+                strides_bytes(&gb.batch_strides),
+            ];
+            let mut args = vec![
+                ga.arg(),
+                gb.arg(),
+                lhs.arg(),
+                rhs.arg(),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(bytemuck::bytes_of(&params)),
+            ];
+            args.extend(layout.iter().map(|v| Arg::bytes(v)));
+            self.command_buffer()?
+                .dispatch_groups(
+                    &pipeline,
+                    &args,
+                    [n.div_ceil(64), m.div_ceil(64), batch],
+                    [32, 2, 2],
+                )
+                .map_err(backend)?;
+            self.counted()
         }
 
         /// MLX's `qmm_splitk`: K split into partitions of whole groups, partial products in

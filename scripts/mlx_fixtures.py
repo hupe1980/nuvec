@@ -203,6 +203,16 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         return xs[0][parse_slice(p["args"])]
     if op == "broadcast_to":
         return mx.broadcast_to(xs[0], nums(p["shape"]))
+    if op == "conv1d":
+        return mx.conv1d(xs[0], xs[1], stride=int(p["stride"]), padding=int(p["padding"]),
+                         dilation=int(p["dilation"]), groups=int(p["groups"]))
+    if op == "gather_mm":
+        # Inputs: a, b, then the indices that `idx` names ("l" lhs, "r" rhs).
+        rest = iter(xs[2:])
+        lhs = next(rest) if "l" in p["idx"] else None
+        rhs = next(rest) if "r" in p["idx"] else None
+        b = mx.swapaxes(xs[1], -1, -2) if p.get("tb") == "1" else xs[1]
+        return mx.gather_mm(xs[0], b, lhs, rhs, sorted_indices=p["sorted"] == "1")
     if op == "repeat":
         axis = int(p["axis"]) if p.get("axis", "") != "" else None
         return mx.repeat(xs[0], int(p["repeats"]), axis)
@@ -448,6 +458,16 @@ derivative("vjp", "vjp-multiply-t", "multiply", [make("float32", (4, 3)), make("
 derivative("vjp", "vjp-where", "where", [make("bool", (2, 3)), make("float32", (2, 3)), make("float32", (3,))])
 derivative("vjp", "vjp-astype-f16", "astype", [make("float32", (5,))], dtype=CODE["float16"])
 derivative("vjp", "vjp-reshape", "reshape", [make("float32", (2, 3))], shape="3,2")
+derivative("vjp", "vjp-conv1d", "conv1d", [make("float32", (2, 8, 4)), make("float32", (6, 3, 2))],
+           stride=2, padding=1, dilation=1, groups=2)
+derivative("vjp", "vjp-conv1d-depthwise", "conv1d", [make("float32", (1, 7, 3)), make("float32", (3, 4, 1))],
+           stride=1, padding=3, dilation=1, groups=3)
+derivative("vjp", "vjp-gather_mm", "gather_mm", [make("float32", (3, 2, 5)), make("float32", (4, 5, 3))],
+           [mx.array([2, 2, 0], dtype=mx.uint32), mx.array([1, 3, 1], dtype=mx.uint32)],
+           idx="lr", sorted=0)
+derivative("vjp", "vjp-gather_mm-sorted", "gather_mm",
+           [make("float32", (6, 1, 4)), make("float32", (3, 4, 5))],
+           [mx.array([0, 0, 1, 2, 2, 2], dtype=mx.uint32)], idx="r", sorted=1)
 derivative("vjp", "vjp-repeat", "repeat", [make("float32", (2, 3))], repeats=2, axis=0)
 derivative("vjp", "vjp-transpose", "transpose", [make("float32", (2, 3, 4))], axes="1,2,0")
 derivative("vjp", "vjp-slice", "slice", [make("float32", (5, 6))], args="1:4:1;::-2")
@@ -584,6 +604,30 @@ for dt in ["int32", "uint8", "int64"]:
     case(f"random-randint-{dt}", "random", [], fn="randint", seed=4, shape="10", low=-3 if dt != "uint8" else 2,
          high=17, dtype=CODE[dt])
 case("random-bernoulli", "random", [], fn="bernoulli", seed=6, shape="2,9", p=0.3)
+# conv1d: input [N, L, C_in], weight [C_out, K, C_in / groups].
+for name, (n, l, ci, co, k, st, pad, dil, g) in {
+    "basic": (2, 9, 3, 4, 3, 1, 0, 1, 1),
+    "stride-pad": (1, 10, 4, 2, 3, 2, 1, 1, 1),
+    "dilated": (1, 12, 2, 3, 3, 1, 2, 2, 1),
+    "groups": (2, 8, 6, 4, 2, 1, 0, 1, 2),
+    "depthwise": (1, 11, 5, 5, 4, 1, 3, 1, 5),
+}.items():
+    for dt in ["float32", "bfloat16"]:
+        case(f"conv1d-{name}-{dt}", "conv1d", [make(dt, (n, l, ci)), make(dt, (co, k, ci // g))],
+             stride=st, padding=pad, dilation=dil, groups=g)
+# gather_mm: a [..., M, K], b [..., K, N], indices into their flattened batches (MLX's CPU
+# kernel supports float32 only).
+for dt in ["float32"]:
+    case(f"gather_mm-lr-{dt}", "gather_mm", [make(dt, (2, 3, 3, 8)), make(dt, (5, 8, 4)),
+         ints("uint32", (2, 1), 0, 6), ints("uint32", (1, 3), 0, 5)], idx="lr", sorted=0)
+    case(f"gather_mm-r-{dt}", "gather_mm", [make(dt, (1, 4, 8)), make(dt, (3, 8, 6)),
+         ints("uint32", (5,), 0, 3)], idx="r", sorted=0)
+    case(f"gather_mm-sorted-{dt}", "gather_mm", [make(dt, (7, 1, 16)), make(dt, (4, 16, 9)),
+         mx.array([0, 1, 1, 1, 3, 3, 3], dtype=mx.uint32)], idx="r", sorted=1)
+case("gather_mm-default", "gather_mm", [make("float32", (3, 2, 4)), make("float32", (3, 4, 2))],
+     idx="", sorted=0)
+case("gather_mm-tb", "gather_mm", [make("float32", (4, 2, 6)), make("float32", (3, 5, 6)),
+     ints("uint32", (4,), 0, 3)], idx="r", sorted=0, tb=1)
 case("repeat-axis", "repeat", [make("float32", (2, 3))], repeats=3, axis=1)
 case("repeat-flat", "repeat", [make("int32", (2, 2))], repeats=2, axis="")
 case("contiguous-transposed", "contiguous", [make("float32", (3, 4))], pre="t")

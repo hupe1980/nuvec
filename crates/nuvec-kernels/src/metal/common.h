@@ -15,9 +15,6 @@ using namespace metal;
 
 namespace nuvec {
 
-// Test helper used by the placeholder kernel.
-inline float twice(float x) { return x * 2.0f; }
-
 // ── Element types ────────────────────────────────────────────────────────────
 // bool and complex64 get distinct types so that overloads never confuse bool with uint8
 // or complex numbers with float2 vectors.

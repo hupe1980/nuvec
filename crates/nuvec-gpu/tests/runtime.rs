@@ -64,21 +64,6 @@ fn device_info() {
 }
 
 #[test]
-fn placeholder_kernel() {
-    let Some(device) = device() else { return };
-    let pipeline = device.pipeline("nuvec_placeholder").unwrap();
-    let mut out = device.new_buffer(1000 * 4).unwrap();
-    let mut cmd = device.command_buffer().unwrap();
-    cmd.dispatch(&pipeline, &[Arg::write(&mut out)], 1000)
-        .unwrap();
-    cmd.commit().wait().unwrap();
-    assert_eq!(
-        read_f32(&out),
-        (0..1000).map(|i| 2.0 * i as f32).collect::<Vec<_>>()
-    );
-}
-
-#[test]
 fn add_one_million() {
     let Some(device) = device() else { return };
     let n = 1_000_000u32;

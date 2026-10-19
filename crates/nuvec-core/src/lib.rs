@@ -46,6 +46,7 @@ mod array;
 mod batching;
 mod buffer;
 mod cast;
+mod conv;
 mod custom;
 mod derivatives;
 mod device;
@@ -70,6 +71,7 @@ mod transforms;
 mod view;
 
 pub use array::Array;
+pub use conv::conv1d;
 pub use custom::{CustomCall, CustomFunction, checkpoint, custom_function};
 pub use device::{Device, DeviceKind, Stream, default_device, default_stream, set_default_stream};
 pub use dtype::{Category, Complex64, DType, Element, at_least_float, bf16, f16, promote_types};
@@ -89,7 +91,7 @@ pub use ops::{
     stop_gradient, subtract, sum, tanh, transpose, where_, zeros,
 };
 pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, ScanOp, ScatterReduce, UnaryOp};
-pub use quantized::{dequantize, gather_qmm, quantize, quantized_matmul};
+pub use quantized::{dequantize, gather_mm, gather_qmm, quantize, quantized_matmul};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
 pub use shape::Flags;
 pub use sorting::{

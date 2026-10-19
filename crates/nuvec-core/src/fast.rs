@@ -98,6 +98,9 @@ pub enum FastOp {
     /// `(q, k, v, g, beta, state)`: the gated delta rule (see [`gated_delta`]), with the
     /// outputs and the final state.
     GatedDelta,
+    /// `(a, b, lhs_indices, rhs_indices[, offsets])`: matrix products of gathered batches
+    /// (see [`crate::gather_mm`]), as [`FastOp::GatherQmm`] in full precision.
+    GatherMm,
     /// `(x, w, scales, biases, lhs_indices, rhs_indices[, offsets])`: quantized matrix
     /// products of gathered batches (see [`crate::gather_qmm`]); the indices are uint32
     /// and broadcast to the output's batch shape. `offsets` (int32, one per batch of `w`)
@@ -419,6 +422,7 @@ impl FastOp {
             Self::Attention { .. } => "scaled_dot_product_attention",
             Self::GatedDelta => "gated_delta",
             Self::GatherQmm { .. } => "gather_qmm",
+            Self::GatherMm => "gather_mm",
         }
     }
 
@@ -433,6 +437,7 @@ impl FastOp {
             Self::Attention { mask, sinks, .. } => 3 + usize::from(*mask) + usize::from(*sinks),
             Self::GatedDelta => 6,
             Self::GatherQmm { .. } => inputs.len().clamp(6, 7),
+            Self::GatherMm => inputs.len().clamp(4, 5),
         };
         if inputs.len() != arity || inputs[0].ndim() == 0 {
             return Err(Error::InvalidArgument(format!(
@@ -462,6 +467,12 @@ impl FastOp {
                 vec![(x.dtype(), shape)]
             }
             Self::GatedDelta => vec![(x.dtype(), inputs[2].shape().to_vec()), like(&inputs[5])],
+            Self::GatherMm => {
+                let b = inputs[1].shape();
+                let mut shape = inputs[2].shape().to_vec();
+                shape.extend([x.shape()[x.ndim() - 2], b[b.len() - 1]]);
+                vec![(x.dtype(), shape)]
+            }
             Self::GatherQmm {
                 bits, transpose, ..
             } => {
@@ -567,6 +578,17 @@ impl FastOp {
             )?],
             Self::Softmax => vec![softmax_graph(x)?],
             Self::GatedDelta => gated_delta_graph(inputs)?,
+            Self::GatherMm => {
+                let rows = |a: &Array, indices: &Array| -> Result<Array> {
+                    let nd = a.ndim();
+                    let shape = [-1, a.shape()[nd - 2] as isize, a.shape()[nd - 1] as isize];
+                    crate::take(&reshape(a, &shape)?, indices, Some(0))
+                };
+                vec![crate::matmul(
+                    &rows(x, &inputs[2])?,
+                    &rows(&inputs[1], &inputs[3])?,
+                )?]
+            }
             Self::GatherQmm {
                 group_size,
                 bits,
@@ -689,7 +711,8 @@ impl FastOp {
             | Self::CrossEntropyVjp
             | Self::Attention { .. }
             | Self::GatedDelta
-            | Self::GatherQmm { .. } => self.fallback_vjp(inputs, cotangents, wanted),
+            | Self::GatherQmm { .. }
+            | Self::GatherMm => self.fallback_vjp(inputs, cotangents, wanted),
         }
     }
 
