@@ -656,7 +656,10 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
         "logsumexp" | "softmax" => 8.0 * eps * e.abs().max(1.0),
         // Statistics in float32, then rounded; kernels and fallbacks round at different
         // points.
-        "rms_norm" | "layer_norm" | "rope" => 16.0 * eps * e.abs().max(1.0),
+        "rms_norm" | "layer_norm" => 16.0 * eps * e.abs().max(1.0),
+        // Sines and cosines of the rotation angles differ in the last bits between GPU
+        // generations.
+        "rope" => 64.0 * eps * e.abs().max(1.0),
         // Two products and a softmax; kernels accumulate in float32, MLX's CPU fallback in
         // the input type.
         "sdpa" => {

@@ -115,7 +115,20 @@ fn scan(
         ScanOp::LogAddExp => a.astype(at_least_float(a.dtype()))?,
         _ => a,
     };
-    single(
+    // 8- and 16-bit integers scan in 32 bits and wrap back (the same modular results):
+    // the reverse exclusive scan of 8-bit integers was wrong on a virtualized Apple GPU
+    // (GitHub's macOS runners), while 32-bit scans are right everywhere.
+    let narrow = a.dtype();
+    let wide = match narrow {
+        DType::U8 | DType::U16 => Some(DType::U32),
+        DType::I8 | DType::I16 => Some(DType::I32),
+        _ => None,
+    };
+    let a = match wide {
+        Some(w) => a.astype(w)?,
+        None => a,
+    };
+    let out = single(
         Primitive::Scan {
             op,
             axis,
@@ -123,7 +136,11 @@ fn scan(
             inclusive,
         },
         a,
-    )
+    )?;
+    match wide {
+        Some(_) => out.astype(narrow),
+        None => Ok(out),
+    }
 }
 
 /// The cumulative sum along `axis` (flattened without one): `reverse` scans from the
