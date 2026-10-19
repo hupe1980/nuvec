@@ -62,6 +62,25 @@ impl MappedFile {
         self.buffer.bytes()
     }
 
+    /// Bytes `offset..offset + len` as storage of their own: one copy into an aligned buffer,
+    /// for files whose arrays are not aligned to their element sizes (safetensors written
+    /// without header padding, as MLX writes them). Arrays made from the copy are views of
+    /// it, and the file's mapping is not kept.
+    pub fn section(&self, offset: usize, len: usize) -> Result<Self> {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return Err(Error::Io(format!(
+                "{len} bytes at offset {offset} exceed the file's {} bytes",
+                self.len()
+            )));
+        }
+        let mut copy = Buffer::try_alloc(len)?;
+        copy.bytes_mut()
+            .copy_from_slice(&self.bytes()[offset..offset + len]);
+        Ok(Self {
+            buffer: Arc::new(copy),
+        })
+    }
+
     /// A row-major array of `dtype` and `shape` stored at byte `offset`: a view of the file
     /// if `offset` is a multiple of the element size, otherwise a copy.
     pub fn array(&self, offset: usize, dtype: DType, shape: &[usize]) -> Result<Array> {

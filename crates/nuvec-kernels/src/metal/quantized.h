@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 //
 // MLX's affine quantization kernels: quantize, dequantize, the quantized matrix-vector
-// products (`qmv_fast`, `qmv`, `qvm`) and the tiled quantized matrix products (`qmm_t`,
-// `qmm_t_splitk`, `qmm_n`), ported from MLX v0.32.4 (mlx/backend/metal/kernels/quantized.h)
-// without the qmv_quad, qmv_wide, split-K qvm, gather and floating-point (mx/nv) kernels.
+// products (`qmv_fast`, `qmv`, `qvm`), the tiled quantized matrix products (`qmm_t`,
+// `qmm_t_splitk`, `qmm_n`) and their gather (mixture-of-experts) variants, ported from MLX
+// v0.32.4 (mlx/backend/metal/kernels/quantized.h, quantized_utils.h and the row-tile
+// scheduler of utils.h) without the qmv_quad, qmv_wide, split-K qvm and floating-point
+// (mx/nv) kernels.
 // Placed in `mlx::quant`; needs steel_gemm.h first (BlockMMA, BlockLoader, elem_to_loc).
 //
 // `affine_quantize` deviates so that it agrees with MLX's CPU quantizer (and nuvec's): the
@@ -2057,6 +2059,683 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
       }
       out[i] = scale * d + bias;
     }
+  }
+}
+
+
+// ── Gather (mixture-of-experts) kernels, from MLX v0.32.4 ──────────────────────────────────
+// `quantized_utils.h`'s GEMM loops, `utils.h`'s row-tile scheduler, the indexed matrix
+// offsets and the `affine_gather_*` kernels.
+
+template <typename T, typename mma_t, typename loader_a_t, typename loader_b_t>
+METAL_FUNC void gemm_loop_aligned(
+    threadgroup T* As,
+    threadgroup T* Bs,
+    thread mma_t& mma_op,
+    thread loader_a_t& loader_a,
+    thread loader_b_t& loader_b,
+    const int k_iterations) {
+  for (int k = 0; k < k_iterations; k++) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Load elements into threadgroup memory
+    loader_a.load_unsafe();
+    loader_b.load_unsafe();
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Multiply and accumulate threadgroup elements
+    mma_op.mma(As, Bs);
+
+    // Prepare for next iteration
+    loader_a.next();
+    loader_b.next();
+  }
+}
+
+template <
+    bool rows_aligned,
+    bool cols_aligned,
+    bool transpose,
+    typename T,
+    typename mma_t,
+    typename loader_a_t,
+    typename loader_b_t>
+METAL_FUNC void gemm_loop_unaligned(
+    threadgroup T* As,
+    threadgroup T* Bs,
+    thread mma_t& mma_op,
+    thread loader_a_t& loader_a,
+    thread loader_b_t& loader_b,
+    const int k_iterations,
+    const short tgp_bm,
+    const short tgp_bn,
+    const short tgp_bk) {
+  for (int k = 0; k < k_iterations; k++) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Load elements into threadgroup memory
+    if (rows_aligned) {
+      loader_a.load_unsafe();
+    } else {
+      loader_a.load_safe(short2(tgp_bk, tgp_bm));
+    }
+    if (cols_aligned) {
+      loader_b.load_unsafe();
+    } else {
+      loader_b.load_safe(
+          transpose ? short2(tgp_bk, tgp_bn) : short2(tgp_bn, tgp_bk));
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Multiply and accumulate threadgroup elements
+    mma_op.mma(As, Bs);
+
+    // Prepare for next iteration
+    loader_a.next();
+    loader_b.next();
+  }
+}
+
+template <typename T, typename mma_t, typename loader_a_t, typename loader_b_t>
+METAL_FUNC void gemm_loop_finalize(
+    threadgroup T* As,
+    threadgroup T* Bs,
+    thread mma_t& mma_op,
+    thread loader_a_t& loader_a,
+    thread loader_b_t& loader_b,
+    const short2 tile_a,
+    const short2 tile_b) {
+  loader_a.load_safe(tile_a);
+  loader_b.load_safe(tile_b);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  mma_op.mma(As, Bs);
+}
+
+
+template <int BM>
+METAL_FUNC bool schedule_row_tile(
+    const device int32_t* offsets,
+    const int num_groups,
+    const int M,
+    const int tile,
+    const uint simd_lane_id,
+    thread int& row,
+    thread int& group,
+    thread short& rows) {
+  int tiles_before = 0;
+  // each lane process an expert
+  for (int e = 0; e < num_groups; e += 32) {
+    const int g = e + simd_lane_id; // shift by lane id
+    int start = M;
+    int end = M;
+    if (g < num_groups) {
+      // start of the experts activations
+      start = offsets[g];
+      // end of the experts activations
+      end = g + 1 < num_groups ? offsets[g + 1] : M;
+    }
+    // number of tiles per expert
+    const int n = (end - start + BM - 1) / BM;
+    // the total number of tiles up to and including this expert
+    const int tiles_through = tiles_before + simd_prefix_inclusive_sum(n);
+    const ushort owner_lane = ushort(simd_sum(int(tiles_through <= tile)));
+    if (owner_lane < 32) {
+      // if true, we found an owner
+      group = e + owner_lane;
+      // fill the row to start
+      row = simd_shuffle(start, owner_lane) +
+          (tile - simd_shuffle(tiles_through - n, owner_lane)) * BM;
+      // number of valid rows in the tile
+      rows = short(min(BM, simd_shuffle(end, owner_lane) - row));
+      return true;
+    }
+    tiles_before = simd_shuffle(tiles_through, 31);
+  }
+  return false;
+}
+
+template <typename T>
+METAL_FUNC void adjust_matrix_offsets(
+    const device T*& x,
+    const device uint32_t*& w,
+    const device T*& scales,
+    const device T*& biases,
+    const device uint32_t* lhs_indices,
+    const device uint32_t* rhs_indices,
+    device T*& y,
+    int output_stride,
+    const constant int& batch_ndims,
+    const constant int* batch_shape,
+    const constant int64_t* lhs_strides,
+    const constant int64_t* rhs_strides,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* s_strides,
+    const constant int64_t* b_strides,
+    uint3 tid [[threadgroup_position_in_grid]]) {
+  // Set the input/output matrices
+  uint32_t x_idx;
+  uint32_t w_idx;
+  if (batch_ndims == 1) {
+    x_idx = lhs_indices[tid.z * lhs_strides[0]];
+    w_idx = rhs_indices[tid.z * rhs_strides[0]];
+  } else {
+    ulong2 idx = elem_to_loc_broadcast(
+        tid.z, batch_shape, lhs_strides, rhs_strides, batch_ndims);
+    x_idx = lhs_indices[idx.x];
+    w_idx = rhs_indices[idx.y];
+  }
+  if (x_batch_ndims == 1) {
+    x += x_idx * x_strides[0];
+  } else {
+    x += elem_to_loc(x_idx, x_shape, x_strides, x_batch_ndims);
+  }
+  if (w_batch_ndims == 1) {
+    w += w_idx * w_strides[0];
+    scales += w_idx * s_strides[0];
+    biases += w_idx * b_strides[0];
+  } else {
+    ulong3 idx = elem_to_loc_broadcast(
+        w_idx, w_shape, w_strides, s_strides, b_strides, w_batch_ndims);
+    w += idx.x;
+    scales += idx.y;
+    biases += idx.z;
+  }
+  y += tid.z * output_stride;
+}
+
+template <typename T, int group_size, int bits, bool has_global_scale = false>
+[[kernel]] void affine_gather_qmv_fast(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    const device uint32_t* lhs_indices [[buffer(4)]],
+    const device uint32_t* rhs_indices [[buffer(5)]],
+    device T* y [[buffer(6)]],
+    const constant int& in_vec_size [[buffer(7)]],
+    const constant int& out_vec_size [[buffer(8)]],
+    const constant int& x_batch_ndims [[buffer(9)]],
+    const constant int* x_shape [[buffer(10)]],
+    const constant int64_t* x_strides [[buffer(11)]],
+    const constant int& w_batch_ndims [[buffer(12)]],
+    const constant int* w_shape [[buffer(13)]],
+    const constant int64_t* w_strides [[buffer(14)]],
+    const constant int64_t* s_strides [[buffer(15)]],
+    const constant int64_t* b_strides [[buffer(16)]],
+    const constant int& batch_ndims [[buffer(17)]],
+    const constant int* batch_shape [[buffer(18)]],
+    const constant int64_t* lhs_strides [[buffer(19)]],
+    const constant int64_t* rhs_strides [[buffer(20)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  int M = x_shape[x_batch_ndims];
+  adjust_matrix_offsets<T>(
+      x,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      y,
+      out_vec_size * M,
+      batch_ndims,
+      batch_shape,
+      lhs_strides,
+      rhs_strides,
+      x_batch_ndims,
+      x_shape,
+      x_strides,
+      w_batch_ndims,
+      w_shape,
+      w_strides,
+      s_strides,
+      b_strides,
+      tid);
+  qmv_fast_impl<T, group_size, bits>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool has_global_scale = false>
+[[kernel]] void affine_gather_qmv(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    const device uint32_t* lhs_indices [[buffer(4)]],
+    const device uint32_t* rhs_indices [[buffer(5)]],
+    device T* y [[buffer(6)]],
+    const constant int& in_vec_size [[buffer(7)]],
+    const constant int& out_vec_size [[buffer(8)]],
+    const constant int& x_batch_ndims [[buffer(9)]],
+    const constant int* x_shape [[buffer(10)]],
+    const constant int64_t* x_strides [[buffer(11)]],
+    const constant int& w_batch_ndims [[buffer(12)]],
+    const constant int* w_shape [[buffer(13)]],
+    const constant int64_t* w_strides [[buffer(14)]],
+    const constant int64_t* s_strides [[buffer(15)]],
+    const constant int64_t* b_strides [[buffer(16)]],
+    const constant int& batch_ndims [[buffer(17)]],
+    const constant int* batch_shape [[buffer(18)]],
+    const constant int64_t* lhs_strides [[buffer(19)]],
+    const constant int64_t* rhs_strides [[buffer(20)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  int M = x_shape[x_batch_ndims];
+  adjust_matrix_offsets<T>(
+      x,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      y,
+      out_vec_size * M,
+      batch_ndims,
+      batch_shape,
+      lhs_strides,
+      rhs_strides,
+      x_batch_ndims,
+      x_shape,
+      x_strides,
+      w_batch_ndims,
+      w_shape,
+      w_strides,
+      s_strides,
+      b_strides,
+      tid);
+  qmv_impl<T, group_size, bits>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, int group_size, int bits, bool has_global_scale = false>
+[[kernel]] void affine_gather_qvm(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    const device uint32_t* lhs_indices [[buffer(4)]],
+    const device uint32_t* rhs_indices [[buffer(5)]],
+    device T* y [[buffer(6)]],
+    const constant int& in_vec_size [[buffer(7)]],
+    const constant int& out_vec_size [[buffer(8)]],
+    const constant int& x_batch_ndims [[buffer(9)]],
+    const constant int* x_shape [[buffer(10)]],
+    const constant int64_t* x_strides [[buffer(11)]],
+    const constant int& w_batch_ndims [[buffer(12)]],
+    const constant int* w_shape [[buffer(13)]],
+    const constant int64_t* w_strides [[buffer(14)]],
+    const constant int64_t* s_strides [[buffer(15)]],
+    const constant int64_t* b_strides [[buffer(16)]],
+    const constant int& batch_ndims [[buffer(17)]],
+    const constant int* batch_shape [[buffer(18)]],
+    const constant int64_t* lhs_strides [[buffer(19)]],
+    const constant int64_t* rhs_strides [[buffer(20)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  int M = x_shape[x_batch_ndims];
+  adjust_matrix_offsets<T>(
+      x,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      y,
+      out_vec_size * M,
+      batch_ndims,
+      batch_shape,
+      lhs_strides,
+      rhs_strides,
+      x_batch_ndims,
+      x_shape,
+      x_strides,
+      w_batch_ndims,
+      w_shape,
+      w_strides,
+      s_strides,
+      b_strides,
+      tid);
+  qvm_impl<T, group_size, bits>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      in_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const bool has_global_scale = false,
+    const int BM = 32,
+    const int BK = 32,
+    const int BN = 32>
+[[kernel]] void affine_gather_qmm_t(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    const device uint32_t* lhs_indices [[buffer(4)]],
+    const device uint32_t* rhs_indices [[buffer(5)]],
+    device T* y [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant int& M [[buffer(9)]],
+    const constant int& x_batch_ndims [[buffer(10)]],
+    const constant int* x_shape [[buffer(11)]],
+    const constant int64_t* x_strides [[buffer(12)]],
+    const constant int& w_batch_ndims [[buffer(13)]],
+    const constant int* w_shape [[buffer(14)]],
+    const constant int64_t* w_strides [[buffer(15)]],
+    const constant int64_t* s_strides [[buffer(16)]],
+    const constant int64_t* b_strides [[buffer(17)]],
+    const constant int& batch_ndims [[buffer(18)]],
+    const constant int* batch_shape [[buffer(19)]],
+    const constant int64_t* lhs_strides [[buffer(20)]],
+    const constant int64_t* rhs_strides [[buffer(21)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)lid;
+
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+
+  adjust_matrix_offsets<T>(
+      x,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      y,
+      M * N,
+      batch_ndims,
+      batch_shape,
+      lhs_strides,
+      rhs_strides,
+      x_batch_ndims,
+      x_shape,
+      x_strides,
+      w_batch_ndims,
+      w_shape,
+      w_strides,
+      s_strides,
+      b_strides,
+      tid);
+  qmm_t_impl<T, group_size, bits, aligned_N, T, BM, BK, BN>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      Xs,
+      Ws,
+      K,
+      N,
+      M,
+      K,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool has_global_scale = false,
+    int BM = 32,
+    int BK = 32,
+    int BN = 32>
+[[kernel]] void affine_gather_qmm_n(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    const device uint32_t* lhs_indices [[buffer(4)]],
+    const device uint32_t* rhs_indices [[buffer(5)]],
+    device T* y [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant int& M [[buffer(9)]],
+    const constant int& x_batch_ndims [[buffer(10)]],
+    const constant int* x_shape [[buffer(11)]],
+    const constant int64_t* x_strides [[buffer(12)]],
+    const constant int& w_batch_ndims [[buffer(13)]],
+    const constant int* w_shape [[buffer(14)]],
+    const constant int64_t* w_strides [[buffer(15)]],
+    const constant int64_t* s_strides [[buffer(16)]],
+    const constant int64_t* b_strides [[buffer(17)]],
+    const constant int& batch_ndims [[buffer(18)]],
+    const constant int* batch_shape [[buffer(19)]],
+    const constant int64_t* lhs_strides [[buffer(20)]],
+    const constant int64_t* rhs_strides [[buffer(21)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)lid;
+
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BK * BN_padded];
+
+  adjust_matrix_offsets<T>(
+      x,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      y,
+      M * N,
+      batch_ndims,
+      batch_shape,
+      lhs_strides,
+      rhs_strides,
+      x_batch_ndims,
+      x_shape,
+      x_strides,
+      w_batch_ndims,
+      w_shape,
+      w_strides,
+      s_strides,
+      b_strides,
+      tid);
+  qmm_n_impl<T, group_size, bits, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose>
+[[kernel]] void affine_gather_qmm_rhs(
+    const device T* x [[buffer(0)]],
+    const device uint32_t* w [[buffer(1)]],
+    const device T* scales [[buffer(2)]],
+    const device T* biases [[buffer(3)]],
+    const device int32_t* offsets [[buffer(4)]],
+    device T* y [[buffer(5)]],
+    const constant int& M [[buffer(6)]],
+    const constant int& N [[buffer(7)]],
+    const constant int& K [[buffer(8)]],
+    const constant int& num_groups [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::BlockMMA<
+      T,
+      T,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      false,
+      transpose,
+      BK_padded,
+      transpose ? BK_padded : BN_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      transpose ? BN : BK,
+      transpose ? BK : BN,
+      transpose ? BK_padded : BN_padded,
+      transpose,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
+
+  // Compute the block
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int N_w = N * bytes_per_pack / pack_factor;
+  const int N_g = N / group_size;
+  const int K_it = K / BK;
+  const size_t stride_w = transpose ? N * K_w : K * N_w;
+  const size_t stride_s = transpose ? N * K_g : K * N_g;
+  int y_row;
+  int group;
+  short tgp_bm;
+  if (!schedule_row_tile<BM>(
+          offsets, num_groups, M, tid.y, simd_lane_id, y_row, group, tgp_bm)) {
+    return;
+  }
+  const int y_col = tid.x * BN;
+  const size_t y_row_long = size_t(y_row);
+  const size_t y_col_long = size_t(y_col);
+
+  // Prepare threadgroup bounds
+  const short tgp_bn = mlx::steel::align_N ? BN : short(min(BN, N - y_col));
+
+  // Calculate the final tiles in the case that K is not aligned
+  const int k_remain = K - K_it * BK;
+  const short2 tile_x = short2(k_remain, tgp_bm);
+  const short2 tile_w =
+      transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
+
+  // Move x and output to the correct block
+  auto wl = (const device uint8_t*)w;
+  x += y_row_long * K;
+  y += y_row_long * N + y_col_long;
+  wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
+  scales += transpose ? y_col_long * K_g : y_col / group_size;
+  biases += transpose ? y_col_long * K_g : y_col / group_size;
+
+  // Prepare threadgroup mma operation
+  thread mma_t mma_op(simd_group_id, simd_lane_id);
+
+  // Prepare threadgroup loading operations
+  thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
+  thread loader_w_t loader_w(
+      wl + group * stride_w,
+      scales + group * stride_s,
+      biases + group * stride_s,
+      transpose ? K : N,
+      Ws,
+      simd_group_id,
+      simd_lane_id);
+
+  // Tile aligned so check outside of the hot loop
+  if (tgp_bm == BM && (mlx::steel::align_N || tgp_bn == BN)) {
+    gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+    if (!mlx::steel::align_K) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+    }
+    mma_op.store_result(y, N);
+  }
+
+  // Tile partially aligned check rows
+  else if (mlx::steel::align_N || tgp_bn == BN) {
+    gemm_loop_unaligned<false, true, transpose>(
+        Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
+    if (!mlx::steel::align_K) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+    }
+    mma_op.store_result_safe(y, N, short2(BN, tgp_bm));
+  }
+
+  // Tile partially aligned check cols
+  else if (tgp_bm == BM) {
+    gemm_loop_unaligned<true, false, transpose>(
+        Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
+    if (!mlx::steel::align_K) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+    }
+    mma_op.store_result_safe(y, N, short2(tgp_bn, BM));
+  }
+
+  // Nothing aligned so check both rows and cols
+  else {
+    gemm_loop_unaligned<false, false, transpose>(
+        Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
+    if (!mlx::steel::align_K) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+    }
+    mma_op.store_result_safe(y, N, short2(tgp_bn, tgp_bm));
   }
 }
 

@@ -23,7 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 from mlx_lm.generate import generate_step
-from mlx_lm.models import llama, qwen2, qwen3, qwen3_5
+from mlx_lm.models import llama, qwen2, qwen3, qwen3_5, qwen3_5_moe
 from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
 
 OUT = Path(__file__).resolve().parent.parent / "crates/nuvec-lm/tests/fixtures"
@@ -39,6 +39,9 @@ QWEN35 = dict(model_type="qwen3_5_text", hidden_size=64, num_hidden_layers=4,
               linear_conv_kernel_dim=4, full_attention_interval=4, attn_output_gate=True,
               rope_parameters=dict(rope_type="default", rope_theta=1e7,
                                    partial_rotary_factor=0.25, mrope_section=[2, 1, 1]))
+QWEN35_MOE = dict(QWEN35, model_type="qwen3_5_moe_text", linear_key_head_dim=32,
+                  num_experts=16, num_experts_per_tok=8, moe_intermediate_size=32,
+                  shared_expert_intermediate_size=64)
 CASES = {
     # Qwen 3: per-head q/k norms, separate output head, float32.
     "qwen3_f32": (qwen3, dict(BASE, model_type="qwen3", head_dim=16, rope_theta=1e6,
@@ -62,6 +65,13 @@ CASES = {
     "qwen3_5_bf16": (qwen3_5, dict(model_type="qwen3_5", tie_word_embeddings=False,
                                    text_config=dict(QWEN35, linear_key_head_dim=32)),
                      mx.bfloat16, None),
+    # Qwen 3.5 MoE: 16 experts, 8 per token (the prompt's 112 pairs take the sorted path),
+    # a gated shared expert; float32.
+    "qwen3_5_moe_f32": (qwen3_5_moe, dict(model_type="qwen3_5_moe", tie_word_embeddings=False,
+                                          text_config=dict(QWEN35_MOE)), None, None),
+    # Qwen 3.5 MoE with 4-bit experts and 8-bit routers (as mlx-community's checkpoints).
+    "qwen3_5_moe_q4": (qwen3_5_moe, dict(model_type="qwen3_5_moe", tie_word_embeddings=False,
+                                         text_config=dict(QWEN35_MOE)), mx.bfloat16, (32, 4)),
     # Qwen 3.5 with 128-feature keys (the packed kernel), 4-bit weights.
     "qwen3_5_q4": (qwen3_5, dict(model_type="qwen3_5", tie_word_embeddings=False,
                                  text_config=dict(QWEN35, linear_key_head_dim=128)),
@@ -80,8 +90,16 @@ def main() -> None:
         config = dict(args)
         if quant is not None:
             group_size, bits = quant
-            nn.quantize(model, group_size=group_size, bits=bits)
             config["quantization"] = {"group_size": group_size, "bits": bits}
+
+            def predicate(path, module):
+                if not hasattr(module, "to_quantized"):
+                    return False
+                if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
+                    config["quantization"][path] = {"group_size": group_size, "bits": 8}
+                    return {"group_size": group_size, "bits": 8}
+                return True
+            nn.quantize(model, group_size=group_size, bits=bits, class_predicate=predicate)
         mx.eval(model.parameters())
         out = OUT / name
         out.mkdir(parents=True, exist_ok=True)
@@ -94,7 +112,7 @@ def main() -> None:
         mx.save_safetensors(str(out / "expected.safetensors"), {
             "prompt": prompt, "logits": logits, "greedy": mx.array(tokens, dtype=mx.uint32)})
         print(f"{name}: {len(tree_flatten(model.parameters()))} tensors, greedy {tokens}")
-        if name == "qwen3_5_f32":
+        if name in ("qwen3_5_f32", "qwen3_5_moe_f32"):
             hugging_face_layout(out, config, dict(tree_flatten(model.parameters())))
     samplers()
 
@@ -119,7 +137,7 @@ def samplers() -> None:
 def hugging_face_layout(src: Path, config: dict, params: dict) -> None:
     """The same Qwen 3.5 model as a Hugging Face checkpoint (`qwen3_5_hf`): text weights
     under `model.language_model.`, convolutions as `[C, 1, K]`, zero-centred norms."""
-    out = OUT / "qwen3_5_hf"
+    out = OUT / src.name.replace("_f32", "_hf")
     out.mkdir(parents=True, exist_ok=True)
     norms = (".input_layernorm.weight", ".post_attention_layernorm.weight", "model.norm.weight",
              ".q_norm.weight", ".k_norm.weight")
@@ -131,10 +149,16 @@ def hugging_face_layout(src: Path, config: dict, params: dict) -> None:
             v = v - 1.0
         k = k.replace("language_model.model.", "model.language_model.")
         hf[k.replace("language_model.lm_head", "lm_head")] = v
+    # Experts as Hugging Face stores them: gate and up fused, under `experts.`.
+    for k in [k for k in hf if k.endswith("switch_mlp.gate_proj.weight")]:
+        prefix = k[: -len("switch_mlp.gate_proj.weight")]
+        up = hf.pop(prefix + "switch_mlp.up_proj.weight")
+        hf[prefix + "experts.gate_up_proj"] = mx.concatenate([hf.pop(k), up], axis=-2)
+        hf[prefix + "experts.down_proj"] = hf.pop(prefix + "switch_mlp.down_proj.weight")
     (out / "config.json").write_text(json.dumps(config, indent=2))
     mx.save_safetensors(str(out / "model.safetensors"), hf)
     (out / "expected.safetensors").write_bytes((src / "expected.safetensors").read_bytes())
-    print("qwen3_5_hf: the same model in Hugging Face's layout")
+    print(f"{out.name}: the same model in Hugging Face's layout")
 
 
 def tree_map_random(params):

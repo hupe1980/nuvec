@@ -142,3 +142,112 @@ pub fn quantized_matmul(
         Ok(out)
     }
 }
+
+/// Quantized matrix products of gathered batches, as MLX's `gather_qmm` (mixture-of-experts
+/// layers): output batch `i` is `x[lhs_indices[i]] · dequantize(w)[rhs_indices[i]]ᵀ` (or
+/// without the transpose), indexing the flattened batch dimensions of `x` (`[..., M, K]`)
+/// and of `w`, `scales` and `biases`. The indices (integers) broadcast together; either
+/// defaults to every batch of its operand in order. `sorted_indices` promises that
+/// `rhs_indices` is sorted (as after grouping rows by expert), which lets one kernel walk
+/// each weight batch once.
+///
+/// ```
+/// use nuvec_core::{Array, Result, gather_qmm, quantize};
+///
+/// # fn main() -> Result<()> {
+/// // Two "experts" of shape [4, 64]: expert e has every weight equal to e + 1.
+/// let w = Array::from_slice(
+///     &(0..512).map(|i| if i < 256 { 1.0f32 } else { 2.0 }).collect::<Vec<_>>(),
+///     &[2, 4, 64],
+/// )?;
+/// let (wq, scales, biases) = quantize(&w, 64, 4)?;
+/// let x = Array::full(&[3, 1, 64], 1.0f32)?; // three tokens
+/// let experts = Array::from_slice(&[1u32, 0, 1], &[3])?;
+/// let y = gather_qmm(&x, &wq, &scales, &biases, None, Some(&experts), true, 64, 4, false)?;
+/// assert_eq!(y.shape(), &[3, 1, 4]);
+/// assert_eq!(y.to_vec::<f32>()?[..5], [128.0, 128.0, 128.0, 128.0, 64.0]);
+/// # Ok(())
+/// # }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn gather_qmm(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    biases: &Array,
+    lhs_indices: Option<&Array>,
+    rhs_indices: Option<&Array>,
+    transpose: bool,
+    group_size: usize,
+    bits: u32,
+    sorted_indices: bool,
+) -> Result<Array> {
+    check_inputs(&[x, w, scales, biases])?;
+    let bits = check_params("gather_qmm", group_size, bits)?;
+    let invalid = |msg: String| Err(Error::InvalidArgument(format!("gather_qmm: {msg}")));
+    let dtype = promote_types(promote_types(x.dtype(), scales.dtype()), biases.dtype());
+    if dtype.category() != Category::Float || dtype.size() > 4 {
+        return Err(Error::UnsupportedDType {
+            op: "gather_qmm",
+            dtype,
+        });
+    }
+    if x.ndim() < 2 || w.ndim() < 2 || scales.shape() != biases.shape() {
+        return invalid(format!(
+            "x must be [..., M, K] and w [..., N, K'], got {:?} and {:?}",
+            x.shape(),
+            w.shape()
+        ));
+    }
+    let (x, scales, biases) = (
+        astype(x, dtype)?,
+        astype(scales, dtype)?,
+        astype(biases, dtype)?,
+    );
+    // Default indices: every batch of the operand, in order.
+    let indices = |a: &Array, given: Option<&Array>| -> Result<Array> {
+        let batch = &a.shape()[..a.ndim() - 2];
+        match given {
+            Some(i)
+                if i.dtype().category() == Category::Float || i.dtype() == crate::DType::Bool =>
+            {
+                Err(Error::InvalidArgument(
+                    "gather_qmm: indices must be integers".into(),
+                ))
+            }
+            Some(i) => astype(i, crate::DType::U32),
+            None => {
+                let n: usize = batch.iter().product();
+                let all = crate::arange(0.0, n as f64, 1.0, crate::DType::U32)?;
+                all.reshape(&batch.iter().map(|&d| d as isize).collect::<Vec<_>>())
+            }
+        }
+    };
+    let (lhs, rhs) = (indices(&x, lhs_indices)?, indices(w, rhs_indices)?);
+    let batch = view::broadcast_shapes("gather_qmm", lhs.shape(), rhs.shape())?;
+    let (lhs, rhs) = (broadcast_to(&lhs, &batch)?, broadcast_to(&rhs, &batch)?);
+    let mut inputs = vec![x.clone(), w.clone(), scales, biases, lhs, rhs.clone()];
+    let m = x.shape()[x.ndim() - 2];
+    let experts: usize = w.shape()[..w.ndim() - 2].iter().product();
+    // Rows sorted by expert, one per output batch: each expert's rows start at the number of
+    // indices below it (MLX's grouped kernel walks every expert's weights once).
+    if sorted_indices && lhs_indices.is_none() && m == 1 && x.ndim() == 3 && batch.len() == 1 {
+        // Rows per expert (scatter-added ones), then their exclusive running sum.
+        let ones = crate::ones(rhs.shape(), crate::DType::I32)?;
+        let zeros = crate::zeros(&[experts], crate::DType::I32)?;
+        let counts = crate::scatter_add_along_axis(&zeros, &rhs, &ones, 0)?;
+        inputs.push(crate::cumsum(&counts, Some(0), false, false)?);
+    }
+    let op = crate::fast::FastOp::GatherQmm {
+        group_size,
+        bits,
+        transpose,
+    };
+    let kernel = transpose && crate::fast::on_gpu(dtype, x.size());
+    let out = if kernel {
+        Array::from_op(Primitive::Fast(op), inputs)?.swap_remove(0)
+    } else {
+        op.fallback(&inputs)?.swap_remove(0)
+    };
+    Ok(out)
+}

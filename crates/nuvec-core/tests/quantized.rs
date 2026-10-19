@@ -478,3 +478,158 @@ mod gpu {
         empty.eval().unwrap();
     }
 }
+
+/// `gather_qmm` against per-batch `quantized_matmul` of the selected batches (CPU), with
+/// explicit and default indices, broadcasting, and gradients and batching for `x`.
+#[test]
+fn gather_qmm_selects_batches() {
+    let mut rng = Rng::new(0x71);
+    let (e, n, k) = (3, 8, 64);
+    let w = random(&mut rng, &[e, n, k], DType::F32);
+    let (wq, s, b) = quantize(&w, 32, 4).unwrap();
+    let x = random(&mut rng, &[4, 2, k], DType::F32);
+    let lhs = Array::from_slice(&[3u32, 0, 2], &[3]).unwrap();
+    let rhs = Array::from_slice(&[1u32, 2, 0], &[3]).unwrap();
+    let got = gather_qmm(&x, &wq, &s, &b, Some(&lhs), Some(&rhs), true, 32, 4, false).unwrap();
+    assert_eq!(got.shape(), &[3, 2, n]);
+    let pick = |a: &Array, i: u32| take(a, &Array::scalar(i), Some(0)).unwrap();
+    for (j, (&l, &r)) in [3u32, 0, 2].iter().zip(&[1u32, 2, 0]).enumerate() {
+        let want = quantized_matmul(
+            &pick(&x, l),
+            &pick(&wq, r),
+            &pick(&s, r),
+            &pick(&b, r),
+            true,
+            32,
+            4,
+        )
+        .unwrap();
+        assert_close(&format!("batch {j}"), &pick(&got, j as u32), &want, 1e-6);
+    }
+    // Default indices: every batch in order (x's batch broadcast against the weights').
+    let x1 = random(&mut rng, &[1, 1, k], DType::F32);
+    let all = gather_qmm(&x1, &wq, &s, &b, None, None, true, 32, 4, false).unwrap();
+    assert_eq!(all.shape(), &[3, 1, n]);
+    // Gradient with respect to x: a row used by two batches gets both contributions.
+    let rows = Array::from_slice(&[1u32, 1], &[2]).unwrap();
+    let experts = Array::from_slice(&[0u32, 1], &[2]).unwrap();
+    let x2 = random(&mut rng, &[2, 1, k], DType::F32);
+    let f = |xs: &[Array]| {
+        let y = gather_qmm(
+            &xs[0],
+            &wq,
+            &s,
+            &b,
+            Some(&rows),
+            Some(&experts),
+            true,
+            32,
+            4,
+            false,
+        )?;
+        Ok(vec![y.reshape(&[-1])?])
+    };
+    let ones = Array::full(&[2 * n], 1.0f32).unwrap();
+    let (_, grads) = vjp(f, std::slice::from_ref(&x2), std::slice::from_ref(&ones)).unwrap();
+    let column_sums = |i: u32| {
+        let w = dequantize(&pick(&wq, i), &pick(&s, i), &pick(&b, i), 32, 4).unwrap();
+        sum(&w, &[0], false).unwrap()
+    };
+    let row = |i: u32| pick(&grads[0], i).reshape(&[-1]).unwrap();
+    assert_close("dx row 0", &row(0), &zeros(&[k], DType::F32).unwrap(), 1e-6);
+    let want = add(column_sums(0), column_sums(1)).unwrap();
+    assert_close("dx row 1", &row(1), &want, 1e-5);
+    // Batching over a leading axis of x matches a loop.
+    let xs = random(&mut rng, &[2, 4, 2, k], DType::F32);
+    let f = |a: &[Array]| {
+        Ok(vec![gather_qmm(
+            &a[0],
+            &wq,
+            &s,
+            &b,
+            Some(&lhs),
+            Some(&rhs),
+            true,
+            32,
+            4,
+            false,
+        )?])
+    };
+    let batched = vmap(f, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+    for i in 0..2u32 {
+        let one = f(&[pick(&xs, i)]).unwrap();
+        assert_close(&format!("vmap {i}"), &pick(&batched[0], i), &one[0], 1e-6);
+    }
+    // Errors: float indices, mismatched index shapes.
+    let bad = Array::from_slice(&[0.0f32], &[1]).unwrap();
+    assert!(gather_qmm(&x, &wq, &s, &b, Some(&bad), None, true, 32, 4, false).is_err());
+    let two = Array::from_slice(&[0u32, 1], &[2]).unwrap();
+    assert!(gather_qmm(&x, &wq, &s, &b, Some(&lhs), Some(&two), true, 32, 4, false).is_err());
+}
+
+#[cfg(target_os = "macos")]
+mod gather_gpu {
+    use super::*;
+
+    fn on<R>(device: Device, f: impl FnOnce() -> R) -> R {
+        let previous = default_stream();
+        set_default_stream(Stream::default_for(device));
+        let r = f();
+        set_default_stream(previous);
+        r
+    }
+
+    /// Every gather kernel (matrix-vector, tiled, grouped over sorted rows) against the CPU.
+    #[test]
+    fn gather_qmm_kernels_match_the_cpu() {
+        if cfg!(miri) || on(Device::gpu(0), || (Array::scalar(1.0f32) * 2.0).eval()).is_err() {
+            return;
+        }
+        let mut rng = Rng::new(0x72);
+        // (experts, N, K, rows M per batch, batches, sorted)
+        let cases: &[(usize, usize, usize, usize, usize, bool)] = &[
+            (8, 64, 512, 1, 6, false),  // qmv_fast
+            (8, 36, 192, 1, 5, false),  // qmv (N not a multiple of 8, K not of 512)
+            (4, 64, 256, 40, 3, false), // qmm_t
+            (4, 40, 128, 33, 2, false), // qmm_t, unaligned
+            (8, 64, 256, 1, 100, true), // grouped, sorted rows
+            (16, 48, 192, 1, 70, true), // grouped, unaligned N
+        ];
+        for &(e, n, k, m, batches, sorted) in cases {
+            for (dtype, gs, bits) in [
+                (DType::F32, 32, 4),
+                (DType::BF16, 64, 4),
+                (DType::F16, 32, 8),
+            ] {
+                let w = random(&mut rng, &[e, n, k], dtype);
+                let (wq, s, b) = quantize(&w, gs, bits).unwrap();
+                let x = random(&mut rng, &[batches, m, k], dtype);
+                let mut ids: Vec<u32> = (0..batches).map(|i| ((i * 7 + 3) % e) as u32).collect();
+                if sorted {
+                    ids.sort_unstable();
+                }
+                let rhs = Array::from_slice(&ids, &[batches]).unwrap();
+                let run = || {
+                    gather_qmm(&x, &wq, &s, &b, None, Some(&rhs), true, gs, bits, sorted).unwrap()
+                };
+                let (gpu, cpu) = (on(Device::gpu(0), run), on(Device::cpu(), run));
+                let tol = match dtype {
+                    DType::F32 => 1e-5,
+                    _ => 1e-2,
+                };
+                let name = format!("{dtype} gs{gs} b{bits} {:?}", (e, n, k, m, batches, sorted));
+                assert_close(&name, &gpu, &cpu, tol);
+            }
+        }
+        // Explicit row indices with a broadcast batch shape.
+        let w = random(&mut rng, &[4, 32, 128], DType::F32);
+        let (wq, s, b) = quantize(&w, 32, 4).unwrap();
+        let x = random(&mut rng, &[3, 1, 128], DType::F32);
+        let lhs = Array::from_slice(&[2u32, 0, 1, 1], &[2, 2]).unwrap();
+        let rhs = Array::from_slice(&[3u32, 1], &[1, 2]).unwrap();
+        let run =
+            || gather_qmm(&x, &wq, &s, &b, Some(&lhs), Some(&rhs), true, 32, 4, false).unwrap();
+        let (gpu, cpu) = (on(Device::gpu(0), run), on(Device::cpu(), run));
+        assert_close("broadcast indices", &gpu, &cpu, 1e-5);
+    }
+}

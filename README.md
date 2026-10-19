@@ -14,10 +14,12 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > Metal kernels), matmul and composable transforms (`grad`, `value_and_grad`, `vjp`,
 > `jvp`, `vmap`, `custom_function`, `checkpoint`; also through complex numbers), `compile`
 > (traced once per input signature, simplified, element-wise chains fused into generated
-> Metal kernels), random numbers
+> Metal kernels), custom Metal kernels from source (`fast::MetalKernel`, as MLX's
+> `metal_kernel`), random numbers (uniform, normal, Gumbel, categorical, integers, Bernoulli)
 > bit-identical to MLX's, MLX's GEMM and GEMV kernels (ported, with split-K and a fused
 > `addmm`), MLX-compatible affine quantization (`quantize`, `dequantize` and
-> `quantized_matmul` with MLX's packing and kernels, 1–8 bits), MLX's fused kernels
+> `quantized_matmul` with MLX's packing and kernels, 1–8 bits, and `gather_qmm` for
+> mixture-of-experts layers), MLX's fused kernels
 > (`fast::rms_norm`, `fast::layer_norm`, `fast::rope`, `fast::cross_entropy`,
 > `fast::scaled_dot_product_attention`, last-axis `softmax` and `logsumexp`; mlx-lm's
 > Gated DeltaNet kernels as `fast::gated_delta`), checkpoint I/O
@@ -26,7 +28,8 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > `QuantizedLinear`, `Embedding`, `RmsNorm`, `LayerNorm`, `Rope`, LoRA, activations,
 > cross-entropy, SGD, Adam, AdamW, Lion and Muon with learning-rate schedules and gradient
 > clipping; `just mnist` trains MLX's MNIST example model), and an LLM runtime (`nuvec-lm`:
-> Llama, Mistral, Qwen 2, Qwen 3 and Qwen 3.5 (hybrid Gated DeltaNet and attention) models
+> Llama, Mistral, Qwen 2, Qwen 3 and Qwen 3.5 (hybrid Gated DeltaNet and attention, dense
+> or mixture-of-experts) models
 > from Hugging Face or MLX checkpoints, including
 > MLX's 4-bit ones, a byte-level BPE tokenizer read from `tokenizer.json`, a KV cache and
 > mlx-lm's sampler (greedy, temperature, top-p, min-p, top-k); `cargo run --release -p nuvec-lm --example generate`). Arrays are

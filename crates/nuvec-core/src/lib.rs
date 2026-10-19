@@ -57,6 +57,7 @@ mod file;
 mod fused;
 mod gpu;
 mod indexing;
+mod kernel;
 mod kernels;
 mod ops;
 mod primitive;
@@ -81,14 +82,14 @@ pub use indexing::{
     take_along_axis,
 };
 pub use ops::{
-    abs, add, addmm, all, any, arange, argmax, argmin, astype, broadcast_to, conjugate, cos,
-    divide, equal, erfinv, exp, expand_dims, greater, greater_equal, less, less_equal, log,
+    abs, add, addmm, all, any, arange, argmax, argmin, astype, broadcast_to, conjugate, contiguous,
+    cos, divide, equal, erfinv, exp, expand_dims, greater, greater_equal, less, less_equal, log,
     logsumexp, matmul, max, maximum, mean, min, minimum, multiply, negative, not_equal, ones, prod,
-    reshape, sigmoid, sign, sin, slice, slice_update, softmax, sqrt, squeeze, stop_gradient,
-    subtract, sum, tanh, transpose, where_, zeros,
+    repeat, reshape, sigmoid, sign, sin, slice, slice_update, softmax, sqrt, squeeze,
+    stop_gradient, subtract, sum, tanh, transpose, where_, zeros,
 };
 pub use primitive::{ArgReduceOp, BinaryOp, Primitive, ReduceOp, ScanOp, ScatterReduce, UnaryOp};
-pub use quantized::{dequantize, quantize, quantized_matmul};
+pub use quantized::{dequantize, gather_qmm, quantize, quantized_matmul};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
 pub use shape::Flags;
 pub use sorting::{

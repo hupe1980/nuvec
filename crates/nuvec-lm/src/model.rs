@@ -6,14 +6,15 @@ use std::sync::LazyLock;
 
 use nuvec::fast::{self, AttentionMask};
 use nuvec::{
-    Array, DType, Result, SliceArg, abs, add, broadcast_to, concatenate, exp, log, maximum,
-    multiply, negative, sigmoid, slice, slice_update, split_at, transpose,
+    Array, DType, Result, SliceArg, abs, add, argpartition, argsort, broadcast_to, concatenate,
+    exp, expand_dims, gather_qmm, log, matmul, maximum, multiply, negative, sigmoid, slice,
+    slice_update, softmax, split_at, squeeze, take, take_along_axis, transpose,
 };
 use nuvec_nn::{
     Embedding, Linear, Module, Parameters, QuantizedEmbedding, QuantizedLinear, RmsNorm, silu,
 };
 
-use crate::config::{Config, LayerType, LinearAttention, RopeScaling};
+use crate::config::{Config, LayerType, LinearAttention, MixtureOfExperts, RopeScaling};
 
 /// A zero-cost stand-in of `shape` (a broadcast scalar), replaced when weights load.
 fn placeholder(shape: &[usize], dtype: DType) -> Result<Array> {
@@ -22,7 +23,6 @@ fn placeholder(shape: &[usize], dtype: DType) -> Result<Array> {
 
 /// `silu(gate) · x` in one kernel, as mlx-lm's compiled `swiglu`.
 fn swiglu(gate: &Array, x: &Array) -> Result<Array> {
-    type Compiled = Box<dyn Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync>;
     static SWIGLU: LazyLock<Compiled> = LazyLock::new(|| {
         Box::new(nuvec::compile(|a: &[Array]| {
             Ok(vec![multiply(silu(&a[0])?, &a[1])?])
@@ -123,6 +123,27 @@ impl Builder<'_> {
                 weight: placeholder(&[output, input], DType::F32)?,
                 bias,
             }),
+        })
+    }
+
+    fn switch(
+        &self,
+        path: &str,
+        input: usize,
+        output: usize,
+        experts: usize,
+    ) -> Result<SwitchProjection> {
+        Ok(match (self.quantized)(path) {
+            Some((group_size, bits)) => SwitchProjection::Quantized {
+                weight: placeholder(&[experts, output, input * bits as usize / 32], DType::U32)?,
+                scales: placeholder(&[experts, output, input / group_size], DType::F32)?,
+                biases: placeholder(&[experts, output, input / group_size], DType::F32)?,
+                group_size,
+                bits,
+            },
+            None => SwitchProjection::Dense {
+                weight: placeholder(&[experts, output, input], DType::F32)?,
+            },
         })
     }
 
@@ -417,11 +438,74 @@ fn softplus(x: &Array) -> Result<Array> {
     y.astype(x.dtype())
 }
 
+/// A compiled function of arrays (traced once per input signature, element-wise chains
+/// fused), as mlx-lm compiles its activations.
+type Compiled = Box<dyn Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync>;
+
 /// The gated RMS normalisation of Gated DeltaNet's output (mlx-lm's
-/// `Qwen3NextRMSNormGated` with `precise_swiglu`): `silu(z) · rms_norm(x)`, in float32.
+/// `Qwen3NextRMSNormGated` with its compiled `precise_swiglu`): `silu(z) · rms_norm(x)`, in
+/// float32.
 fn gated_norm(x: &Array, z: &Array, norm: &RmsNorm) -> Result<Array> {
-    let n = norm.forward(x)?.astype(DType::F32)?;
-    multiply(silu(&z.astype(DType::F32)?)?, &n)?.astype(x.dtype())
+    static GATE: LazyLock<Compiled> = LazyLock::new(|| {
+        Box::new(nuvec::compile(|a: &[Array]| {
+            let (n, z) = (a[0].astype(DType::F32)?, a[1].astype(DType::F32)?);
+            Ok(vec![multiply(silu(&z)?, &n)?.astype(a[0].dtype())?])
+        }))
+    });
+    Ok(GATE(&[norm.forward(x)?, z.clone()])?.swap_remove(0))
+}
+
+/// Gated DeltaNet's per-head decay, `exp(−exp(A_log) · softplus(a + dt_bias))` in float32
+/// (mlx-lm's compiled `compute_g`).
+fn decay(a: &Array, dt_bias: &Array, a_log: &Array) -> Result<Array> {
+    static DECAY: LazyLock<Compiled> = LazyLock::new(|| {
+        Box::new(nuvec::compile(|x: &[Array]| {
+            let rate = exp(&x[2].astype(DType::F32)?)?;
+            let g = exp(&multiply(negative(&rate)?, softplus(&add(&x[0], &x[1])?)?)?)?;
+            Ok(vec![g])
+        }))
+    });
+    Ok(DECAY(&[a.clone(), dt_bias.clone(), a_log.clone()])?.swap_remove(0))
+}
+
+/// The causal depthwise convolution of `input` (`[B, L + K − 1, C]`) with `weight`
+/// (`[C, K, 1]`), then `silu`: summed in float32 and rounded once, as MLX's convolution
+/// kernel, in one fused kernel.
+fn causal_conv_silu(input: &Array, weight: &Array) -> Result<Array> {
+    static CONV: LazyLock<Compiled> = LazyLock::new(|| {
+        Box::new(nuvec::compile(|x: &[Array]| {
+            let (input, w) = (&x[0], &x[1]);
+            let (channels, kernel) = (w.shape()[0], w.shape()[1]);
+            let l = input.shape()[1] + 1 - kernel;
+            let w = w.reshape(&[channels as isize, kernel as isize])?;
+            let mut acc: Option<Array> = None;
+            for j in 0..kernel {
+                let j = j as isize;
+                let rows = slice(
+                    input,
+                    &[
+                        SliceArg::full(),
+                        SliceArg::new(Some(j), Some(j + l as isize), 1),
+                        SliceArg::full(),
+                    ],
+                )?;
+                let wj = slice(
+                    &w,
+                    &[SliceArg::full(), SliceArg::new(Some(j), Some(j + 1), 1)],
+                )?
+                .reshape(&[channels as isize])?
+                .astype(DType::F32)?; // after the slice, so the cast fuses
+                let term = multiply(&rows.astype(DType::F32)?, &wj)?;
+                acc = Some(match acc {
+                    Some(sum) => add(&sum, &term)?,
+                    None => term,
+                });
+            }
+            let conv = acc.expect("kernel is at least 1").astype(input.dtype())?;
+            Ok(vec![silu(&conv)?])
+        }))
+    });
+    Ok(CONV(&[input.clone(), weight.clone()])?.swap_remove(0))
 }
 
 /// A Gated DeltaNet layer (mlx-lm's `qwen3_5.GatedDeltaNet`): a causal depthwise
@@ -497,28 +581,7 @@ impl GatedDeltaNet {
         let kept = rows(l, kernel - 1)?;
         // After a prompt, a copy: the view would keep the whole input alive.
         cache.conv = Some(if l > 1 { multiply(&kept, 1.0)? } else { kept });
-        // Accumulated in float32 and rounded once, as MLX's convolution kernels.
-        let w = self
-            .conv1d
-            .reshape(&[channels as isize, kernel as isize])?
-            .astype(DType::F32)?;
-        let mut conv = None;
-        for j in 0..kernel {
-            let wj = slice(
-                &w,
-                &[
-                    SliceArg::full(),
-                    SliceArg::new(Some(j as isize), Some(j as isize + 1), 1),
-                ],
-            )?
-            .reshape(&[channels as isize])?;
-            let term = multiply(&rows(j, l)?, &wj)?;
-            conv = Some(match conv {
-                Some(acc) => add(&acc, &term)?,
-                None => term,
-            });
-        }
-        let conv = silu(&conv.expect("kernel is at least 1").astype(input.dtype())?)?;
+        let conv = causal_conv_silu(&input, &self.conv1d)?;
         let mut parts = split_at(&conv, &[hk * dk, 2 * hk * dk], -1)?;
         let shaped = |a: Array, h: usize, d: usize| {
             a.reshape(&[b as isize, l as isize, h as isize, d as isize])
@@ -532,11 +595,7 @@ impl GatedDeltaNet {
         let q = multiply(&nuvec::fast::rms_norm(&q, None, eps)?, f64::from(inv * inv))?;
         let k = multiply(&nuvec::fast::rms_norm(&k, None, eps)?, f64::from(inv))?;
         // Per-head decay and write strength (mlx-lm's `compute_g`, in float32).
-        let decay = multiply(
-            negative(&exp(&self.a_log.astype(DType::F32)?)?)?,
-            softplus(&add(&a, &self.dt_bias)?)?,
-        )?;
-        let g = exp(&decay)?;
+        let g = decay(&a, &self.dt_bias, &self.a_log)?;
         let beta = sigmoid(&beta)?;
         let state = match cache.recurrent.take() {
             Some(s) => s,
@@ -580,6 +639,22 @@ struct Mlp {
     down_proj: Projection,
 }
 
+impl Mlp {
+    fn new(b: &Builder<'_>, path: &str, input: usize, hidden: usize, bias: bool) -> Result<Self> {
+        let p = |name: &str| format!("{path}.{name}");
+        Ok(Self {
+            gate_proj: b.projection(&p("gate_proj"), input, hidden, bias)?,
+            up_proj: b.projection(&p("up_proj"), input, hidden, bias)?,
+            down_proj: b.projection(&p("down_proj"), hidden, input, bias)?,
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let gated = swiglu(&self.gate_proj.forward(x)?, &self.up_proj.forward(x)?)?;
+        self.down_proj.forward(&gated)
+    }
+}
+
 impl Module for Mlp {
     fn visit(&mut self, p: &mut Parameters<'_>) {
         p.module("gate_proj", &mut self.gate_proj);
@@ -588,10 +663,223 @@ impl Module for Mlp {
     }
 }
 
+/// One linear layer per expert, `[experts, out, in]`, applied to each row with its own
+/// expert (mlx-lm's `SwitchLinear` and `QuantizedSwitchLinear`).
+#[derive(Debug, Clone)]
+enum SwitchProjection {
+    /// Full precision: the chosen experts' weights are gathered.
+    Dense { weight: Array },
+    /// MLX's affine quantization: [`gather_qmm`].
+    Quantized {
+        weight: Array,
+        scales: Array,
+        biases: Array,
+        group_size: usize,
+        bits: u32,
+    },
+}
+
+impl SwitchProjection {
+    /// `x` (`[..., 1, in]`) through expert `indices` (broadcast with `x`'s batch); rows
+    /// sorted by expert if `sorted`.
+    fn forward(&self, x: &Array, indices: &Array, sorted: bool) -> Result<Array> {
+        match self {
+            Self::Dense { weight } => {
+                let w = take(weight, indices, Some(0))?;
+                let nd = w.ndim();
+                let mut axes: Vec<usize> = (0..nd).collect();
+                axes.swap(nd - 1, nd - 2);
+                matmul(x, &transpose(&w, &axes)?)
+            }
+            Self::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => gather_qmm(
+                x,
+                weight,
+                scales,
+                biases,
+                None,
+                Some(indices),
+                true,
+                *group_size,
+                *bits,
+                sorted,
+            ),
+        }
+    }
+}
+
+impl Module for SwitchProjection {
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        match self {
+            Self::Dense { weight } => p.param("weight", weight),
+            Self::Quantized {
+                weight,
+                scales,
+                biases,
+                ..
+            } => {
+                p.param("weight", weight);
+                p.param("scales", scales);
+                p.param("biases", biases);
+            }
+        }
+    }
+}
+
+/// The experts' SwiGLU MLPs (mlx-lm's `SwitchGLU`).
+#[derive(Debug, Clone)]
+struct SwitchGlu {
+    gate_proj: SwitchProjection,
+    up_proj: SwitchProjection,
+    down_proj: SwitchProjection,
+}
+
+impl SwitchGlu {
+    /// `x` (`[B, L, D]`) through each token's experts `indices` (`[B, L, k]`):
+    /// `[B, L, k, D]`. With many rows, they are sorted by expert first, so that each
+    /// expert's weights are read once (mlx-lm's `_gather_sort`).
+    fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+        let (b, l, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        let k = indices.shape()[2];
+        let through = |x: &Array, idx: &Array, sorted: bool| -> Result<Array> {
+            let up = self.up_proj.forward(x, idx, sorted)?;
+            let gate = self.gate_proj.forward(x, idx, sorted)?;
+            self.down_proj.forward(&swiglu(&gate, &up)?, idx, sorted)
+        };
+        if indices.size() < 64 {
+            let x = expand_dims(&expand_dims(x, -2)?, -2)?; // [B, L, 1, 1, D]
+            return squeeze(&through(&x, indices, false)?, &[-2]);
+        }
+        let flat = indices.reshape(&[-1])?;
+        let order = argsort(&flat, Some(0))?;
+        let restore = argsort(&order, Some(0))?;
+        // Each pair's token: pair `t·k + j` belongs to token `t`.
+        let tokens = broadcast_to(
+            &nuvec::arange(0.0, (b * l) as f64, 1.0, DType::U32)?.reshape(&[-1, 1])?,
+            &[b * l, k],
+        )?
+        .reshape(&[-1])?;
+        let rows = take(
+            &x.reshape(&[-1, 1, d as isize])?,
+            &take(&tokens, &order, Some(0))?,
+            Some(0),
+        )?;
+        let out = through(&rows, &take(&flat, &order, Some(0))?, true)?;
+        take(&out, &restore, Some(0))?.reshape(&[b as isize, l as isize, k as isize, d as isize])
+    }
+}
+
+impl Module for SwitchGlu {
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        p.module("gate_proj", &mut self.gate_proj);
+        p.module("up_proj", &mut self.up_proj);
+        p.module("down_proj", &mut self.down_proj);
+    }
+}
+
+/// A mixture-of-experts MLP (mlx-lm's `Qwen3NextSparseMoeBlock`): a softmax router picks
+/// each token's best experts, whose outputs are summed with the (renormalised) router
+/// weights, plus a shared expert gated by a sigmoid.
+#[derive(Debug, Clone)]
+struct MoeMlp {
+    gate: Projection,
+    switch_mlp: SwitchGlu,
+    shared_expert: Mlp,
+    shared_expert_gate: Projection,
+    experts_per_token: usize,
+    norm_topk_prob: bool,
+}
+
+impl MoeMlp {
+    fn new(b: &Builder<'_>, path: &str, d: usize, moe: MixtureOfExperts) -> Result<Self> {
+        let p = |name: &str| format!("{path}.{name}");
+        let (e, i) = (moe.experts, moe.intermediate_size);
+        Ok(Self {
+            gate: b.projection(&p("gate"), d, e, false)?,
+            switch_mlp: SwitchGlu {
+                gate_proj: b.switch(&p("switch_mlp.gate_proj"), d, i, e)?,
+                up_proj: b.switch(&p("switch_mlp.up_proj"), d, i, e)?,
+                down_proj: b.switch(&p("switch_mlp.down_proj"), i, d, e)?,
+            },
+            shared_expert: Mlp::new(
+                b,
+                &p("shared_expert"),
+                d,
+                moe.shared_intermediate_size,
+                false,
+            )?,
+            shared_expert_gate: b.projection(&p("shared_expert_gate"), d, 1, false)?,
+            experts_per_token: moe.experts_per_token,
+            norm_topk_prob: moe.norm_topk_prob,
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let k = self.experts_per_token as isize;
+        // The best `k` experts by router logit (as by probability: softmax is monotonic) and
+        // their weights: the probabilities, or renormalised over the chosen experts, the
+        // softmax of their logits (`p_i / Σ_top p_j` with `p = softmax(logits)`).
+        let logits = self.gate.forward(x)?;
+        let order = argpartition(&logits, -k, Some(-1))?;
+        let e = order.shape()[2] as isize;
+        let top = slice(
+            &order,
+            &[
+                SliceArg::full(),
+                SliceArg::full(),
+                SliceArg::new(Some(e - k), None, 1),
+            ],
+        )?;
+        let scores = match self.norm_topk_prob {
+            true => softmax(&take_along_axis(&logits, &top, -1)?, &[-1])?,
+            false => take_along_axis(&softmax(&logits, &[-1])?, &top, -1)?,
+        };
+        // The weighted sum of the experts' outputs as one product (`[1, k] · [k, D]` per
+        // token), accumulated in float32.
+        let experts = self.switch_mlp.forward(x, &top)?;
+        let y = squeeze(&matmul(&expand_dims(&scores, -2)?, &experts)?, &[-2])?;
+        let shared = multiply(
+            sigmoid(&self.shared_expert_gate.forward(x)?)?,
+            self.shared_expert.forward(x)?,
+        )?;
+        add(&y, &shared)
+    }
+}
+
+impl Module for MoeMlp {
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        p.module("gate", &mut self.gate);
+        p.module("switch_mlp", &mut self.switch_mlp);
+        p.module("shared_expert", &mut self.shared_expert);
+        p.module("shared_expert_gate", &mut self.shared_expert_gate);
+    }
+}
+
+/// A layer's MLP.
+#[derive(Debug, Clone)]
+enum BlockMlp {
+    Dense(Box<Mlp>),
+    Moe(Box<MoeMlp>),
+}
+
+impl Module for BlockMlp {
+    fn visit(&mut self, p: &mut Parameters<'_>) {
+        match self {
+            Self::Dense(m) => m.visit(p),
+            Self::Moe(m) => m.visit(p),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Block {
     mixer: Mixer,
-    mlp: Mlp,
+    mlp: BlockMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -605,9 +893,11 @@ impl Block {
         };
         let h = add(x, &mixed)?;
         let n = self.post_attention_layernorm.forward(&h)?;
-        let m = &self.mlp;
-        let gated = swiglu(&m.gate_proj.forward(&n)?, &m.up_proj.forward(&n)?)?;
-        add(&h, m.down_proj.forward(&gated)?)
+        let mlp = match &self.mlp {
+            BlockMlp::Dense(m) => m.forward(&n)?,
+            BlockMlp::Moe(m) => m.forward(&n)?,
+        };
+        add(&h, &mlp)
     }
 }
 
@@ -668,25 +958,20 @@ impl Model {
                 };
                 Ok(Block {
                     mixer,
-                    mlp: Mlp {
-                        gate_proj: b.projection(
-                            &path("mlp.gate_proj"),
+                    mlp: match c.moe {
+                        Some(moe) => BlockMlp::Moe(Box::new(MoeMlp::new(
+                            &b,
+                            &path("mlp"),
+                            c.hidden_size,
+                            moe,
+                        )?)),
+                        None => BlockMlp::Dense(Box::new(Mlp::new(
+                            &b,
+                            &path("mlp"),
                             c.hidden_size,
                             c.intermediate_size,
                             c.mlp_bias,
-                        )?,
-                        up_proj: b.projection(
-                            &path("mlp.up_proj"),
-                            c.hidden_size,
-                            c.intermediate_size,
-                            c.mlp_bias,
-                        )?,
-                        down_proj: b.projection(
-                            &path("mlp.down_proj"),
-                            c.intermediate_size,
-                            c.hidden_size,
-                            c.mlp_bias,
-                        )?,
+                        )?)),
                     },
                     input_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps)?,
                     post_attention_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps)?,

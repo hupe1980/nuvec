@@ -2,7 +2,9 @@
 //! tensor names to their dtype, shape and byte range, then the tensors' bytes.
 //!
 //! Loading maps the file without a copy (see [`MappedFile`]): every tensor is a view of the
-//! mapped bytes, read from disk (or the page cache) when first used.
+//! mapped bytes, read from disk (or the page cache) when first used. Files whose tensors are
+//! not aligned to their element sizes (MLX writes headers without padding) are copied once,
+//! as a whole, and their tensors are views of the copy.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -74,7 +76,8 @@ fn usize_of(v: &Json, what: &str) -> Result<usize> {
 /// The reference implementation's limit on the header size.
 const MAX_HEADER: usize = 100_000_000;
 
-/// Loads a safetensors file. The tensors are views of the memory-mapped file.
+/// Loads a safetensors file. The tensors are views of the memory-mapped file (or of one
+/// copy of its data, if they are not aligned to their element sizes).
 ///
 /// Validation follows the reference implementation: a header of at most 100 MB, an
 /// optional (or `null`) `__metadata__` of strings, and tensors whose byte ranges, sorted
@@ -163,9 +166,19 @@ pub fn load_safetensors(path: impl AsRef<Path>) -> Result<SafeTensors> {
             "the tensors do not cover the data to the end of the file",
         ));
     }
+    // A data section not aligned for every tensor (MLX writes headers without padding) is
+    // copied once, as a whole: views of one aligned copy, without keeping the mapping
+    // alive besides per-tensor copies (which would hold the checkpoint twice).
+    let aligned = ranges
+        .iter()
+        .all(|(begin, _, _, dtype, _)| (start + begin).is_multiple_of(dtype.size()));
+    let (data, base) = match aligned {
+        true => (file, start),
+        false => (file.section(start, at)?, 0),
+    };
     for (begin, _, name, dtype, shape) in ranges {
         out.tensors
-            .insert(name, file.array(start + begin, dtype, &shape)?);
+            .insert(name, data.array(base + begin, dtype, &shape)?);
     }
     Ok(out)
 }

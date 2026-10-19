@@ -338,6 +338,20 @@ fn random_case(case: &Case) -> Result<Array> {
         "split" => random::split(key.as_ref().unwrap(), p("num").parse().unwrap()),
         "uniform" => random::uniform(f("low"), f("high"), &shape, dtype, key.as_ref()),
         "normal" => random::normal(&shape, dtype, opt("loc"), opt("scale"), key.as_ref()),
+        "gumbel" => random::gumbel(&shape, dtype, key.as_ref()),
+        "categorical" => random::categorical(
+            &to_array(&case.inputs[0]),
+            p("axis").parse().unwrap(),
+            key.as_ref(),
+        ),
+        "randint" => random::randint(
+            p("low").parse().unwrap(),
+            p("high").parse().unwrap(),
+            &shape,
+            dtype,
+            key.as_ref(),
+        ),
+        "bernoulli" => random::bernoulli(f("p"), &shape, key.as_ref()),
         other => panic!("unknown random function {other}"),
     }
 }
@@ -525,6 +539,12 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "slice" => slice(&xs[0], &slice_args(p("args"))),
         "broadcast_to" => broadcast_to(&xs[0], &usizes(p("shape"))),
         "expand_dims" => expand_dims(&xs[0], p("axis").parse().unwrap()),
+        "repeat" => {
+            let axis = (!p("axis").is_empty()).then(|| p("axis").parse().unwrap());
+            repeat(&xs[0], p("repeats").parse().unwrap(), axis)
+        }
+        "contiguous" if p("pre") == "t" => contiguous(&xs[0].t()?),
+        "contiguous" => contiguous(&xs[0]),
         "squeeze" => squeeze(&xs[0], &ints(p("axes"))),
         "sort" => sort(&xs[0], Some(p("axis").parse().unwrap())),
         "argsort" => argsort(&xs[0], Some(p("axis").parse().unwrap())),
@@ -605,7 +625,10 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
     match op {
         // Normal samples go through erfinv's logarithm, whose last bits differ between
         // implementations; bits and uniform samples are exact.
-        "random" if case.params["fn"] == "normal" => 8.0 * eps * e.abs().max(1.0),
+        // Logarithms (normal's erfinv, gumbel's −log(−log u)) differ in the last bits.
+        "random" if matches!(case.params["fn"].as_str(), "normal" | "gumbel") => {
+            8.0 * eps * e.abs().max(1.0)
+        }
         "erfinv" => 8.0 * eps * e.abs().max(f64::MIN_POSITIVE),
         "logsumexp" | "softmax" => 8.0 * eps * e.abs().max(1.0),
         // Statistics in float32, then rounded; kernels and fallbacks round at different

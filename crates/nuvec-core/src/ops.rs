@@ -888,6 +888,43 @@ impl Neg for Array {
     }
 }
 
+/// `a` with each element repeated `repeats` times along `axis` (of the flattened array
+/// without one), as MLX's `repeat`.
+///
+/// ```
+/// use nuvec_core::{Array, Result, repeat};
+///
+/// # fn main() -> Result<()> {
+/// let a = Array::from_slice(&[1i32, 2, 3, 4], &[2, 2])?;
+/// assert_eq!(repeat(&a, 2, Some(1))?.to_vec::<i32>()?, [1, 1, 2, 2, 3, 3, 4, 4]);
+/// assert_eq!(repeat(&a, 2, None)?.shape(), &[8]);
+/// # Ok(())
+/// # }
+/// ```
+pub fn repeat(a: &Array, repeats: usize, axis: Option<isize>) -> Result<Array> {
+    let (a, axis) = match axis {
+        Some(axis) => (a.clone(), view::normalize_axis(axis, a.ndim())?),
+        None => (reshape(a, &[-1])?, 0),
+    };
+    let mut wide: Vec<usize> = a.shape().to_vec();
+    wide.insert(axis + 1, repeats);
+    let mut out: Vec<isize> = a.shape().iter().map(|&d| d as isize).collect();
+    out[axis] *= repeats as isize;
+    reshape(
+        &broadcast_to(&expand_dims(&a, axis as isize + 1)?, &wide)?,
+        &out,
+    )
+}
+
+/// `a` in row-major memory: itself if it already is, else a copy (MLX's `contiguous`).
+pub fn contiguous(a: &Array) -> Result<Array> {
+    if a.flags().row_contiguous {
+        return Ok(a.clone());
+    }
+    let shape: Vec<isize> = a.shape().iter().map(|&d| d as isize).collect();
+    reshape(&reshape(a, &[-1])?, &shape)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

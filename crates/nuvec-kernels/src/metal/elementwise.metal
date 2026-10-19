@@ -3,7 +3,9 @@
 // Element-wise kernels: unary, binary (including comparisons), select, and strided copy.
 //
 // Variants: `_c` for contiguous operands (each operand is either laid out like the output or
-// a broadcast scalar, chosen by a flag), `_g` for any layout (shape plus signed strides).
+// a broadcast scalar, chosen by a flag), `_g` for any layout (shape plus signed strides), and
+// `_g3` for layouts of at most three (collapsed) dimensions on a 3-D grid, whose offsets need
+// no divisions (MLX's `_nd1` to `_nd3` kernels).
 // Every operand also takes an element offset, so views bind their buffer at offset 0.
 
 #include "common.h"
@@ -132,6 +134,64 @@ template <typename T>
     out[i] = take ? a[a_off + loc(i, shape, a_strides, ndim)] : b[b_off + loc(i, shape, b_strides, ndim)];
 }
 
+template <typename T, typename U, typename Op>
+[[kernel]] void unary_g3(
+    device const T* a [[buffer(0)]],
+    device U* out [[buffer(1)]],
+    constant long& a_off [[buffer(2)]],
+    constant int* shape [[buffer(3)]],
+    constant long* a_strides [[buffer(4)]],
+    constant int& ndim [[buffer(5)]],
+    uint3 p [[thread_position_in_grid]]) {
+    out[out3(p, shape)] = Op()(a[a_off + loc3(p, a_strides)]);
+}
+
+template <typename T, typename U, typename Op>
+[[kernel]] void binary_g3(
+    device const T* a [[buffer(0)]],
+    device const T* b [[buffer(1)]],
+    device U* out [[buffer(2)]],
+    constant long& a_off [[buffer(3)]],
+    constant long& b_off [[buffer(4)]],
+    constant int* shape [[buffer(5)]],
+    constant long* a_strides [[buffer(6)]],
+    constant long* b_strides [[buffer(7)]],
+    constant int& ndim [[buffer(8)]],
+    uint3 p [[thread_position_in_grid]]) {
+    out[out3(p, shape)] = Op()(a[a_off + loc3(p, a_strides)], b[b_off + loc3(p, b_strides)]);
+}
+
+template <typename T>
+[[kernel]] void copy_g3(
+    device const T* a [[buffer(0)]],
+    device T* out [[buffer(1)]],
+    constant long& a_off [[buffer(2)]],
+    constant int* shape [[buffer(3)]],
+    constant long* a_strides [[buffer(4)]],
+    constant int& ndim [[buffer(5)]],
+    uint3 p [[thread_position_in_grid]]) {
+    out[out3(p, shape)] = a[a_off + loc3(p, a_strides)];
+}
+
+template <typename T>
+[[kernel]] void select_g3(
+    device const uchar* c [[buffer(0)]],
+    device const T* a [[buffer(1)]],
+    device const T* b [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    constant long& c_off [[buffer(4)]],
+    constant long& a_off [[buffer(5)]],
+    constant long& b_off [[buffer(6)]],
+    constant int* shape [[buffer(7)]],
+    constant long* c_strides [[buffer(8)]],
+    constant long* a_strides [[buffer(9)]],
+    constant long* b_strides [[buffer(10)]],
+    constant int& ndim [[buffer(11)]],
+    uint3 p [[thread_position_in_grid]]) {
+    bool take = c[c_off + loc3(p, c_strides)] != 0;
+    out[out3(p, shape)] = take ? a[a_off + loc3(p, a_strides)] : b[b_off + loc3(p, b_strides)];
+}
+
 // Gathers any layout into a contiguous buffer (by element size).
 template <typename T>
 [[kernel]] void copy_g(
@@ -151,14 +211,19 @@ template <typename T>
     template [[host_name("nuvec_unary_" #op "_" #name "_c")]] [[kernel]] void unary_c<T, U, Op>( \
         device const T*, device U*, constant long&, constant uint&, uint);                    \
     template [[host_name("nuvec_unary_" #op "_" #name "_g")]] [[kernel]] void unary_g<T, U, Op>( \
-        device const T*, device U*, constant long&, constant int*, constant long*, constant int&, uint);
+        device const T*, device U*, constant long&, constant int*, constant long*, constant int&, uint); \
+    template [[host_name("nuvec_unary_" #op "_" #name "_g3")]] [[kernel]] void unary_g3<T, U, Op>( \
+        device const T*, device U*, constant long&, constant int*, constant long*, constant int&, uint3);
 
 #define NUVEC_BINARY(op, Op, name, T, U)                                                                \
     template [[host_name("nuvec_binary_" #op "_" #name "_c")]] [[kernel]] void binary_c<T, U, Op>(      \
         device const T*, device const T*, device U*, constant long&, constant long&, constant uint&, uint); \
     template [[host_name("nuvec_binary_" #op "_" #name "_g")]] [[kernel]] void binary_g<T, U, Op>(      \
         device const T*, device const T*, device U*, constant long&, constant long&, constant int*,     \
-        constant long*, constant long*, constant int&, uint);
+        constant long*, constant long*, constant int&, uint);                                          \
+    template [[host_name("nuvec_binary_" #op "_" #name "_g3")]] [[kernel]] void binary_g3<T, U, Op>(    \
+        device const T*, device const T*, device U*, constant long&, constant long&, constant int*,     \
+        constant long*, constant long*, constant int&, uint3);
 
 // Integers: arithmetic, ordering, negation, abs.
 #define NUVEC_INT_KERNELS(name, T)              \
@@ -234,8 +299,14 @@ NUVEC_BINARY(ne, Ne, complex64, complex64_t, nbool)
         device const uchar*, device const T*, device const T*, device T*, constant long&,           \
         constant long&, constant long&, constant int*, constant long*, constant long*,              \
         constant long*, constant int&, uint);                                                       \
+    template [[host_name("nuvec_select_" #bits "_g3")]] [[kernel]] void select_g3<T>(              \
+        device const uchar*, device const T*, device const T*, device T*, constant long&,           \
+        constant long&, constant long&, constant int*, constant long*, constant long*,              \
+        constant long*, constant int&, uint3);                                                      \
     template [[host_name("nuvec_copy_" #bits "_g")]] [[kernel]] void copy_g<T>(                    \
-        device const T*, device T*, constant long&, constant int*, constant long*, constant int&, uint);
+        device const T*, device T*, constant long&, constant int*, constant long*, constant int&, uint); \
+    template [[host_name("nuvec_copy_" #bits "_g3")]] [[kernel]] void copy_g3<T>(                  \
+        device const T*, device T*, constant long&, constant int*, constant long*, constant int&, uint3);
 
 NUVEC_MOVE(8, uchar)
 NUVEC_MOVE(16, ushort)

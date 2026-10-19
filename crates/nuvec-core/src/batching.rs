@@ -167,6 +167,7 @@ impl Primitive {
                 Ok((vec![crate::ops::addmm(&c, &a, &b, alpha, beta)?], 0))
             }
             Self::Fast(op) => op.vmap(inputs, axes),
+            Self::MetalKernel(_) => Err(crate::Error::InvalidArgument("metal_kernel: no derivative or batching rule (wrap the kernel in `custom_function`)".into())),
             Self::Compiled(fused) => fused.vmap(inputs, axes),
             Self::Quantize { group_size, bits } => {
                 let (wq, scales, biases) =

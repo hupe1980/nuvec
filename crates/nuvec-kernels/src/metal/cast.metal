@@ -30,11 +30,25 @@ template <typename S, typename D>
     out[i] = convert<S, D>(a[a_off + loc(i, shape, a_strides, ndim)]);
 }
 
+template <typename S, typename D>
+[[kernel]] void cast_g3(
+    device const S* a [[buffer(0)]],
+    device D* out [[buffer(1)]],
+    constant long& a_off [[buffer(2)]],
+    constant int* shape [[buffer(3)]],
+    constant long* a_strides [[buffer(4)]],
+    constant int& ndim [[buffer(5)]],
+    uint3 p [[thread_position_in_grid]]) {
+    out[out3(p, shape)] = convert<S, D>(a[a_off + loc3(p, a_strides)]);
+}
+
 #define NUVEC_CAST(sname, S, dname, D)                                                               \
     template [[host_name("nuvec_cast_" #sname "_" #dname "_c")]] [[kernel]] void cast_c<S, D>(       \
         device const S*, device D*, constant long&, constant uint&, uint);                          \
     template [[host_name("nuvec_cast_" #sname "_" #dname "_g")]] [[kernel]] void cast_g<S, D>(       \
-        device const S*, device D*, constant long&, constant int*, constant long*, constant int&, uint);
+        device const S*, device D*, constant long&, constant int*, constant long*, constant int&, uint); \
+    template [[host_name("nuvec_cast_" #sname "_" #dname "_g3")]] [[kernel]] void cast_g3<S, D>(     \
+        device const S*, device D*, constant long&, constant int*, constant long*, constant int&, uint3);
 
 #define NUVEC_CAST_FROM(sname, S)                    \
     NUVEC_CAST(sname, S, bool, nbool)                \

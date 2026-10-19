@@ -244,4 +244,14 @@ template <> struct To<complex64_t> {
 
 template <typename S, typename D> inline D convert(S x) { return To<D>::from(canon(x)); }
 
+// The element of a 3-D grid position in a layout of three dimensions (outermost first).
+inline long loc3(uint3 p, constant long* strides) {
+    return long(p.z) * strides[0] + long(p.y) * strides[1] + long(p.x) * strides[2];
+}
+
+// The contiguous output index of a 3-D grid position.
+inline long out3(uint3 p, constant int* shape) {
+    return (long(p.z) * shape[1] + p.y) * shape[2] + p.x;
+}
+
 } // namespace nuvec

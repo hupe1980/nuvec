@@ -181,6 +181,14 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
             scale = float(p["scale"]) if "scale" in p else None
             kw = {k: v for k, v in (("loc", loc), ("scale", scale)) if v is not None}
             return mx.random.normal(shape, dtype, key=key, **kw)
+        if fn == "gumbel":
+            return mx.random.gumbel(shape, dtype, key=key)
+        if fn == "categorical":
+            return mx.random.categorical(xs[0], axis=int(p["axis"]), key=key)
+        if fn == "randint":
+            return mx.random.randint(int(p["low"]), int(p["high"]), shape, dtype, key=key)
+        if fn == "bernoulli":
+            return mx.random.bernoulli(float(p["p"]), shape, key=key)
         raise ValueError(fn)
     if op == "where":
         return mx.where(xs[0], xs[1], xs[2])
@@ -195,6 +203,11 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         return xs[0][parse_slice(p["args"])]
     if op == "broadcast_to":
         return mx.broadcast_to(xs[0], nums(p["shape"]))
+    if op == "repeat":
+        axis = int(p["axis"]) if p.get("axis", "") != "" else None
+        return mx.repeat(xs[0], int(p["repeats"]), axis)
+    if op == "contiguous":
+        return mx.contiguous(xs[0].T if p.get("pre") == "t" else xs[0])
     if op == "expand_dims":
         return mx.expand_dims(xs[0], int(p["axis"]))
     if op == "squeeze":
@@ -435,6 +448,7 @@ derivative("vjp", "vjp-multiply-t", "multiply", [make("float32", (4, 3)), make("
 derivative("vjp", "vjp-where", "where", [make("bool", (2, 3)), make("float32", (2, 3)), make("float32", (3,))])
 derivative("vjp", "vjp-astype-f16", "astype", [make("float32", (5,))], dtype=CODE["float16"])
 derivative("vjp", "vjp-reshape", "reshape", [make("float32", (2, 3))], shape="3,2")
+derivative("vjp", "vjp-repeat", "repeat", [make("float32", (2, 3))], repeats=2, axis=0)
 derivative("vjp", "vjp-transpose", "transpose", [make("float32", (2, 3, 4))], axes="1,2,0")
 derivative("vjp", "vjp-slice", "slice", [make("float32", (5, 6))], args="1:4:1;::-2")
 derivative("vjp", "vjp-broadcast_to", "broadcast_to", [make("float32", (3, 1))], shape="2,3,4")
@@ -560,6 +574,19 @@ case("random-seq-first", "random", [], fn="uniform", seq=1, seed=0, shape="5", l
      dtype=CODE["float32"])
 case("random-seq-third", "random", [], fn="uniform", seq=1, seed=0, skip=2, shape="5", low=0.0,
      high=1.0, dtype=CODE["float32"])
+
+for dt in ["float32", "bfloat16"]:
+    case(f"random-gumbel-{dt}", "random", [], fn="gumbel", seed=5, shape="3,7", dtype=CODE[dt])
+case("random-categorical", "random", [make("float32", (4, 9))], fn="categorical", seed=9, axis=-1)
+case("random-categorical-axis0", "random", [make("bfloat16", (6, 3))], fn="categorical", seed=2,
+     axis=0)
+for dt in ["int32", "uint8", "int64"]:
+    case(f"random-randint-{dt}", "random", [], fn="randint", seed=4, shape="10", low=-3 if dt != "uint8" else 2,
+         high=17, dtype=CODE[dt])
+case("random-bernoulli", "random", [], fn="bernoulli", seed=6, shape="2,9", p=0.3)
+case("repeat-axis", "repeat", [make("float32", (2, 3))], repeats=3, axis=1)
+case("repeat-flat", "repeat", [make("int32", (2, 2))], repeats=2, axis="")
+case("contiguous-transposed", "contiguous", [make("float32", (3, 4))], pre="t")
 
 # addmm: alpha * (a @ b) + beta * c, with c broadcast (inputs: a, b, c).
 case("addmm-bias", "addmm", [make("float32", (5, 7)), make("float32", (7, 3)), make("float32", (3,))],

@@ -77,6 +77,22 @@ pub struct LinearAttention {
     pub conv_kernel: usize,
 }
 
+/// Mixture-of-experts MLPs (Qwen 3.5 MoE): each token's `experts_per_token` best experts
+/// (by a softmax router), weighted, plus a gated shared expert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MixtureOfExperts {
+    /// Experts per layer.
+    pub experts: usize,
+    /// Experts each token uses.
+    pub experts_per_token: usize,
+    /// Width of each expert's hidden layer.
+    pub intermediate_size: usize,
+    /// Width of the shared expert's hidden layer.
+    pub shared_intermediate_size: usize,
+    /// The chosen experts' weights are renormalised to sum to one.
+    pub norm_topk_prob: bool,
+}
+
 /// A decoder-only transformer of the Llama family (Llama, Mistral, Qwen 2, Qwen 3) or a
 /// hybrid of attention and Gated DeltaNet layers (Qwen 3.5).
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +141,8 @@ pub struct Config {
     /// Features of each head the rotary embedding turns (`partial_rotary_factor` of
     /// `head_dim`).
     pub rope_dims: usize,
+    /// Mixture-of-experts MLPs in every layer, for MoE models.
+    pub moe: Option<MixtureOfExperts>,
     /// The quantization, for MLX-quantized checkpoints.
     pub quantization: Option<Quantization>,
     /// Ids that end generation.
@@ -157,7 +175,7 @@ impl Config {
             .and_then(Json::as_str)
             .ok_or_else(|| invalid("`model_type` missing"))?;
         let model_type = match model_type {
-            "qwen3_5_text" => "qwen3_5",
+            "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => "qwen3_5",
             other => other,
         }
         .to_owned();
@@ -168,9 +186,19 @@ impl Config {
             other => return Err(invalid(format!("unsupported model type {other:?}"))),
         };
         let hybrid = model_type == "qwen3_5";
-        if hybrid && c.get("num_experts").and_then(Json::as_i64).unwrap_or(0) > 0 {
-            return Err(invalid("mixture-of-experts layers are not supported yet"));
-        }
+        let moe = match c.get("num_experts").and_then(Json::as_i64).unwrap_or(0) {
+            experts if hybrid && experts > 0 => Some(MixtureOfExperts {
+                experts: experts as usize,
+                experts_per_token: int("num_experts_per_tok")?,
+                intermediate_size: int("moe_intermediate_size")?,
+                shared_intermediate_size: int("shared_expert_intermediate_size")?,
+                norm_topk_prob: c
+                    .get("norm_topk_prob")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(true),
+            }),
+            _ => None,
+        };
         // Qwen 3.5 keeps its rotary settings in `rope_parameters`.
         let rope = c.get("rope_parameters").filter(|r| **r != Json::Null);
         let rope_float = |k: &str| {
@@ -237,7 +265,12 @@ impl Config {
         Ok(Self {
             hidden_size,
             num_hidden_layers: layers,
-            intermediate_size: int("intermediate_size")?,
+            intermediate_size: match moe {
+                // MoE configs have no dense MLP width.
+                Some(m) => int("intermediate_size").unwrap_or(m.intermediate_size),
+                None => int("intermediate_size")?,
+            },
+            moe,
             layer_types,
             linear_attention,
             attn_output_gate: hybrid
@@ -327,7 +360,16 @@ fn quantization(q: Option<&Json>) -> Result<Option<Quantization>> {
         .iter()
         .filter_map(|(path, v)| {
             let (g, b) = (get(v, "group_size")?, get(v, "bits")?);
-            Some((path.clone(), g as usize, b as u32))
+            // Under the text model's names, as the loader renames weights.
+            let path = match (
+                path.strip_prefix("model.language_model."),
+                path.strip_prefix("language_model."),
+            ) {
+                (Some(rest), _) => format!("model.{rest}"),
+                (_, Some(rest)) => rest.to_owned(),
+                _ => path.clone(),
+            };
+            Some((path, g as usize, b as u32))
         })
         .collect();
     Ok(Some(Quantization {

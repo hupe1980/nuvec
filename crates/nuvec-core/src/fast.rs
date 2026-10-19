@@ -35,6 +35,8 @@ use crate::{
 };
 use crate::{stack, zeros};
 
+pub use crate::kernel::{KernelCall, KernelConfig, MetalKernel, TemplateArg};
+
 /// A fused operation (see the [module documentation](self)).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -96,6 +98,18 @@ pub enum FastOp {
     /// `(q, k, v, g, beta, state)`: the gated delta rule (see [`gated_delta`]), with the
     /// outputs and the final state.
     GatedDelta,
+    /// `(x, w, scales, biases, lhs_indices, rhs_indices[, offsets])`: quantized matrix
+    /// products of gathered batches (see [`crate::gather_qmm`]); the indices are uint32
+    /// and broadcast to the output's batch shape. `offsets` (int32, one per batch of `w`)
+    /// marks where each weight batch's rows start when the rows are sorted by it.
+    GatherQmm {
+        /// Values per scale and bias.
+        group_size: usize,
+        /// Bits per value.
+        bits: u8,
+        /// `x · wᵀ` (else `x · w`).
+        transpose: bool,
+    },
 }
 
 /// The mask of [`scaled_dot_product_attention`].
@@ -404,6 +418,7 @@ impl FastOp {
             Self::CrossEntropyVjp => "cross_entropy_vjp",
             Self::Attention { .. } => "scaled_dot_product_attention",
             Self::GatedDelta => "gated_delta",
+            Self::GatherQmm { .. } => "gather_qmm",
         }
     }
 
@@ -417,6 +432,7 @@ impl FastOp {
             Self::Rope { .. } => inputs.len().clamp(2, 3),
             Self::Attention { mask, sinks, .. } => 3 + usize::from(*mask) + usize::from(*sinks),
             Self::GatedDelta => 6,
+            Self::GatherQmm { .. } => inputs.len().clamp(6, 7),
         };
         if inputs.len() != arity || inputs[0].ndim() == 0 {
             return Err(Error::InvalidArgument(format!(
@@ -446,6 +462,18 @@ impl FastOp {
                 vec![(x.dtype(), shape)]
             }
             Self::GatedDelta => vec![(x.dtype(), inputs[2].shape().to_vec()), like(&inputs[5])],
+            Self::GatherQmm {
+                bits, transpose, ..
+            } => {
+                let w = inputs[1].shape();
+                let n = match transpose {
+                    true => w[w.len() - 2],
+                    false => w[w.len() - 1] * 32 / usize::from(*bits),
+                };
+                let mut shape = inputs[4].shape().to_vec();
+                shape.extend([x.shape()[x.ndim() - 2], n]);
+                vec![(x.dtype(), shape)]
+            }
         })
     }
 
@@ -539,6 +567,16 @@ impl FastOp {
             )?],
             Self::Softmax => vec![softmax_graph(x)?],
             Self::GatedDelta => gated_delta_graph(inputs)?,
+            Self::GatherQmm {
+                group_size,
+                bits,
+                transpose,
+            } => vec![gather_qmm_graph(
+                inputs,
+                *group_size,
+                u32::from(*bits),
+                *transpose,
+            )?],
             Self::LogSumExp => vec![logsumexp_graph(x)?],
             Self::CrossEntropy => {
                 let classes = x.shape()[x.ndim() - 1];
@@ -650,7 +688,8 @@ impl FastOp {
             | Self::LayerNormVjp { .. }
             | Self::CrossEntropyVjp
             | Self::Attention { .. }
-            | Self::GatedDelta => self.fallback_vjp(inputs, cotangents, wanted),
+            | Self::GatedDelta
+            | Self::GatherQmm { .. } => self.fallback_vjp(inputs, cotangents, wanted),
         }
     }
 
@@ -1172,4 +1211,32 @@ fn gated_delta_graph(inputs: &[Array]) -> Result<Vec<Array>> {
         false => stack(&ys, 1)?,
     };
     Ok(vec![y, astype(&s, state.dtype())?])
+}
+
+/// The gathered quantized products from ordinary operations: the indexed batches of `x` and
+/// of the weights, then one batched quantized product.
+fn gather_qmm_graph(
+    inputs: &[Array],
+    group_size: usize,
+    bits: u32,
+    transpose: bool,
+) -> Result<Array> {
+    let (lhs, rhs) = (&inputs[4], &inputs[5]);
+    let rows = |a: &Array, indices: &Array| -> Result<Array> {
+        let nd = a.ndim();
+        let flat = reshape(
+            a,
+            &[-1, a.shape()[nd - 2] as isize, a.shape()[nd - 1] as isize],
+        )?;
+        crate::take(&flat, indices, Some(0))
+    };
+    crate::quantized_matmul(
+        &rows(&inputs[0], lhs)?,
+        &rows(&inputs[1], rhs)?,
+        &rows(&inputs[2], rhs)?,
+        &rows(&inputs[3], rhs)?,
+        transpose,
+        group_size,
+        bits,
+    )
 }

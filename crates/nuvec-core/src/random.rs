@@ -147,6 +147,63 @@ pub fn normal(
     }
 }
 
+/// Gumbel samples of `shape` and floating-point `dtype`, as MLX: `−log(−log(u))` for `u`
+/// uniform in `[0, 1)`.
+pub fn gumbel(shape: &[usize], dtype: DType, key: Option<&Array>) -> Result<Array> {
+    let u = uniform(0.0, 1.0, shape, dtype, key)?;
+    crate::ops::negative(&crate::ops::log(&crate::ops::negative(&crate::ops::log(
+        &u,
+    )?)?)?)
+}
+
+/// Indices (uint32) drawn from the categorical distributions whose unnormalised log
+/// probabilities run along `axis` of `logits`, as MLX: the argmax of `logits` plus Gumbel
+/// noise. The result has `logits`' shape without `axis`.
+///
+/// ```
+/// use nuvec_core::{Array, Result, random};
+///
+/// # fn main() -> Result<()> {
+/// // One certain outcome per row.
+/// let logits = Array::from_slice(&[0.0f32, -1e9, -1e9, -1e9, -1e9, 0.0], &[2, 3])?;
+/// let draws = random::categorical(&logits, -1, Some(&random::key(7)))?;
+/// assert_eq!(draws.to_vec::<u32>()?, [0, 2]);
+/// # Ok(())
+/// # }
+/// ```
+pub fn categorical(logits: &Array, axis: isize, key: Option<&Array>) -> Result<Array> {
+    let noise = gumbel(logits.shape(), logits.dtype(), key)?;
+    crate::ops::argmax(&add(&noise, logits)?, Some(axis), false)
+}
+
+/// Integers in `[low, high)` of `shape` and integer `dtype`, as MLX: uniform floats in
+/// `[low, high)` rounded down.
+pub fn randint(
+    low: i64,
+    high: i64,
+    shape: &[usize],
+    dtype: DType,
+    key: Option<&Array>,
+) -> Result<Array> {
+    if dtype.category() == crate::Category::Float || dtype == DType::Complex64 {
+        return Err(Error::UnsupportedDType {
+            op: "randint",
+            dtype,
+        });
+    }
+    let u = uniform(low as f64, high as f64, shape, DType::F32, key)?;
+    let u = crate::ops::maximum(&u, Array::scalar(low as f32))?;
+    // floor(u): truncation, one less where it rounded a negative value up.
+    let t = u.astype(DType::I64)?;
+    let up = crate::ops::less(&u, &t.astype(DType::F32)?)?;
+    subtract(&t, up.astype(DType::I64)?)?.astype(dtype)
+}
+
+/// Booleans of `shape` that are true with probability `p`, as MLX: `uniform < p`.
+pub fn bernoulli(p: f64, shape: &[usize], key: Option<&Array>) -> Result<Array> {
+    crate::ops::less(&uniform(0.0, 1.0, shape, DType::F32, key)?, p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

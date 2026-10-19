@@ -2,7 +2,7 @@
 //
 // Affine quantization kernels (see quantized.h) for float16, bfloat16 and float32, group
 // sizes 32, 64 and 128, and 1–6 or 8 bits, with the batched, partial-row and aligned
-// variants MLX's dispatch selects.
+// variants MLX's dispatch selects, and the transposed gather (mixture-of-experts) kernels.
 
 #include "steel_gemm.h"
 #include "quantized.h"
@@ -32,7 +32,12 @@
     NUVEC_Q(qmm_t_splitk, iname, T, gs, b, "_al0", false)                                 \
     NUVEC_Q(qmm_t_splitk, iname, T, gs, b, "_al1", true)                                  \
     NUVEC_Q(qmm_n, iname, T, gs, b, "_batch0", false)                                     \
-    NUVEC_Q(qmm_n, iname, T, gs, b, "_batch1", true)
+    NUVEC_Q(qmm_n, iname, T, gs, b, "_batch1", true)                                      \
+    NUVEC_Q(gather_qmv_fast, iname, T, gs, b, "")                                         \
+    NUVEC_Q(gather_qmv, iname, T, gs, b, "")                                              \
+    NUVEC_Q(gather_qmm_t, iname, T, gs, b, "_al0", false)                                 \
+    NUVEC_Q(gather_qmm_t, iname, T, gs, b, "_al1", true)                                  \
+    NUVEC_Q(gather_qmm_rhs, iname, T, gs, b, "_nt", 16, 32, 32, 1, 2, true)
 
 #define NUVEC_Q_BITS(iname, T, gs)                                                        \
     NUVEC_Q_ALL(iname, T, gs, 1)                                                          \

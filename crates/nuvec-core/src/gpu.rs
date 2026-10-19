@@ -783,6 +783,7 @@ mod metal {
             let dtype = operands.first().map(|(m, _)| m.dtype);
             let not64 = |d: DType| d != DType::F64;
             match (primitive, dtype) {
+                (Primitive::MetalKernel(_), _) => true,
                 (Primitive::Unary(op), Some(d)) => {
                     not64(d)
                         && match op {
@@ -855,6 +856,9 @@ mod metal {
         ) -> Result<Vec<Data>> {
             if let Primitive::Fast(op) = primitive {
                 return self.fast(op, operands, outputs);
+            }
+            if let Primitive::MetalKernel(call) = primitive {
+                return self.metal_kernel(call, operands, outputs);
             }
             if let Primitive::Compiled(fused) = primitive {
                 return self.fused(fused, operands, outputs);
@@ -962,14 +966,24 @@ mod metal {
                 .iter()
                 .map(|(_, d)| bytes(&(d.offset as i64)))
                 .collect();
+            let mut grid = None;
             let name = if general {
                 let strides: Vec<&[isize]> =
                     operands.iter().map(|(m, _)| m.strides.as_slice()).collect();
-                let (shape, collapsed) = collapse(&out.shape, &strides);
+                let (mut shape, mut collapsed) = collapse(&out.shape, &strides);
+                // Up to three dimensions: a 3-D grid, offsets without divisions.
+                let small = shape.len() <= 3 && shape.iter().all(|&d| d <= u32::MAX as usize);
+                if small {
+                    while shape.len() < 3 {
+                        shape.insert(0, 1);
+                        collapsed.iter_mut().for_each(|s| s.insert(0, 0));
+                    }
+                    grid = Some([shape[2], shape[1], shape[0]]);
+                }
                 consts.push(shape_bytes(&shape));
                 consts.extend(collapsed.iter().map(|s| strides_bytes(s)));
                 consts.push(bytes(&(shape.len() as i32)));
-                format!("{base}_g")
+                format!("{base}_g{}", if small { "3" } else { "" })
             } else {
                 let flags: u32 = modes
                     .iter()
@@ -987,7 +1001,23 @@ mod metal {
             let mut args: Vec<Arg<'_>> = inputs.into_iter().map(Arg::read).collect();
             args.push(Arg::write(output));
             args.extend(consts.iter().map(|c| Arg::bytes(c)));
-            self.dispatch(&name, &args, out.size)
+            match grid {
+                Some(grid) => self.dispatch_grid(&name, &args, grid),
+                None => self.dispatch(&name, &args, out.size),
+            }
+        }
+
+        /// One thread per position of a 3-D grid (`[x, y, z]`, x innermost).
+        fn dispatch_grid(&mut self, name: &str, args: &[Arg<'_>], grid: [usize; 3]) -> Result<()> {
+            if grid.contains(&0) {
+                return Ok(());
+            }
+            let pipeline = self.pipeline(name)?;
+            let group = block_dims(grid);
+            self.command_buffer()?
+                .dispatch_threads(&pipeline, args, grid, group)
+                .map_err(backend)?;
+            self.counted()
         }
 
         /// A fused element-wise graph as one generated kernel: each input is read as a
@@ -1064,6 +1094,40 @@ mod metal {
             axis: usize,
             buffer: &mut Buffer,
         ) -> Result<()> {
+            // Whole contiguous rows with one index each (`take` along a leading axis).
+            let nd = ind.shape.len();
+            let row: usize = ind.shape[axis + 1..].iter().product();
+            let rows_layout = ind.shape[..axis].iter().all(|&d| d == 1)
+                && (axis + 1..nd).all(|d| ind.strides[d] == 0 || ind.shape[d] == 1)
+                && crate::shape::row_contiguous_strides(&src.shape[axis + 1..])
+                    .iter()
+                    .zip(&src.strides[axis + 1..])
+                    .zip(&src.shape[axis + 1..])
+                    .all(|((want, got), &n)| n == 1 || want == got)
+                && row <= u32::MAX as usize
+                && ind.shape[axis] <= u32::MAX as usize;
+            if rows_layout && row > 0 {
+                let name = format!(
+                    "nuvec_gather_rows_{}_{}",
+                    bits(src.dtype.size()),
+                    ind.dtype.name()
+                );
+                let consts = [
+                    bytes(&(src_data.offset as i64)),
+                    bytes(&(ind_data.offset as i64)),
+                    bytes(&(ind.strides[axis] as i64)),
+                    bytes(&(src.strides[axis] as i64)),
+                    bytes(&(src.shape[axis] as i64)),
+                    bytes(&(row as i64)),
+                ];
+                let mut args = vec![
+                    Arg::read(src_data.buffer.metal().expect("checked")),
+                    Arg::read(ind_data.buffer.metal().expect("checked")),
+                    Arg::write(buffer.metal_mut().expect("device storage")),
+                ];
+                args.extend(consts.iter().map(|c| Arg::bytes(c)));
+                return self.dispatch_grid(&name, &args, [row, ind.shape[axis], 1]);
+            }
             let name = format!(
                 "nuvec_gather_{}_{}",
                 bits(src.dtype.size()),
@@ -1422,21 +1486,35 @@ mod metal {
         /// Gathers an operand into contiguous memory, walking its own logical shape (a
         /// reshape keeps the row-major element order of its input).
         fn copy(&mut self, (meta, data): Operand<'_>, buffer: &mut Buffer) -> Result<()> {
-            let (shape, [strides]) = nuvec_cpu::collapse_dims(&meta.shape, [&meta.strides]);
+            let (mut shape, [mut strides]) = nuvec_cpu::collapse_dims(&meta.shape, [&meta.strides]);
+            let small = shape.len() <= 3 && shape.iter().all(|&d| d <= u32::MAX as usize);
+            if small {
+                while shape.len() < 3 {
+                    shape.insert(0, 1);
+                    strides.insert(0, 0);
+                }
+            }
             let consts = [
                 bytes(&(data.offset as i64)),
                 shape_bytes(&shape),
                 strides_bytes(&strides),
                 bytes(&(shape.len() as i32)),
             ];
-            let name = format!("nuvec_copy_{}_g", bits(meta.dtype.size()));
+            let name = format!(
+                "nuvec_copy_{}_g{}",
+                bits(meta.dtype.size()),
+                if small { "3" } else { "" }
+            );
             let input = data.buffer.metal().expect("checked");
             let mut args = vec![
                 Arg::read(input),
                 Arg::write(buffer.metal_mut().expect("device storage")),
             ];
             args.extend(consts.iter().map(|c| Arg::bytes(c)));
-            self.dispatch(&name, &args, meta.size)
+            match small {
+                true => self.dispatch_grid(&name, &args, [shape[2], shape[1], shape[0]]),
+                false => self.dispatch(&name, &args, meta.size),
+            }
         }
 
         fn reduce(
@@ -2084,6 +2162,14 @@ mod metal {
             if *op == FastOp::GatedDelta {
                 return self.gated_delta(operands, outputs);
             }
+            if let FastOp::GatherQmm {
+                group_size, bits, ..
+            } = *op
+            {
+                let mut out = alloc(&outputs[0])?;
+                self.gather_qmm(operands, &outputs[0], (group_size, bits), &mut out)?;
+                return Ok(vec![Data::new(out)]);
+            }
             let mut out = alloc(&outputs[0])?;
             let x = self.packed(operands[0], true)?;
             let dt = operands[0].0.dtype;
@@ -2293,7 +2379,9 @@ mod metal {
                         .map_err(backend)?;
                     self.counted()?;
                 }
-                FastOp::Attention { .. } | FastOp::GatedDelta => unreachable!("handled above"),
+                FastOp::Attention { .. } | FastOp::GatedDelta | FastOp::GatherQmm { .. } => {
+                    unreachable!("handled above")
+                }
                 FastOp::CrossEntropy | FastOp::CrossEntropyVjp => {
                     let vjp = *op == FastOp::CrossEntropyVjp;
                     let name =
@@ -2317,6 +2405,77 @@ mod metal {
             let mut data = vec![Data::new(out)];
             data.extend(extra.into_iter().map(Data::new));
             Ok(data)
+        }
+
+        /// A custom kernel ([`crate::fast::MetalKernel`]): its source generated for the inputs'
+        /// dtypes, compiled once per source, and dispatched over its grid. Outputs with an
+        /// initial value start as copies of it.
+        fn metal_kernel(
+            &mut self,
+            call: &crate::kernel::KernelCall,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+        ) -> Result<Vec<Data>> {
+            use crate::kernel::{Binding, InputLayout};
+            let n = call.input_count();
+            let ins = operands[..n]
+                .iter()
+                .map(|&o| match call.row_contiguous_inputs() {
+                    true => self.packed(o, true),
+                    false => self.view_if(o, true),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let layouts: Vec<InputLayout> = operands[..n]
+                .iter()
+                .map(|(m, _)| InputLayout {
+                    dtype: m.dtype,
+                    scalar: m.shape.is_empty(),
+                })
+                .collect();
+            let mut outs = outputs
+                .iter()
+                .map(|o| Buffer::try_alloc_gpu(o.size * o.dtype.size()))
+                .collect::<Result<Vec<_>>>()?;
+            for (i, out) in outs.iter_mut().enumerate() {
+                if let Some(&init) = operands.get(n + i) {
+                    self.copy(init, out)?;
+                }
+            }
+            let (name, source) = call.source(&layouts);
+            let device = self
+                .device()
+                .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+            let pipeline = device
+                .pipeline_from_source(&name, || source)
+                .map_err(backend)?;
+            let bindings = call.bindings(&layouts);
+            let consts: Vec<Vec<u8>> = bindings
+                .iter()
+                .map(|b| match *b {
+                    Binding::Shape(i) => shape_bytes(&ins[i].shape),
+                    Binding::Strides(i) => strides_bytes(&ins[i].strides),
+                    Binding::Ndim(i) => (ins[i].shape.len() as i32).to_le_bytes().to_vec(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            let mut writes = outs
+                .iter_mut()
+                .map(|b| Some(b.metal_mut().expect("device storage")))
+                .collect::<Vec<_>>();
+            let mut args = Vec::with_capacity(bindings.len());
+            for (b, c) in bindings.iter().zip(&consts) {
+                args.push(match *b {
+                    Binding::Input(i) => ins[i].arg(),
+                    Binding::Output(i) => Arg::write(writes[i].take().expect("bound once")),
+                    _ => Arg::bytes(c),
+                });
+            }
+            self.command_buffer()?
+                .dispatch_threads(&pipeline, &args, call.grid, call.threadgroup)
+                .map_err(backend)?;
+            drop(args);
+            self.counted()?;
+            Ok(outs.into_iter().map(Data::new).collect())
         }
 
         /// mlx-lm's gated delta kernels (`gated_delta.py`), generated for the head sizes and
@@ -2897,6 +3056,113 @@ mod metal {
                 )
             };
             self.dispatch_groups(&name, &args, [m, n.div_ceil(per_group), batch], [32, 2, 1])
+        }
+
+        /// MLX's gather kernels (`GatherQMM::eval_gpu`, transposed weights): rows sorted by
+        /// weight batch with their `offsets` run the grouped `gather_qmm_rhs` (each batch's
+        /// weights read once per column tile); otherwise `gather_qmv(_fast)` below the
+        /// matrix-vector limit and `gather_qmm_t` above it, one output batch per grid layer.
+        fn gather_qmm(
+            &mut self,
+            operands: &[Operand<'_>],
+            out: &Output,
+            (group_size, bits): (usize, u8),
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let x = self.packed(operands[0], false)?;
+            let w = self.packed(operands[1], false)?;
+            let s = self.packed(operands[2], false)?;
+            let b = self.packed(operands[3], false)?;
+            let lhs = self.view_if(operands[4], true)?;
+            let rhs = self.view_if(operands[5], true)?;
+            let nd = x.shape.len();
+            let (m, k) = (x.shape[nd - 2], x.shape[nd - 1]);
+            let n = out.shape[out.shape.len() - 1];
+            let batch = out.size / m / n;
+            let base = format!("{}_gs{group_size}_b{bits}", out.dtype.name());
+            let ints = |v: usize| (v as i32).to_le_bytes();
+            if let Some(&offsets) = operands.get(6) {
+                // `x` is `[rows, 1, K]`, sorted by weight batch.
+                let offsets = self.packed(offsets, true)?;
+                let groups = operands[6].0.size;
+                let (rows, nb, kb, gb) = (ints(batch), ints(n), ints(k), ints(groups));
+                let args = [
+                    x.arg(),
+                    w.arg(),
+                    s.arg(),
+                    b.arg(),
+                    offsets.arg(),
+                    Arg::write(buffer.metal_mut().expect("device storage")),
+                    Arg::bytes(&rows),
+                    Arg::bytes(&nb),
+                    Arg::bytes(&kb),
+                    Arg::bytes(&gb),
+                ];
+                let name = format!("nuvec_affine_gather_qmm_rhs_{base}_nt");
+                let constants = [(201, n.is_multiple_of(32)), (202, k.is_multiple_of(32))];
+                let pipeline = self.pipeline_with(&name, &constants)?;
+                // Every expert adds at most one partial row tile.
+                let tiles = batch.div_ceil(16) + groups;
+                self.command_buffer()?
+                    .dispatch_groups(&pipeline, &args, [n.div_ceil(32), tiles, 1], [32, 2, 1])
+                    .map_err(backend)?;
+                return self.counted();
+            }
+            let info = self
+                .device()
+                .map(|d| d.info())
+                .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+            let (generation, class) = (info.generation.unwrap_or(0), info.class.unwrap_or('g'));
+            let limit = qmv_batch_limit(k, n, generation, class);
+            let batch_shape = &out.shape[..out.shape.len() - 2];
+            let layout = [
+                ints(nd - 2).to_vec(),
+                shape_bytes(&x.shape),
+                strides_bytes(&x.strides),
+                ints(w.shape.len() - 2).to_vec(),
+                shape_bytes(&w.shape),
+                strides_bytes(&w.strides),
+                strides_bytes(&s.strides),
+                strides_bytes(&b.strides),
+                ints(batch_shape.len()).to_vec(),
+                shape_bytes(batch_shape),
+                strides_bytes(&lhs.strides),
+                strides_bytes(&rhs.strides),
+            ];
+            let mut args = vec![
+                w.arg(),
+                s.arg(),
+                b.arg(),
+                x.arg(),
+                lhs.arg(),
+                rhs.arg(),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+            ];
+            let (kb, nb, mb) = (ints(k), ints(n), ints(m));
+            if m >= limit {
+                args.extend([Arg::bytes(&kb), Arg::bytes(&nb), Arg::bytes(&mb)]);
+                args.extend(layout.iter().map(|v| Arg::bytes(v)));
+                let name = format!(
+                    "nuvec_affine_gather_qmm_t_{base}_al{}",
+                    u8::from(n.is_multiple_of(32))
+                );
+                return self.dispatch_groups(
+                    &name,
+                    &args,
+                    [n.div_ceil(32), m.div_ceil(32), batch],
+                    [32, 2, 2],
+                );
+            }
+            args.extend([Arg::bytes(&kb), Arg::bytes(&nb)]);
+            args.extend(layout.iter().map(|v| Arg::bytes(v)));
+            let bits = usize::from(bits);
+            let fast = k % (pack_factor(bits, 32) * if bits == 2 { 1 } else { 2 } * 32) == 0
+                && n.is_multiple_of(8);
+            let name = match fast {
+                true => format!("nuvec_affine_gather_qmv_fast_{base}"),
+                false => format!("nuvec_affine_gather_qmv_{base}"),
+            };
+            self.dispatch_groups(&name, &args, [m, n.div_ceil(8), batch], [32, 2, 1])
         }
 
         /// MLX's `qmm_splitk`: K split into partitions of whole groups, partial products in

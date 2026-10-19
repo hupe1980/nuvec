@@ -365,6 +365,8 @@ pub enum Primitive {
     /// function's outputs, which this node presents unchanged (views); transforms use the
     /// function's custom rules.
     Custom(CustomCall),
+    /// A custom Metal kernel ([`crate::fast::MetalKernel`]).
+    MetalKernel(crate::kernel::KernelCall),
     /// Test-only two-output primitive: `(a + b, a * b)`.
     #[cfg(test)]
     AddMultiply,
@@ -422,6 +424,7 @@ impl Primitive {
             Self::Dequantize { .. } => "dequantize",
             Self::QuantizedMatmul { .. } => "quantized_matmul",
             Self::Custom(_) => "custom_function",
+            Self::MetalKernel(_) => "metal_kernel",
             #[cfg(test)]
             Self::AddMultiply => "add_multiply",
         }
@@ -807,6 +810,13 @@ impl Primitive {
                 let mut shape: Shape = x.shape().into();
                 shape[xn - 1] = outer;
                 computed(x.dtype(), &shape)
+            }
+            Self::MetalKernel(call) => {
+                return Ok(call
+                    .outputs
+                    .iter()
+                    .map(|(dtype, shape)| computed(*dtype, shape))
+                    .collect());
             }
             Self::Custom(call) => {
                 let outputs = inputs.get(call.primals..).unwrap_or_default();

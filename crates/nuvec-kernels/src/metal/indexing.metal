@@ -69,6 +69,24 @@ template <typename T, typename I>
     out[i] = src[src_off + s + j * src_strides[axis]];
 }
 
+// Whole rows: `out[j, r] = src[ind[j], r]` for contiguous source rows of `row` elements
+// (`take` along a leading axis), one thread per element on a 2-D grid, no index arithmetic.
+template <typename T, typename I>
+[[kernel]] void gather_rows(
+    device const T* src [[buffer(0)]],
+    device const I* ind [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    constant long& src_off [[buffer(3)]],
+    constant long& ind_off [[buffer(4)]],
+    constant long& ind_stride [[buffer(5)]],
+    constant long& src_stride [[buffer(6)]],
+    constant long& axis_len [[buffer(7)]],
+    constant long& row [[buffer(8)]],
+    uint2 p [[thread_position_in_grid]]) {
+    long j = axis_index(ind[ind_off + long(p.y) * ind_stride], axis_len);
+    out[long(p.y) * row + p.x] = src[src_off + j * src_stride + p.x];
+}
+
 // Atomic `*p += v`: native for 32-bit types; 16-bit floats through a compare-and-swap on
 // the containing 32-bit word (adding in float and rounding once, as `op_add`).
 inline void atomic_add(device float* p, float v) {
@@ -191,6 +209,9 @@ template <typename T>
         device const T*, device const I*, device T*, constant long&, constant long&,            \
         constant int*, constant long*, constant long*, constant int&, constant int&,            \
         constant long&, uint);                                                                  \
+    template [[host_name("nuvec_gather_rows_" #bits "_" #iname)]] [[kernel]] void              \
+    gather_rows<T, I>(device const T*, device const I*, device T*, constant long&,              \
+        constant long&, constant long&, constant long&, constant long&, constant long&, uint2); \
     template [[host_name("nuvec_scatter_" #bits "_" #iname)]] [[kernel]] void                  \
     scatter_axis<T, I>(                                                                         \
         device const T*, device const I*, device T*, constant long&, constant long&,            \

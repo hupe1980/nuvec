@@ -98,6 +98,28 @@ fn sanitize(weights: BTreeMap<String, Array>) -> Result<BTreeMap<String, Array>>
             (k, v)
         })
         .collect();
+    // Hugging Face MoE checkpoints fuse each layer's expert gate and up projections
+    // (`experts.gate_up_proj`, `[E, 2·I, D]`), as mlx-lm's `qwen3_5_moe.sanitize` splits.
+    let fused: Vec<String> = weights
+        .keys()
+        .filter(|k| k.ends_with(".mlp.experts.gate_up_proj"))
+        .cloned()
+        .collect();
+    for key in fused {
+        let prefix = key.trim_end_matches("experts.gate_up_proj").to_owned();
+        let gate_up = weights.remove(&key).expect("listed");
+        let mid = gate_up.shape()[gate_up.ndim() - 2] / 2;
+        let mut halves = nuvec::split_at(&gate_up, &[mid], -2)?;
+        let up = halves.pop().expect("two halves");
+        weights.insert(format!("{prefix}switch_mlp.up_proj.weight"), up);
+        weights.insert(
+            format!("{prefix}switch_mlp.gate_proj.weight"),
+            halves.pop().expect("two halves"),
+        );
+        if let Some(down) = weights.remove(&format!("{prefix}experts.down_proj")) {
+            weights.insert(format!("{prefix}switch_mlp.down_proj.weight"), down);
+        }
+    }
     let unsanitized = weights
         .iter()
         .any(|(k, v)| k.contains("conv1d.weight") && v.shape().last() != Some(&1));

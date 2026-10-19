@@ -246,3 +246,28 @@ fn reads_null_metadata_and_copies_misaligned_tensors() {
     assert_eq!(st.tensors["b"].to_vec::<f32>().unwrap(), vec![1.5]);
     std::fs::remove_file(path).ok();
 }
+
+#[test]
+fn unpadded_headers_are_copied_once() {
+    // An unpadded header (as MLX writes) leaves the whole data section misaligned: it is
+    // copied once, and every tensor reads its values from the copy.
+    let h = b"{ \"w\":{\"dtype\":\"U32\",\"shape\":[2],\"data_offsets\":[0,8]},\"s\":{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[8,12]},\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[12,16]}}";
+    assert_ne!(
+        (8 + h.len()) % 4,
+        0,
+        "the data section must start misaligned"
+    );
+    let mut bytes = (h.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(h);
+    bytes.extend(7u32.to_le_bytes());
+    bytes.extend(u32::MAX.to_le_bytes());
+    bytes.extend([0x80, 0x3f, 0x00, 0x40]); // bfloat16 1.0 and 2.0
+    bytes.extend((-0.5f32).to_le_bytes());
+    let path = temp("unpadded.safetensors");
+    std::fs::write(&path, &bytes).unwrap();
+    let st = load_safetensors(&path).unwrap();
+    assert_eq!(st.tensors["w"].to_vec::<u32>().unwrap(), vec![7, u32::MAX]);
+    assert_eq!(f64s(&st.tensors["s"]), vec![1.0, 2.0]);
+    assert_eq!(st.tensors["x"].to_vec::<f32>().unwrap(), vec![-0.5]);
+    std::fs::remove_file(path).ok();
+}

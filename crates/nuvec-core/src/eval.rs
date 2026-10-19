@@ -478,6 +478,9 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
             )?)
         }
         Primitive::Fast(op) => op.eval_cpu(operands),
+        Primitive::MetalKernel(_) => Err(Error::InvalidArgument(
+            "metal_kernel: custom kernels run on the GPU only".into(),
+        )),
         Primitive::Compiled(fused) => fused.eval_cpu(operands),
         Primitive::Quantize { group_size, bits } => {
             let (packed, scales, biases) =

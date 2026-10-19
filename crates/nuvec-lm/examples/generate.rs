@@ -78,7 +78,7 @@ fn main() -> nuvec::Result<()> {
     );
     if let Some(d) = nuvec::gpu::Device::shared() {
         println!(
-            "Peak memory: {:.3} GB allocated (weights are memory-mapped)",
+            "Peak memory: {:.3} GB allocated (memory-mapped weights not included)",
             d.memory().peak as f64 / 1e9
         );
     }
