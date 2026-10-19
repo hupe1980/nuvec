@@ -29,6 +29,7 @@ fn assert_close(name: &str, got: &Array, want: &Array, tol: f64) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn tolerance(dtype: DType) -> f64 {
     match dtype {
         DType::F32 => 2e-5,

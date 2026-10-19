@@ -1,0 +1,13 @@
+{
+  "name": "nuvec",
+  "short_name": "nuvec",
+  "description": "MLX for Rust, written in Rust: lazy arrays, autodiff and Metal kernels on Apple Silicon.",
+  "start_url": "/nuvec/",
+  "display": "standalone",
+  "background_color": "#0a0b10",
+  "theme_color": "#0a0b10",
+  "icons": [
+    { "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

@@ -263,7 +263,7 @@ fn matmul_gradients() {
         -1.0,
         1.0,
     );
-    // beta scales c's derivative in both modes (MLX 0.32.4's jvp drops it; see D-033).
+    // beta scales c's derivative in both modes (MLX 0.32.4's jvp drops it, a bug there).
     check(
         "addmm",
         |x| addmm(&x[2], &x[0], &x[1], 1.5, -0.5),

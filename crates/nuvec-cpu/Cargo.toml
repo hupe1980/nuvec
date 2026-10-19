@@ -1,6 +1,7 @@
 [package]
 name = "nuvec-cpu"
 description = "Pure-Rust CPU backend for nuvec"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

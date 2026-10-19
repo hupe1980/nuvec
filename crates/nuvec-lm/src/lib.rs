@@ -1,7 +1,13 @@
-//! LLM runtime: Llama-family models (Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE) and Qwen 3.5
-//! (hybrid, dense or MoE) loaded from Hugging Face or MLX checkpoints (including MLX's quantized ones), a byte-level BPE tokenizer,
-//! a key-value cache, token generation and sampling (temperature, top-p, min-p, top-k), as
-//! mlx-lm.
+//! LLM runtime with mlx-lm's behaviour and speed:
+//!
+//! - **Models:** Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE and Qwen 3.5 (hybrid Gated
+//!   DeltaNet and attention, dense or mixture-of-experts), from Hugging Face or MLX
+//!   checkpoints, including MLX's quantized ones (memory-mapped, not copied).
+//! - **Tokenizer:** byte-level BPE read from `tokenizer.json`.
+//! - **Generation:** chunked prefill, a pipelined decode loop with the KV cache updated in
+//!   place, mlx-lm's samplers (temperature, top-p, min-p, top-k), and [speculative
+//!   decoding](speculative) with pluggable drafters; memory is wired while generating
+//!   ([`WiredLimit`]).
 //!
 //! ```no_run
 //! use nuvec_lm::{GenerateOptions, generate, load};

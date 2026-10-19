@@ -1,6 +1,7 @@
 [package]
 name = "nuvec-kernels"
 description = "Metal kernel sources and the precompiled nuvec.metallib"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

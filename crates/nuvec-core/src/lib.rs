@@ -55,9 +55,13 @@ mod error;
 mod eval;
 pub mod fast;
 mod file;
+// Parts of it are only used by the Metal backend.
+#[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
 mod fused;
 mod gpu;
 mod indexing;
+// Parts of it are only used by the Metal backend.
+#[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
 mod kernel;
 mod kernels;
 mod ops;

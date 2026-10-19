@@ -1,6 +1,7 @@
 [package]
 name = "nuvec-nn"
 description = "Neural-network modules, layers and optimizers for nuvec"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

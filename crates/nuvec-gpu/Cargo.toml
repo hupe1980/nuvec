@@ -1,6 +1,7 @@
 [package]
 name = "nuvec-gpu"
 description = "Metal backend for nuvec: device, command encoding, memory and kernel dispatch"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -125,7 +125,7 @@ fn misuse_shape_mismatch() {
 #[test]
 fn misuse_dtype_mismatch() {
     common::on_cpu();
-    // Since F-003, mixed dtypes promote (float32 * int32 -> float32) instead of failing.
+    // Mixed dtypes promote (float32 * int32 -> float32) instead of failing.
     let c = multiply(Array::scalar(1.5f32), Array::scalar(2i32)).unwrap();
     assert_eq!(c.dtype(), DType::F32);
     assert_eq!(c.item::<f32>().unwrap(), 3.0);

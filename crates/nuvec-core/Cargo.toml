@@ -1,6 +1,7 @@
 [package]
 name = "nuvec-core"
 description = "Lazy array graph, primitives, dtypes and evaluation for nuvec"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

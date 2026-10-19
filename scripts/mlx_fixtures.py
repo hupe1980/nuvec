@@ -324,7 +324,7 @@ case("where-broadcast", "where", [make("bool", (3, 1)), make("float32", (3, 4)),
 case("where-int-cond", "where", [ints("int32", (2, 3), -1, 2), make("float16", (2, 3)), make("float16", ())])
 
 # astype: edge values to every dtype. Values stay inside every target's range: MLX's
-# out-of-range float->int casts are C++ undefined behaviour (nuvec saturates, D-021).
+# out-of-range float->int casts are C++ undefined behaviour (nuvec saturates).
 EDGE_F32 = mx.array(np.array([0.0, -0.0, 1.5, -1.5, 2.5, 100.25, -100.75, 127.0], dtype=np.float32))
 for dt in ALL:
     case(f"astype-float32-{dt}", "astype", [EDGE_F32], dtype=CODE[dt])
@@ -354,7 +354,7 @@ case("squeeze-axis", "squeeze", [make("float32", (1, 3, 1))], axes="0")
 case("arange-int", "arange", [], start=0, stop=10, step=3, dtype=CODE["int32"])
 case("arange-neg", "arange", [], start=1, stop=0, step=-0.25, dtype=CODE["float32"])
 # Exact steps only: MLX accumulates `start += step` in the target type, nuvec computes
-# `start + i*step` once (D-021), so inexact steps differ in the last bits.
+# `start + i*step` once, so inexact steps differ in the last bits.
 case("arange-f16", "arange", [], start=-2, stop=2, step=0.25, dtype=CODE["float16"])
 case("arange-empty", "arange", [], start=5, stop=1, step=1, dtype=CODE["float32"])
 case("zeros-bf16", "zeros", [], shape="2,3", dtype=CODE["bfloat16"])

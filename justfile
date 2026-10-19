@@ -46,6 +46,14 @@ metal-check:
     MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu
     NUVEC_METALLIB=off MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu --test runtime
 
+# Build the website (Zola) into site/public.
+site:
+    zola --root site build
+
+# Serve the website locally with live reload.
+site-serve:
+    zola --root site serve
+
 # ── MLX reference (needs uv; never part of `ci`) ──────────────────────────────
 
 # Re-record the MLX fixtures replayed by `tests/mlx.rs` (pinned MLX, CPU device).

@@ -2,8 +2,8 @@
 //!
 //! The rules follow MLX's `primitives.cpp` and are built from ops, so derivatives are lazy
 //! graphs that can be evaluated anywhere and differentiated again. Every primitive has both
-//! rules (D-015: a missing rule is a compile error). Complex reverse-mode rules follow MLX's
-//! convention: the cotangent times the conjugate derivative (D-030).
+//! rules (a missing rule is a compile error). Complex reverse-mode rules follow MLX's
+//! convention: the cotangent times the conjugate derivative.
 
 use crate::array::Array;
 use crate::cast::Canon;

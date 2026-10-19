@@ -1,6 +1,7 @@
 [package]
 name = "nuvec-distributed"
-description = "Collectives over TCP rings and Thunderbolt RDMA for nuvec"
+description = "Reserved for distributed collectives in nuvec (no functional API yet)"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

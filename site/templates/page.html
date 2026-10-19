@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block body_class %}docs{% endblock body_class %}
+
+{% block structured_data %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "TechArticle",
+      "headline": {{ page.title | json_encode | safe }},
+      "description": {{ page.description | default(value=config.description) | json_encode | safe }},
+      "url": "{{ page.permalink }}",
+      "inLanguage": "en",
+      "proficiencyLevel": "Expert",
+      "about": { "@type": "SoftwareSourceCode", "name": "nuvec", "codeRepository": "{{ config.extra.repo }}" },
+      "isPartOf": { "@type": "WebSite", "name": "nuvec", "url": "{{ config.base_url }}/" }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "nuvec", "item": "{{ config.base_url }}/" },
+        { "@type": "ListItem", "position": 2, "name": "Docs", "item": "{{ get_url(path='@/docs/_index.md') }}" },
+        { "@type": "ListItem", "position": 3, "name": {{ page.title | json_encode | safe }}, "item": "{{ page.permalink }}" }
+      ]
+    }
+  ]
+}
+</script>
+{% endblock structured_data %}
+
+{% block content %}
+{% set docs = get_section(path="docs/_index.md") %}
+<div class="wrap docs-layout">
+  <aside class="sidebar" aria-label="Documentation">
+    <label class="search">
+      <span class="visually-hidden">Search the docs</span>
+      <input id="search" type="search" placeholder="Search docs…  /" autocomplete="off">
+    </label>
+    <ul id="search-results" class="search-results" hidden></ul>
+    <nav>
+      {%- set group = "" %}
+      <ul>
+        {%- for p in docs.pages %}
+        {%- if p.extra.group and p.extra.group != group %}{% set_global group = p.extra.group %}<li class="nav-group">{{ group }}</li>{% endif %}
+        <li><a href="{{ p.permalink }}"{% if p.permalink == page.permalink %} aria-current="page"{% endif %}>{{ p.title }}</a></li>
+        {%- endfor %}
+      </ul>
+    </nav>
+  </aside>
+  <article class="prose">
+    <p class="breadcrumbs"><a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a> / {{ page.title }}</p>
+    <h1>{{ page.title }}</h1>
+    {%- if page.description %}<p class="page-lead">{{ page.description }}</p>{% endif %}
+    {{ page.content | safe }}
+    <nav class="pager" aria-label="Previous and next">
+      {%- if page.lower %}<a class="prev" href="{{ page.lower.permalink }}"><small>Previous</small>{{ page.lower.title }}</a>{% else %}<span></span>{% endif %}
+      {%- if page.higher %}<a class="next" href="{{ page.higher.permalink }}"><small>Next</small>{{ page.higher.title }}</a>{% endif %}
+    </nav>
+    <p class="edit"><a href="{{ config.extra.repo }}/edit/main/site/content/{{ page.relative_path }}" rel="noopener">✏️ Edit this page on GitHub</a></p>
+  </article>
+  {%- if page.toc and page.toc | length > 1 %}
+  <nav class="toc" aria-label="On this page">
+    <p>On this page</p>
+    <ul>{% for h in page.toc %}<li><a href="{{ h.permalink | safe }}">{{ h.title }}</a></li>{% endfor %}</ul>
+  </nav>
+  {%- endif %}
+</div>
+{% endblock content %}
+
+{% block scripts %}
+<script src="{{ get_url(path='elasticlunr.min.js') }}" defer></script>
+<script src="{{ get_url(path='search.js', cachebust=true) }}" defer></script>
+<script src="{{ get_url(path='copy.js', cachebust=true) }}" defer></script>
+{% endblock scripts %}

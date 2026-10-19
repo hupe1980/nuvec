@@ -20,7 +20,7 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 use super::buffer::Guard;
 use super::residency::Residency;
-use crate::{GpuError, Result};
+use crate::{GpuError, MemoryStats, Result};
 
 /// The virtual-memory page size on Apple silicon.
 pub(crate) const PAGE: usize = 16 * 1024;
@@ -68,28 +68,6 @@ unsafe impl Send for Cached {}
 // SAFETY: shared access only retains or binds the buffer (the placeholder); its memory is
 // never read or written through a shared reference.
 unsafe impl Sync for Cached {}
-
-/// Memory use and limits of a device's allocator, in bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryStats {
-    /// Bytes in live buffers (rounded allocation sizes).
-    pub active: usize,
-    /// Highest `active` since creation or the last [`Device::reset_peak`](super::Device::reset_peak).
-    pub peak: usize,
-    /// Bytes held in the cache for reuse.
-    pub cache: usize,
-    /// Allocations that would push `active` past this fail.
-    pub memory_limit: usize,
-    /// The cache is trimmed to at most this many bytes.
-    pub cache_limit: usize,
-    /// Buffers obtained from Metal (cache misses) so far.
-    pub system_allocations: u64,
-    /// Buffers are kept resident up to this many bytes (see
-    /// [`Device::set_wired_limit`](super::Device::set_wired_limit)).
-    pub wired_limit: usize,
-    /// Bytes currently wired.
-    pub wired: usize,
-}
 
 /// The size an allocation of `len` bytes is rounded up to.
 pub(crate) fn rounded(len: usize) -> usize {

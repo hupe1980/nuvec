@@ -1,0 +1,29 @@
+{%- if page and page.description %}{% set page_description = page.description %}{% elif section and section.description %}{% set page_description = section.description %}{% endif %}
+{%- if page and page.title %}{% set page_title = page.title ~ " · nuvec" %}{% elif section and section.title and section.path != "/" %}{% set page_title = section.title ~ " · nuvec" %}{% endif %}
+{%- if page %}{% set page_url = page.permalink %}{% elif section %}{% set page_url = section.permalink %}{% endif %}
+<title>{{ page_title }}</title>
+<meta name="description" content="{{ page_description }}">
+<link rel="canonical" href="{{ page_url }}">
+<meta name="robots" content="{% if noindex %}noindex{% else %}index, follow, max-image-preview:large{% endif %}">
+<meta name="author" content="{{ config.author }}">
+<meta name="theme-color" content="#0a0b10" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta property="og:type" content="{% if page %}article{% else %}website{% endif %}">
+<meta property="og:site_name" content="nuvec">
+<meta property="og:locale" content="en_US">
+<meta property="og:title" content="{{ page_title }}">
+<meta property="og:description" content="{{ page_description }}">
+<meta property="og:url" content="{{ page_url }}">
+<meta property="og:image" content="{{ get_url(path='og.png') }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="nuvec — MLX for Rust, written in Rust">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ page_title }}">
+<meta name="twitter:description" content="{{ page_description }}">
+<meta name="twitter:image" content="{{ get_url(path='og.png') }}">
+<link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
+<link rel="apple-touch-icon" href="{{ get_url(path='apple-touch-icon.png') }}">
+<link rel="manifest" href="{{ get_url(path='site.webmanifest') }}">
+<link rel="sitemap" type="application/xml" href="{{ get_url(path='sitemap.xml') }}">
+<link rel="stylesheet" href="{{ get_url(path='style.css', cachebust=true) }}">

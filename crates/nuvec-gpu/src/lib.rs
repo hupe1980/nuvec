@@ -27,22 +27,23 @@
 
 mod error;
 mod info;
+mod memory;
 
 pub use error::{GpuError, Result};
 pub use info::DeviceInfo;
+pub use memory::MemoryStats;
 
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(target_os = "macos")]
 pub use metal::{
-    Arg, Buffer, CommandBuffer, Constant, Device, MemoryStats, Pending, Pipeline, Submitted,
-    Timeline, profile,
+    Arg, Buffer, CommandBuffer, Constant, Device, Pending, Pipeline, Submitted, Timeline, profile,
 };
 
 #[cfg(not(target_os = "macos"))]
 mod stub;
 #[cfg(not(target_os = "macos"))]
-pub use stub::Device;
+pub use stub::{Device, profile};
 
 /// The version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

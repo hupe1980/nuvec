@@ -10,7 +10,6 @@ use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 
-pub use allocator::MemoryStats;
 use allocator::Pool;
 pub use buffer::Buffer;
 pub use command::{Arg, CommandBuffer, Pending, Submitted, Timeline};
@@ -24,7 +23,7 @@ use objc2_metal::{
 };
 
 use crate::info::parse_architecture;
-use crate::{DeviceInfo, GpuError, Result};
+use crate::{DeviceInfo, GpuError, MemoryStats, Result};
 
 type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 

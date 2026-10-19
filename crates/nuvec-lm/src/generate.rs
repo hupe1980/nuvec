@@ -57,10 +57,10 @@ impl WiredLimit {
             nuvec::gpu::Device::shared().filter(|_| default_device().kind == DeviceKind::Gpu);
         WiredLimit(device.and_then(|d| {
             let limit = d.info().recommended_working_set as usize;
-            if d.memory().wired_limit >= limit {
-                return None;
-            }
-            d.set_wired_limit(limit).ok()
+            // Already as high (an outer `WiredLimit`): nothing to restore.
+            d.set_wired_limit(limit)
+                .ok()
+                .filter(|&previous| previous < limit)
         }))
     }
 }
@@ -179,7 +179,7 @@ impl Iterator for Generation<'_> {
         if self.produced < self.options.max_tokens {
             // Submit the following step, then wait for this token (mlx-lm's order): the GPU
             // never waits for the host between steps. The cache the step writes is still in
-            // flight; nothing else refers to it, so it is updated in place (D-058).
+            // flight; nothing else refers to it, so it is updated in place.
             let next = match self.step(&y) {
                 Ok(next) => next,
                 Err(e) => return Some(Err(e)),

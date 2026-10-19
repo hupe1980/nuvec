@@ -69,7 +69,7 @@ fn slice_update_writes_in_place_when_it_owns_its_base() {
 
 /// The decode order (mlx-lm's): each step is submitted while the previous one is still in
 /// flight, and a small result of the previous step is read afterwards. The base is then
-/// in flight, held only by pending work, and is still written in place (D-058).
+/// in flight, held only by pending work, and is still written in place.
 #[test]
 fn slice_update_writes_in_place_into_bases_still_in_flight() {
     if !gpu_available() {
@@ -83,9 +83,10 @@ fn slice_update_writes_in_place_into_bases_still_in_flight() {
         let row = |i: usize| [SliceArg::from(i as isize..i as isize + 1), SliceArg::full()];
         let mut a = zeros(&[64, n / 64], DType::F32).unwrap();
         a.eval().unwrap();
-        // Work that keeps each step's command buffer running while the next is built.
-        let m = Array::full(&[1024, 1024], 1.0f32 / 1024.0).unwrap();
-        m.eval().unwrap();
+        // Work that keeps each step's command buffer running while the next is built,
+        // without allocating anything sizeable (a reduction of a resident 64 MiB array).
+        let big = Array::full(&[16 << 20], 1.0f32 / (16 << 20) as f32).unwrap();
+        big.eval().unwrap();
         gpu_peak_since_reset();
         let resident = nuvec_gpu::Device::shared().map_or(0, |d| d.memory().active);
         let mut token: Option<Array> = None;
@@ -93,19 +94,18 @@ fn slice_update_writes_in_place_into_bases_still_in_flight() {
             let update = Array::full(&[1, n / 64], i as f32).unwrap();
             a = slice_update(&a, &update, &row(i)).unwrap();
             // A small result of this step, read only after the next step is submitted.
-            let busy = sum(&matmul(&m, &m).unwrap(), &[], false).unwrap();
+            let busy = sum(&big, &[], false).unwrap();
             let next = add(sum(&slice(&a, &row(i)).unwrap(), &[], false).unwrap(), busy).unwrap();
             async_eval(&[a.clone(), next.clone()]).unwrap();
             if let Some(t) = token.replace(next) {
-                let want = (i - 1) as f32 * (n / 64) as f32 + 1024.0;
+                let want = (i - 1) as f32 * (n / 64) as f32 + 1.0;
                 assert!((t.item::<f32>().unwrap() - want).abs() < 1.0);
             }
         }
-        // A copy per step would have held two 16 MiB buffers at once (besides the 4 MiB
-        // product).
+        // A copy per step would have held two 16 MiB buffers at once.
         let peak = gpu_peak_since_reset();
         assert!(
-            peak < resident + (4 << 20) + n * 4 / 2,
+            peak < resident + n * 4 / 2,
             "peak {peak}, before {resident}"
         );
         let v = a.to_vec::<f32>().unwrap();

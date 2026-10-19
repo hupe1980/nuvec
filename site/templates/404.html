@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+
+{% block seo %}
+{%- set page_title = "Page not found · nuvec" %}
+{%- set page_description = config.description %}
+{%- set page_url = config.base_url ~ "/404.html" %}
+{%- set noindex = true %}
+{% endblock seo %}
+
+{% block content %}
+<div class="wrap not-found">
+  <p class="eyebrow">404</p>
+  <h1>Page not found</h1>
+  <p>The page you are looking for does not exist or has moved.</p>
+  <p class="cta"><a class="button primary" href="{{ get_url(path='@/docs/_index.md') }}">Go to the docs</a> <a class="button ghost" href="{{ get_url(path='/') }}">Home</a></p>
+</div>
+{% endblock content %}

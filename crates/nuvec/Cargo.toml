@@ -1,6 +1,7 @@
 [package]
 name = "nuvec"
 description = "Pure-Rust array framework for Apple Silicon in the spirit of MLX: lazy arrays, unified memory, composable transforms"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -2,7 +2,7 @@
 //!
 //! Following MLX, operations promote operand types and broadcast shapes here, by inserting
 //! `AsType` and `Broadcast` nodes, so primitives always see operands of equal shape and
-//! dtype (D-019). Views (`reshape`, `transpose`, `slice`, `broadcast_to`, `expand_dims`,
+//! dtype. Views (`reshape`, `transpose`, `slice`, `broadcast_to`, `expand_dims`,
 //! `squeeze`) share their input's data whenever the layout permits.
 
 use std::ops::{Add, Div, Mul, Neg, Sub};

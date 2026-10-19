@@ -43,7 +43,7 @@ pub(crate) struct Output {
     /// Set exactly once, when the node is evaluated (or at creation for leaves).
     pub(crate) slot: OnceLock<Result<Data>>,
     /// GPU data whose command buffer is committed on the device timeline but may not have
-    /// completed: later GPU work may read it before `slot` is set (D-032).
+    /// completed: later GPU work (ordered after it on the device) may read it before `slot` is set.
     pub(crate) inflight: InFlight,
 }
 
@@ -57,6 +57,7 @@ pub(crate) struct InFlight(Mutex<InFlightState>);
 pub(crate) enum InFlightState {
     #[default]
     Unset,
+    #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
     Set(Data),
     /// Taken over by a consumer that writes into it in place; never published.
     Donated,
@@ -67,7 +68,8 @@ impl InFlight {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Exposes `data` (once).
+    /// Exposes `data` (once; only GPU work has in-flight data).
+    #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
     pub(crate) fn set(&self, data: Data) {
         let mut state = self.lock();
         if matches!(*state, InFlightState::Unset) {

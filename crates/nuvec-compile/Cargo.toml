@@ -1,6 +1,7 @@
 [package]
 name = "nuvec-compile"
 description = "Function compilation for nuvec: tracing, graph simplification and kernel fusion"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

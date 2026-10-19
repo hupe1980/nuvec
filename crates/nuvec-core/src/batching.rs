@@ -3,7 +3,7 @@
 //! Each rule receives the real batched inputs with their batch axes (`None` for unbatched
 //! inputs) and records the batched computation. Rules that change axes first move the batch
 //! axis to the front; element-wise rules without axis changes keep it in place. Every
-//! primitive has a rule (D-015), so `vmap` needs no loop fallback.
+//! primitive has a rule (a missing one fails to compile), so `vmap` needs no loop fallback.
 
 use crate::array::Array;
 use crate::ops::{broadcast_to, expand_dims, matmul, reshape, transpose};

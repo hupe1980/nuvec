@@ -3,28 +3,28 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/nuvec"
-homepage = "https://github.com/hupe1980/nuvec"
+homepage = "https://hupe1980.github.io/nuvec"
 readme = "README.md"
 authors = ["hupe1980"]
-keywords = ["mlx", "array", "metal", "apple-silicon", "machine-learning"]
+keywords = ["mlx", "metal", "apple-silicon", "machine-learning", "llm"]
 categories = ["science", "mathematics"]
 
 [workspace.dependencies]
-nuvec = { path = "crates/nuvec", version = "0.0.1" }
-nuvec-core = { path = "crates/nuvec-core", version = "0.0.1" }
-nuvec-compile = { path = "crates/nuvec-compile", version = "0.0.1" }
-nuvec-cpu = { path = "crates/nuvec-cpu", version = "0.0.1" }
-nuvec-distributed = { path = "crates/nuvec-distributed", version = "0.0.1" }
-nuvec-gpu = { path = "crates/nuvec-gpu", version = "0.0.1" }
-nuvec-io = { path = "crates/nuvec-io", version = "0.0.1" }
-nuvec-kernels = { path = "crates/nuvec-kernels", version = "0.0.1" }
-nuvec-lm = { path = "crates/nuvec-lm", version = "0.0.1" }
-nuvec-nn = { path = "crates/nuvec-nn", version = "0.0.1" }
+nuvec = { path = "crates/nuvec", version = "0.1.0" }
+nuvec-core = { path = "crates/nuvec-core", version = "0.1.0" }
+nuvec-compile = { path = "crates/nuvec-compile", version = "0.1.0" }
+nuvec-cpu = { path = "crates/nuvec-cpu", version = "0.1.0" }
+nuvec-distributed = { path = "crates/nuvec-distributed", version = "0.1.0" }
+nuvec-gpu = { path = "crates/nuvec-gpu", version = "0.1.0" }
+nuvec-io = { path = "crates/nuvec-io", version = "0.1.0" }
+nuvec-kernels = { path = "crates/nuvec-kernels", version = "0.1.0" }
+nuvec-lm = { path = "crates/nuvec-lm", version = "0.1.0" }
+nuvec-nn = { path = "crates/nuvec-nn", version = "0.1.0" }
 
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2", "block2"] }

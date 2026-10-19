@@ -1,9 +1,9 @@
 //! GPU evaluation: encodes supported primitives as Metal kernels on unified memory.
 //!
 //! Work is committed in chunks without waiting; an evaluation's chunks are ordered on the GPU
-//! by a timeline (D-031). Outputs of encoded kernels stay *pending* (in a side table, not yet
-//! in the nodes' slots) until their chunk has completed; completion handlers then publish
-//! them, chunk by chunk in commit order, so data in a slot is always complete and a failure
+//! by a timeline. Outputs of encoded kernels stay *pending* (exposed to later GPU work as
+//! in-flight data, not yet in the nodes' slots) until their chunk has completed; completion
+//! publishes them, chunk by chunk in commit order, so data in a slot is always complete and a failure
 //! marks the outputs of its chunk and of every later chunk of the evaluation as failed.
 //! Primitives without a GPU kernel fall back to the CPU after [`GpuEval::flush`], which waits
 //! for this evaluation's outstanding work (unified memory needs no copies).
@@ -122,8 +122,8 @@ mod metal {
     /// A committed chunk's nodes, weakly: their data is in flight in the nodes themselves
     /// (exposed at commit) and is published from there. Nodes nothing refers to any more
     /// are dropped at once (their memory returns to the allocator, for later GPU work to
-    /// reuse after these uses), and a consumer may take a pending output over (donation,
-    /// D-058), so neither nodes nor data are held until completion.
+    /// reuse after these uses), and a consumer may take a pending output over (donation),
+    /// so neither nodes nor data are held until completion.
     type Committed = Vec<Weak<Node>>;
 
     fn weak(chunk: &[(Arc<Node>, Vec<Data>)]) -> Committed {
@@ -178,7 +178,7 @@ mod metal {
 
     /// The first GPU command failure on this device. GPU work may read other evaluations'
     /// in-flight results, so once a command fails every later GPU result is reported as
-    /// failed too (D-032), as in MLX, where a command-buffer error ends the stream.
+    /// failed too, as in MLX, where a command-buffer error ends the stream.
     static DEVICE_FAILURE: Mutex<Option<Error>> = Mutex::new(None);
 
     fn device_result(result: Result<()>) -> Result<()> {

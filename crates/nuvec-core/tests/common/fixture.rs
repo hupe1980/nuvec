@@ -709,8 +709,8 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
         }
         // A sum of the larger operand and log1p(exp(·)): absolute error near zero.
         "logaddexp" => 4.0 * eps * e.abs().max(1.0),
-        // Complex division is not exactly rounded (and MLX's C++ build may contract to
-        // FMA), see D-021.
+        // Complex division is not exactly rounded (and MLX's C++ build may contract it to
+        // fused multiply-adds).
         "divide" if expected.dtype == DType::Complex64 => {
             4.0 * eps * e.abs().max(f64::MIN_POSITIVE)
         }

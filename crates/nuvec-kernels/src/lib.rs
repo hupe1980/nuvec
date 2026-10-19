@@ -5,11 +5,16 @@
 //! disabled with `NUVEC_METALLIB=off`, the sources are embedded instead so they can
 //! be compiled at runtime. [`MODE`] reports which of these happened.
 //!
-//! The kernels: element-wise operations, casts, copies, gather and scatter along an axis,
-//! MLX's reductions, MLX's GEMM (steel,
-//! split-K) and GEMV, MLX's affine quantization kernels (quantize, dequantize and the
-//! quantized matrix products), and MLX's fused kernels (softmax, log-sum-exp, RMS and layer
-//! normalisation, RoPE, cross entropy, scaled dot-product attention).
+//! The kernels:
+//!
+//! - element-wise operations, casts, copies, gather and scatter along an axis;
+//! - MLX's reductions, sort (block and multi-block merge) and scans;
+//! - MLX's GEMM (steel tiles, split-K, fused `addmm`), GEMV and gather GEMM (`gather_mm`);
+//! - MLX's affine quantization: quantize, dequantize and the quantized products, including
+//!   the mixture-of-experts gather kernels;
+//! - MLX's fused kernels: softmax, log-sum-exp, RMS and layer normalisation, RoPE, cross
+//!   entropy, scaled dot-product attention (vector, two-pass and tiled);
+//! - mlx-lm's Gated DeltaNet kernels.
 //!
 //! **Status:** pre-alpha.
 

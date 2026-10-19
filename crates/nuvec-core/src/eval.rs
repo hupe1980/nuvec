@@ -258,7 +258,7 @@ fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
 /// whole of a writable buffer with no other handle. Ownership proves the write exclusive,
 /// so no reference counting of other users is needed.
 ///
-/// The base may be finished, or still in flight in an earlier evaluation (D-058): pending
+/// The base may be finished, or still in flight in an earlier evaluation: pending
 /// work holds nodes and data only weakly, so the in-flight copy is then the data's only
 /// handle; taking it over (under the lock that publishing takes) means it is never
 /// published. The buffer's fences order the write after the work that produces and reads

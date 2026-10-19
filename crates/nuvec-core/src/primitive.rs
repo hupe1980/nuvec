@@ -1,11 +1,11 @@
 //! What a graph node computes.
 //!
-//! Primitives form a closed enum (D-015): equality and hashing — the basis for
+//! Primitives form a closed enum: equality and hashing — the basis for
 //! common-subexpression elimination — are derived, and every per-primitive rule (output
 //! inference here; gradient, batching and fusion rules later) is an exhaustive `match`.
 //!
 //! Primitives require operands of equal shape and dtype. Promotion and broadcasting happen
-//! in the ops layer, which inserts `AsType` and `Broadcast` nodes (D-019).
+//! in the ops layer, which inserts `AsType` and `Broadcast` nodes.
 
 use smallvec::{SmallVec, smallvec};
 

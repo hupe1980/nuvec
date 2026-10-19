@@ -29,14 +29,23 @@
 //! # }
 //! ```
 //!
-//! The crate root re-exports the everyday API; the layers below are available as modules.
+//! What is inside:
 //!
-//! **Status:** pre-alpha. NumPy/MLX semantics (promotion, broadcasting, zero-copy views,
-//! element-wise operations, weak scalar operands, reductions, matmul, MLX-compatible affine
-//! quantization, fused `fast` kernels) and composable
-//! transforms (`grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`,
-//! `checkpoint`), evaluated on the GPU by default (asynchronously submitted; see
-//! `async_eval`) or on the CPU.
+//! - **Arrays** with MLX/NumPy semantics: 14 dtypes, type promotion, broadcasting, zero-copy
+//!   views, indexing, reductions, sorting, scans and matmul.
+//! - **Transforms** that compose: [`grad`], [`value_and_grad`], [`vjp`], [`jvp`], [`vmap`],
+//!   [`custom_function`], [`checkpoint`] and [`compile()`] (kernel fusion).
+//! - **Metal kernels** ported from MLX (GEMM, GEMV, quantized products, attention,
+//!   normalisation, RoPE, sort, scan), MLX-compatible affine [quantization](quantize) and
+//!   custom kernels from source ([`fast::MetalKernel`]).
+//! - **Evaluation** on the GPU by default, submitted asynchronously ([`async_eval`],
+//!   [`schedule`]), or on the CPU; memory limits and wired memory on [`gpu::Device`].
+//! - **I/O** ([`io`]): safetensors and npy, memory-mapped without a copy.
+//!
+//! The crate root re-exports the everyday API; the layers below are available as modules.
+//! Neural-network layers and optimizers are in `nuvec-nn`, the LLM runtime in `nuvec-lm`.
+//!
+//! **Status:** pre-alpha: the API may change between releases.
 
 #![forbid(unsafe_code)]
 

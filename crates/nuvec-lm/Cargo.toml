@@ -1,6 +1,7 @@
 [package]
 name = "nuvec-lm"
-description = "LLM runtime for nuvec: model loading, KV caches and sampling"
+description = "LLM runtime for nuvec: Llama/Qwen models, MLX checkpoints, sampling, speculative decoding"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

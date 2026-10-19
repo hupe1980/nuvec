@@ -1,6 +1,7 @@
 [package]
 name = "nuvec-io"
 description = "Zero-copy safetensors and npy loading for nuvec"
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

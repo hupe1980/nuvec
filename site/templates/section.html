@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block body_class %}docs{% endblock body_class %}
+
+{% block structured_data %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "CollectionPage",
+      "name": {{ section.title | json_encode | safe }},
+      "description": {{ section.description | default(value=config.description) | json_encode | safe }},
+      "url": "{{ section.permalink }}",
+      "isPartOf": { "@type": "WebSite", "name": "nuvec", "url": "{{ config.base_url }}/" }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "nuvec", "item": "{{ config.base_url }}/" },
+        { "@type": "ListItem", "position": 2, "name": "Docs", "item": "{{ section.permalink }}" }
+      ]
+    }
+  ]
+}
+</script>
+{% endblock structured_data %}
+
+{% block content %}
+<div class="wrap docs-index">
+  <p class="eyebrow">Documentation</p>
+  <h1>{{ section.title }}</h1>
+  <div class="prose wide">{{ section.content | safe }}</div>
+  {%- set group = "" %}
+  {%- for p in section.pages %}
+  {%- if p.extra.group and p.extra.group != group %}
+  {%- if group != "" %}</div>{% endif %}
+  {% set_global group = p.extra.group %}
+  <h2 class="group-title">{{ group }}</h2>
+  <div class="cards">
+  {%- endif %}
+    <a class="card card-link" href="{{ p.permalink }}">
+      <h3>{{ p.title }}</h3>
+      <p>{{ p.description }}</p>
+    </a>
+  {%- endfor %}
+  </div>
+</div>
+{% endblock content %}

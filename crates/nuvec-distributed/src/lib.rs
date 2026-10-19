@@ -1,6 +1,6 @@
-//! Distributed collectives over TCP rings and Thunderbolt RDMA.
+//! Reserved for distributed collectives (multi-Mac execution).
 //!
-//! **Status:** pre-alpha. This crate has no functional API yet.
+//! **Status:** this crate has no functional API yet.
 
 /// The version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

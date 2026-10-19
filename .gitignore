@@ -54,3 +54,4 @@ rustc-ice-*.txt
 # Python bytecode (from running scripts/)
 __pycache__/
 *.pyc
+/site/public
