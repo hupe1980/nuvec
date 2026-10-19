@@ -2,9 +2,10 @@
 //! command encoding with minimal barriers.
 //!
 //! ```no_run
+//! # #[cfg(target_os = "macos")]
+//! # fn main() -> nuvec_gpu::Result<()> {
 //! use nuvec_gpu::{Arg, Device};
 //!
-//! # fn main() -> nuvec_gpu::Result<()> {
 //! let Some(device) = Device::system_default() else { return Ok(()) }; // no Metal here
 //! let add = device.pipeline("nuvec_add_f32")?;
 //! let a = device.buffer_from(&1.0f32.to_le_bytes().repeat(4))?;
@@ -16,6 +17,8 @@
 //! assert_eq!(&out.contents()?[..4], &3.0f32.to_le_bytes());
 //! # Ok(())
 //! # }
+//! # #[cfg(not(target_os = "macos"))]
+//! # fn main() {} // Metal exists only on Apple platforms
 //! ```
 //!
 //! Buffers live in shared (unified) memory: the CPU reads GPU results in place. CPU access
