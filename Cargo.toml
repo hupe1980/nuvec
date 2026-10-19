@@ -51,8 +51,10 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLFence",
     "MTLFunctionConstantValues",
     "MTLLibrary",
+    "MTLResidencySet",
     "MTLResource",
     "MTLTypes",
+    "objc2-core-foundation",
 ] }
 half = { version = "2.7", features = ["bytemuck"] }
 smallvec = { version = "1", features = ["union", "const_generics"] }

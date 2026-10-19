@@ -42,16 +42,6 @@ pub(crate) fn writable(data: &Data, meta: &Output) -> bool {
     }
 }
 
-/// Shared by both implementations: publish outputs to a node's slots.
-fn publish(node: &Node, outputs: Vec<Data>, result: &Result<()>) {
-    for (output, data) in node.outputs.iter().zip(outputs) {
-        let _ = output.slot.set(match result {
-            Ok(()) => Ok(data),
-            Err(e) => Err(e.clone()),
-        });
-    }
-}
-
 #[cfg(not(all(target_os = "macos", not(miri))))]
 mod stub {
     use super::*;
@@ -78,7 +68,9 @@ mod stub {
             unreachable!("no GPU kernels on this target")
         }
         pub(crate) fn defer(&mut self, node: Arc<Node>, outputs: Vec<Data>) {
-            publish(&node, outputs, &Ok(()));
+            for (output, data) in node.outputs.iter().zip(outputs) {
+                let _ = output.slot.set(Ok(data));
+            }
         }
         pub(crate) fn slice_update_in_place(
             &mut self,
@@ -127,6 +119,33 @@ mod metal {
 
     type Chunk = Vec<(Arc<Node>, Vec<Data>)>;
 
+    /// A committed chunk's nodes, weakly: their data is in flight in the nodes themselves
+    /// (exposed at commit) and is published from there. Nodes nothing refers to any more
+    /// are dropped at once (their memory returns to the allocator, for later GPU work to
+    /// reuse after these uses), and a consumer may take a pending output over (donation,
+    /// D-058), so neither nodes nor data are held until completion.
+    type Committed = Vec<Weak<Node>>;
+
+    fn weak(chunk: &[(Arc<Node>, Vec<Data>)]) -> Committed {
+        chunk.iter().map(|(node, _)| Arc::downgrade(node)).collect()
+    }
+
+    /// Publishes a completed node's in-flight outputs; donated outputs are never published.
+    fn publish_committed(node: &Node, result: &Result<()>) {
+        for output in &node.outputs {
+            let data = match &*output.inflight.lock() {
+                crate::array::InFlightState::Set(d) => Some(d.clone()),
+                _ => None,
+            };
+            let value = match (result, data) {
+                (Err(e), _) => Err(e.clone()),
+                (Ok(()), Some(d)) => Ok(d),
+                (Ok(()), None) => continue,
+            };
+            let _ = output.slot.set(value);
+        }
+    }
+
     /// Completion state shared with an evaluation's completion handlers.
     #[derive(Default)]
     struct Shared {
@@ -136,9 +155,12 @@ mod metal {
     #[derive(Default)]
     struct Publishing {
         /// Per committed chunk: its outputs, until published.
-        chunks: Vec<Option<Chunk>>,
+        chunks: Vec<Option<Committed>>,
         /// Per committed chunk: its result, once complete.
         results: Vec<Option<Result<()>>>,
+        /// Per committed chunk: whether its outputs are exposed as in-flight data (they are
+        /// published only then).
+        exposed: Vec<bool>,
         /// Chunks published so far (in commit order).
         next: usize,
         /// The first failure; it fails every later chunk too.
@@ -149,7 +171,7 @@ mod metal {
     fn expose(chunk: &Chunk) {
         for (node, outputs) in chunk {
             for (output, data) in node.outputs.iter().zip(outputs) {
-                let _ = output.inflight.set(data.clone());
+                output.inflight.set(data.clone());
             }
         }
     }
@@ -178,14 +200,31 @@ mod metal {
         fn complete(&self, k: usize, result: Result<()>) {
             let mut p = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             p.results[k] = Some(result);
-            while let Some(Some(result)) = p.results.get(p.next).cloned() {
+            Self::publish_ready(&mut p);
+        }
+
+        /// Records that chunk `k`'s outputs are exposed, and publishes what is ready.
+        fn exposed(&self, k: usize) {
+            let mut p = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            p.exposed[k] = true;
+            Self::publish_ready(&mut p);
+        }
+
+        /// Publishes, in order, every chunk that is complete and exposed.
+        fn publish_ready(p: &mut Publishing) {
+            while let (Some(Some(result)), Some(true)) = (
+                p.results.get(p.next).cloned(),
+                p.exposed.get(p.next).copied(),
+            ) {
                 if let (Err(e), None) = (&result, &p.error) {
                     p.error = Some(e.clone());
                 }
                 let result = p.error.clone().map_or(Ok(()), Err);
                 let next = p.next;
-                for (node, outputs) in p.chunks[next].take().unwrap_or_default() {
-                    publish(&node, outputs, &result);
+                for node in p.chunks[next].take().unwrap_or_default() {
+                    if let Some(node) = node.upgrade() {
+                        publish_committed(&node, &result);
+                    }
                 }
                 p.next += 1;
             }
@@ -464,6 +503,7 @@ mod metal {
             BinaryOp::Divide => "div",
             BinaryOp::Maximum => "max",
             BinaryOp::Minimum => "min",
+            BinaryOp::LogAddExp => "logaddexp",
             BinaryOp::Equal => "eq",
             BinaryOp::NotEqual => "ne",
             BinaryOp::Less => "lt",
@@ -480,6 +520,38 @@ mod metal {
     /// The kernel family suffix for element size `bytes`.
     fn bits(bytes: usize) -> usize {
         bytes * 8
+    }
+
+    /// A 3-D copy's geometry in 16-byte units when the innermost dimension is contiguous
+    /// in every layout and every stride and offset is a multiple of the unit (fewer, wider
+    /// memory accesses); the element width in bits to copy with.
+    fn widen(
+        size: usize,
+        shape: &mut [usize],
+        strides: &mut [&mut Vec<isize>],
+        offsets: &mut [&mut isize],
+    ) -> usize {
+        let n = 16 / size;
+        let last = shape.len() - 1;
+        let aligned = n > 1
+            && shape[last].is_multiple_of(n)
+            && strides
+                .iter()
+                .all(|s| s[last] == 1 && s[..last].iter().all(|&x| x.rem_euclid(n as isize) == 0))
+            && offsets.iter().all(|o| o.rem_euclid(n as isize) == 0);
+        if !aligned {
+            return bits(size);
+        }
+        shape[last] /= n;
+        for s in strides.iter_mut() {
+            for x in &mut s[..last] {
+                *x /= n as isize;
+            }
+        }
+        for o in offsets.iter_mut() {
+            **o /= n as isize;
+        }
+        128
     }
 
     /// An operand of the quantized kernels: its buffer and byte offset, in a layout the
@@ -797,6 +869,7 @@ mod metal {
                     not64(d)
                         && match op {
                             BinaryOp::Divide => is_float(d) || d == DType::Complex64,
+                            BinaryOp::LogAddExp => is_float(d),
                             BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => true,
                             BinaryOp::Equal | BinaryOp::NotEqual => true,
                             _ => d != DType::Complex64,
@@ -1448,20 +1521,47 @@ mod metal {
             if meta.size == 0 {
                 return Ok(());
             }
+            // Dimensions contiguous in both layouts merged: at most three take a 3-D grid
+            // without index divisions.
+            let (mut shape, [mut from, mut to]) =
+                nuvec_cpu::collapse_dims(&meta.shape, [&meta.strides, strides]);
+            let small = shape.len() <= 3 && shape.iter().all(|&d| d <= u32::MAX as usize);
+            let (mut from_off, mut to_off) = (data.offset, offset);
+            let mut width = bits(meta.dtype.size());
+            if small {
+                while shape.len() < 3 {
+                    shape.insert(0, 1);
+                    from.insert(0, 0);
+                    to.insert(0, 0);
+                }
+                width = widen(
+                    meta.dtype.size(),
+                    &mut shape,
+                    &mut [&mut from, &mut to],
+                    &mut [&mut from_off, &mut to_off],
+                );
+            }
             let consts = [
-                bytes(&(data.offset as i64)),
-                bytes(&(offset as i64)),
-                shape_bytes(&meta.shape),
-                strides_bytes(&meta.strides),
-                strides_bytes(strides),
-                bytes(&(meta.shape.len() as i32)),
+                bytes(&(from_off as i64)),
+                bytes(&(to_off as i64)),
+                shape_bytes(&shape),
+                strides_bytes(&from),
+                strides_bytes(&to),
+                bytes(&(shape.len() as i32)),
             ];
             let mut args = vec![
                 Arg::read(data.buffer.metal().expect("checked")),
                 Arg::write(buffer.metal_mut().expect("device storage")),
             ];
             args.extend(consts.iter().map(|c| Arg::bytes(c)));
-            let name = format!("nuvec_copy_into_{}", bits(meta.dtype.size()));
+            let name = format!("nuvec_copy_into_{width}");
+            if small {
+                return self.dispatch_grid(
+                    &format!("{name}_g3"),
+                    &args,
+                    [shape[2], shape[1], shape[0]],
+                );
+            }
             self.dispatch(&name, &args, meta.size)
         }
 
@@ -1488,23 +1588,28 @@ mod metal {
         fn copy(&mut self, (meta, data): Operand<'_>, buffer: &mut Buffer) -> Result<()> {
             let (mut shape, [mut strides]) = nuvec_cpu::collapse_dims(&meta.shape, [&meta.strides]);
             let small = shape.len() <= 3 && shape.iter().all(|&d| d <= u32::MAX as usize);
+            let mut from_off = data.offset;
+            let mut width = bits(meta.dtype.size());
             if small {
                 while shape.len() < 3 {
                     shape.insert(0, 1);
                     strides.insert(0, 0);
                 }
+                // The output is row-contiguous: aligned with the input's innermost run.
+                width = widen(
+                    meta.dtype.size(),
+                    &mut shape,
+                    &mut [&mut strides],
+                    &mut [&mut from_off],
+                );
             }
             let consts = [
-                bytes(&(data.offset as i64)),
+                bytes(&(from_off as i64)),
                 shape_bytes(&shape),
                 strides_bytes(&strides),
                 bytes(&(shape.len() as i32)),
             ];
-            let name = format!(
-                "nuvec_copy_{}_g{}",
-                bits(meta.dtype.size()),
-                if small { "3" } else { "" }
-            );
+            let name = format!("nuvec_copy_{width}_g{}", if small { "3" } else { "" });
             let input = data.buffer.metal().expect("checked");
             let mut args = vec![
                 Arg::read(input),
@@ -3474,14 +3579,20 @@ mod metal {
         fn counted(&mut self) -> Result<()> {
             self.dispatches += 1;
             let busy = self.device().is_some_and(|d| d.in_flight() > 0);
-            let limit = *self.limit.get_or_insert(if busy {
+            // Profiling times each dispatch alone.
+            let profiling = nuvec_gpu::profile::enabled();
+            let limit = *self.limit.get_or_insert(if profiling {
+                1
+            } else if busy {
                 MAX_DISPATCHES
             } else {
                 IDLE_DISPATCHES
             });
             if self.dispatches >= limit {
                 self.commit();
-                self.limit = Some(if busy {
+                self.limit = Some(if profiling {
+                    1
+                } else if busy {
                     (limit * 2).min(MAX_DISPATCHES)
                 } else {
                     IDLE_DISPATCHES
@@ -3505,10 +3616,11 @@ mod metal {
                 let result = std::mem::take(&mut self.foreign)
                     .iter()
                     .try_for_each(|a| a.out().slot.wait().clone().map(|_| ()));
-                let committed = self.chunk.clone();
-                let k = self.reserve();
-                self.shared.complete(k, result);
+                let committed = std::mem::take(&mut self.chunk);
+                let k = self.reserve(&committed);
                 expose(&committed);
+                self.shared.exposed(k);
+                self.shared.complete(k, result);
                 return;
             };
             // This command buffer runs after every foreign producer (device timeline).
@@ -3516,26 +3628,33 @@ mod metal {
             if let Some(device) = self.device {
                 device.wait_for_capacity(MAX_IN_FLIGHT);
             }
-            let committed = self.chunk.clone();
-            let k = self.reserve();
+            // Held until exposed: a completion handler that runs first publishes from it.
+            let committed = std::mem::take(&mut self.chunk);
+            let k = self.reserve(&committed);
             let shared = self.shared.clone();
             let pending = cmd.commit_then(move |result| {
                 shared.complete(k, device_result(result.map_err(backend)));
             });
+            // Profiling times each command buffer alone: nothing may overlap it.
+            if nuvec_gpu::profile::enabled() {
+                pending.wait();
+            }
             self.submitted.push(pending);
             // Only now, after the commit, may other evaluations encode work that reads it.
             expose(&committed);
+            self.shared.exposed(k);
         }
 
-        /// Registers the open chunk as committed chunk `k`.
-        fn reserve(&mut self) -> usize {
+        /// Registers `chunk` (the open chunk) as committed chunk `k`.
+        fn reserve(&mut self, chunk: &Chunk) -> usize {
             let mut p = self
                 .shared
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            p.chunks.push(Some(std::mem::take(&mut self.chunk)));
+            p.chunks.push(Some(weak(chunk)));
             p.results.push(None);
+            p.exposed.push(false);
             p.chunks.len() - 1
         }
 
@@ -3568,7 +3687,7 @@ mod metal {
                     .unwrap_or_else(PoisonError::into_inner);
                 let next = p.next;
                 for chunk in p.chunks[next..].iter_mut().flatten() {
-                    chunk.retain(|(node, _)| Arc::strong_count(node) > 1);
+                    chunk.retain(|node| node.strong_count() > 0);
                 }
             }
             self.index.retain(|_, (node, _)| node.strong_count() > 0);
@@ -3673,11 +3792,15 @@ mod metal {
         fn chunks_publish_in_order_and_failures_poison_later_chunks() {
             let shared = Shared::default();
             let nodes: Vec<_> = (0..3).map(|_| pending()).collect();
+            for (node, data) in &nodes {
+                node.outputs[0].inflight.set(data[0].clone());
+            }
             {
                 let mut p = shared.state.lock().unwrap();
                 for n in &nodes {
-                    p.chunks.push(Some(vec![n.clone()]));
+                    p.chunks.push(Some(weak(std::slice::from_ref(n))));
                     p.results.push(None);
+                    p.exposed.push(true);
                 }
             }
             let slot = |i: usize| nodes[i].0.outputs[0].slot.get().map(Result::is_ok);

@@ -204,6 +204,22 @@ template <typename T>
     out[out_off + loc(i, shape, out_strides, ndim)] = a[a_off + loc(i, shape, a_strides, ndim)];
 }
 
+// `copy_into` for at most three dimensions (collapsed for both layouts): a 3-D grid whose
+// offsets are multiply-adds (MLX's `copy_gg_nd3`).
+template <typename T>
+[[kernel]] void copy_into_g3(
+    device const T* a [[buffer(0)]],
+    device T* out [[buffer(1)]],
+    constant long& a_off [[buffer(2)]],
+    constant long& out_off [[buffer(3)]],
+    constant int* shape [[buffer(4)]],
+    constant long* a_strides [[buffer(5)]],
+    constant long* out_strides [[buffer(6)]],
+    constant int& ndim [[buffer(7)]],
+    uint3 p [[thread_position_in_grid]]) {
+    out[out_off + loc3(p, out_strides)] = a[a_off + loc3(p, a_strides)];
+}
+
 #define NUVEC_GATHER(bits, T, iname, I)                                                          \
     template [[host_name("nuvec_gather_" #bits "_" #iname)]] [[kernel]] void gather_axis<T, I>( \
         device const T*, device const I*, device T*, constant long&, constant long&,            \
@@ -248,9 +264,17 @@ NUVEC_INDEXING(int64, long)
 #define NUVEC_COPY_INTO(bits, T)                                                               \
     template [[host_name("nuvec_copy_into_" #bits)]] [[kernel]] void copy_into<T>(            \
         device const T*, device T*, constant long&, constant long&, constant int*,             \
-        constant long*, constant long*, constant int&, uint);
+        constant long*, constant long*, constant int&, uint);                                   \
+    template [[host_name("nuvec_copy_into_" #bits "_g3")]] [[kernel]] void copy_into_g3<T>(   \
+        device const T*, device T*, constant long&, constant long&, constant int*,             \
+        constant long*, constant long*, constant int&, uint3);
 
 NUVEC_COPY_INTO(8, uchar)
 NUVEC_COPY_INTO(16, ushort)
 NUVEC_COPY_INTO(32, uint)
 NUVEC_COPY_INTO(64, ulong)
+
+// 16-byte units, for layouts whose innermost dimension is contiguous and aligned.
+template [[host_name("nuvec_copy_into_128_g3")]] [[kernel]] void copy_into_g3<uint4>(
+    device const uint4*, device uint4*, constant long&, constant long&, constant int*,
+    constant long*, constant long*, constant int&, uint3);

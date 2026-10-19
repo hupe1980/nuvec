@@ -51,12 +51,12 @@ pub use nuvec_core::{
     bf16, broadcast_to, checkpoint, concatenate, conjugate, contiguous, conv1d, cos, cummax,
     cummin, cumprod, cumsum, custom_function, default_device, default_stream, dequantize, divide,
     equal, erfinv, eval, exp, expand_dims, f16, gather_mm, gather_qmm, grad, greater,
-    greater_equal, jvp, less, less_equal, log, logcumsumexp, logsumexp, matmul, max, maximum, mean,
-    min, minimum, multiply, negative, not_equal, ones, partition, prod, promote_types,
-    put_along_axis, quantize, quantized_matmul, repeat, reshape, scatter_add_along_axis, schedule,
-    set_default_stream, sigmoid, sign, sin, slice, slice_update, softmax, sort, split, split_at,
-    sqrt, squeeze, stack, stop_gradient, subtract, sum, take, take_along_axis, tanh, topk,
-    transpose, value_and_grad, vjp, vmap, where_, zeros,
+    greater_equal, jvp, less, less_equal, log, logaddexp, logcumsumexp, logsumexp, matmul, max,
+    maximum, mean, min, minimum, multiply, negative, not_equal, ones, partition, prod,
+    promote_types, put_along_axis, quantize, quantized_matmul, repeat, reshape,
+    scatter_add_along_axis, schedule, set_default_stream, sigmoid, sign, sin, slice, slice_update,
+    softmax, sort, split, split_at, sqrt, squeeze, stack, stop_gradient, subtract, sum, take,
+    take_along_axis, tanh, topk, transpose, value_and_grad, vjp, vmap, where_, zeros,
 };
 pub use nuvec_core::{fast, random};
 pub use nuvec_cpu as cpu;

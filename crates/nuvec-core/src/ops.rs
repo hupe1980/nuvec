@@ -36,13 +36,14 @@ fn check_inputs(inputs: &[&Array]) -> Result<()> {
 fn binary(op: BinaryOp, a: &Array, b: &Array) -> Result<Array> {
     check_inputs(&[a, b])?;
     let mut dtype = promote_types(a.dtype(), b.dtype());
-    if op == BinaryOp::Divide {
+    if matches!(op, BinaryOp::Divide | BinaryOp::LogAddExp) {
         dtype = at_least_float(dtype);
     }
     let ordered = matches!(
         op,
         BinaryOp::Maximum
             | BinaryOp::Minimum
+            | BinaryOp::LogAddExp
             | BinaryOp::Less
             | BinaryOp::LessEqual
             | BinaryOp::Greater
@@ -88,6 +89,11 @@ binary_fn! {
     maximum => Maximum;
     /// Element-wise minimum; NaN propagates. Not defined for complex numbers.
     minimum => Minimum;
+    /// Element-wise `log(exp(a) + exp(b))`, computed stably as MLX does: the larger operand
+    /// plus `log1p(exp(smaller − larger))`, or the larger one when the smaller is −∞ or the
+    /// larger +∞. Integers are promoted to floating point; NaN propagates. Not defined for
+    /// complex numbers.
+    logaddexp => LogAddExp;
     /// Element-wise `a == b` as a bool array.
     equal => Equal;
     /// Element-wise `a != b` as a bool array.

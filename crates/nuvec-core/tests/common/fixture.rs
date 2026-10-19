@@ -440,6 +440,7 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "divide" => Some(divide),
         "maximum" => Some(maximum),
         "minimum" => Some(minimum),
+        "logaddexp" => Some(logaddexp),
         "equal" => Some(equal),
         "not_equal" => Some(not_equal),
         "less" => Some(less),
@@ -683,10 +684,13 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
             };
             cancels * (n.unwrap_or(1) as f64 + 8.0) * eps * e.abs().max(1.0)
         }
-        // Sums of `K · C_in` products, in another order than MLX's kernels.
+        // Sums of `K · C_in / groups` products, in another order than MLX's kernels: as a
+        // product, bounded by the operands' magnitudes (the sum may cancel).
         "conv1d" => {
+            let bound = |t: &Tensor| values(t).iter().fold(1.0f64, |m, &(re, _)| m.max(re.abs()));
             let w = &case.inputs[1].shape;
-            (w[1] * w[2]) as f64 * 2.0 * eps * e.abs().max(1.0)
+            let k = (w[1] * w[2]) as f64;
+            4.0 * (k + 1.0) * eps * bound(&case.inputs[0]) * bound(&case.inputs[1])
         }
         // Each step rounds in MLX (float32), once in nuvec (f64): the error grows with
         // the scanned length.
@@ -703,6 +707,8 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
         "exp" | "log" | "sqrt" | "sin" | "cos" | "tanh" | "sigmoid" => {
             4.0 * eps * e.abs().max(f64::MIN_POSITIVE)
         }
+        // A sum of the larger operand and log1p(exp(·)): absolute error near zero.
+        "logaddexp" => 4.0 * eps * e.abs().max(1.0),
         // Complex division is not exactly rounded (and MLX's C++ build may contract to
         // FMA), see D-021.
         "divide" if expected.dtype == DType::Complex64 => {

@@ -143,6 +143,7 @@ impl Device {
             unsafe { libc::munmap(ptr, map_len) };
             return Err(GpuError::OutOfMemory(len));
         };
+        self.pool().track(&raw);
         Ok(Buffer {
             raw: Some(raw),
             ptr: start,
@@ -367,6 +368,7 @@ impl Drop for Buffer {
             if self.mapped {
                 // Metal unmaps the file once the last reference (ours or a command
                 // buffer's) is released.
+                self.pool.untrack(&raw);
                 drop(raw);
                 return;
             }

@@ -29,15 +29,20 @@ Rust from the ground up, with **no bindings** to MLX or any other C/C++ library.
 > `QuantizedLinear`, `Embedding`, `RmsNorm`, `LayerNorm`, `Rope`, LoRA, activations,
 > cross-entropy, SGD, Adam, AdamW, Lion and Muon with learning-rate schedules and gradient
 > clipping; `just mnist` trains MLX's MNIST example model), and an LLM runtime (`nuvec-lm`:
-> Llama, Mistral, Qwen 2, Qwen 3 and Qwen 3.5 (hybrid Gated DeltaNet and attention, dense
-> or mixture-of-experts) models
+> Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE and Qwen 3.5 (hybrid Gated DeltaNet and
+> attention, dense or mixture-of-experts) models
 > from Hugging Face or MLX checkpoints, including
 > MLX's 4-bit ones, a byte-level BPE tokenizer read from `tokenizer.json`, a KV cache and
-> mlx-lm's sampler (greedy, temperature, top-p, min-p, top-k); `cargo run --release -p nuvec-lm --example generate`). Arrays are
+> mlx-lm's sampler (greedy, temperature, top-p, min-p, top-k), speculative decoding with
+> prompt-lookup drafts (greedy, attention-only models), with memory wired during
+> generation as mlx-lm does; `cargo run --release -p nuvec-lm --example generate`). Arrays are
 > evaluated on the GPU by default (Metal kernels on unified memory, submitted asynchronously;
 > `async_eval` overlaps host work with GPU work, and `schedule` orders a graph ahead of
 > starting it) or on the CPU
-> (`set_default_stream(Stream::default_for(Device::cpu()))`).
+> (`set_default_stream(Stream::default_for(Device::cpu()))`). The GPU allocator follows
+> MLX's: a buffer cache, memory and cache limits, statistics, and a wired limit that keeps
+> buffers and memory-mapped checkpoints resident (residency sets, macOS 15+), all on
+> `nuvec::gpu::Device::shared()`.
 
 ## Platforms
 

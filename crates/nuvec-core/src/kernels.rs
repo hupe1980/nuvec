@@ -524,6 +524,7 @@ pub(crate) fn binary(op: BinaryOp, a: Operand<'_>, b: Operand<'_>) -> Result<Buf
                 BinaryOp::Multiply => go!(T::mul_),
                 BinaryOp::Divide => go!(T::div_),
                 BinaryOp::Maximum => go!(T::max_),
+                BinaryOp::LogAddExp => go!(T::logaddexp_),
                 _ => go!(T::min_),
             }
             Ok(out)
@@ -949,6 +950,9 @@ trait Num: Scalar {
     fn is_nan_(self) -> bool {
         false
     }
+    fn logaddexp_(self, _: Self) -> Self {
+        unreachable!("logaddexp of a non-float type: {REJECTED}")
+    }
 }
 
 const REJECTED: &str = "rejected by the ops layer";
@@ -1028,6 +1032,17 @@ macro_rules! float_num {
             fn neg_(self) -> Self { -self }
             fn abs_(self) -> Self { self.abs() }
             fn is_nan_(self) -> bool { self.is_nan() }
+            fn logaddexp_(self, o: Self) -> Self {
+                if self.is_nan() || o.is_nan() {
+                    return <$t>::NAN;
+                }
+                let (max, min) = (self.max(o), self.min(o));
+                if min == <$t>::NEG_INFINITY || max == <$t>::INFINITY {
+                    max
+                } else {
+                    max + (min - max).exp().ln_1p()
+                }
+            }
             fn float_(self, op: UnaryOp) -> Self {
                 match op {
                     UnaryOp::Exp => self.exp(),
@@ -1140,6 +1155,7 @@ macro_rules! half_num {
             fn abs_(self) -> Self { <$t>::from_f32(self.to_f32().abs()) }
             fn is_nan_(self) -> bool { self.is_nan() }
             fn float_(self, op: UnaryOp) -> Self { <$t>::from_f32(self.to_f32().float_(op)) }
+            fn logaddexp_(self, o: Self) -> Self { <$t>::from_f32(self.to_f32().logaddexp_(o.to_f32())) }
         }
     )*};
 }

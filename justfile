@@ -73,12 +73,12 @@ bench-gemm:
     uv run scripts/bench_gemm.py
 
 # GPU quantized matrix products (4-bit decode and prefill shapes): nuvec vs MLX.
-bench-quant:
-    uv run scripts/bench_quant.py
+bench-quant *filter:
+    uv run scripts/bench_quant.py {{filter}}
 
 # GPU fused operations (norms, RoPE, softmax, log-sum-exp, cross entropy): nuvec vs MLX.
-bench-fast:
-    uv run scripts/bench_fast.py
+bench-fast *filter:
+    uv run scripts/bench_fast.py {{filter}}
 
 # GPU compiled element-wise functions (GELU, SwiGLU gating, Adam step): nuvec vs MLX.
 bench-compile:
@@ -87,6 +87,10 @@ bench-compile:
 # Text generation (prefill and decode) with a cached model: nuvec-lm vs mlx-lm.
 bench-lm model="mlx-community/Qwen3-8B-4bit" tokens="256":
     uv run scripts/bench_lm.py {{model}} {{tokens}}
+
+# Parity table over a model roster: nuvec-lm vs mlx-lm (cached models only).
+bench-parity *models:
+    uv run scripts/bench_parity.py {{models}}
 
 # Checkpoint loading (2 GiB safetensors, warm page cache): nuvec vs MLX.
 bench-load:

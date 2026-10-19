@@ -254,9 +254,15 @@ fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
 
 /// The buffer of a `slice_update`'s base, taken over to be written in place (MLX's
 /// donation): only when the evaluation owns the base outright — its node has no other
-/// handle (so no other array, view or pending work refers to it), it is finished, and its
-/// data is the whole of a writable buffer with no other handle. Ownership proves the
-/// write exclusive, so no reference counting of other users is needed.
+/// strong handle (so no other array, view or consumer refers to it) — and its data is the
+/// whole of a writable buffer with no other handle. Ownership proves the write exclusive,
+/// so no reference counting of other users is needed.
+///
+/// The base may be finished, or still in flight in an earlier evaluation (D-058): pending
+/// work holds nodes and data only weakly, so the in-flight copy is then the data's only
+/// handle; taking it over (under the lock that publishing takes) means it is never
+/// published. The buffer's fences order the write after the work that produces and reads
+/// it.
 fn donation(
     node: &Node,
     primitive: &Primitive,
@@ -271,24 +277,49 @@ fn donation(
     {
         return None;
     }
-    let base = Arc::get_mut(&mut inputs[0].node)?;
-    let [out] = base.outputs.as_mut_slice() else {
-        return None;
-    };
-    let Some(Ok(data)) = out.slot.get() else {
-        return None;
-    };
-    // The slot and (if it was published from in-flight work) the in-flight copy.
-    let handles = 1 + usize::from(out.inflight.get().is_some());
-    if !out.flags.row_contiguous
-        || !crate::gpu::writable(data, out)
-        || Arc::strong_count(&data.buffer) != handles
-    {
+    let base = &mut inputs[0].node;
+    if Arc::strong_count(base) != 1 {
         return None;
     }
-    out.inflight.take();
-    match out.slot.take() {
-        Some(Ok(data)) => Some(data),
+    let usable = |data: &Data, out: &crate::array::Output, handles: usize| {
+        out.flags.row_contiguous
+            && crate::gpu::writable(data, out)
+            && Arc::strong_count(&data.buffer) == handles
+    };
+    // Finished: no pending work refers to it any more, so it is owned outright.
+    if let Some(base) = Arc::get_mut(base) {
+        let [out] = base.outputs.as_mut_slice() else {
+            return None;
+        };
+        if let Some(Ok(data)) = out.slot.get() {
+            // The slot and (if it was published from in-flight work) the in-flight copy.
+            let handles = 1 + usize::from(out.inflight.get().is_some());
+            if !usable(data, out, handles) {
+                return None;
+            }
+            out.inflight.clear();
+            return match out.slot.take() {
+                Some(Ok(data)) => Some(data),
+                _ => None,
+            };
+        }
+    }
+    // In flight: only weak references from pending work remain besides ours.
+    let [out] = base.outputs.as_slice() else {
+        return None;
+    };
+    if out.slot.get().is_some() {
+        return None;
+    }
+    let mut state = out.inflight.lock();
+    let crate::array::InFlightState::Set(data) = &*state else {
+        return None;
+    };
+    if !usable(data, out, 1) {
+        return None;
+    }
+    match std::mem::replace(&mut *state, crate::array::InFlightState::Donated) {
+        crate::array::InFlightState::Set(data) => Some(data),
         _ => None,
     }
 }
@@ -327,7 +358,7 @@ fn input_data<'a>(
         // runs after it, so it may read the data at once.
         *pending = true;
         foreign.push(input);
-        Ok(d.clone())
+        Ok(d)
     } else {
         // Produced by another evaluation (another thread, or an earlier `async_eval`):
         // submit our own GPU work first, so two evaluations never wait on each other.

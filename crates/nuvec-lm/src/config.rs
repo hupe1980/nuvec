@@ -77,9 +77,9 @@ pub struct LinearAttention {
     pub conv_kernel: usize,
 }
 
-/// Mixture-of-experts MLPs (Qwen 3.5 MoE): each token's `experts_per_token` best experts
-/// (by a softmax router), weighted, plus a gated shared expert.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Mixture-of-experts MLPs (Qwen 3 MoE, Qwen 3.5 MoE): each token's `experts_per_token`
+/// best experts (by a softmax router), weighted, plus (Qwen 3.5) a gated shared expert.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixtureOfExperts {
     /// Experts per layer.
     pub experts: usize,
@@ -87,13 +87,24 @@ pub struct MixtureOfExperts {
     pub experts_per_token: usize,
     /// Width of each expert's hidden layer.
     pub intermediate_size: usize,
-    /// Width of the shared expert's hidden layer.
-    pub shared_intermediate_size: usize,
+    /// Width of the shared expert's hidden layer, if there is one.
+    pub shared_intermediate_size: Option<usize>,
     /// The chosen experts' weights are renormalised to sum to one.
     pub norm_topk_prob: bool,
+    /// Every `sparse_step`-th layer is a mixture of experts (`decoder_sparse_step`).
+    pub sparse_step: usize,
+    /// Layers with a dense MLP regardless (`mlp_only_layers`).
+    pub dense_layers: Vec<usize>,
 }
 
-/// A decoder-only transformer of the Llama family (Llama, Mistral, Qwen 2, Qwen 3) or a
+impl MixtureOfExperts {
+    /// Whether layer `i` is a mixture of experts (mlx-lm's rule).
+    pub fn is_sparse(&self, i: usize) -> bool {
+        !self.dense_layers.contains(&i) && (i + 1).is_multiple_of(self.sparse_step.max(1))
+    }
+}
+
+/// A decoder-only transformer of the Llama family (Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE) or a
 /// hybrid of attention and Gated DeltaNet layers (Qwen 3.5).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -183,19 +194,36 @@ impl Config {
             "llama" | "mistral" => (flag("attention_bias"), flag("attention_bias"), false),
             "qwen2" => (true, false, false),
             "qwen3" | "qwen3_5" => (flag("attention_bias"), flag("attention_bias"), true),
+            "qwen3_moe" => (false, false, true),
             other => return Err(invalid(format!("unsupported model type {other:?}"))),
         };
         let hybrid = model_type == "qwen3_5";
+        let qwen3_moe = model_type == "qwen3_moe";
         let moe = match c.get("num_experts").and_then(Json::as_i64).unwrap_or(0) {
-            experts if hybrid && experts > 0 => Some(MixtureOfExperts {
+            experts if (hybrid || qwen3_moe) && experts > 0 => Some(MixtureOfExperts {
                 experts: experts as usize,
                 experts_per_token: int("num_experts_per_tok")?,
                 intermediate_size: int("moe_intermediate_size")?,
-                shared_intermediate_size: int("shared_expert_intermediate_size")?,
+                shared_intermediate_size: match hybrid {
+                    true => Some(int("shared_expert_intermediate_size")?),
+                    false => None,
+                },
+                // mlx-lm's defaults: on for Qwen 3.5, off for Qwen 3.
                 norm_topk_prob: c
                     .get("norm_topk_prob")
                     .and_then(Json::as_bool)
-                    .unwrap_or(true),
+                    .unwrap_or(hybrid),
+                sparse_step: int("decoder_sparse_step").unwrap_or(1),
+                dense_layers: c
+                    .get("mlp_only_layers")
+                    .and_then(Json::as_array)
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(Json::as_i64)
+                            .map(|i| i as usize)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             _ => None,
         };
@@ -265,8 +293,8 @@ impl Config {
         Ok(Self {
             hidden_size,
             num_hidden_layers: layers,
-            intermediate_size: match moe {
-                // MoE configs have no dense MLP width.
+            intermediate_size: match &moe {
+                // MoE configs may have no dense MLP width.
                 Some(m) => int("intermediate_size").unwrap_or(m.intermediate_size),
                 None => int("intermediate_size")?,
             },
@@ -282,12 +310,15 @@ impl Config {
             vocab_size: int("vocab_size")?,
             rms_norm_eps: float("rms_norm_eps").unwrap_or(1e-6),
             rope_theta: rope_float("rope_theta").unwrap_or(10000.0),
-            rope_scaling: match hybrid {
+            rope_scaling: match (hybrid, qwen3_moe) {
                 // `rope_parameters` also carries multimodal sections (text uses plain RoPE).
-                true => rope_scaling(rope)?,
-                false => rope_scaling(c.get("rope_scaling"))?,
+                (true, _) => rope_scaling(rope)?,
+                // mlx-lm's Qwen 3 MoE ignores `rope_scaling`.
+                (_, true) => RopeScaling::None,
+                _ => rope_scaling(c.get("rope_scaling"))?,
             },
-            rope_traditional: model_type != "qwen3" && flag("rope_traditional"),
+            rope_traditional: !matches!(model_type.as_str(), "qwen3" | "qwen3_moe")
+                && flag("rope_traditional"),
             tie_word_embeddings: top
                 .get("tie_word_embeddings")
                 .or_else(|| c.get("tie_word_embeddings"))

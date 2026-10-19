@@ -13,7 +13,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use nuvec_lm::{GenerateOptions, Sampler, StreamDecoder, generate, load};
+use nuvec_lm::{GenerateOptions, Sampler, StreamDecoder, WiredLimit, generate, load};
 
 fn main() -> nuvec::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,6 +47,8 @@ fn main() -> nuvec::Result<()> {
     let eos = model.config.eos_token_ids.clone();
 
     println!("==========");
+    // Wired before the clock starts, as mlx-lm's `stream_generate` does.
+    let _wired = WiredLimit::new();
     let start = Instant::now();
     let mut generation = generate(&model, &ids, options)?;
     let first = generation.next().transpose()?;

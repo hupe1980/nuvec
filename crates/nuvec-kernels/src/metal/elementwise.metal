@@ -41,6 +41,7 @@ NUVEC_BINARY_OP(Mul, op_mul(a, b))
 NUVEC_BINARY_OP(Div, op_div(a, b))
 NUVEC_BINARY_OP(Max, op_max(a, b))
 NUVEC_BINARY_OP(Min, op_min(a, b))
+NUVEC_BINARY_OP(LogAddExp, op_logaddexp(a, b))
 NUVEC_BINARY_OP(Eq, nbool{uchar(op_eq(a, b))})
 NUVEC_BINARY_OP(Ne, nbool{uchar(!op_eq(a, b))})
 NUVEC_BINARY_OP(Lt, nbool{uchar(op_lt(a, b))})
@@ -245,6 +246,7 @@ template <typename T>
 #define NUVEC_FLOAT_KERNELS(name, T)            \
     NUVEC_INT_KERNELS(name, T)                  \
     NUVEC_BINARY(div, Div, name, T, T)          \
+    NUVEC_BINARY(logaddexp, LogAddExp, name, T, T) \
     NUVEC_UNARY(exp, Exp, name, T, T)           \
     NUVEC_UNARY(log, Log, name, T, T)           \
     NUVEC_UNARY(sqrt, Sqrt, name, T, T)         \
@@ -312,3 +314,8 @@ NUVEC_MOVE(8, uchar)
 NUVEC_MOVE(16, ushort)
 NUVEC_MOVE(32, uint)
 NUVEC_MOVE(64, ulong)
+
+// 16-byte units, for layouts whose innermost dimension is contiguous and aligned.
+template [[host_name("nuvec_copy_128_g3")]] [[kernel]] void copy_g3<uint4>(
+    device const uint4*, device uint4*, constant long&, constant int*, constant long*,
+    constant int&, uint3);

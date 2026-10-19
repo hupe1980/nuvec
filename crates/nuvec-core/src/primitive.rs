@@ -12,7 +12,7 @@ use smallvec::{SmallVec, smallvec};
 use crate::custom::CustomCall;
 use crate::shape::{Shape, Strides};
 use crate::view::{self, DimSlice};
-use crate::{Array, DType, Error, Result};
+use crate::{Array, Category, DType, Error, Result};
 
 /// An element-wise function of one operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,6 +81,8 @@ pub enum BinaryOp {
     Maximum,
     /// The smaller operand; NaN propagates.
     Minimum,
+    /// `log(exp(a) + exp(b))`, computed stably (MLX's `logaddexp`); NaN propagates.
+    LogAddExp,
     /// `a == b`.
     Equal,
     /// `a != b`.
@@ -117,6 +119,7 @@ impl BinaryOp {
             Self::Divide => "divide",
             Self::Maximum => "maximum",
             Self::Minimum => "minimum",
+            Self::LogAddExp => "logaddexp",
             Self::Equal => "equal",
             Self::NotEqual => "not_equal",
             Self::Less => "less",
@@ -449,6 +452,12 @@ impl Primitive {
             Self::Binary(op) => {
                 let [a, b] = self.arity::<2>(inputs)?;
                 self.same_shape_and_dtype(a, b)?;
+                if *op == BinaryOp::LogAddExp && a.dtype().category() != Category::Float {
+                    return Err(Error::UnsupportedDType {
+                        op: op.name(),
+                        dtype: a.dtype(),
+                    });
+                }
                 computed(
                     if op.is_comparison() {
                         DType::Bool

@@ -10,14 +10,16 @@ method (operations submitted back to back with `async_eval` after a warm-up, bes
 bursts, one or eight operations per `async_eval`), alternating the two programs twice,
 then prints microseconds per operation, the nuvec/MLX time ratio and its geometric mean.
 
-Usage: `just bench-fast`.
+Usage: `just bench-fast [filter]` (cases whose name contains `filter`).
 """
 
 from __future__ import annotations
 
 import math
+import os
 import platform
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -37,10 +39,15 @@ CASES = [
     ("cross_entropy-mnist", (256, 10)),
     ("sdpa-decode512", (1, 32, 8, 1, 512, 128)),
     ("sdpa-decode4096", (1, 32, 8, 1, 4096, 128)),
+    ("sdpa-decode32k", (1, 32, 8, 1, 32768, 128)),
     ("sdpa-prefill", (1, 32, 8, 1024, 1024, 128)),
     ("sdpa-prefill64", (1, 16, 16, 2048, 2048, 64)),
+    ("sdpa-chunk2048", (1, 16, 8, 2048, 2048, 128)),
+    ("sdpa-chunk1793", (1, 16, 8, 1793, 3841, 128)),
 ]
-DTYPES = {"float32": mx.float32, "float16": mx.float16}
+DTYPES = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
+FILTER = sys.argv[1] if len(sys.argv) > 1 else ""
+CASES = [c for c in CASES if FILTER in c[0]]
 
 
 def op(name: str, x: mx.array, w: mx.array, targets: mx.array) -> mx.array:
@@ -103,7 +110,8 @@ def mlx_results() -> dict[tuple[str, str], tuple[float, float]]:
 
 def nuvec_results() -> dict[tuple[str, str], tuple[float, float]]:
     proc = subprocess.run(["cargo", "bench", "-q", "-p", "nuvec-core", "--bench", "fast"],
-                          cwd=ROOT, capture_output=True, text=True, check=True)
+                          cwd=ROOT, capture_output=True, text=True, check=True,
+                          env={**os.environ, "BENCH_FILTER": FILTER})
     out = {}
     for line in proc.stdout.splitlines():
         name, label, single, grouped = line.split("\t")

@@ -3,6 +3,8 @@
 mod allocator;
 mod buffer;
 mod command;
+pub mod profile;
+mod residency;
 
 use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
@@ -103,7 +105,13 @@ impl Device {
         let ram = objc2_foundation::NSProcessInfo::processInfo().physicalMemory();
         let options = objc2_metal::MTLResourceOptions::StorageModeShared;
         let placeholder = device.newBufferWithLength_options(16, options);
-        let pool = Arc::new(Pool::new(info.recommended_working_set, ram, placeholder));
+        let residency = residency::Residency::new(residency::attach(&device, &queue));
+        let pool = Arc::new(Pool::new(
+            info.recommended_working_set,
+            ram,
+            placeholder,
+            residency,
+        ));
         Some(Device {
             inner: Arc::new(Inner {
                 device,
@@ -137,6 +145,29 @@ impl Device {
     /// Sets the cache limit, trimming the cache to it, and returns the previous one.
     pub fn set_cache_limit(&self, bytes: usize) -> usize {
         self.inner.pool.set_cache_limit(bytes)
+    }
+
+    /// Sets the wired limit and returns the previous one (MLX's `set_wired_limit`; 0 by
+    /// default). Buffers, mapped files included, are kept resident up to this many bytes
+    /// while GPU work runs, instead of being made resident per command buffer, which can
+    /// page memory in again under pressure. Lowering it unwires buffers until the wired set
+    /// fits. A limit above the recommended working set is an error. Without residency sets
+    /// (before macOS 15, or on GPUs before Metal 3) the limit is recorded but nothing is
+    /// wired.
+    pub fn set_wired_limit(&self, bytes: usize) -> Result<usize> {
+        if bytes as u64 > self.inner.info.recommended_working_set {
+            return Err(GpuError::InvalidArgument(format!(
+                "wired limit {bytes} exceeds the recommended working set ({} bytes)",
+                self.inner.info.recommended_working_set
+            )));
+        }
+        Ok(self.inner.pool.set_wired_limit(bytes))
+    }
+
+    /// Whether buffers can be wired on this system (residency sets: macOS 15 and a Metal 3
+    /// GPU).
+    pub fn can_wire(&self) -> bool {
+        self.inner.pool.can_wire()
     }
 
     /// Releases every cached buffer.

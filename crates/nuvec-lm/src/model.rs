@@ -271,17 +271,29 @@ impl KvCache {
         let (prev, l) = (self.offset, keys.shape()[2]);
         let capacity = self.keys.as_ref().map_or(0, |k| k.shape()[2]);
         if self.keys.is_none() || prev + l > capacity {
-            let grow = |old: &Option<Array>, like: &Array| -> Result<Array> {
-                let mut shape = like.shape().to_vec();
-                shape[2] = l.div_ceil(CACHE_STEP) * CACHE_STEP;
-                let fresh = nuvec::zeros(&shape, like.dtype())?;
-                match old {
-                    Some(old) => concatenate(&[positions(old, prev)?, fresh], 2),
-                    None => Ok(fresh),
+            // Grown by whole steps (mlx-lm's rule), written in one concatenation: the cached
+            // positions, the new ones, then zeros up to the step (no copy of the grown cache
+            // to update it).
+            let pad = l.div_ceil(CACHE_STEP) * CACHE_STEP - l;
+            let grow = |old: &Option<Array>, new: &Array| -> Result<Array> {
+                let mut parts = Vec::with_capacity(3);
+                if let Some(old) = old {
+                    parts.push(positions(old, prev)?);
                 }
+                parts.push(new.clone());
+                if pad > 0 {
+                    let mut shape = new.shape().to_vec();
+                    shape[2] = pad;
+                    parts.push(nuvec::zeros(&shape, new.dtype())?);
+                }
+                concatenate(&parts, 2)
             };
-            self.keys = Some(grow(&self.keys, &keys)?);
-            self.values = Some(grow(&self.values, &values)?);
+            let (k, v) = (grow(&self.keys, &keys)?, grow(&self.values, &values)?);
+            self.offset = prev + l;
+            let (pk, pv) = (positions(&k, self.offset)?, positions(&v, self.offset)?);
+            self.keys = Some(k);
+            self.values = Some(v);
+            return Ok((pk, pv));
         }
         self.offset = prev + l;
         let write = |cache: &mut Option<Array>, new: &Array| -> Result<Array> {
@@ -299,6 +311,25 @@ impl KvCache {
         let k = write(&mut self.keys, &keys)?;
         let v = write(&mut self.values, &values)?;
         Ok((k, v))
+    }
+
+    /// Forgets the last `n` positions (rejected speculative tokens): later writes overwrite
+    /// them. Only attention caches can be trimmed; a Gated DeltaNet layer's recurrent
+    /// state cannot be rolled back.
+    pub fn trim(&mut self, n: usize) -> Result<()> {
+        if self.conv.is_some() || self.recurrent.is_some() {
+            return Err(nuvec::Error::InvalidArgument(
+                "a Gated DeltaNet layer's state cannot be trimmed".into(),
+            ));
+        }
+        if n > self.offset {
+            return Err(nuvec::Error::InvalidArgument(format!(
+                "cannot trim {n} of {} cached positions",
+                self.offset
+            )));
+        }
+        self.offset -= n;
+        Ok(())
     }
 
     /// The cached arrays (to evaluate them).
@@ -788,14 +819,14 @@ impl Module for SwitchGlu {
 struct MoeMlp {
     gate: Projection,
     switch_mlp: SwitchGlu,
-    shared_expert: Mlp,
-    shared_expert_gate: Projection,
+    /// Qwen 3.5's gated shared expert.
+    shared: Option<(Mlp, Projection)>,
     experts_per_token: usize,
     norm_topk_prob: bool,
 }
 
 impl MoeMlp {
-    fn new(b: &Builder<'_>, path: &str, d: usize, moe: MixtureOfExperts) -> Result<Self> {
+    fn new(b: &Builder<'_>, path: &str, d: usize, moe: &MixtureOfExperts) -> Result<Self> {
         let p = |name: &str| format!("{path}.{name}");
         let (e, i) = (moe.experts, moe.intermediate_size);
         Ok(Self {
@@ -805,14 +836,13 @@ impl MoeMlp {
                 up_proj: b.switch(&p("switch_mlp.up_proj"), d, i, e)?,
                 down_proj: b.switch(&p("switch_mlp.down_proj"), i, d, e)?,
             },
-            shared_expert: Mlp::new(
-                b,
-                &p("shared_expert"),
-                d,
-                moe.shared_intermediate_size,
-                false,
-            )?,
-            shared_expert_gate: b.projection(&p("shared_expert_gate"), d, 1, false)?,
+            shared: match moe.shared_intermediate_size {
+                Some(size) => Some((
+                    Mlp::new(b, &p("shared_expert"), d, size, false)?,
+                    b.projection(&p("shared_expert_gate"), d, 1, false)?,
+                )),
+                None => None,
+            },
             experts_per_token: moe.experts_per_token,
             norm_topk_prob: moe.norm_topk_prob,
         })
@@ -834,19 +864,24 @@ impl MoeMlp {
                 SliceArg::new(Some(e - k), None, 1),
             ],
         )?;
+        // In float32, as mlx-lm's `softmax(…, precise=True)`.
+        let logits = logits.astype(DType::F32)?;
         let scores = match self.norm_topk_prob {
             true => softmax(&take_along_axis(&logits, &top, -1)?, &[-1])?,
             false => take_along_axis(&softmax(&logits, &[-1])?, &top, -1)?,
         };
         // The weighted sum of the experts' outputs as one product (`[1, k] · [k, D]` per
-        // token), accumulated in float32.
+        // token) in float32, rounded once to the activations' type, as mlx-lm.
         let experts = self.switch_mlp.forward(x, &top)?;
         let y = squeeze(&matmul(&expand_dims(&scores, -2)?, &experts)?, &[-2])?;
-        let shared = multiply(
-            sigmoid(&self.shared_expert_gate.forward(x)?)?,
-            self.shared_expert.forward(x)?,
-        )?;
-        add(&y, &shared)
+        let y = y.astype(experts.dtype())?;
+        let Some((expert, gate)) = &self.shared else {
+            return Ok(y);
+        };
+        add(
+            &y,
+            multiply(sigmoid(&gate.forward(x)?)?, expert.forward(x)?)?,
+        )
     }
 }
 
@@ -854,8 +889,10 @@ impl Module for MoeMlp {
     fn visit(&mut self, p: &mut Parameters<'_>) {
         p.module("gate", &mut self.gate);
         p.module("switch_mlp", &mut self.switch_mlp);
-        p.module("shared_expert", &mut self.shared_expert);
-        p.module("shared_expert_gate", &mut self.shared_expert_gate);
+        if let Some((expert, gate)) = &mut self.shared {
+            p.module("shared_expert", expert);
+            p.module("shared_expert_gate", gate);
+        }
     }
 }
 
@@ -957,7 +994,7 @@ impl Model {
                 };
                 Ok(Block {
                     mixer,
-                    mlp: match c.moe {
+                    mlp: match c.moe.as_ref().filter(|m| m.is_sparse(i)) {
                         Some(moe) => BlockMlp::Moe(Box::new(MoeMlp::new(
                             &b,
                             &path("mlp"),

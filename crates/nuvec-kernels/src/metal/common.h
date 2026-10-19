@@ -66,6 +66,28 @@ NUVEC_INT_OPS(long, ulong)
 
 // ── Arithmetic: half precision computes in float and rounds once ────────────
 
+// MLX's log1p (`utils.h`).
+inline float log1p_(float x) {
+    float xp1 = 1.0f + x;
+    if (xp1 == numeric_limits<float>::max()) {
+        return numeric_limits<float>::max();
+    }
+    if (xp1 == 1.0f) {
+        return x;
+    }
+    return x * (precise::log(xp1) / (xp1 - 1.0f));
+}
+
+// MLX's LogAddExp: the larger operand plus log1p(exp(smaller - larger)).
+inline float logaddexp_(float x, float y) {
+    if (isnan(x) || isnan(y)) {
+        return NAN;
+    }
+    float mx = max(x, y);
+    float mn = min(x, y);
+    return (mn == -INFINITY || mx == INFINITY) ? mx : mx + log1p_(precise::exp(mn - mx));
+}
+
 inline float sigmoid_(float x) {
     if (x >= 0.0f) {
         return 1.0f / (1.0f + precise::exp(-x));
@@ -126,7 +148,8 @@ inline float erfinv_(float a) {
     inline T op_cos(T a) { return T(precise::cos(float(a))); }                                \
     inline T op_tanh(T a) { return T(precise::tanh(float(a))); }                              \
     inline T op_sigmoid(T a) { return T(sigmoid_(float(a))); }                                \
-    inline T op_erfinv(T a) { return T(erfinv_(float(a))); }
+    inline T op_erfinv(T a) { return T(erfinv_(float(a))); }                                  \
+    inline T op_logaddexp(T a, T b) { return T(logaddexp_(float(a), float(b))); }
 
 NUVEC_FLOAT_OPS(half)
 NUVEC_FLOAT_OPS(bfloat)

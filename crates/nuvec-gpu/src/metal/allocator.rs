@@ -7,6 +7,9 @@
 //! As in MLX, a buffer freed while submitted GPU work still uses it is cached at once: GPU
 //! work encoded later may reuse it, ordered after those uses by the buffer's fences (its
 //! [`Guard`] goes with it). CPU access waits until the buffer is idle.
+//!
+//! New buffers are wired up to the wired limit ([`Residency`]); evicted ones are unwired
+//! before they are released.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -16,6 +19,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 use super::buffer::Guard;
+use super::residency::Residency;
 use crate::{GpuError, Result};
 
 /// The virtual-memory page size on Apple silicon.
@@ -80,6 +84,11 @@ pub struct MemoryStats {
     pub cache_limit: usize,
     /// Buffers obtained from Metal (cache misses) so far.
     pub system_allocations: u64,
+    /// Buffers are kept resident up to this many bytes (see
+    /// [`Device::set_wired_limit`](super::Device::set_wired_limit)).
+    pub wired_limit: usize,
+    /// Bytes currently wired.
+    pub wired: usize,
 }
 
 /// The size an allocation of `len` bytes is rounded up to.
@@ -113,6 +122,7 @@ struct State {
     cache_limit: usize,
     working_set: usize,
     system_allocations: u64,
+    residency: Residency,
 }
 
 impl State {
@@ -169,6 +179,12 @@ impl State {
             return;
         }
         if target == 0 {
+            for (_, e) in self.small.iter().flatten() {
+                self.residency.erase(&e.raw.0);
+            }
+            for e in self.large.values() {
+                self.residency.erase(&e.raw.0);
+            }
             self.small.iter_mut().for_each(Vec::clear);
             self.large.clear();
             self.cached = 0;
@@ -190,10 +206,18 @@ impl State {
             evict.insert(stamp);
             self.cached -= size;
         }
+        let residency = &mut self.residency;
+        let mut keep = |stamp: &u64, e: &Entry| {
+            let evicted = evict.contains(stamp);
+            if evicted {
+                residency.erase(&e.raw.0);
+            }
+            !evicted
+        };
         self.small
             .iter_mut()
-            .for_each(|v| v.retain(|(stamp, _)| !evict.contains(stamp)));
-        self.large.retain(|&(_, stamp), _| !evict.contains(&stamp));
+            .for_each(|v| v.retain(|(stamp, e)| keep(stamp, e)));
+        self.large.retain(|&(_, stamp), e| keep(&stamp, e));
     }
 
     /// GC threshold: cached memory is released before active + cached reaches it.
@@ -204,7 +228,12 @@ impl State {
 
 impl Pool {
     /// A pool with MLX's default limits for a GPU with the given working set and RAM.
-    pub(crate) fn new(working_set: u64, ram: u64, placeholder: Option<Raw>) -> Self {
+    pub(crate) fn new(
+        working_set: u64,
+        ram: u64,
+        placeholder: Option<Raw>,
+        residency: Residency,
+    ) -> Self {
         let memory_limit = (1.5 * working_set as f64).min(0.95 * ram as f64) as usize;
         Pool {
             state: Mutex::new(State {
@@ -218,6 +247,7 @@ impl Pool {
                 cache_limit: memory_limit,
                 working_set: working_set as usize,
                 system_allocations: 0,
+                residency,
             }),
             placeholder: placeholder.map(Cached),
         }
@@ -268,7 +298,9 @@ impl Pool {
             MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
         match device.newBufferWithLength_options(size, options) {
             Some(raw) => {
-                self.lock().system_allocations += 1;
+                let mut s = self.lock();
+                s.system_allocations += 1;
+                s.residency.insert(&raw);
                 Ok(Some((raw, size, None)))
             }
             None => {
@@ -297,7 +329,31 @@ impl Pool {
             memory_limit: s.memory_limit,
             cache_limit: s.cache_limit,
             system_allocations: s.system_allocations,
+            wired_limit: s.residency.capacity(),
+            wired: s.residency.wired(),
         }
+    }
+
+    /// Wires a buffer made outside the pool (a mapped file) while it fits under the limit.
+    pub(crate) fn track(&self, raw: &Raw) {
+        self.lock().residency.insert(raw);
+    }
+
+    /// Unwires a buffer made outside the pool before it is released.
+    pub(crate) fn untrack(&self, raw: &Raw) {
+        self.lock().residency.erase(raw);
+    }
+
+    /// Whether buffers can be wired on this system (residency sets: macOS 15, Metal 3).
+    pub(crate) fn can_wire(&self) -> bool {
+        self.lock().residency.supported()
+    }
+
+    pub(crate) fn set_wired_limit(&self, limit: usize) -> usize {
+        let mut s = self.lock();
+        let previous = s.residency.capacity();
+        s.residency.resize(limit);
+        previous
     }
 
     pub(crate) fn set_memory_limit(&self, limit: usize) -> usize {
@@ -337,7 +393,7 @@ mod tests {
 
     #[test]
     fn default_limits_follow_mlx() {
-        let pool = Pool::new(40_000_000_000, 48_000_000_000, None);
+        let pool = Pool::new(40_000_000_000, 48_000_000_000, None, Residency::new(None));
         let stats = pool.stats();
         assert_eq!(stats.memory_limit, 45_600_000_000); // min(1.5 * 40e9, 0.95 * 48e9)
         assert_eq!(stats.cache_limit, stats.memory_limit);

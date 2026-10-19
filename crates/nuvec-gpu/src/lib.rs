@@ -22,7 +22,8 @@
 //! is refused while submitted work uses a buffer, and GPU writes need `&mut Buffer`, so
 //! CPU and GPU never race on the same memory.
 //!
-//! **Status:** pre-alpha. Not yet wired into array evaluation.
+//! Arrays evaluated on the GPU (`nuvec-core`) use the process-wide [`Device::shared`]; its
+//! allocator's limits and statistics are set and read there.
 
 mod error;
 mod info;
@@ -35,7 +36,7 @@ mod metal;
 #[cfg(target_os = "macos")]
 pub use metal::{
     Arg, Buffer, CommandBuffer, Constant, Device, MemoryStats, Pending, Pipeline, Submitted,
-    Timeline,
+    Timeline, profile,
 };
 
 #[cfg(not(target_os = "macos"))]

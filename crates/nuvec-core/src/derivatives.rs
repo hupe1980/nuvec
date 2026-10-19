@@ -404,6 +404,11 @@ impl Primitive {
                     (BinaryOp::Maximum, _) => multiply(v, less_equal(a, b)?.astype(a.dtype())?)?,
                     (BinaryOp::Minimum, 0) => multiply(v, less(a, b)?.astype(a.dtype())?)?,
                     (BinaryOp::Minimum, _) => multiply(v, greater_equal(a, b)?.astype(a.dtype())?)?,
+                    // As MLX: σ(a − b) for `a`, 1 − σ(a − b) for `b`.
+                    (BinaryOp::LogAddExp, 0) => multiply(v, ops::sigmoid(&subtract(a, b)?)?)?,
+                    (BinaryOp::LogAddExp, _) => {
+                        multiply(v, subtract(1, ops::sigmoid(&subtract(a, b)?)?)?)?
+                    }
                     // Comparisons have no derivative.
                     _ => return Ok(None),
                 }

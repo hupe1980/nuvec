@@ -12,8 +12,18 @@ impl Device {
         None
     }
 
+    /// Always `None`: Metal exists only on Apple platforms.
+    pub fn shared() -> Option<&'static Device> {
+        None
+    }
+
     /// Unreachable: no `Device` can be constructed on this target.
     pub fn info(&self) -> &DeviceInfo {
+        match self.0 {}
+    }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    pub fn set_wired_limit(&self, _bytes: usize) -> crate::Result<usize> {
         match self.0 {}
     }
 }

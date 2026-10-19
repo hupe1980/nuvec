@@ -97,6 +97,8 @@ pub struct CommandBuffer {
     /// In-flight guards of the buffers used, and the buffers themselves (kept alive).
     guards: Vec<(Arc<Guard>, bool)>,
     retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// The kernels dispatched, while profiling.
+    kernels: Vec<Arc<str>>,
 }
 
 impl Device {
@@ -118,6 +120,7 @@ impl Device {
             barriers: 0,
             guards: Vec::new(),
             retained: Vec::new(),
+            kernels: Vec::new(),
         })
     }
 }
@@ -192,7 +195,7 @@ impl CommandBuffer {
         if group > width {
             group -= group % width;
         }
-        self.encode(pipeline, args, |encoder| {
+        self.encode(pipeline, args, [threads, 1, 1], |encoder| {
             encoder
                 .dispatchThreads_threadsPerThreadgroup(size([threads, 1, 1]), size([group, 1, 1]));
         })
@@ -218,7 +221,8 @@ impl CommandBuffer {
         if groups.contains(&0) || per_group == 0 {
             return validate(args);
         }
-        self.encode(pipeline, args, |encoder| {
+        let extent = [0, 1, 2].map(|d| groups[d] * threads[d]);
+        self.encode(pipeline, args, extent, |encoder| {
             encoder.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(threads));
         })
     }
@@ -243,18 +247,26 @@ impl CommandBuffer {
         if grid.contains(&0) || per_group == 0 {
             return validate(args);
         }
-        self.encode(pipeline, args, |encoder| {
+        self.encode(pipeline, args, grid, |encoder| {
             encoder.dispatchThreads_threadsPerThreadgroup(size(grid), size(group));
         })
     }
 
-    /// Validates and binds `args`, inserts a barrier if needed, then lets `dispatch` encode.
+    /// Validates and binds `args`, inserts a barrier if needed, then lets `dispatch` encode
+    /// over `extent` threads (for profiling).
     fn encode(
         &mut self,
         pipeline: &Pipeline,
         args: &[Arg<'_>],
+        extent: [usize; 3],
         dispatch: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
     ) -> Result<()> {
+        if super::profile::enabled() {
+            self.kernels.push(match super::profile::shapes() {
+                true => format!("{} {extent:?}", pipeline.name()).into(),
+                false => pipeline.name.clone(),
+            });
+        }
         validate(args)?;
         if self.conflicts(args) {
             self.encoder()?
@@ -362,6 +374,7 @@ impl CommandBuffer {
         };
         let finish: Finish = Arc::new(Mutex::new(Some(Completion {
             on_complete: Box::new(on_complete),
+            kernels: std::mem::take(&mut self.kernels),
             unfenced: self.own.is_none(),
             guards: std::mem::take(&mut self.guards),
             _retained: std::mem::take(&mut self.retained),
@@ -370,7 +383,7 @@ impl CommandBuffer {
         let shared = finish.clone();
         let handler = RcBlock::new(move |raw: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // SAFETY: Metal passes the completed command buffer, valid for this call.
-            complete(&shared, || status(unsafe { raw.as_ref() }));
+            complete(&shared, unsafe { raw.as_ref() });
         });
         // SAFETY: the block is valid, and Metal copies it before this call returns. It is
         // called at most once, on any thread: its captures are `Send` (the buffers are
@@ -476,6 +489,8 @@ fn validate(args: &[Arg<'_>]) -> Result<()> {
 /// [`CommandBuffer::commit_then`] completes.
 struct Completion {
     on_complete: Box<dyn FnOnce(Result<()>) + Send>,
+    /// The kernels dispatched, while profiling.
+    kernels: Vec<Arc<str>>,
     guards: Vec<(Arc<Guard>, bool)>,
     /// The command buffer had no timeline fence: its uses count as committed only now.
     unfenced: bool,
@@ -491,11 +506,12 @@ unsafe impl Send for Completion {}
 type Finish = Arc<Mutex<Option<Completion>>>;
 
 /// Runs the completion once, whoever gets there first (the waiter or Metal's handler).
-fn complete(finish: &Finish, result: impl FnOnce() -> Result<()>) {
+fn complete(finish: &Finish, raw: &ProtocolObject<dyn MTLCommandBuffer>) {
     let Some(c) = finish.lock().unwrap_or_else(PoisonError::into_inner).take() else {
         return;
     };
-    let result = result();
+    let result = status(raw);
+    super::profile::record(&c.kernels, raw.GPUEndTime() - raw.GPUStartTime());
     for (guard, write) in c.guards {
         if c.unfenced {
             guard.committed();
@@ -519,7 +535,7 @@ impl Pending {
     /// Blocks until the GPU has finished; the completion has run when this returns.
     pub fn wait(&self) {
         self.raw.waitUntilCompleted();
-        complete(&self.finish, || status(&self.raw));
+        complete(&self.finish, &self.raw);
     }
 }
 

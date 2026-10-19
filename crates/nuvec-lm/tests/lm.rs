@@ -116,7 +116,12 @@ fn half_precision_qwen3_5_stays_close_to_mlx_lm() {
     if !gpu() {
         return;
     }
-    for name in ["qwen3_5_bf16", "qwen3_5_q4", "qwen3_5_moe_q4"] {
+    for name in [
+        "qwen3_5_bf16",
+        "qwen3_5_q4",
+        "qwen3_5_moe_q4",
+        "qwen3_moe_q4",
+    ] {
         let (got, want) = logits(name);
         let scale = want.iter().fold(1.0f32, |m, x| m.max(x.abs()));
         let diffs: Vec<f32> = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).collect();
@@ -143,6 +148,18 @@ fn mixture_of_experts_qwen3_5_matches_mlx_lm() {
 }
 
 /// The MoE model in Hugging Face's layout (fused expert gate and up projections).
+/// Qwen 3 MoE: sparse and dense layers, no shared expert.
+#[test]
+fn mixture_of_experts_qwen3_matches_mlx_lm() {
+    check("qwen3_moe_f32", 1e-4);
+}
+
+/// Hugging Face Qwen 3 MoE checkpoints store each expert separately.
+#[test]
+fn hugging_face_qwen3_moe_checkpoints_are_stacked() {
+    check("qwen3_moe_hf", 1e-4);
+}
+
 #[test]
 fn hugging_face_moe_checkpoints_are_sanitized() {
     check("qwen3_5_moe_hf", 1e-4);
@@ -283,4 +300,69 @@ fn sampling_draws_only_kept_tokens() {
             );
         }
     }
+}
+
+/// Speculative decoding gives mlx-lm's greedy tokens whatever the drafter proposes: the
+/// true continuation (everything accepted, fewer steps), wrong tokens (everything
+/// rejected), or prompt lookup; hybrid models are refused.
+#[test]
+fn speculative_decoding_keeps_the_greedy_output() {
+    use nuvec_lm::{Drafter, PromptLookup, speculative_generate};
+    if !gpu() {
+        return;
+    }
+    /// Proposes `tokens` after the prompt (right or wrong).
+    struct Fixed {
+        prompt: usize,
+        tokens: Vec<u32>,
+    }
+    impl Drafter for Fixed {
+        fn draft(&mut self, context: &[u32], max: usize) -> Vec<u32> {
+            let done = context.len() - self.prompt;
+            self.tokens.iter().skip(done).take(max).copied().collect()
+        }
+    }
+    for name in ["qwen3_f32", "llama_bf16"] {
+        let (dir, prompt, _, _, greedy) = fixture(name);
+        let model = load_model(&dir).unwrap();
+        let options = GenerateOptions {
+            max_tokens: greedy.len(),
+            ..Default::default()
+        };
+        let run = |drafter: Box<dyn Drafter>| {
+            let mut g = speculative_generate(&model, &prompt, options, drafter, 4).unwrap();
+            let ids: Vec<u32> = g.by_ref().collect::<nuvec::Result<_>>().unwrap();
+            (ids, g.stats())
+        };
+        let oracle = Fixed {
+            prompt: prompt.len(),
+            tokens: greedy.clone(),
+        };
+        let (ids, stats) = run(Box::new(oracle));
+        assert_eq!(ids, greedy, "{name}: oracle drafts");
+        assert_eq!(
+            stats.accepted, stats.drafted,
+            "{name}: oracle drafts accepted"
+        );
+        assert!(stats.steps <= greedy.len().div_ceil(5), "{name}: {stats:?}");
+        let wrong = Fixed {
+            prompt: prompt.len(),
+            tokens: greedy.iter().map(|t| (t + 1) % 128).collect(),
+        };
+        let (ids, stats) = run(Box::new(wrong));
+        assert_eq!(ids, greedy, "{name}: wrong drafts");
+        assert_eq!((stats.accepted, stats.steps), (0, greedy.len()), "{name}");
+        let (ids, _) = run(Box::<PromptLookup>::default());
+        assert_eq!(ids, greedy, "{name}: prompt lookup");
+    }
+    let (dir, prompt, _, _, _) = fixture("qwen3_5_f32");
+    let model = load_model(&dir).unwrap();
+    let hybrid = speculative_generate(
+        &model,
+        &prompt,
+        GenerateOptions::default(),
+        PromptLookup::default(),
+        4,
+    );
+    assert!(hybrid.is_err());
 }

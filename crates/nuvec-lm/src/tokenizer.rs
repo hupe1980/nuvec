@@ -240,6 +240,59 @@ pub struct Tokenizer {
     ignore_merges: bool,
     to_char: [char; 256],
     to_byte: HashMap<char, u8>,
+    /// Special tokens the post-processor puts around a single sequence (Llama's
+    /// `<|begin_of_text|>`): before and after it.
+    template: Template,
+}
+
+/// Special tokens (text and id) before and after a sequence.
+type Template = (Vec<(String, u32)>, Vec<(String, u32)>);
+
+/// The special tokens around sequence `A` in a `TemplateProcessing` post-processor (also
+/// inside a `Sequence`).
+fn template(post: Option<&Json>) -> Template {
+    let Some(post) = post else {
+        return Default::default();
+    };
+    if post.get("type").and_then(Json::as_str) == Some("Sequence") {
+        return post
+            .get("processors")
+            .and_then(Json::as_array)
+            .unwrap_or_default()
+            .iter()
+            .map(|p| template(Some(p)))
+            .find(|(before, after)| !before.is_empty() || !after.is_empty())
+            .unwrap_or_default();
+    }
+    if post.get("type").and_then(Json::as_str) != Some("TemplateProcessing") {
+        return Default::default();
+    }
+    let special = post.get("special_tokens");
+    let (mut before, mut after, mut seen) = (Vec::new(), Vec::new(), false);
+    for piece in post
+        .get("single")
+        .and_then(Json::as_array)
+        .unwrap_or_default()
+    {
+        if piece.get("Sequence").is_some() {
+            seen = true;
+        } else if let Some(name) = piece
+            .get("SpecialToken")
+            .and_then(|t| t.get("id"))
+            .and_then(Json::as_str)
+        {
+            let ids = special
+                .and_then(|s| s.get(name))
+                .and_then(|t| t.get("ids"))
+                .and_then(Json::as_array)
+                .unwrap_or_default();
+            for id in ids.iter().filter_map(Json::as_i64) {
+                let side = if seen { &mut after } else { &mut before };
+                side.push((name.to_owned(), id as u32));
+            }
+        }
+    }
+    (before, after)
 }
 
 impl Tokenizer {
@@ -342,6 +395,7 @@ impl Tokenizer {
                 .unwrap_or(false),
             to_char,
             to_byte,
+            template: template(file.get("post_processor")),
         })
     }
 
@@ -410,8 +464,23 @@ impl Tokenizer {
         self.tokens.len()
     }
 
-    /// The ids of `text`. Added tokens (`<|im_start|>`, …) in the text are encoded as such.
+    /// The ids of `text`, with the special tokens the tokenizer's post-processor adds
+    /// (Llama's `<|begin_of_text|>`) unless the text already starts with them, as mlx-lm
+    /// encodes prompts. Added tokens (`<|im_start|>`, …) in the text are encoded as such.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        let (before, after) = &self.template;
+        let present = !before.is_empty() && text.starts_with(&before[0].0);
+        if before.is_empty() && after.is_empty() || present {
+            return self.encode_text(text);
+        }
+        let mut ids: Vec<u32> = before.iter().map(|(_, id)| *id).collect();
+        ids.extend(self.encode_text(text));
+        ids.extend(after.iter().map(|(_, id)| *id));
+        ids
+    }
+
+    /// The ids of `text` alone, without the post-processor's special tokens.
+    pub fn encode_text(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
         let mut rest = text;
         while !rest.is_empty() {
@@ -658,6 +727,35 @@ mod tests {
         }
         out.push('"');
         out
+    }
+
+    /// Llama's post-processor puts `<|begin_of_text|>` first, unless the text has it.
+    #[test]
+    fn template_special_tokens_are_added_once() {
+        let chars = byte_chars();
+        let entries: Vec<String> = chars
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}:{i}", json_quote(&c.to_string())))
+            .collect();
+        let text = format!(
+            r#"{{"pre_tokenizer":{{"type":"ByteLevel","add_prefix_space":false,"use_regex":true}},
+              "added_tokens":[{{"id":300,"content":"<|bos|>","special":true}}],
+              "post_processor":{{"type":"Sequence","processors":[{{"type":"ByteLevel"}},
+                {{"type":"TemplateProcessing","single":[{{"SpecialToken":{{"id":"<|bos|>","type_id":0}}}},
+                  {{"Sequence":{{"id":"A","type_id":0}}}}],
+                  "special_tokens":{{"<|bos|>":{{"id":"<|bos|>","ids":[300],"tokens":["<|bos|>"]}}}}}}]}},
+              "model":{{"type":"BPE","vocab":{{{}}},"merges":[]}}}}"#,
+            entries.join(",")
+        );
+        let t = Tokenizer::from_json(&json::parse(text.as_bytes()).unwrap()).unwrap();
+        assert_eq!(
+            t.encode("hi"),
+            [300, t.token_id("h").unwrap(), t.token_id("i").unwrap()]
+        );
+        assert_eq!(t.encode("<|bos|>hi"), t.encode("hi"));
+        assert_eq!(t.encode_text("hi").len(), 2);
+        assert_eq!(tiny().encode("hello"), tiny().encode_text("hello"));
     }
 
     #[test]

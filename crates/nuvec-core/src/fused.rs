@@ -75,7 +75,9 @@ impl Fused {
                 UnaryOp::Conjugate => false,
                 _ => is_float(d),
             },
-            (Primitive::Binary(op), &[a, b]) => a == b && (*op != BinaryOp::Divide || is_float(a)),
+            (Primitive::Binary(op), &[a, b]) => {
+                a == b && (!matches!(op, BinaryOp::Divide | BinaryOp::LogAddExp) || is_float(a))
+            }
             (Primitive::Select, &[c, a, b]) => c == DType::Bool && a == b,
             (Primitive::AsType(to), &[_]) => computes(*to),
             _ => false,
@@ -373,6 +375,7 @@ fn binary_expr(op: BinaryOp, a: &str, b: &str) -> String {
         BinaryOp::Divide => format!("op_div({a}, {b})"),
         BinaryOp::Maximum => format!("op_max({a}, {b})"),
         BinaryOp::Minimum => format!("op_min({a}, {b})"),
+        BinaryOp::LogAddExp => format!("op_logaddexp({a}, {b})"),
         BinaryOp::Equal => format!("nbool{{uchar(op_eq({a}, {b}))}}"),
         BinaryOp::NotEqual => format!("nbool{{uchar(!op_eq({a}, {b}))}}"),
         BinaryOp::Less => format!("nbool{{uchar(op_lt({a}, {b}))}}"),

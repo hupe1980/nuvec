@@ -19,8 +19,10 @@ Usage: `just bench-quant`.
 from __future__ import annotations
 
 import math
+import os
 import platform
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -40,7 +42,14 @@ SHAPES = [
     ("qmm-m512", 512, 4096, 4096, True, 4, 64),
     ("qvm4096", 1, 4096, 4096, False, 4, 64),
     ("qmm-n128", 128, 4096, 4096, False, 4, 64),
+    ("qmm-961x8192", 961, 2048, 8192, True, 4, 64),
+    ("qmm-961x2048", 961, 2048, 2048, True, 4, 64),
+    ("gqmm-up", 7688, 2048, 512, True, 4, 64),
+    ("gqmm-down", 7688, 512, 2048, True, 4, 64),
 ]
+EXPERTS = 256
+FILTER = sys.argv[1] if len(sys.argv) > 1 else ""
+SHAPES = [s for s in SHAPES if FILTER in s[0]]
 DTYPES = {"float16": mx.float16, "bfloat16": mx.bfloat16}
 
 
@@ -49,14 +58,20 @@ def mlx_results() -> dict[tuple[str, str], float]:
     out = {}
     for label, dtype in DTYPES.items():
         for name, m, k, n, transpose, bits, gs in SHAPES:
-            w = mx.random.uniform(-1, 1, (n, k) if transpose else (k, n)).astype(dtype)
+            gathered = name.startswith("gqmm")
+            shape = (EXPERTS, n, k) if gathered else (n, k) if transpose else (k, n)
+            w = mx.random.uniform(-1, 1, shape).astype(dtype)
             wq, s, b = mx.quantize(w, group_size=gs, bits=bits)
-            x = mx.random.uniform(-1, 1, (m, k)).astype(dtype)
-            mx.eval(wq, s, b, x)
+            x = mx.random.uniform(-1, 1, (m, 1, k) if gathered else (m, k)).astype(dtype)
+            experts = mx.array([i * EXPERTS // m for i in range(m)], dtype=mx.uint32)
+            mx.eval(wq, s, b, x, experts)
             nbytes = k * n * bits // 8
             reps = min(max(40_000_000_000 // 10 // max(nbytes + 2 * m * k * n, 1), 20), 4000)
 
             def product() -> mx.array:
+                if gathered:
+                    return mx.gather_qmm(x, wq, s, b, rhs_indices=experts, transpose=True,
+                                         group_size=gs, bits=bits, sorted_indices=True)
                 return mx.quantized_matmul(x, wq, s, b, transpose=transpose, group_size=gs,
                                            bits=bits)
 
@@ -82,7 +97,8 @@ def mlx_results() -> dict[tuple[str, str], float]:
 
 def nuvec_results() -> dict[tuple[str, str], float]:
     proc = subprocess.run(["cargo", "bench", "-q", "-p", "nuvec-core", "--bench", "quant"],
-                          cwd=ROOT, capture_output=True, text=True, check=True)
+                          cwd=ROOT, capture_output=True, text=True, check=True,
+                          env={**os.environ, "BENCH_FILTER": FILTER})
     out = {}
     for line in proc.stdout.splitlines():
         name, label, single, grouped = line.split("\t")

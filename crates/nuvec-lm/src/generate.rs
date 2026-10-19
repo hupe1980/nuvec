@@ -1,8 +1,10 @@
 //! Token generation, as mlx-lm's `generate_step`: the prompt is prefilled in chunks, then
-//! each step is built while the GPU runs the previous one and submitted once its token is
-//! read, so the KV cache is updated in place (the evaluator owns it then).
+//! each step is built and submitted while the GPU runs the previous one, and the previous
+//! token is read afterwards; the KV cache is updated in place. While it runs,
+//! the GPU keeps memory resident up to its recommended working set (mlx-lm's
+//! `wired_limit`).
 
-use nuvec::{Array, Result, async_eval, eval, logsumexp, schedule, subtract};
+use nuvec::{Array, DeviceKind, Result, async_eval, default_device, eval, logsumexp, subtract};
 
 use crate::model::{KvCache, Model};
 use crate::sample::Sampler;
@@ -37,6 +39,54 @@ pub struct Generation<'a> {
     /// The next token, submitted but maybe not computed yet.
     next: Option<Array>,
     produced: usize,
+    wired: WiredLimit,
+}
+
+/// mlx-lm's `wired_limit`: while it lives, the GPU keeps memory (the model's weights
+/// first) resident up to its recommended working set; the previous limit returns when it is
+/// dropped. [`generate`] holds one; holding one around it moves the cost of wiring out of
+/// the generation (as mlx-lm's benchmarks do). Does nothing off the GPU, or when the limit
+/// is already as high.
+#[derive(Debug)]
+pub struct WiredLimit(Option<usize>);
+
+impl WiredLimit {
+    /// Raises the wired limit to the recommended working set.
+    pub fn new() -> Self {
+        let device =
+            nuvec::gpu::Device::shared().filter(|_| default_device().kind == DeviceKind::Gpu);
+        WiredLimit(device.and_then(|d| {
+            let limit = d.info().recommended_working_set as usize;
+            if d.memory().wired_limit >= limit {
+                return None;
+            }
+            d.set_wired_limit(limit).ok()
+        }))
+    }
+}
+
+impl Default for WiredLimit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for WiredLimit {
+    fn drop(&mut self) {
+        if let (Some(previous), Some(d)) = (self.0, nuvec::gpu::Device::shared()) {
+            let _ = d.set_wired_limit(previous);
+        }
+    }
+}
+
+impl Drop for Generation<'_> {
+    /// Waits for the submitted step before its memory is unwired (errors were or would
+    /// have been reported by `next`).
+    fn drop(&mut self) {
+        if let (Some(_), Some(y)) = (self.wired.0, self.next.take()) {
+            let _ = eval(std::slice::from_ref(&y));
+        }
+    }
 }
 
 /// Starts generating after `prompt` (at least one token): prefills it and submits the
@@ -51,22 +101,17 @@ pub fn generate<'a>(
             "generate: empty prompt".into(),
         ));
     }
+    let wired = WiredLimit::new();
     let mut cache = model.new_cache();
-    let (mut rest, last) = prompt.split_at(prompt.len() - 1);
-    while !rest.is_empty() {
-        let n = rest.len().min(options.prefill_step.max(1));
-        let chunk = Array::from_slice(&rest[..n], &[1, n])?;
-        // The logits are never evaluated: only the cache is computed.
-        model.forward(&chunk, &mut cache)?;
-        eval(&cache.iter().flat_map(KvCache::state).collect::<Vec<_>>())?;
-        rest = &rest[n..];
-    }
+    let (rest, last) = prompt.split_at(prompt.len() - 1);
+    prefill(model, &mut cache, rest, options.prefill_step)?;
     let mut g = Generation {
         model,
         cache,
         options,
         next: None,
         produced: 0,
+        wired,
     };
     if options.max_tokens > 0 {
         let first = g.step(&Array::from_slice(last, &[1])?)?;
@@ -74,6 +119,24 @@ pub fn generate<'a>(
         g.next = Some(first);
     }
     Ok(g)
+}
+
+/// Runs `tokens` through the model in chunks of `step`, extending `cache` (the logits are
+/// never computed).
+pub(crate) fn prefill(
+    model: &Model,
+    cache: &mut [KvCache],
+    mut tokens: &[u32],
+    step: usize,
+) -> Result<()> {
+    while !tokens.is_empty() {
+        let n = tokens.len().min(step.max(1));
+        let chunk = Array::from_slice(&tokens[..n], &[1, n])?;
+        model.forward(&chunk, cache)?;
+        eval(&cache.iter().flat_map(KvCache::state).collect::<Vec<_>>())?;
+        tokens = &tokens[n..];
+    }
+    Ok(())
 }
 
 impl Generation<'_> {
@@ -114,22 +177,18 @@ impl Iterator for Generation<'_> {
         let y = self.next.take()?;
         self.produced += 1;
         if self.produced < self.options.max_tokens {
-            // Build and order the following step, wait for this token, then submit: the
-            // cache the step writes is then finished and owned by the step alone, so it is
-            // updated in place. The GPU starts on the first dispatches while the rest is
-            // encoded.
+            // Submit the following step, then wait for this token (mlx-lm's order): the GPU
+            // never waits for the host between steps. The cache the step writes is still in
+            // flight; nothing else refers to it, so it is updated in place (D-058).
             let next = match self.step(&y) {
                 Ok(next) => next,
                 Err(e) => return Some(Err(e)),
             };
-            let scheduled = schedule(std::slice::from_ref(&next));
-            let id = y.item::<u32>();
-            drop(y);
-            if let Err(e) = scheduled.async_eval() {
+            if let Err(e) = async_eval(std::slice::from_ref(&next)) {
                 return Some(Err(e));
             }
             self.next = Some(next);
-            return Some(id);
+            return Some(y.item::<u32>());
         }
         Some(y.item::<u32>())
     }

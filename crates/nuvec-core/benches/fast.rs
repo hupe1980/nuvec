@@ -24,8 +24,15 @@ const CASES: &[(&str, &[usize])] = &[
     // Attention: (B, Hq, Hkv, Lq, Lk, D); decode with GQA, causal prefill.
     ("sdpa-decode512", &[1, 32, 8, 1, 512, 128]),
     ("sdpa-decode4096", &[1, 32, 8, 1, 4096, 128]),
+    // Keys and values too large for the system cache (as in a model's decode, whose
+    // layers' caches never all fit).
+    ("sdpa-decode32k", &[1, 32, 8, 1, 32768, 128]),
     ("sdpa-prefill", &[1, 32, 8, 1024, 1024, 128]),
     ("sdpa-prefill64", &[1, 16, 16, 2048, 2048, 64]),
+    // Language-model prefill (Qwen3-0.6B heads): a 2,048-token chunk, then the second chunk
+    // of a 3,841-token prompt over the whole cache.
+    ("sdpa-chunk2048", &[1, 16, 8, 2048, 2048, 128]),
+    ("sdpa-chunk1793", &[1, 16, 8, 1793, 3841, 128]),
 ];
 
 fn op(name: &str, x: &Array, w: &Array, targets: &Array) -> Result<Array> {
@@ -58,8 +65,15 @@ fn op(name: &str, x: &Array, w: &Array, targets: &Array) -> Result<Array> {
 
 fn main() -> Result<()> {
     set_default_stream(Stream::default_for(Device::gpu(0)));
-    for (dtype, label) in [(DType::F32, "float32"), (DType::F16, "float16")] {
-        for &(name, shape) in CASES {
+    // Cases whose name contains this (all when unset).
+    let filter = std::env::var("BENCH_FILTER").unwrap_or_default();
+    let dtypes = [
+        (DType::F32, "float32"),
+        (DType::F16, "float16"),
+        (DType::BF16, "bfloat16"),
+    ];
+    for (dtype, label) in dtypes {
+        for &(name, shape) in CASES.iter().filter(|(n, _)| n.contains(filter.as_str())) {
             let uniform =
                 |s: &[usize]| random::uniform(-1.0, 1.0, s, DType::F32, None)?.astype(dtype);
             let (x, w, shape) = if name.starts_with("sdpa") {

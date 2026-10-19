@@ -104,7 +104,7 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         xs = [pre_view(xs[0], p.get("pre"))] + xs[1:]
     binary = {
         "add": mx.add, "subtract": mx.subtract, "multiply": mx.multiply, "divide": mx.divide,
-        "maximum": mx.maximum, "minimum": mx.minimum, "equal": mx.equal,
+        "maximum": mx.maximum, "minimum": mx.minimum, "logaddexp": mx.logaddexp, "equal": mx.equal,
         "not_equal": mx.not_equal, "less": mx.less, "less_equal": mx.less_equal,
         "greater": mx.greater, "greater_equal": mx.greater_equal, "matmul": mx.matmul,
     }
@@ -293,6 +293,14 @@ for dt in ALL:
         case(f"maximum-{dt}", "maximum", [make(dt, (2, 5), edge=True), make(dt, (2, 5))])
         case(f"minimum-{dt}-t", "minimum", [make(dt, (5, 2), edge=True), make(dt, (2, 5))], pre="t")
 
+# logaddexp: every float type with NaN/inf edges (both infinite included), integers promoted.
+for dt in ["float32", "float16", "bfloat16", "float64"]:
+    case(f"logaddexp-{dt}", "logaddexp", [make(dt, (3, 4), edge=True), make(dt, (4,))])
+INF = mx.array([np.inf, -np.inf, np.inf, -np.inf, np.nan, 0.0, -30.0, 80.0])
+case("logaddexp-infinities", "logaddexp",
+     [INF, mx.array([np.inf, -np.inf, -np.inf, 1.0, 2.0, -30.0, 0.0, 80.0])])
+case("logaddexp-int", "logaddexp", [ints("int32", (2, 3), -5, 5), ints("int32", (3,), -5, 5)])
+
 # Promotion between mixed dtypes.
 for a, b in [("int8", "uint8"), ("uint64", "int64"), ("int32", "float16"), ("float16", "bfloat16"),
              ("bool", "float32"), ("uint32", "int16"), ("int64", "complex64"), ("bool", "bool")]:
@@ -452,6 +460,8 @@ derivative("vjp", "vjp-tanh-f64", "tanh", [make("float64", (4,))])
 for op in ["add", "subtract", "multiply", "divide", "maximum", "minimum"]:
     derivative("vjp", f"vjp-{op}-broadcast", op, [make("float32", (2, 3)), positive("float32", (3,))])
 tie = ints("float32", (6,), -2, 3)
+derivative("vjp", "vjp-logaddexp", "logaddexp", [make("float32", (2, 3)), make("float32", (3,))])
+derivative("jvp", "jvp-logaddexp", "logaddexp", [make("float32", (4,)), make("float32", (4,))])
 derivative("vjp", "vjp-maximum-ties", "maximum", [tie, ints("float32", (6,), -2, 3)])
 derivative("vjp", "vjp-minimum-ties", "minimum", [tie, ints("float32", (6,), -2, 3)])
 derivative("vjp", "vjp-multiply-t", "multiply", [make("float32", (4, 3)), make("float32", (3, 4))], pre="t")
@@ -510,6 +520,7 @@ batched("vmap-add-shared", "add", [make("float32", (3, 4)), make("float32", (4,)
 batched("vmap-multiply-axes", "multiply", [make("float32", (2, 3)), make("float32", (3, 2))], "1,0")
 batched("vmap-multiply-f16", "multiply", [make("float16", (3, 4)), make("float16", (3, 4))], "0,0")
 batched("vmap-divide", "divide", [make("float32", (3, 2)), positive("float32", (2, 3))], "0,1", out_axes=1)
+batched("vmap-logaddexp", "logaddexp", [make("float32", (4,)), make("float32", (4, 2))], "n,1")
 batched("vmap-maximum", "maximum", [make("float32", (4,)), make("float32", (4, 2))], "n,1")
 batched("vmap-less", "less", [make("float32", (3, 2)), make("float32", (3, 2))], "0,0")
 batched("vmap-where", "where", [make("bool", (2, 3)), make("float32", (4, 2, 3)), make("float32", (3,))], "n,0,n")

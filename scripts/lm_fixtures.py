@@ -23,7 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 from mlx_lm.generate import generate_step
-from mlx_lm.models import llama, qwen2, qwen3, qwen3_5, qwen3_5_moe
+from mlx_lm.models import llama, qwen2, qwen3, qwen3_5, qwen3_5_moe, qwen3_moe
 from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
 
 OUT = Path(__file__).resolve().parent.parent / "crates/nuvec-lm/tests/fixtures"
@@ -42,6 +42,10 @@ QWEN35 = dict(model_type="qwen3_5_text", hidden_size=64, num_hidden_layers=4,
 QWEN35_MOE = dict(QWEN35, model_type="qwen3_5_moe_text", linear_key_head_dim=32,
                   num_experts=16, num_experts_per_tok=8, moe_intermediate_size=32,
                   shared_expert_intermediate_size=64)
+# Qwen 3 MoE: layers 0 and 2 sparse (16 experts, 4 per token), layer 1 dense.
+QWEN3_MOE = dict(BASE, model_type="qwen3_moe", num_hidden_layers=3, head_dim=16, rope_theta=1e6,
+                 tie_word_embeddings=False, num_experts=16, num_experts_per_tok=4,
+                 moe_intermediate_size=32, decoder_sparse_step=1, mlp_only_layers=[1])
 CASES = {
     # Qwen 3: per-head q/k norms, separate output head, float32.
     "qwen3_f32": (qwen3, dict(BASE, model_type="qwen3", head_dim=16, rope_theta=1e6,
@@ -72,6 +76,10 @@ CASES = {
     # Qwen 3.5 MoE with 4-bit experts and 8-bit routers (as mlx-community's checkpoints).
     "qwen3_5_moe_q4": (qwen3_5_moe, dict(model_type="qwen3_5_moe", tie_word_embeddings=False,
                                          text_config=dict(QWEN35_MOE)), mx.bfloat16, (32, 4)),
+    # Qwen 3 MoE, renormalised top-k weights, float32.
+    "qwen3_moe_f32": (qwen3_moe, dict(QWEN3_MOE, norm_topk_prob=True), None, None),
+    # Qwen 3 MoE with the probabilities as weights, 4-bit experts and 8-bit routers.
+    "qwen3_moe_q4": (qwen3_moe, dict(QWEN3_MOE, norm_topk_prob=False), mx.bfloat16, (32, 4)),
     # Qwen 3.5 with 128-feature keys (the packed kernel), 4-bit weights.
     "qwen3_5_q4": (qwen3_5, dict(model_type="qwen3_5", tie_word_embeddings=False,
                                  text_config=dict(QWEN35, linear_key_head_dim=128)),
@@ -114,6 +122,8 @@ def main() -> None:
         print(f"{name}: {len(tree_flatten(model.parameters()))} tensors, greedy {tokens}")
         if name in ("qwen3_5_f32", "qwen3_5_moe_f32"):
             hugging_face_layout(out, config, dict(tree_flatten(model.parameters())))
+        if name == "qwen3_moe_f32":
+            hugging_face_experts(out, config, dict(tree_flatten(model.parameters())))
     samplers()
 
 
@@ -159,6 +169,25 @@ def hugging_face_layout(src: Path, config: dict, params: dict) -> None:
     mx.save_safetensors(str(out / "model.safetensors"), hf)
     (out / "expected.safetensors").write_bytes((src / "expected.safetensors").read_bytes())
     print(f"{out.name}: the same model in Hugging Face's layout")
+
+
+def hugging_face_experts(src: Path, config: dict, params: dict) -> None:
+    """The same Qwen 3 MoE model as a Hugging Face checkpoint (`qwen3_moe_hf`): each
+    expert's projections stored separately (`experts.{e}.{name}.weight`)."""
+    out = OUT / src.name.replace("_f32", "_hf")
+    out.mkdir(parents=True, exist_ok=True)
+    hf = {}
+    for k, v in params.items():
+        if ".switch_mlp." in k:
+            prefix, name = k.split(".switch_mlp.")
+            for e in range(v.shape[0]):
+                hf[f"{prefix}.experts.{e}.{name}"] = v[e]
+        else:
+            hf[k] = v
+    (out / "config.json").write_text(json.dumps(config, indent=2))
+    mx.save_safetensors(str(out / "model.safetensors"), hf)
+    (out / "expected.safetensors").write_bytes((src / "expected.safetensors").read_bytes())
+    print(f"{out.name}: the same model with experts stored separately")
 
 
 def tree_map_random(params):

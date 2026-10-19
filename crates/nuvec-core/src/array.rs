@@ -44,7 +44,52 @@ pub(crate) struct Output {
     pub(crate) slot: OnceLock<Result<Data>>,
     /// GPU data whose command buffer is committed on the device timeline but may not have
     /// completed: later GPU work may read it before `slot` is set (D-032).
-    pub(crate) inflight: OnceLock<Data>,
+    pub(crate) inflight: InFlight,
+}
+
+/// An output's in-flight data (see [`Output::inflight`]). It is published to the slot from
+/// here on completion, unless a consumer took it over first (donation): the lock orders
+/// the two.
+#[derive(Default)]
+pub(crate) struct InFlight(Mutex<InFlightState>);
+
+#[derive(Default)]
+pub(crate) enum InFlightState {
+    #[default]
+    Unset,
+    Set(Data),
+    /// Taken over by a consumer that writes into it in place; never published.
+    Donated,
+}
+
+impl InFlight {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, InFlightState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Exposes `data` (once).
+    pub(crate) fn set(&self, data: Data) {
+        let mut state = self.lock();
+        if matches!(*state, InFlightState::Unset) {
+            *state = InFlightState::Set(data);
+        }
+    }
+
+    /// The data, if exposed and not donated.
+    pub(crate) fn get(&self) -> Option<Data> {
+        match &*self.lock() {
+            InFlightState::Set(data) => Some(data.clone()),
+            _ => None,
+        }
+    }
+
+    /// Drops the data (the slot holds it now), unless donated.
+    pub(crate) fn clear(&mut self) {
+        let state = self.0.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if matches!(state, InFlightState::Set(_)) {
+            *state = InFlightState::Unset;
+        }
+    }
 }
 
 /// Evaluated data: elements of a (possibly shared) buffer, starting at `offset` and laid
@@ -140,7 +185,7 @@ impl Output {
             flags,
             size,
             slot,
-            inflight: OnceLock::new(),
+            inflight: InFlight::default(),
         })
     }
 }

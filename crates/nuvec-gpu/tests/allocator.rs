@@ -220,3 +220,64 @@ fn shared_device_is_a_singleton() {
     };
     assert!(std::ptr::eq(a, b));
 }
+
+#[test]
+fn wired_limit_wires_buffers_up_to_it() {
+    let Some(device) = device() else { return };
+    let wired = |d: &Device| d.memory().wired;
+    assert_eq!((device.memory().wired_limit, wired(&device)), (0, 0)); // MLX's default
+    let too_much = device.info().recommended_working_set as usize + 1;
+    assert!(matches!(
+        device.set_wired_limit(too_much),
+        Err(GpuError::InvalidArgument(_))
+    ));
+    assert_eq!(device.set_wired_limit(4 * PAGE).unwrap(), 0);
+    let mut buffers: Vec<_> = (0..3)
+        .map(|_| device.new_buffer(2 * PAGE).unwrap())
+        .collect();
+    if !device.can_wire() {
+        assert_eq!(wired(&device), 0);
+        return;
+    }
+    // Two fit; the third waits outside the set.
+    assert_eq!(wired(&device), 4 * PAGE);
+    // Lowering the limit unwires, raising it wires the waiting buffers.
+    device.set_wired_limit(2 * PAGE).unwrap();
+    assert_eq!(wired(&device), 2 * PAGE);
+    assert_eq!(device.set_wired_limit(8 * PAGE).unwrap(), 2 * PAGE);
+    assert_eq!(wired(&device), 6 * PAGE);
+    // Wired buffers work as usual.
+    let add = device.pipeline("nuvec_binary_add_float32_c").unwrap();
+    let n = 2 * PAGE / 4;
+    let (a, b) = (buffers.pop().unwrap(), buffers.pop().unwrap());
+    let (offset, scalars) = (0i64.to_le_bytes(), 0u32.to_le_bytes());
+    let mut cmd = device.command_buffer().unwrap();
+    cmd.dispatch(
+        &add,
+        &[
+            Arg::read(&a),
+            Arg::read(&b),
+            Arg::write(&mut buffers[0]),
+            Arg::bytes(&offset),
+            Arg::bytes(&offset),
+            Arg::bytes(&scalars),
+        ],
+        n,
+    )
+    .unwrap();
+    cmd.commit().wait().unwrap();
+    // Cached buffers stay wired; released ones leave the set.
+    drop((a, b, buffers));
+    assert_eq!(wired(&device), 6 * PAGE);
+    device.clear_cache();
+    assert_eq!(wired(&device), 0);
+    // Mapped files are wired too, and unwired when released.
+    let path = std::env::temp_dir().join(format!("nuvec-wired-{}", std::process::id()));
+    std::fs::write(&path, vec![1u8; 3 * PAGE]).unwrap();
+    let mapped = device.map_file(&path).unwrap();
+    assert_eq!(wired(&device), 3 * PAGE);
+    drop(mapped);
+    assert_eq!(wired(&device), 0);
+    std::fs::remove_file(&path).unwrap();
+    device.set_wired_limit(0).unwrap();
+}

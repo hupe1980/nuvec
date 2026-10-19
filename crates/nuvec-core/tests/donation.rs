@@ -24,6 +24,9 @@ fn on<R>(device: Device, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Serialises the tests that measure peak memory (tests run on parallel threads).
+static PEAK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Bytes the GPU allocator has held for arrays at most since the last call.
 fn gpu_peak_since_reset() -> usize {
     nuvec_gpu::Device::shared().map_or(0, |d| {
@@ -38,6 +41,9 @@ fn slice_update_writes_in_place_when_it_owns_its_base() {
     if !gpu_available() {
         return;
     }
+    let _serial = PEAK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     on(Device::gpu(0), || {
         let n = 4 << 20; // 16 MiB of float32
         let row = |i: usize| [SliceArg::from(i as isize..i as isize + 1), SliceArg::full()];
@@ -54,6 +60,52 @@ fn slice_update_writes_in_place_when_it_owns_its_base() {
         let peak = gpu_peak_since_reset();
         assert!(
             peak < resident + n * 4 / 2,
+            "peak {peak}, before {resident}"
+        );
+        let v = a.to_vec::<f32>().unwrap();
+        assert!((0..64).all(|i| v[i * n / 64] == i as f32 && v[(i + 1) * n / 64 - 1] == i as f32));
+    });
+}
+
+/// The decode order (mlx-lm's): each step is submitted while the previous one is still in
+/// flight, and a small result of the previous step is read afterwards. The base is then
+/// in flight, held only by pending work, and is still written in place (D-058).
+#[test]
+fn slice_update_writes_in_place_into_bases_still_in_flight() {
+    if !gpu_available() {
+        return;
+    }
+    let _serial = PEAK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    on(Device::gpu(0), || {
+        let n = 4 << 20; // 16 MiB of float32
+        let row = |i: usize| [SliceArg::from(i as isize..i as isize + 1), SliceArg::full()];
+        let mut a = zeros(&[64, n / 64], DType::F32).unwrap();
+        a.eval().unwrap();
+        // Work that keeps each step's command buffer running while the next is built.
+        let m = Array::full(&[1024, 1024], 1.0f32 / 1024.0).unwrap();
+        m.eval().unwrap();
+        gpu_peak_since_reset();
+        let resident = nuvec_gpu::Device::shared().map_or(0, |d| d.memory().active);
+        let mut token: Option<Array> = None;
+        for i in 0..64 {
+            let update = Array::full(&[1, n / 64], i as f32).unwrap();
+            a = slice_update(&a, &update, &row(i)).unwrap();
+            // A small result of this step, read only after the next step is submitted.
+            let busy = sum(&matmul(&m, &m).unwrap(), &[], false).unwrap();
+            let next = add(sum(&slice(&a, &row(i)).unwrap(), &[], false).unwrap(), busy).unwrap();
+            async_eval(&[a.clone(), next.clone()]).unwrap();
+            if let Some(t) = token.replace(next) {
+                let want = (i - 1) as f32 * (n / 64) as f32 + 1024.0;
+                assert!((t.item::<f32>().unwrap() - want).abs() < 1.0);
+            }
+        }
+        // A copy per step would have held two 16 MiB buffers at once (besides the 4 MiB
+        // product).
+        let peak = gpu_peak_since_reset();
+        assert!(
+            peak < resident + (4 << 20) + n * 4 / 2,
             "peak {peak}, before {resident}"
         );
         let v = a.to_vec::<f32>().unwrap();

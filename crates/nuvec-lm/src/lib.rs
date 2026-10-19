@@ -1,5 +1,5 @@
-//! LLM runtime: Llama-family models (Llama, Mistral, Qwen 2, Qwen 3) loaded from Hugging
-//! Face or MLX checkpoints (including MLX's quantized ones), a byte-level BPE tokenizer,
+//! LLM runtime: Llama-family models (Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE) and Qwen 3.5
+//! (hybrid, dense or MoE) loaded from Hugging Face or MLX checkpoints (including MLX's quantized ones), a byte-level BPE tokenizer,
 //! a key-value cache, token generation and sampling (temperature, top-p, min-p, top-k), as
 //! mlx-lm.
 //!
@@ -30,20 +30,24 @@ pub mod config;
 pub mod generate;
 pub mod model;
 pub mod sample;
+pub mod speculative;
 pub mod tokenizer;
 
 pub use config::Config;
-pub use generate::{GenerateOptions, Generation, generate};
+pub use generate::{GenerateOptions, Generation, WiredLimit, generate};
 pub use model::{KvCache, Model};
 pub use sample::Sampler;
+pub use speculative::{
+    Drafter, PromptLookup, SpeculativeGeneration, SpeculativeStats, speculative_generate,
+};
 pub use tokenizer::{StreamDecoder, Tokenizer};
 
 /// The version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The directory of `model`: a path, or a Hugging Face repository id (`org/name`) found
-/// in the local cache (`$HF_HOME/hub` or `~/.cache/huggingface/hub`). Nothing is
-/// downloaded.
+/// in the local cache (`$HF_HOME/hub` or `~/.cache/huggingface/hub`): the snapshot
+/// `refs/main` names, or else the most recently modified one. Nothing is downloaded.
 pub fn resolve(model: &str) -> Result<PathBuf> {
     let path = Path::new(model);
     if path.is_dir() {
@@ -56,13 +60,23 @@ pub fn resolve(model: &str) -> Result<PathBuf> {
         })
         .ok_or_else(|| Error::InvalidArgument("no Hugging Face cache directory".into()))?;
     let repo = hub.join(format!("models--{}", model.replace('/', "--")));
-    let revision = std::fs::read_to_string(repo.join("refs/main")).map_err(|_| {
+    let missing = || {
         Error::InvalidArgument(format!(
             "{model}: not a directory and not in the Hugging Face cache at {}",
             hub.display()
         ))
-    })?;
-    Ok(repo.join("snapshots").join(revision.trim()))
+    };
+    if let Ok(revision) = std::fs::read_to_string(repo.join("refs/main")) {
+        return Ok(repo.join("snapshots").join(revision.trim()));
+    }
+    // Caches filled without a ref (copied, or downloaded by revision).
+    std::fs::read_dir(repo.join("snapshots"))
+        .map_err(|_| missing())?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("config.json").exists())
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+        .ok_or_else(missing)
 }
 
 /// Loads a model and its tokenizer from a directory with `config.json`,
@@ -118,6 +132,28 @@ fn sanitize(weights: BTreeMap<String, Array>) -> Result<BTreeMap<String, Array>>
         );
         if let Some(down) = weights.remove(&format!("{prefix}experts.down_proj")) {
             weights.insert(format!("{prefix}switch_mlp.down_proj.weight"), down);
+        }
+    }
+    // Hugging Face Qwen 3 MoE checkpoints store each expert's projections separately
+    // (`experts.{e}.{name}.weight`), stacked as mlx-lm's `qwen3_moe.sanitize` does.
+    let first: Vec<String> = weights
+        .keys()
+        .filter(|k| k.ends_with(".mlp.experts.0.up_proj.weight"))
+        .cloned()
+        .collect();
+    for key in first {
+        let prefix = key.trim_end_matches("experts.0.up_proj.weight").to_owned();
+        for name in ["up_proj", "down_proj", "gate_proj"] {
+            let mut experts = Vec::new();
+            while let Some(w) =
+                weights.remove(&format!("{prefix}experts.{}.{name}.weight", experts.len()))
+            {
+                experts.push(w);
+            }
+            weights.insert(
+                format!("{prefix}switch_mlp.{name}.weight"),
+                nuvec::stack(&experts, 0)?,
+            );
         }
     }
     let unsanitized = weights
