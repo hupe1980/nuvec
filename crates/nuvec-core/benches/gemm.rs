@@ -29,6 +29,10 @@ const SHAPES: &[(&str, usize, usize, usize, usize, bool)] = &[
 ];
 
 fn main() -> Result<()> {
+    // `cargo test --all-targets` runs bench binaries too: measure only under `cargo bench`.
+    if !std::env::args().any(|a| a == "--bench") {
+        return Ok(());
+    }
     set_default_stream(Stream::default_for(Device::gpu(0)));
     for (dtype, label) in [
         (DType::F32, "float32"),

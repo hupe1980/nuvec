@@ -4,6 +4,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice};
 
@@ -286,12 +287,14 @@ impl std::fmt::Debug for Guard {
     }
 }
 
-/// The fences of ordered command buffers that use a buffer, while any use is pending.
+/// The fences of ordered command buffers whose uses of a buffer are pending.
 #[derive(Debug, Default)]
 struct Fences {
     /// The last writer's.
     writer: Option<Fence>,
-    /// Every user's since the buffer was last idle.
+    /// Every pending use's (a command buffer's fence leaves when it completes, so a buffer
+    /// that is never idle, such as weights read by every pipelined step, keeps only the
+    /// fences of work still in flight).
     users: Vec<Fence>,
 }
 
@@ -344,7 +347,19 @@ impl Guard {
         }
     }
 
-    pub(crate) fn release(&self, write: bool) {
+    /// A use's command buffer completed (or was abandoned); `fence` is its fence, if it
+    /// recorded one: nothing has to wait for that work any more.
+    pub(crate) fn release(&self, write: bool, fence: Option<&Fence>) {
+        if let Some(fence) = fence {
+            let mut fences = self.fences.lock().unwrap_or_else(PoisonError::into_inner);
+            let same = |f: &Fence| Retained::as_ptr(f) == Retained::as_ptr(fence);
+            if let Some(i) = fences.users.iter().position(same) {
+                fences.users.swap_remove(i);
+            }
+            if fences.writer.as_ref().is_some_and(same) {
+                fences.writer = None;
+            }
+        }
         if write {
             self.writers.fetch_sub(1, Ordering::AcqRel);
         }
@@ -390,5 +405,41 @@ impl std::fmt::Debug for Buffer {
             .field("len", &self.len)
             .field("in_use", &self.in_use())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2_metal::MTLDevice;
+
+    use super::*;
+
+    /// A buffer that is never idle (as weights read by every pipelined step) keeps only
+    /// the fences of uses still pending, not one per command buffer since it was idle.
+    #[test]
+    fn completed_fences_leave_buffers_that_stay_in_use() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let new_fence = || device.raw().newFence().expect("a fence");
+        let guard = Guard::default();
+        // A long-running use keeps the buffer busy throughout.
+        let long = new_fence();
+        guard.acquire(false);
+        guard.record(&long, false);
+        guard.committed();
+        for _ in 0..1000 {
+            let fence = new_fence();
+            guard.acquire(true);
+            guard.record(&fence, true);
+            guard.committed();
+            guard.release(true, Some(&fence));
+        }
+        let fences = guard.fences.lock().unwrap();
+        assert_eq!(fences.users.len(), 1);
+        assert!(fences.writer.is_none());
+        drop(fences);
+        guard.release(false, Some(&long));
+        assert!(guard.idle());
     }
 }

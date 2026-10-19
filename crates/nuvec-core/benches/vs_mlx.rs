@@ -34,6 +34,10 @@ fn evaluated(a: Array) -> Result<Array> {
 }
 
 fn main() -> Result<()> {
+    // `cargo test --all-targets` runs bench binaries too: measure only under `cargo bench`.
+    if !std::env::args().any(|a| a == "--bench") {
+        return Ok(());
+    }
     // Rows without a prefix measure the CPU (the default device is the GPU when present).
     set_default_stream(Stream::default_for(Device::cpu()));
     let one = Array::scalar(1.0f32);

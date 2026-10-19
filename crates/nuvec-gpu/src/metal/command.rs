@@ -356,6 +356,7 @@ impl CommandBuffer {
             device: self.device.clone(),
             raw: self.raw.clone(),
             unfenced: self.own.is_none(),
+            own: self.own.clone(),
             guards: std::mem::take(&mut self.guards),
             _retained: std::mem::take(&mut self.retained),
             done: false,
@@ -374,6 +375,7 @@ impl CommandBuffer {
         };
         let finish: Finish = Arc::new(Mutex::new(Some(Completion {
             on_complete: Box::new(on_complete),
+            own: self.own.clone(),
             kernels: std::mem::take(&mut self.kernels),
             unfenced: self.own.is_none(),
             guards: std::mem::take(&mut self.guards),
@@ -441,7 +443,7 @@ impl Drop for CommandBuffer {
         }
         for (guard, write) in self.guards.drain(..) {
             guard.committed();
-            guard.release(write);
+            guard.release(write, None); // abandoned before its fences were recorded
         }
     }
 }
@@ -489,6 +491,8 @@ fn validate(args: &[Arg<'_>]) -> Result<()> {
 /// [`CommandBuffer::commit_then`] completes.
 struct Completion {
     on_complete: Box<dyn FnOnce(Result<()>) + Send>,
+    /// The command buffer's fence, recorded on the buffers it uses.
+    own: Option<Fence>,
     /// The kernels dispatched, while profiling.
     kernels: Vec<Arc<str>>,
     guards: Vec<(Arc<Guard>, bool)>,
@@ -516,7 +520,7 @@ fn complete(finish: &Finish, raw: &ProtocolObject<dyn MTLCommandBuffer>) {
         if c.unfenced {
             guard.committed();
         }
-        guard.release(write);
+        guard.release(write, c.own.as_ref());
     }
     drop(c._retained);
     c.device.flights().end();
@@ -552,6 +556,8 @@ pub struct Submitted {
     /// The command buffer had no timeline fence: its uses count as committed only once
     /// complete.
     unfenced: bool,
+    /// The command buffer's fence, recorded on the buffers it uses.
+    own: Option<Fence>,
     guards: Vec<(Arc<Guard>, bool)>,
     _retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     done: bool,
@@ -573,7 +579,7 @@ impl Submitted {
             if self.unfenced {
                 guard.committed();
             }
-            guard.release(write);
+            guard.release(write, self.own.as_ref());
         }
         self.device.flights().end();
         status(&self.raw)

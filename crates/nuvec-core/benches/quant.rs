@@ -36,6 +36,10 @@ const SHAPES: &[(&str, usize, usize, usize, bool, u32, usize)] = &[
 const EXPERTS: usize = 256;
 
 fn main() -> Result<()> {
+    // `cargo test --all-targets` runs bench binaries too: measure only under `cargo bench`.
+    if !std::env::args().any(|a| a == "--bench") {
+        return Ok(());
+    }
     set_default_stream(Stream::default_for(Device::gpu(0)));
     // Cases whose name contains this (all when unset).
     let filter = std::env::var("BENCH_FILTER").unwrap_or_default();

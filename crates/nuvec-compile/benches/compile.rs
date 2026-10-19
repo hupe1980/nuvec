@@ -43,6 +43,10 @@ type Case = (&'static str, usize, fn(&[Array]) -> Result<Vec<Array>>);
 const CASES: &[Case] = &[("gelu", 1, gelu), ("swiglu", 2, swiglu), ("adam", 4, adam)];
 
 fn main() -> Result<()> {
+    // `cargo test --all-targets` runs bench binaries too: measure only under `cargo bench`.
+    if !std::env::args().any(|a| a == "--bench") {
+        return Ok(());
+    }
     set_default_stream(Stream::default_for(Device::gpu(0)));
     for (dtype, label) in [(DType::F32, "float32"), (DType::F16, "float16")] {
         for &(name, arity, f) in CASES {

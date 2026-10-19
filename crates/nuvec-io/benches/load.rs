@@ -12,8 +12,11 @@ use nuvec_core::{Device, Stream, eval, set_default_stream, sum};
 use nuvec_io::load_safetensors;
 
 fn main() -> nuvec_core::Result<()> {
-    // `cargo test --all-targets` runs this without a file: nothing to measure.
-    let Some(path) = std::env::args().nth(1).filter(|a| !a.starts_with("--")) else {
+    // `cargo test --all-targets` runs bench binaries too: measure only under `cargo bench`.
+    if !std::env::args().any(|a| a == "--bench") {
+        return Ok(());
+    }
+    let Some(path) = std::env::args().skip(1).find(|a| !a.starts_with("--")) else {
         eprintln!("usage: load <file.safetensors> (see scripts/bench_load.py)");
         return Ok(());
     };
