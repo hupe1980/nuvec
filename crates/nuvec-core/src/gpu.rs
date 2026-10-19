@@ -2298,12 +2298,20 @@ mod metal {
                     } else {
                         "logsumexp"
                     };
-                    let looped = axis > 4096;
-                    let name = format!(
-                        "nuvec_{kind}_{}_{dtn}",
-                        if looped { "looped" } else { "block" }
-                    );
-                    let pipeline = self.pipeline(&name)?;
+                    let name = |looped: bool| {
+                        format!(
+                            "nuvec_{kind}_{}_{dtn}",
+                            if looped { "looped" } else { "block" }
+                        )
+                    };
+                    // One block per row while the row fits the pipeline's threadgroup limit
+                    // (which depends on the GPU), else the looped kernel.
+                    let mut pipeline = self.pipeline(&name(axis > 4096))?;
+                    let mut looped = axis > 4096;
+                    if !looped && row_threads(axis, 4) > pipeline.max_threads_per_threadgroup() {
+                        looped = true;
+                        pipeline = self.pipeline(&name(true))?;
+                    }
                     let group = if looped {
                         pipeline.max_threads_per_threadgroup()
                     } else {
@@ -2325,13 +2333,20 @@ mod metal {
                         false => None,
                     };
                     let (limit, reads) = if layer { (6656, 8) } else { (4096, 4) };
-                    let looped = axis > limit;
-                    let name = format!(
-                        "nuvec_{}{}_{dtn}",
-                        if layer { "layer_norm" } else { "rms" },
-                        if looped { "_looped" } else { "" }
-                    );
-                    let pipeline = self.pipeline(&name)?;
+                    let name = |looped: bool| {
+                        format!(
+                            "nuvec_{}{}_{dtn}",
+                            if layer { "layer_norm" } else { "rms" },
+                            if looped { "_looped" } else { "" }
+                        )
+                    };
+                    let mut looped = axis > limit;
+                    let mut pipeline = self.pipeline(&name(looped))?;
+                    if !looped && row_threads(axis, reads) > pipeline.max_threads_per_threadgroup()
+                    {
+                        looped = true;
+                        pipeline = self.pipeline(&name(true))?;
+                    }
                     let group = if looped {
                         pipeline.max_threads_per_threadgroup()
                     } else {
@@ -2356,7 +2371,20 @@ mod metal {
                     let g = self.packed(operands[if layer { 3 } else { 2 }], true)?;
                     let has_w = !w.shape.is_empty();
                     let (limit, reads) = if layer { (8192, 8) } else { (4096, 4) };
-                    let looped = axis > limit;
+                    let name = |looped: bool| {
+                        format!(
+                            "nuvec_vjp_{}{}_{dtn}",
+                            if layer { "layer_norm" } else { "rms" },
+                            if looped { "_looped" } else { "" }
+                        )
+                    };
+                    let mut looped = axis > limit;
+                    let mut pipeline = self.pipeline_with(&name(looped), &[(20, has_w)])?;
+                    if !looped && row_threads(axis, reads) > pipeline.max_threads_per_threadgroup()
+                    {
+                        looped = true;
+                        pipeline = self.pipeline_with(&name(true), &[(20, has_w)])?;
+                    }
                     // RMS rows are grouped (about 512 threadgroups); layer norm: one row each.
                     let per_group = if !layer && !looped {
                         rows.div_ceil(512)
@@ -2364,12 +2392,6 @@ mod metal {
                         1
                     };
                     let groups = rows.div_ceil(per_group);
-                    let name = format!(
-                        "nuvec_vjp_{}{}_{dtn}",
-                        if layer { "layer_norm" } else { "rms" },
-                        if looped { "_looped" } else { "" }
-                    );
-                    let pipeline = self.pipeline_with(&name, &[(20, has_w)])?;
                     let group = if looped {
                         pipeline.max_threads_per_threadgroup()
                     } else {
