@@ -227,7 +227,7 @@ fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
     #[cfg(test)]
     counter::inc();
     let mut inputs = inputs;
-    let result = match donation(node, &primitive, &mut inputs, gpu) {
+    let result = match donation(node, &primitive, &mut inputs, &mut *gpu) {
         Some(base) => in_place(node, &primitive, &inputs, base, gpu),
         None => compute(node, &primitive, &inputs, gpu),
     };
@@ -267,7 +267,7 @@ fn donation(
     node: &Node,
     primitive: &Primitive,
     inputs: &mut [Array],
-    gpu: &GpuEval,
+    gpu: &mut GpuEval,
 ) -> Option<Data> {
     let device = node.stream.device;
     let writes_base = matches!(
@@ -279,14 +279,20 @@ fn donation(
         return None;
     }
     let base = &mut inputs[0].node;
-    if Arc::strong_count(base) != 1 {
-        return None;
-    }
     let usable = |data: &Data, out: &crate::array::Output, handles: usize| {
         out.flags.row_contiguous
             && crate::gpu::writable(data, out)
             && Arc::strong_count(&data.buffer) == handles
     };
+    // Produced earlier in this evaluation: taken over from it if nothing else refers to it.
+    if let [out] = base.outputs.as_slice()
+        && let Some(data) = gpu.take_pending(base, |data, handles| usable(data, out, handles))
+    {
+        return Some(data);
+    }
+    if Arc::strong_count(base) != 1 {
+        return None;
+    }
     // Finished: no pending work refers to it any more, so it is owned outright.
     if let Some(base) = Arc::get_mut(base) {
         let [out] = base.outputs.as_mut_slice() else {

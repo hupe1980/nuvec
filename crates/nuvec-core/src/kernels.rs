@@ -53,23 +53,27 @@ pub(crate) fn slice_update(
 ) -> Result<Buffer> {
     fn run<T: Pod>(base: Operand<'_>, update: Operand<'_>, slices: &[DimSlice]) -> Result<Buffer> {
         let mut out = contiguous(base.0, base.1)?;
-        let values = contiguous(update.0, update.1)?;
         let (strides, offset) =
             view::slice_geometry(&shape::row_contiguous_strides(&base.0.shape), slices);
         let shape = &update.0.shape;
         let dst = out.typed_mut::<T>();
-        // Walk the update in row-major order with an odometer over the region's strides.
+        // The update read in place through its own strides (no temporary copy), in row-major
+        // order with an odometer over both layouts.
+        let src = update.1.buffer.typed::<T>();
+        let src_strides = &update.0.strides;
         let mut index = vec![0usize; shape.len()];
-        let mut at = offset;
-        for &x in values.typed::<T>() {
-            dst[at as usize] = x;
+        let (mut at, mut from) = (offset, update.1.offset);
+        for _ in 0..update.0.size {
+            dst[at as usize] = src[from as usize];
             for d in (0..shape.len()).rev() {
                 index[d] += 1;
                 at += strides[d];
+                from += src_strides[d];
                 if index[d] < shape[d] {
                     break;
                 }
                 at -= strides[d] * shape[d] as isize;
+                from -= src_strides[d] * shape[d] as isize;
                 index[d] = 0;
             }
         }

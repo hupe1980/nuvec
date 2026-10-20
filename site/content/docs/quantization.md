@@ -26,7 +26,7 @@ let y = quantized_matmul(&x, &wq, &scales, &biases, true, 64, 4)?; // x · wᵀ
 let w_approx = dequantize(&wq, &scales, &biases, 64, 4)?;
 ```
 
-On the GPU, products use MLX's kernels chosen by shape: matrix-vector kernels (`qmv`, `qmv_fast`) for single rows, as in decode, tiled kernels (`qmm_t`, `qmm_n`) for many rows, and split-K when the output is small but the inner dimension long. For 4-bit products of 4 or more rows below the tiled kernels' threshold (speculative verification, small batches), nuvec's own kernel unpacks each weight once for two rows.
+On the GPU, products use MLX's kernels chosen by shape: matrix-vector kernels (`qmv`, `qmv_fast`) for single rows, as in decode, tiled kernels (`qmm_t`, `qmm_n`) for many rows, and split-K when the output is small but the inner dimension long. For 4-bit products of 4 or more rows below the tiled kernels' threshold (speculative verification, small batches), nuvec's own kernel unpacks each weight once for two rows; each row's result equals the single-row product bit for bit, so results do not depend on how many rows share a product.
 
 ## Mixture of experts
 

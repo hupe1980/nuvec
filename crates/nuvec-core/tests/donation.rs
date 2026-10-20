@@ -161,3 +161,158 @@ fn slice_update_differentiates_on_the_gpu() {
         assert_eq!(g, [20.0, 40.0, 0.0, 0.0]);
     });
 }
+
+/// On the CPU, a strided update (a transpose) is read in place: the update allocates only
+/// its result, not a contiguous copy of the update.
+#[test]
+fn cpu_slice_update_reads_strided_updates_in_place() {
+    if !gpu_available() {
+        return;
+    }
+    let _serial = PEAK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    on(Device::cpu(), || {
+        let (rows, cols) = (32, 4096);
+        let base = zeros(&[64, cols], DType::F32).unwrap();
+        let source = arange(0.0, (rows * cols) as f64, 1.0, DType::F32)
+            .unwrap()
+            .reshape(&[cols as isize, rows as isize])
+            .unwrap();
+        base.eval().unwrap();
+        source.eval().unwrap();
+        let update = source.t().unwrap(); // [rows, cols], strided
+        gpu_peak_since_reset();
+        let resident = nuvec_gpu::Device::shared().map_or(0, |d| d.memory().active);
+        let region = [SliceArg::from(0..rows as isize), SliceArg::full()];
+        let out = slice_update(&base, &update, &region).unwrap();
+        out.eval().unwrap();
+        // The result (a copy of the base: the CPU does not donate) and nothing else; a
+        // contiguous copy of the update would add another 512 KiB.
+        let peak = gpu_peak_since_reset();
+        let (base_bytes, update_bytes) = (64 * cols * 4, rows * cols * 4);
+        assert!(
+            peak < resident + base_bytes + update_bytes / 2,
+            "peak {peak}, before {resident}"
+        );
+        let v = out.to_vec::<f32>().unwrap();
+        assert_eq!((v[0], v[1], v[cols]), (0.0, 32.0, 1.0));
+        assert_eq!(v[rows * cols], 0.0);
+    });
+}
+
+/// Bases produced earlier in the same evaluation are written in place too: growing a cache
+/// by `zeros`, then the old part, then a new segment, in one evaluation, holds one cache.
+#[test]
+fn slice_update_writes_in_place_into_bases_of_the_same_evaluation() {
+    if !gpu_available() {
+        return;
+    }
+    let _serial = PEAK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    on(Device::gpu(0), || {
+        let (heads, d, old_len, seg_len, cap) = (8, 128, 1024, 1024, 2304);
+        let part = |len: usize, start: f64| {
+            let n = (heads * len * d) as f64;
+            arange(start, start + n, 1.0, DType::F32)
+                .unwrap()
+                .reshape(&[1, heads as isize, len as isize, d as isize])
+                .unwrap()
+        };
+        let (old, seg) = (part(old_len, 0.0), part(seg_len, 1e7));
+        old.eval().unwrap();
+        seg.eval().unwrap();
+        let at = |a: usize, b: usize| {
+            [
+                SliceArg::full(),
+                SliceArg::full(),
+                SliceArg::from(a as isize..b as isize),
+                SliceArg::full(),
+            ]
+        };
+        gpu_peak_since_reset();
+        let resident = nuvec_gpu::Device::shared().map_or(0, |dv| dv.memory().active);
+        // (The intermediate is not bound to a name: a shadowed binding would keep it alive.)
+        let grown = slice_update(
+            &slice_update(
+                &zeros(&[1, heads, cap, d], DType::F32).unwrap(),
+                &old,
+                &at(0, old_len),
+            )
+            .unwrap(),
+            &seg,
+            &at(old_len, old_len + seg_len),
+        )
+        .unwrap();
+        grown.eval().unwrap();
+        let cache = heads * cap * d * 4;
+        let peak = gpu_peak_since_reset();
+        assert!(
+            peak < resident + cache * 3 / 2,
+            "peak {peak}, before {resident}, cache {cache}"
+        );
+        let want = concatenate(
+            &[
+                old.clone(),
+                seg.clone(),
+                zeros(&[1, heads, cap - old_len - seg_len, d], DType::F32).unwrap(),
+            ],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            grown.to_vec::<f32>().unwrap(),
+            want.to_vec::<f32>().unwrap()
+        );
+
+        // A chain long enough to span several command buffers (committed ones included).
+        let n = 4 << 20;
+        let row = |i: usize| [SliceArg::from(i as isize..i as isize + 1), SliceArg::full()];
+        gpu_peak_since_reset();
+        let resident = nuvec_gpu::Device::shared().map_or(0, |dv| dv.memory().active);
+        let mut a = zeros(&[64, n / 64], DType::F32).unwrap();
+        for i in 0..64 {
+            // A scalar update (broadcast), so that only the cache takes memory.
+            a = slice_update(&a, &Array::scalar(i as f32), &row(i)).unwrap();
+        }
+        a.eval().unwrap();
+        let peak = gpu_peak_since_reset();
+        assert!(
+            peak < resident + n * 4 * 3 / 2,
+            "chain: peak {peak}, before {resident}"
+        );
+        let v = a.to_vec::<f32>().unwrap();
+        assert!((0..64).all(|i| v[i * n / 64] == i as f32 && v[(i + 1) * n / 64 - 1] == i as f32));
+    });
+}
+
+/// Within one evaluation, a base another array still holds is never written, and a reader
+/// encoded before an in-place write sees the values before it.
+#[test]
+fn same_evaluation_donation_respects_holders_and_earlier_readers() {
+    if !gpu_available() {
+        return;
+    }
+    on(Device::gpu(0), || {
+        let row = [SliceArg::from(0..1), SliceArg::full()];
+        let update = Array::full(&[1, 1024], 7.0f32).unwrap();
+        // Held: `a` must keep its values.
+        let a = add(zeros(&[16, 1024], DType::F32).unwrap(), 1.0).unwrap();
+        let b = slice_update(&a, &update, &row).unwrap();
+        eval(&[b.clone(), a.clone()]).unwrap();
+        assert!(a.to_vec::<f32>().unwrap().iter().all(|&x| x == 1.0));
+        assert_eq!(b.to_vec::<f32>().unwrap()[0], 7.0);
+        // Read before the write in the same evaluation: `sum` sees the ones.
+        for _ in 0..20 {
+            let a = add(zeros(&[16, 1024], DType::F32).unwrap(), 1.0).unwrap();
+            let total = sum(&a, &[], false).unwrap();
+            let b = slice_update(&a, &update, &row).unwrap();
+            drop(a);
+            eval(&[total.clone(), b.clone()]).unwrap();
+            assert_eq!(total.item::<f32>().unwrap(), 16.0 * 1024.0);
+            let v = b.to_vec::<f32>().unwrap();
+            assert!(v[..1024].iter().all(|&x| x == 7.0) && v[1024..].iter().all(|&x| x == 1.0));
+        }
+    });
+}

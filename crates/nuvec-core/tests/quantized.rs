@@ -751,3 +751,44 @@ mod gather_gpu {
         assert_close("broadcast indices", &gpu, &cpu, 1e-5);
     }
 }
+
+/// Few-row 4-bit products (nuvec's `qmv_rows`) equal the one-row product of each row bit for
+/// bit, so results do not depend on how many rows share a product (speculative
+/// verification and batching give plain decoding's numbers).
+#[cfg(target_os = "macos")]
+#[test]
+fn few_row_products_equal_one_row_products_bit_for_bit() {
+    if cfg!(miri) {
+        return;
+    }
+    let previous = default_stream();
+    set_default_stream(Stream::default_for(Device::gpu(0)));
+    if (&Array::scalar(1.0f32) + 1.0).eval().is_err() {
+        set_default_stream(previous);
+        return;
+    }
+    // (rows, K, N, group): odd and even rows, partial output rows (N % 8 != 0).
+    for (m, k, n, gs) in [(6, 4096, 512, 64), (5, 1024, 1000, 32), (4, 2048, 256, 128)] {
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            let w = random::normal(&[n, k], dtype, None, None, Some(&random::key(1))).unwrap();
+            let (wq, s, b) = quantize(&w, gs, 4).unwrap();
+            let x = random::normal(&[m, k], dtype, None, None, Some(&random::key(2))).unwrap();
+            let bits = |a: Array| -> Vec<u32> {
+                let v = a.astype(DType::F32).unwrap().to_vec::<f32>().unwrap();
+                v.into_iter().map(f32::to_bits).collect()
+            };
+            let all = bits(quantized_matmul(&x, &wq, &s, &b, true, gs, 4).unwrap());
+            for r in 0..m {
+                let row = SliceArg::from(r as isize..r as isize + 1);
+                let xr = slice(&x, &[row, SliceArg::full()]).unwrap();
+                let one = bits(quantized_matmul(&xr, &wq, &s, &b, true, gs, 4).unwrap());
+                assert!(
+                    one == all[r * n..(r + 1) * n],
+                    "{dtype} {:?}: row {r} differs",
+                    (m, k, n, gs)
+                );
+            }
+        }
+    }
+    set_default_stream(previous);
+}

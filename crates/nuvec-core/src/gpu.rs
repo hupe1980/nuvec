@@ -95,6 +95,13 @@ mod stub {
         pub(crate) fn lookup(&self, _: &Arc<Node>, _: u32) -> Option<Data> {
             None
         }
+        pub(crate) fn take_pending(
+            &mut self,
+            _: &Arc<Node>,
+            _: impl Fn(&Data, usize) -> bool,
+        ) -> Option<Data> {
+            None
+        }
         pub(crate) fn flush(&mut self) -> Result<()> {
             Ok(())
         }
@@ -3999,6 +4006,44 @@ mod metal {
                 }
             }
             self.index.retain(|_, (node, _)| node.strong_count() > 0);
+        }
+
+        /// Takes over `node`'s output (one output) when this evaluation produced it and
+        /// nothing but the caller's input refers to it (donation within an evaluation).
+        /// In the open command buffer, the node is held by that input and the open chunk,
+        /// and its data by the chunk and the index: both entries are removed and the data
+        /// returned (nothing else can read the output, so it is never published).
+        /// In a committed command buffer, only the index holds the data besides the node:
+        /// its entry is removed, and `None` leaves the caller's in-flight path to take the
+        /// data. `usable(data, handles)` checks the layout and that the buffer has exactly
+        /// `handles` handles. Later dispatches that write the buffer are ordered after its
+        /// producer and readers by the encoder's barriers and the buffer's fences.
+        pub(crate) fn take_pending(
+            &mut self,
+            node: &Arc<Node>,
+            usable: impl Fn(&Data, usize) -> bool,
+        ) -> Option<Data> {
+            let key = Arc::as_ptr(node);
+            let (_, outputs) = self.index.get(&key)?;
+            let [data] = outputs.as_slice() else {
+                return None;
+            };
+            match self.chunk.iter().position(|(n, _)| Arc::ptr_eq(n, node)) {
+                Some(at) => {
+                    if Arc::strong_count(node) != 2 || !usable(data, 2) {
+                        return None;
+                    }
+                    self.index.remove(&key);
+                    self.chunk.remove(at).1.pop()
+                }
+                None => {
+                    // The index's handle and the node's in-flight one.
+                    if Arc::strong_count(node) == 1 && usable(data, 2) {
+                        self.index.remove(&key);
+                    }
+                    None
+                }
+            }
         }
 
         /// The pending output `output` of `node`, if it was encoded in this evaluation.

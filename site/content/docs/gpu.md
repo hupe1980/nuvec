@@ -24,7 +24,7 @@ Buffers live in shared memory: the CPU reads GPU results in place. Rust's owners
 Two techniques keep memory low:
 
 - **Reuse while the GPU runs.** A buffer dropped while submitted work still uses it goes back to the cache immediately; later GPU work may reuse it, ordered after those uses by its fences (MLX does the same).
-- **In-place updates (donation).** When an update's input is owned by nothing else — no other handle, view or pending consumer — the update writes into it instead of copying. That covers inputs still being computed by earlier, in-flight work, which is what lets a decode loop submit step *n + 1* before reading token *n*.
+- **In-place updates (donation).** When an update's input is owned by nothing else — no other handle, view or pending consumer — the update writes into it instead of copying. That covers inputs computed earlier in the same evaluation and inputs still being computed by earlier, in-flight work, which is what lets a decode loop submit step *n + 1* before reading token *n*.
 
 ## Memory limits
 

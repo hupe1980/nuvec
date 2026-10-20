@@ -4,6 +4,14 @@ All notable changes to nuvec are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (before 1.0, minor versions may break the API).
 
+## [Unreleased]
+
+### Fixed
+- `slice_update` on the CPU reads a strided update in place instead of copying it first.
+- `slice_update` (and `norm_rope` into a cache) writes in place into a base computed
+  earlier in the same evaluation instead of copying it, so a chain of updates evaluated at
+  once holds one buffer.
+
 ## [0.2.0] - 2026-10-20
 
 Faster decoding through fused kernels, speculative decoding on hybrid models, and MoE
@@ -73,5 +81,6 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/hupe1980/nuvec/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/nuvec/releases/tag/v0.1.0

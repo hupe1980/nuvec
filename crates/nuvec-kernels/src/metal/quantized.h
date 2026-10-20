@@ -1508,8 +1508,8 @@ METAL_FUNC void adjust_matrix_offsets(
 
 // nuvec's own: 4-bit `qmv_fast` over `R` input rows. Each thread unpacks a weight row's
 // codes once and applies them to every input row with `qdot`'s expression; `qmv_fast`
-// unpacks them again per row, which bounds few-row products. Rows past `m` repeat the
-// last row and are not stored.
+// unpacks them again per row, which bounds few-row products. Each row's result equals
+// `qmv_fast`'s bit for bit (tested). Rows past `m` repeat the last row and are not stored.
 template <typename T, int group_size, int bits, bool partial_rows, int R>
 [[kernel]] void affine_qmv_rows(
     const device uint32_t* w [[buffer(0)]],
