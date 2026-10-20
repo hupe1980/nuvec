@@ -48,7 +48,7 @@ for id in generate(&model, &prompt, options)? {
 
 - **Chunked prefill** (2,048 tokens at a time, as mlx-lm) with the cache written once per position.
 - **A pipelined decode loop:** step *n + 1* is built and submitted while the GPU still runs step *n*; token *n* is read afterwards. The KV cache is updated in place, even while the previous step is still in flight.
-- **MLX's kernels** for every hot operation, and mlx-lm's compiled activations.
+- **MLX's kernels** for every hot operation, mlx-lm's compiled activations, and fused kernels that shorten each layer's chain of dependent dispatches (residual add + norm; q/k norm + RoPE + cache write).
 - **Wired memory** while generating (`WiredLimit`), as mlx-lm does, so weights are not paged out between steps.
 
 See [benchmarks](@/docs/benchmarks.md) for the numbers and [speculative decoding](@/docs/speculative-decoding.md) for going beyond them.

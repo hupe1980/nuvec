@@ -1,6 +1,6 @@
 +++
 title = "Fused and custom Metal kernels"
-description = "nuvec's fast module: MLX's fused RMSNorm, LayerNorm, RoPE, attention, cross entropy and Gated DeltaNet kernels, plus custom Metal kernels written from source."
+description = "nuvec's fast module: fused RMSNorm, LayerNorm, RoPE, attention, cross entropy and Gated DeltaNet kernels, plus custom Metal kernels written from source."
 weight = 60
 [extra]
 group = "GPU"
@@ -8,16 +8,19 @@ group = "GPU"
 
 ## Fused kernels (`nuvec::fast`)
 
-The `fast` module exposes MLX's fused operations. Each one is a single Metal kernel on the GPU and an equivalent composition of ordinary operations elsewhere; the composition also defines its derivatives and batching, so they work under every transform.
+The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each one is a single Metal kernel on the GPU and an equivalent composition of ordinary operations elsewhere; the composition also defines its derivatives and batching, so they work under every transform.
 
 | Function | What it computes |
 |---|---|
 | `rms_norm(x, weight, eps)` | RMS normalization over the last axis |
+| `add_rms_norm(x, residual, weight, eps)` | `x + residual` and its RMS normalization (a transformer block's residual connection) |
 | `layer_norm(x, weight, bias, eps)` | Layer normalization |
 | `rope(x, dims, traditional, base, scale, offset, freqs)` | Rotary position embeddings, optionally on the first `dims` features only |
+| `norm_rope(x, norm, rotation, offset, cache)` | Per-head RMS normalization and RoPE, optionally written straight into a KV cache |
 | `scaled_dot_product_attention(q, k, v, scale, mask, sinks)` | Attention with grouped-query heads, causal, boolean or additive masks and attention sinks |
 | `cross_entropy(logits, targets)` | Fused log-softmax and negative log-likelihood |
 | `gated_delta(q, k, v, g, beta, state)` | The Gated DeltaNet recurrence (Qwen 3.5's linear attention), returning the outputs and the new state |
+| `gated_delta_steps(q, k, v, g, beta, state)` | The same, returning the state after every step (to roll the recurrence back) |
 
 Attention picks MLX's kernel for the shape: vector kernels for short queries (decode), a two-pass split-K kernel for long contexts, and the tiled flash-style kernel for prefill. `softmax` and `logsumexp` over the last axis use fused kernels too.
 

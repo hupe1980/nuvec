@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "nuvec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nuvec-compile",
  "nuvec-core",
@@ -315,14 +315,14 @@ dependencies = [
 
 [[package]]
 name = "nuvec-compile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nuvec-core",
 ]
 
 [[package]]
 name = "nuvec-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "nuvec-cpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gemm",
  "half",
@@ -341,14 +341,14 @@ dependencies = [
 
 [[package]]
 name = "nuvec-distributed"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nuvec-core",
 ]
 
 [[package]]
 name = "nuvec-gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "block2",
  "dispatch2",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "nuvec-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nuvec-core",
  "nuvec-gpu",
@@ -369,11 +369,11 @@ dependencies = [
 
 [[package]]
 name = "nuvec-kernels"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nuvec-lm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nuvec",
  "nuvec-nn",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "nuvec-nn"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nuvec",
 ]

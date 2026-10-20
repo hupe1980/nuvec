@@ -26,17 +26,8 @@ const MACOS_MIN: &str = "-mmacosx-version-min=15.0";
 const PRECISE: &str = "-fno-fast-math";
 /// No implicit fused multiply-add: element-wise results round like the CPU backend.
 const NO_CONTRACT: &str = "-ffp-contract=off";
-/// Kernels compiled with contraction (MLX's default): they have no bit-exact CPU
-/// counterpart, and fused multiply-adds speed up their dot products (attention decode by
-/// about 15%, 4-bit prefill products by about 3%). Exact kernels in these files (affine
-/// `quantize`/`dequantize`) turn it off with `#pragma clang fp contract(off)`.
-const CONTRACTED: &[&str] = &[
-    "sdpa.metal",
-    "quantized.metal",
-    "gemm.metal",
-    "gemv.metal",
-    "gather_gemm.metal",
-];
+// `CONTRACTED`: shared with the runtime compiler (`nuvec_kernels::contracted`).
+include!("src/contracted.rs");
 
 fn main() {
     println!(
@@ -44,6 +35,7 @@ fn main() {
     );
     // A directory is rescanned recursively, so header edits trigger a rebuild too.
     println!("cargo::rerun-if-changed=src/metal");
+    println!("cargo::rerun-if-changed=src/contracted.rs");
     println!("cargo::rerun-if-env-changed={OPT_OUT}");
     println!("cargo::rerun-if-env-changed={REQUIRE}");
     println!("cargo::rerun-if-env-changed=DEVELOPER_DIR");

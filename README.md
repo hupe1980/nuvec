@@ -36,14 +36,14 @@ Same machine, same day, same checkpoints: `nuvec-lm` against `mlx-lm` 0.32.2 (Ap
 
 | Model | Kind | Prefill (961 tokens) | Decode |
 |---|---|---:|---:|
-| Qwen3-0.6B 4-bit | dense | 1.03× | 1.03–1.04× |
-| Llama-3.2-3B 4-bit | dense | 1.01× | 0.98–0.99× |
-| Qwen3-8B 4-bit | dense | 1.00× | 0.97–1.00× |
-| Qwen3.5-9B 4-bit | hybrid | 0.99× | 0.97–1.00× |
-| Qwen3-30B-A3B 4-bit | MoE | 0.99× | 1.02× |
-| Qwen3.6-35B-A3B 4-bit | hybrid MoE | 0.96× | 1.00–1.01× |
+| Qwen3-0.6B 4-bit | dense | 1.07× | 1.06–1.09× |
+| Llama-3.2-3B 4-bit | dense | 1.00× | 1.01× |
+| Qwen3-8B 4-bit | dense | 1.01× | 1.01–1.03× |
+| Qwen3.5-9B 4-bit | hybrid | 1.00× | 0.99× |
+| Qwen3-30B-A3B 4-bit | MoE | 0.99× | 1.03× |
+| Qwen3.6-35B-A3B 4-bit | hybrid MoE | 0.98× | 1.01–1.02× |
 
-Speculative decoding with prompt-lookup drafts doubles decode speed on text that repeats its input (Qwen3-8B: 53 → 106 tok/s), at about the same speed otherwise. Full tables and methodology: [benchmarks](https://hupe1980.github.io/nuvec/docs/benchmarks/).
+Speculative decoding with prompt-lookup drafts more than doubles decode speed on text that repeats its input (Qwen3-8B: 53 → 115 tok/s), at about the same speed otherwise. Full tables and methodology: [benchmarks](https://hupe1980.github.io/nuvec/docs/benchmarks/).
 
 ## 🚀 Quick start
 

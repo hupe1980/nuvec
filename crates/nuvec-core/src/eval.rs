@@ -270,11 +270,12 @@ fn donation(
     gpu: &GpuEval,
 ) -> Option<Data> {
     let device = node.stream.device;
-    if !matches!(primitive, Primitive::SliceUpdate { .. })
-        || node.tracer
-        || device.kind == DeviceKind::Cpu
-        || !gpu.available(device)
-    {
+    let writes_base = matches!(
+        primitive,
+        Primitive::SliceUpdate { .. }
+            | Primitive::Fast(crate::fast::FastOp::NormRope { cache: true, .. })
+    );
+    if !writes_base || node.tracer || device.kind == DeviceKind::Cpu || !gpu.available(device) {
         return None;
     }
     let base = &mut inputs[0].node;
@@ -324,7 +325,7 @@ fn donation(
     }
 }
 
-/// A `slice_update` written into its donated base.
+/// A `slice_update` (or a `norm_rope` into a cache) written into its donated base.
 fn in_place(
     node: &Node,
     primitive: &Primitive,
@@ -333,10 +334,19 @@ fn in_place(
     gpu: &mut GpuEval,
 ) -> Result<(Vec<Data>, bool)> {
     let (mut pending, mut foreign) = (false, Vec::new());
-    let update = input_data(&inputs[1], gpu, &mut pending, &mut foreign)?;
-    let slices = primitive.dim_slices(node.outputs[0].shape.len())?;
+    let rest = inputs[1..]
+        .iter()
+        .map(|a| input_data(a, gpu, &mut pending, &mut foreign))
+        .collect::<Result<Vec<_>>>()?;
+    let operands: Vec<Operand<'_>> = inputs[1..].iter().map(Array::out).zip(&rest).collect();
     let out = &node.outputs[0];
-    let data = gpu.slice_update_in_place(base, out, (inputs[1].out(), &update), &slices)?;
+    let data = match primitive {
+        Primitive::Fast(op) => gpu.norm_rope_in_place(base, op, &operands, out)?,
+        _ => {
+            let slices = primitive.dim_slices(out.shape.len())?;
+            gpu.slice_update_in_place(base, out, operands[0], &slices)?
+        }
+    };
     Ok((vec![data], true))
 }
 

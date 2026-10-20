@@ -4,6 +4,39 @@ All notable changes to nuvec are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (before 1.0, minor versions may break the API).
 
+## [0.2.0] - 2026-10-20
+
+Faster decoding through fused kernels, speculative decoding on hybrid models, and MoE
+prefill at mlx-lm's speed.
+
+### Added
+- `fast::add_rms_norm`: a residual addition and its RMS normalisation in one kernel.
+- `fast::norm_rope` and `fast::Rotation`: per-head RMS norm, RoPE and an in-place KV cache
+  write in one kernel.
+- `fast::gated_delta_steps` and `KvCache::keep_steps`: speculative decoding on hybrid
+  (Gated DeltaNet) models, which roll back rejected drafts.
+- `MemoryStats::mapped` and `MemoryStats::wired_mapped`: memory-mapped checkpoints, which
+  `active` and `peak` do not count.
+- `random::next_key`, to pass the thread's key sequence into compiled functions.
+- GPU kernels for depthwise `conv1d`, random bits and 4-bit products of a few rows.
+- Run-to-run determinism tests on the GPU.
+
+### Changed
+- **Breaking:** `MemoryStats` has two new fields; `FastOp::GatedDelta` has a `steps` field.
+- `nuvec-lm` fuses residual additions with the next norm and prepares queries and keys
+  with `norm_rope`: Qwen3-0.6B decode 1.06–1.09× mlx-lm (was 1.00–1.04×), same tokens.
+- Sorted `gather_qmm` groups rows only with enough rows per expert, as MLX:
+  Qwen3.6-35B-A3B prefill 0.97–1.14× mlx-lm (was 0.92–0.96×).
+- Speculative decoding on Qwen3-8B: 2.16× on repetitive text (was 1.98×), 1.02× on
+  natural text (was 0.96×).
+- Sampling with a temperature costs about 1% over greedy decoding (was 7–8% on small
+  models): random bits run on the GPU and the categorical draw is compiled.
+
+### Fixed
+- Kernels compiled from embedded sources (no Metal toolchain at build time) gave slightly
+  different results than the precompiled library; they now match, and the first launch
+  takes about half as long.
+
 ## [0.1.0] - 2026-10-19
 
 The first release: MLX's programming model in pure Rust, with an LLM runtime at mlx-lm's speed.
@@ -40,4 +73,5 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
+[0.2.0]: https://github.com/hupe1980/nuvec/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/nuvec/releases/tag/v0.1.0

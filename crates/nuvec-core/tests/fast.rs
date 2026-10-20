@@ -214,6 +214,396 @@ mod gpu {
     }
 
     #[test]
+    fn add_rms_norm_equals_add_then_rms_norm() {
+        if !gpu_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x67);
+        let composed = |x: &Array, r: &Array, w: Option<&Array>| -> Result<Vec<Array>> {
+            let h = add(x, r)?;
+            let y = fast::rms_norm(&h, w, 1e-5)?;
+            Ok(vec![h, y])
+        };
+        let fused = |x: &Array, r: &Array, w: Option<&Array>| -> Result<Vec<Array>> {
+            let (h, y) = fast::add_rms_norm(x, r, w, 1e-5)?;
+            Ok(vec![h, y])
+        };
+        // Single-row kernel, looped kernel (> 4096 features), many rows.
+        for shape in [
+            vec![9],
+            vec![3, 7],
+            vec![2, 1, 1024],
+            vec![700, 64],
+            vec![2, 5000],
+        ] {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let d = shape[shape.len() - 1];
+                let x = random(&mut rng, &shape, dtype);
+                let r = random(&mut rng, &shape, dtype);
+                let w = random(&mut rng, &[d], dtype);
+                let name = format!("{dtype} {shape:?}");
+                // The kernel against the unfused kernels: bit for bit.
+                on(Device::gpu(0), || {
+                    for w in [Some(&w), None] {
+                        let (got, want) = (fused(&x, &r, w).unwrap(), composed(&x, &r, w).unwrap());
+                        for (i, (g, c)) in got.iter().zip(&want).enumerate() {
+                            assert_close(&format!("add_rms {name} #{i}"), g, c, 0.0);
+                        }
+                    }
+                });
+                // The kernel against the CPU fallback, with gradients through both outputs.
+                let (gh, gy) = (
+                    random(&mut rng, &shape, dtype),
+                    random(&mut rng, &shape, dtype),
+                );
+                let tol = tolerance(dtype) * if shape[0] > 500 { 8.0 } else { 1.0 };
+                both(&format!("add_rms grads {name}"), tol, || {
+                    let f = |xs: &[Array]| fused(&xs[0], &xs[1], Some(&xs[2]));
+                    let primals = [x.clone(), r.clone(), w.clone()];
+                    let (mut out, grads) = vjp(f, &primals, &[gh.clone(), gy.clone()])?;
+                    out.extend(grads);
+                    Ok(out)
+                });
+            }
+        }
+        // Strided and offset operands (a transpose and a slice) are packed first.
+        let x = random(&mut rng, &[16, 6], DType::F32).t().unwrap();
+        let r = slice(
+            &random(&mut rng, &[8, 20], DType::F32),
+            &[
+                SliceArg::new(Some(1), Some(7), 1),
+                SliceArg::new(Some(2), Some(18), 1),
+            ],
+        )
+        .unwrap();
+        on(Device::gpu(0), || {
+            let (got, want) = (
+                fused(&x, &r, None).unwrap(),
+                composed(&x, &r, None).unwrap(),
+            );
+            for (g, c) in got.iter().zip(&want) {
+                assert_close("add_rms strided", g, c, 0.0);
+            }
+        });
+        // A weight that widens the sum's dtype: the composed operations.
+        let (x, r) = (
+            random(&mut rng, &[2, 8], DType::BF16),
+            random(&mut rng, &[2, 8], DType::BF16),
+        );
+        let w = random(&mut rng, &[8], DType::F32);
+        let (got, want) = (
+            fused(&x, &r, Some(&w)).unwrap(),
+            composed(&x, &r, Some(&w)).unwrap(),
+        );
+        assert_eq!((got[0].dtype(), got[1].dtype()), (DType::BF16, DType::F32));
+        for (g, c) in got.iter().zip(&want) {
+            assert_close("add_rms widened", g, c, 0.0);
+        }
+        // Forward mode and batching (the fallback defines them).
+        let (x, r) = (
+            random(&mut rng, &[3, 4, 32], DType::F32),
+            random(&mut rng, &[3, 4, 32], DType::F32),
+        );
+        let w = random(&mut rng, &[32], DType::F32);
+        let (tx, tr) = (
+            random(&mut rng, &[3, 4, 32], DType::F32),
+            random(&mut rng, &[3, 4, 32], DType::F32),
+        );
+        let (_, got) = jvp(
+            |xs| fused(&xs[0], &xs[1], Some(&w)),
+            &[x.clone(), r.clone()],
+            &[tx.clone(), tr.clone()],
+        )
+        .unwrap();
+        let (_, want) = jvp(
+            |xs| composed(&xs[0], &xs[1], Some(&w)),
+            &[x.clone(), r.clone()],
+            &[tx, tr],
+        )
+        .unwrap();
+        for (g, c) in got.iter().zip(&want) {
+            assert_close("add_rms jvp", g, c, 1e-6);
+        }
+        // `x` batched along its middle axis, a residual shared by every example.
+        let r = random(&mut rng, &[3, 32], DType::F32);
+        let got = vmap(
+            |xs| fused(&xs[0], &xs[1], Some(&w)),
+            &[Some(1), None],
+            &[0, 0],
+        )(&[x.clone(), r.clone()])
+        .unwrap();
+        let want = vmap(
+            |xs| composed(&xs[0], &xs[1], Some(&w)),
+            &[Some(1), None],
+            &[0, 0],
+        )(&[x, r])
+        .unwrap();
+        for (g, c) in got.iter().zip(&want) {
+            assert_close("add_rms vmap", g, c, 1e-6);
+        }
+    }
+
+    /// `norm_rope` composed of its parts.
+    fn norm_rope_composed(
+        x: &Array,
+        norm: Option<(&Array, f32)>,
+        rotation: fast::Rotation<'_>,
+        offset: usize,
+        cache: Option<&Array>,
+    ) -> Result<Array> {
+        let x = match norm {
+            Some((w, eps)) => fast::rms_norm(x, Some(w), eps)?,
+            None => x.clone(),
+        };
+        let r = fast::rope(
+            &x,
+            rotation.dims,
+            rotation.traditional,
+            rotation.base,
+            rotation.scale,
+            &Array::scalar(offset as i32),
+            rotation.freqs,
+        )?;
+        match cache {
+            Some(c) => {
+                let mut region = vec![SliceArg::full(); 4];
+                region[2] = SliceArg::new(
+                    Some(offset as isize),
+                    Some((offset + r.shape()[2]) as isize),
+                    1,
+                );
+                slice_update(c, &r, &region)
+            }
+            None => Ok(r),
+        }
+    }
+
+    #[test]
+    fn norm_rope_equals_rms_norm_rope_and_slice_update() {
+        if !gpu_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x68);
+        let freqs = Array::from_slice(
+            &(0..32)
+                .map(|i| 1.5f32 + i as f32 * 0.75)
+                .collect::<Vec<_>>(),
+            &[32],
+        )
+        .unwrap();
+        // (batch, heads, length, head size, rotated dims, offset, cache capacity)
+        let cases = [
+            (1, 4, 1, 128, 128, 0, 256),
+            (1, 2, 1, 128, 128, 37, 256),
+            (2, 3, 5, 64, 64, 9, 16),
+            (1, 2, 3, 80, 64, 4, 8),
+            (1, 1, 2, 256, 64, 100, 102),
+        ];
+        for (b, h, l, d, dims, offset, capacity) in cases {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                // The projection's layout, `[B, L, H, D]`, transposed to `[B, H, L, D]`.
+                let x = transpose(&random(&mut rng, &[b, l, h, d], dtype), &[0, 2, 1, 3]).unwrap();
+                let w = random(&mut rng, &[d], dtype);
+                let cache = random(&mut rng, &[b, h, capacity, d], dtype);
+                for (normed, traditional, with_freqs, cached) in [
+                    (true, false, false, false),
+                    (true, false, false, true),
+                    (false, false, false, true),
+                    (true, true, false, true),
+                    (false, true, false, false),
+                    (true, false, true, true),
+                ] {
+                    if with_freqs && dims != 64 {
+                        continue;
+                    }
+                    let rotation = fast::Rotation {
+                        dims,
+                        traditional,
+                        base: (!with_freqs).then_some(10000.0),
+                        scale: 1.0,
+                        freqs: with_freqs.then_some(&freqs),
+                    };
+                    let norm = normed.then_some((&w, 1e-6));
+                    let cache = cached.then_some(&cache);
+                    let name = format!(
+                        "{dtype} {:?} norm {normed} trad {traditional} freqs {with_freqs} cache {cached}",
+                        (b, h, l, d, dims, offset)
+                    );
+                    on(Device::gpu(0), || {
+                        let got = fast::norm_rope(&x, norm, rotation, offset, cache).unwrap();
+                        let want = norm_rope_composed(&x, norm, rotation, offset, cache).unwrap();
+                        assert_close(&name, &got, &want, 0.0);
+                    });
+                }
+                // The kernel against the CPU fallback, with gradients for `x`, the weight and
+                // the cache.
+                let g = random(&mut rng, &[b, h, capacity, d], dtype);
+                let rotation = fast::Rotation {
+                    dims,
+                    traditional: false,
+                    base: Some(10000.0),
+                    scale: 0.5,
+                    freqs: None,
+                };
+                // The weight's gradient sums every row, rounded to the dtype after the inverse
+                // rotation: looser than a single normalisation's.
+                let tol = tolerance(dtype) * 4.0;
+                both(
+                    &format!("norm_rope grads {dtype} {:?}", (b, h, l, d)),
+                    tol,
+                    || {
+                        let f = |xs: &[Array]| {
+                            let n = Some((&xs[1], 1e-6));
+                            Ok(vec![fast::norm_rope(
+                                &xs[0],
+                                n,
+                                rotation,
+                                offset,
+                                Some(&xs[2]),
+                            )?])
+                        };
+                        with_grads(f, &[x.clone(), w.clone(), cache.clone()], &g)
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn norm_rope_writes_an_owned_cache_in_place_and_copies_a_shared_one() {
+        if !gpu_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x69);
+        let rotation = fast::Rotation {
+            dims: 64,
+            traditional: false,
+            base: Some(10000.0),
+            scale: 1.0,
+            freqs: None,
+        };
+        let w = random(&mut rng, &[64], DType::BF16);
+        let steps: Vec<Array> = (0..6)
+            .map(|_| random(&mut rng, &[1, 2, 1, 64], DType::BF16))
+            .collect();
+        let start = random(&mut rng, &[1, 2, 8, 64], DType::BF16);
+        // Decoding: each step's cache is the only handle to the previous one (donated).
+        let decode = |fused: bool| -> Array {
+            let mut cache = start.clone();
+            cache.eval().unwrap();
+            let mut kept = Vec::new();
+            for (i, x) in steps.iter().enumerate() {
+                let next = if fused {
+                    fast::norm_rope(x, Some((&w, 1e-6)), rotation, i, Some(&cache))
+                } else {
+                    norm_rope_composed(x, Some((&w, 1e-6)), rotation, i, Some(&cache))
+                }
+                .unwrap();
+                // Every other step keeps the previous cache alive: it must not change.
+                if i % 2 == 1 {
+                    kept.push((cache.clone(), values(&cache)));
+                }
+                cache = next;
+                async_eval(std::slice::from_ref(&cache)).unwrap();
+            }
+            for (old, before) in kept {
+                assert_eq!(values(&old), before, "a shared cache was written");
+            }
+            cache
+        };
+        on(Device::gpu(0), || {
+            assert_close("decode", &decode(true), &decode(false), 0.0);
+        });
+        // Invalid caches are rejected.
+        let x = random(&mut rng, &[1, 2, 3, 64], DType::F32);
+        for bad in [
+            &[1, 2, 4, 64][..],
+            &[1, 3, 8, 64],
+            &[1, 2, 8, 32],
+            &[2, 8, 64],
+        ] {
+            let c = zeros(bad, DType::F32).unwrap();
+            assert!(
+                fast::norm_rope(&x, None, rotation, 2, Some(&c)).is_err(),
+                "{bad:?}"
+            );
+        }
+        // Forward mode and batching through the fallback.
+        let (x, t) = (
+            random(&mut rng, &[2, 2, 3, 64], DType::F32),
+            random(&mut rng, &[2, 2, 3, 64], DType::F32),
+        );
+        let w = random(&mut rng, &[64], DType::F32);
+        let cache = random(&mut rng, &[2, 2, 8, 64], DType::F32);
+        let fused = |xs: &[Array]| {
+            Ok(vec![fast::norm_rope(
+                &xs[0],
+                Some((&w, 1e-6)),
+                rotation,
+                4,
+                Some(&cache),
+            )?])
+        };
+        let composed = |xs: &[Array]| {
+            Ok(vec![norm_rope_composed(
+                &xs[0],
+                Some((&w, 1e-6)),
+                rotation,
+                4,
+                Some(&cache),
+            )?])
+        };
+        let got = jvp(fused, std::slice::from_ref(&x), std::slice::from_ref(&t)).unwrap();
+        let want = jvp(composed, std::slice::from_ref(&x), std::slice::from_ref(&t)).unwrap();
+        assert_close("norm_rope jvp", &got.1[0], &want.1[0], 1e-6);
+        let xs = random(&mut rng, &[3, 2, 2, 3, 64], DType::F32);
+        let got = vmap(fused, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+        let want = vmap(composed, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+        assert_close("norm_rope vmap", &got[0], &want[0], 1e-6);
+    }
+
+    #[test]
+    fn depthwise_conv1d_matches_the_fallback() {
+        if !gpu_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x6a);
+        // (batch, length, channels, kernel, stride, padding, dilation)
+        let cases = [
+            (1, 964, 96, 4, 1, 0, 1),
+            (2, 17, 5, 3, 1, 2, 1),
+            (1, 30, 8, 3, 2, 1, 2),
+            (3, 9, 1, 9, 1, 4, 1),
+        ];
+        for (n, l, c, k, stride, padding, dilation) in cases {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let x = random(&mut rng, &[n, l, c], dtype);
+                let w = random(&mut rng, &[c, k, 1], dtype);
+                let name = format!(
+                    "conv1d {dtype} {:?}",
+                    (n, l, c, k, stride, padding, dilation)
+                );
+                let f =
+                    |xs: &[Array]| Ok(vec![conv1d(&xs[0], &xs[1], stride, padding, dilation, c)?]);
+                // The kernel against its fallback, bit for bit.
+                both(&name, 0.0, || f(&[x.clone(), w.clone()]));
+                let l_out = (l + 2 * padding - dilation * (k - 1) - 1) / stride + 1;
+                let g = random(&mut rng, &[n, l_out, c], dtype);
+                both(&format!("{name} grads"), tolerance(dtype), || {
+                    with_grads(f, &[x.clone(), w.clone()], &g)
+                });
+            }
+        }
+        // A strided input (a transpose) and mixed dtypes (promoted).
+        let x = random(&mut rng, &[1, 6, 20], DType::BF16);
+        let x = transpose(&x, &[0, 2, 1]).unwrap();
+        let w = random(&mut rng, &[6, 3, 1], DType::F32);
+        both("conv1d strided mixed", 0.0, || {
+            Ok(vec![conv1d(&x, &w, 1, 1, 1, 6)?])
+        });
+    }
+
+    #[test]
     fn softmax_logsumexp_and_cross_entropy_match_the_fallback() {
         if !gpu_available() {
             return;
@@ -731,7 +1121,7 @@ mod gated_delta_gpu {
                 let fused = on(Device::gpu(0), || {
                     matches!(
                         run().0.primitive(),
-                        Some(Primitive::Fast(fast::FastOp::GatedDelta))
+                        Some(Primitive::Fast(fast::FastOp::GatedDelta { steps: false }))
                     )
                 });
                 assert!(fused, "{:?} should use a kernel", (b, t, hk, hv, dk, dv));
@@ -741,6 +1131,45 @@ mod gated_delta_gpu {
                 let tol = |d: DType| if d == DType::F32 { 2e-4 } else { tolerance(d) };
                 assert_close(&format!("{name} y"), &gy, &cy, tol(dtype));
                 assert_close(&format!("{name} state"), &gs, &cs, tol(gate));
+                // Every step's state: the same outputs bit for bit, the last state the final
+                // one, and step `i`'s state that of the first `i + 1` steps alone.
+                let first = |x: &Array, n: usize| {
+                    let mut args = vec![SliceArg::full(); x.ndim()];
+                    args[1] = SliceArg::new(Some(0), Some(n as isize), 1);
+                    slice(x, &args).unwrap()
+                };
+                let step = |states: &Array, i: usize| {
+                    let mut args = vec![SliceArg::full(); 5];
+                    args[1] = SliceArg::new(Some(i as isize), Some(i as isize + 1), 1);
+                    squeeze(&slice(states, &args).unwrap(), &[1]).unwrap()
+                };
+                let steps = || fast::gated_delta_steps(&q, &k, &v, &g, &beta, &state).unwrap();
+                on(Device::gpu(0), || {
+                    let (sy, ss) = steps();
+                    assert_eq!(ss.shape(), [b, t, hv, dv, dk]);
+                    assert_close(&format!("{name} steps y"), &sy, &gy, 0.0);
+                    assert_close(&format!("{name} steps last"), &step(&ss, t - 1), &gs, 0.0);
+                    for i in 0..t {
+                        let (_, si) = fast::gated_delta(
+                            &first(&q, i + 1),
+                            &first(&k, i + 1),
+                            &first(&v, i + 1),
+                            &first(&g, i + 1),
+                            &first(&beta, i + 1),
+                            &state,
+                        )
+                        .unwrap();
+                        assert_close(&format!("{name} step {i}"), &step(&ss, i), &si, 0.0);
+                    }
+                });
+                let (_, cpu_steps) = on(Device::cpu(), steps);
+                let (_, gpu_steps) = on(Device::gpu(0), steps);
+                assert_close(
+                    &format!("{name} steps cpu"),
+                    &gpu_steps,
+                    &cpu_steps,
+                    tol(gate),
+                );
             }
         }
         // Gradients through the fused forward match the CPU.

@@ -20,7 +20,7 @@ No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ 
 
 ## How fast is it?
 
-On par with MLX: nuvec-lm decodes at 0.97–1.04× and prefills at a geometric mean of 1.04× the speed of mlx-lm across seven models on an M4 Pro. See [benchmarks](@/docs/benchmarks.md).
+On par with MLX: nuvec-lm decodes at 0.99–1.09× and prefills at a geometric mean of 1.05× the speed of mlx-lm across seven models on an M4 Pro. See [benchmarks](@/docs/benchmarks.md).
 
 ## Which Macs are supported?
 

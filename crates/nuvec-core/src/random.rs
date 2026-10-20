@@ -37,8 +37,10 @@ pub fn seed(seed: u64) {
     SEQUENCE.set(Some(key(seed)));
 }
 
-/// The next key of this thread's sequence (`split` the current key; keep the first half).
-fn next_key() -> Result<Array> {
+/// The next key of this thread's sequence (`split` the current key; keep the first half),
+/// the key that functions called without one use. Useful to pass the sequence's state into
+/// a compiled function, where keys drawn inside would be frozen at the first trace.
+pub fn next_key() -> Result<Array> {
     let current = SEQUENCE.with_borrow_mut(|k| k.get_or_insert_with(|| key(time_seed())).clone());
     let (keep, out) = split_pair(&current)?;
     SEQUENCE.set(Some(keep));

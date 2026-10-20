@@ -227,16 +227,31 @@ impl Rope {
         Ok(rope)
     }
 
-    fn forward(&self, x: &Array, offset: usize) -> Result<Array> {
-        fast::rope(
-            x,
-            self.dims,
-            self.traditional,
-            self.freqs.is_none().then_some(self.base),
-            self.scale,
-            &Array::scalar(offset as i32),
-            self.freqs.as_ref(),
-        )
+    fn rotation(&self) -> fast::Rotation<'_> {
+        fast::Rotation {
+            dims: self.dims,
+            traditional: self.traditional,
+            base: self.freqs.is_none().then_some(self.base),
+            scale: self.scale,
+            freqs: self.freqs.as_ref(),
+        }
+    }
+}
+
+/// Keys before they are cached: `[B, kv_heads, L, head_dim]`, to be normalised (optionally)
+/// and rotated at the cache's offset as they are written ([`fast::norm_rope`]: one kernel
+/// from the projection to the cache).
+struct Keys<'a> {
+    x: Array,
+    norm: Option<&'a RmsNorm>,
+    rope: &'a Rope,
+}
+
+impl Keys<'_> {
+    /// The keys at positions `offset..`, written into `cache` if given.
+    fn rotate(&self, offset: usize, cache: Option<&Array>) -> Result<Array> {
+        let norm = self.norm.map(|n| (&n.weight, n.eps));
+        fast::norm_rope(&self.x, norm, self.rope.rotation(), offset, cache)
     }
 }
 
@@ -254,6 +269,11 @@ pub struct KvCache {
     /// The recurrent state, `[B, value_heads, value_head_dim, key_head_dim]` (float32).
     recurrent: Option<Array>,
     offset: usize,
+    /// Whether Gated DeltaNet layers keep every step's state ([`KvCache::keep_steps`]).
+    keep_steps: bool,
+    /// From the last forward with `keep_steps`: every step's recurrent state
+    /// (`[B, T, ...]`) and the convolution's input (`[B, kernel − 1 + T, channels]`).
+    steps: Option<(Array, Array)>,
 }
 
 /// Positions added to a cache's capacity at a time.
@@ -267,8 +287,8 @@ impl KvCache {
 
     /// Writes `keys` and `values` (`[B, kv_heads, L, head_dim]`) after the cached positions
     /// and returns all cached positions.
-    fn update(&mut self, keys: Array, values: Array) -> Result<(Array, Array)> {
-        let (prev, l) = (self.offset, keys.shape()[2]);
+    fn update(&mut self, keys: Keys<'_>, values: Array) -> Result<(Array, Array)> {
+        let (prev, l) = (self.offset, values.shape()[2]);
         let capacity = self.keys.as_ref().map_or(0, |k| k.shape()[2]);
         if self.keys.is_none() || prev + l > capacity {
             // Grown by whole steps (mlx-lm's rule), written in one concatenation: the cached
@@ -288,6 +308,7 @@ impl KvCache {
                 }
                 concatenate(&parts, 2)
             };
+            let keys = keys.rotate(prev, None)?;
             let (k, v) = (grow(&self.keys, &keys)?, grow(&self.values, &values)?);
             self.offset = prev + l;
             let (pk, pv) = (positions(&k, self.offset)?, positions(&v, self.offset)?);
@@ -296,31 +317,68 @@ impl KvCache {
             return Ok((pk, pv));
         }
         self.offset = prev + l;
-        let write = |cache: &mut Option<Array>, new: &Array| -> Result<Array> {
-            let all = cache.take().expect("allocated above");
-            let region = [
-                SliceArg::full(),
-                SliceArg::full(),
-                SliceArg::new(Some(prev as isize), Some(self.offset as isize), 1),
-                SliceArg::full(),
-            ];
-            let updated = slice_update(&all, new, &region)?;
-            *cache = Some(updated.clone());
-            positions(&updated, self.offset)
-        };
-        let k = write(&mut self.keys, &keys)?;
-        let v = write(&mut self.values, &values)?;
-        Ok((k, v))
+        // Each write takes the cache's only handle, so it is done in place.
+        let all = self.keys.take().expect("allocated above");
+        let k = keys.rotate(prev, Some(&all))?;
+        self.keys = Some(k.clone());
+        let all = self.values.take().expect("allocated above");
+        let region = [
+            SliceArg::full(),
+            SliceArg::full(),
+            SliceArg::new(Some(prev as isize), Some(self.offset as isize), 1),
+            SliceArg::full(),
+        ];
+        let v = slice_update(&all, &values, &region)?;
+        self.values = Some(v.clone());
+        Ok((positions(&k, self.offset)?, positions(&v, self.offset)?))
+    }
+
+    /// Makes Gated DeltaNet layers keep the state after every position of the following
+    /// forwards ([`nuvec::fast::gated_delta_steps`]), so that [`trim`](Self::trim) can roll
+    /// them back. It costs writing each position's state; speculative decoding turns it on
+    /// for verification only. Attention layers ignore it.
+    pub fn keep_steps(&mut self, on: bool) {
+        self.keep_steps = on;
+        if !on {
+            self.steps = None;
+        }
     }
 
     /// Forgets the last `n` positions (rejected speculative tokens): later writes overwrite
-    /// them. Only attention caches can be trimmed; a Gated DeltaNet layer's recurrent
-    /// state cannot be rolled back.
+    /// them. A Gated DeltaNet layer rolls back to the state after the position before them,
+    /// which needs the last forward to have kept its steps ([`keep_steps`](Self::keep_steps))
+    /// and `n` to be less than that forward's length.
     pub fn trim(&mut self, n: usize) -> Result<()> {
         if self.conv.is_some() || self.recurrent.is_some() {
-            return Err(nuvec::Error::InvalidArgument(
-                "a Gated DeltaNet layer's state cannot be trimmed".into(),
-            ));
+            if n == 0 {
+                return Ok(());
+            }
+            let Some((states, input)) = self.steps.take() else {
+                return Err(nuvec::Error::InvalidArgument(
+                    "a Gated DeltaNet layer rolls back only after a forward that kept its \
+                     steps (KvCache::keep_steps)"
+                        .into(),
+                ));
+            };
+            let t = states.shape()[1];
+            if n >= t {
+                return Err(nuvec::Error::InvalidArgument(format!(
+                    "cannot roll back {n} of the last forward's {t} positions"
+                )));
+            }
+            let along = |a: &Array, start: usize, len: usize| -> Result<Array> {
+                let mut args = vec![SliceArg::full(); a.ndim()];
+                args[1] = SliceArg::new(Some(start as isize), Some((start + len) as isize), 1);
+                slice(a, &args)
+            };
+            let kept = t - n;
+            self.recurrent = Some(squeeze(&along(&states, kept - 1, 1)?, &[1])?);
+            // The last `kernel − 1` inputs before the rejected positions (a copy: the view
+            // would keep the whole input alive).
+            let window = input.shape()[1] - t;
+            self.conv = Some(multiply(&along(&input, kept, window)?, 1.0)?);
+            self.offset -= n;
+            return Ok(());
         }
         if n > self.offset {
             return Err(nuvec::Error::InvalidArgument(format!(
@@ -402,13 +460,9 @@ impl Attention {
 
     fn forward(&self, x: &Array, mask: AttentionMask<'_>, cache: &mut KvCache) -> Result<Array> {
         let (b, l) = (x.shape()[0] as isize, x.shape()[1] as isize);
-        let heads = |h: Array, n: usize, norm: &Option<RmsNorm>| -> Result<Array> {
-            let h = h.reshape(&[b, l, n as isize, -1])?;
-            let h = match norm {
-                Some(norm) => norm.forward(&h)?,
-                None => h,
-            };
-            transpose(&h, &[0, 2, 1, 3])
+        // `[B, L, H·D]` as `[B, H, L, D]` (a view).
+        let heads = |h: Array, n: usize| -> Result<Array> {
+            transpose(&h.reshape(&[b, l, n as isize, -1])?, &[0, 2, 1, 3])
         };
         let offset = cache.offset();
         // With an output gate, each head's projection is its query, then its gate.
@@ -425,15 +479,22 @@ impl Attention {
                 (parts.pop().expect("two parts"), Some(g))
             }
         };
-        let q = self
-            .rope
-            .forward(&heads(q, self.heads, &self.q_norm)?, offset)?;
-        let k = self.rope.forward(
-            &heads(self.k_proj.forward(x)?, self.kv_heads, &self.k_norm)?,
+        // The query (and, written into the cache, the key) normalised and rotated in one
+        // kernel each.
+        let q = fast::norm_rope(
+            &heads(q, self.heads)?,
+            self.q_norm.as_ref().map(|n| (&n.weight, n.eps)),
+            self.rope.rotation(),
             offset,
+            None,
         )?;
-        let v = heads(self.v_proj.forward(x)?, self.kv_heads, &None)?;
-        let (k, v) = cache.update(k, v)?;
+        let keys = Keys {
+            x: heads(self.k_proj.forward(x)?, self.kv_heads)?,
+            norm: self.k_norm.as_ref(),
+            rope: &self.rope,
+        };
+        let v = heads(self.v_proj.forward(x)?, self.kv_heads)?;
+        let (k, v) = cache.update(keys, v)?;
         let o = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None)?;
         let o = transpose(&o, &[0, 2, 1, 3])?.reshape(&[b, l, -1])?;
         match gate {
@@ -500,43 +561,11 @@ fn decay(a: &Array, dt_bias: &Array, a_log: &Array) -> Result<Array> {
 }
 
 /// The causal depthwise convolution of `input` (`[B, L + K − 1, C]`) with `weight`
-/// (`[C, K, 1]`), then `silu`: summed in float32 and rounded once, as MLX's convolution
-/// kernel, in one fused kernel.
+/// (`[C, K, 1]`), then `silu`, as mlx-lm: the convolution is one depthwise kernel (summed in
+/// float32 and rounded once, as MLX's).
 fn causal_conv_silu(input: &Array, weight: &Array) -> Result<Array> {
-    static CONV: LazyLock<Compiled> = LazyLock::new(|| {
-        Box::new(nuvec::compile(|x: &[Array]| {
-            let (input, w) = (&x[0], &x[1]);
-            let (channels, kernel) = (w.shape()[0], w.shape()[1]);
-            let l = input.shape()[1] + 1 - kernel;
-            let w = w.reshape(&[channels as isize, kernel as isize])?;
-            let mut acc: Option<Array> = None;
-            for j in 0..kernel {
-                let j = j as isize;
-                let rows = slice(
-                    input,
-                    &[
-                        SliceArg::full(),
-                        SliceArg::new(Some(j), Some(j + l as isize), 1),
-                        SliceArg::full(),
-                    ],
-                )?;
-                let wj = slice(
-                    &w,
-                    &[SliceArg::full(), SliceArg::new(Some(j), Some(j + 1), 1)],
-                )?
-                .reshape(&[channels as isize])?
-                .astype(DType::F32)?; // after the slice, so the cast fuses
-                let term = multiply(&rows.astype(DType::F32)?, &wj)?;
-                acc = Some(match acc {
-                    Some(sum) => add(&sum, &term)?,
-                    None => term,
-                });
-            }
-            let conv = acc.expect("kernel is at least 1").astype(input.dtype())?;
-            Ok(vec![silu(&conv)?])
-        }))
-    });
-    Ok(CONV(&[input.clone(), weight.clone()])?.swap_remove(0))
+    let channels = weight.shape()[0];
+    silu(&nuvec::conv1d(input, weight, 1, 0, 1, channels)?)
 }
 
 /// A Gated DeltaNet layer (mlx-lm's `qwen3_5.GatedDeltaNet`): a causal depthwise
@@ -632,8 +661,19 @@ impl GatedDeltaNet {
             Some(s) => s,
             None => nuvec::zeros(&[b, hv, dv, dk], DType::F32)?,
         };
-        let (out, state) = nuvec::fast::gated_delta(&q, &k, &v, &g, &beta, &state)?;
-        cache.recurrent = Some(state);
+        let out = if cache.keep_steps {
+            let (out, states) = nuvec::fast::gated_delta_steps(&q, &k, &v, &g, &beta, &state)?;
+            let mut last = vec![SliceArg::full(); states.ndim()];
+            last[1] = SliceArg::new(Some(l as isize - 1), Some(l as isize), 1);
+            let last = slice(&states, &last)?;
+            cache.recurrent = Some(squeeze(&last, &[1])?);
+            cache.steps = Some((states, input));
+            out
+        } else {
+            let (out, state) = nuvec::fast::gated_delta(&q, &k, &v, &g, &beta, &state)?;
+            cache.recurrent = Some(state);
+            out
+        };
         cache.offset += l;
         let z = z.reshape(&[b as isize, l as isize, hv as isize, dv as isize])?;
         let out = gated_norm(&out, &z, &self.norm)?;
@@ -920,20 +960,38 @@ struct Block {
     post_attention_layernorm: RmsNorm,
 }
 
+/// `x + r` and its normalisation, in one kernel ([`fast::add_rms_norm`]); `x` alone
+/// without `r`.
+fn add_norm(x: &Array, r: Option<&Array>, norm: &RmsNorm) -> Result<(Array, Array)> {
+    match r {
+        Some(r) => fast::add_rms_norm(x, r, Some(&norm.weight), norm.eps),
+        None => Ok((x.clone(), norm.forward(x)?)),
+    }
+}
+
 impl Block {
-    fn forward(&self, x: &Array, mask: AttentionMask<'_>, cache: &mut KvCache) -> Result<Array> {
-        let n = self.input_layernorm.forward(x)?;
+    /// The block on `x + pending` (the previous block's MLP output, not yet added):
+    /// gives the residual stream after attention and this block's MLP output. Each
+    /// residual addition is fused with the normalisation that follows it, so a layer has
+    /// no dependent dispatch for the additions.
+    fn forward(
+        &self,
+        x: &Array,
+        pending: Option<&Array>,
+        mask: AttentionMask<'_>,
+        cache: &mut KvCache,
+    ) -> Result<(Array, Array)> {
+        let (x, n) = add_norm(x, pending, &self.input_layernorm)?;
         let mixed = match &self.mixer {
             Mixer::Attention(a) => a.forward(&n, mask, cache)?,
             Mixer::Linear(l) => l.forward(&n, cache)?,
         };
-        let h = add(x, &mixed)?;
-        let n = self.post_attention_layernorm.forward(&h)?;
+        let (h, n) = add_norm(&x, Some(&mixed), &self.post_attention_layernorm)?;
         let mlp = match &self.mlp {
             BlockMlp::Dense(m) => m.forward(&n)?,
             BlockMlp::Moe(m) => m.forward(&n)?,
         };
-        add(&h, &mlp)
+        Ok((h, mlp))
     }
 }
 
@@ -1051,10 +1109,12 @@ impl Model {
         } else {
             AttentionMask::None
         };
+        let mut pending = None;
         for (layer, c) in self.model.layers.iter().zip(cache) {
-            h = layer.forward(&h, mask, c)?;
+            let (next, mlp) = layer.forward(&h, pending.as_ref(), mask, c)?;
+            (h, pending) = (next, Some(mlp));
         }
-        let h = self.model.norm.forward(&h)?;
+        let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm)?;
         match &self.lm_head {
             Some(head) => head.forward(&h),
             None => self.model.embed_tokens.as_linear(&h),

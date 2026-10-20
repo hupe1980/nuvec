@@ -100,6 +100,8 @@ struct State {
     cache_limit: usize,
     working_set: usize,
     system_allocations: u64,
+    /// Bytes of live buffers made outside the pool (mapped files), not in `active`.
+    mapped: usize,
     residency: Residency,
 }
 
@@ -225,6 +227,7 @@ impl Pool {
                 cache_limit: memory_limit,
                 working_set: working_set as usize,
                 system_allocations: 0,
+                mapped: 0,
                 residency,
             }),
             placeholder: placeholder.map(Cached),
@@ -278,7 +281,7 @@ impl Pool {
             Some(raw) => {
                 let mut s = self.lock();
                 s.system_allocations += 1;
-                s.residency.insert(&raw);
+                s.residency.insert(&raw, false);
                 Ok(Some((raw, size, None)))
             }
             None => {
@@ -309,17 +312,23 @@ impl Pool {
             system_allocations: s.system_allocations,
             wired_limit: s.residency.capacity(),
             wired: s.residency.wired(),
+            mapped: s.mapped,
+            wired_mapped: s.residency.wired_mapped(),
         }
     }
 
     /// Wires a buffer made outside the pool (a mapped file) while it fits under the limit.
     pub(crate) fn track(&self, raw: &Raw) {
-        self.lock().residency.insert(raw);
+        let mut s = self.lock();
+        s.mapped += objc2_metal::MTLResource::allocatedSize(&**raw);
+        s.residency.insert(raw, true);
     }
 
     /// Unwires a buffer made outside the pool before it is released.
     pub(crate) fn untrack(&self, raw: &Raw) {
-        self.lock().residency.erase(raw);
+        let mut s = self.lock();
+        s.mapped -= objc2_metal::MTLResource::allocatedSize(&**raw);
+        s.residency.erase(raw);
     }
 
     /// Whether buffers can be wired on this system (residency sets: macOS 15, Metal 3).

@@ -26,7 +26,7 @@ let y = quantized_matmul(&x, &wq, &scales, &biases, true, 64, 4)?; // x · wᵀ
 let w_approx = dequantize(&wq, &scales, &biases, 64, 4)?;
 ```
 
-On the GPU, products use MLX's kernels chosen by shape: matrix-vector kernels (`qmv`, `qmv_fast`) for a few rows, as in decode, tiled kernels (`qmm_t`, `qmm_n`) for many rows, and split-K when the output is small but the inner dimension long.
+On the GPU, products use MLX's kernels chosen by shape: matrix-vector kernels (`qmv`, `qmv_fast`) for single rows, as in decode, tiled kernels (`qmm_t`, `qmm_n`) for many rows, and split-K when the output is small but the inner dimension long. For 4-bit products of 4 or more rows below the tiled kernels' threshold (speculative verification, small batches), nuvec's own kernel unpacks each weight once for two rows.
 
 ## Mixture of experts
 
@@ -39,7 +39,7 @@ use nuvec::gather_qmm;
 let y = gather_qmm(&x, &wq, &scales, &biases, None, Some(&experts), true, 64, 4, true)?;
 ```
 
-With rows sorted by expert (the last argument), a grouped kernel reads each expert's weights once. `gather_mm` is the same for full-precision weights.
+With rows sorted by expert (the last argument) and at least four rows per expert on average, a grouped kernel reads each expert's weights once; with fewer, each row gets its own product, as in MLX. `gather_mm` is the same for full-precision weights.
 
 ## Training through quantized weights
 

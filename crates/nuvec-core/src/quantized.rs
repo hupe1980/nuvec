@@ -206,7 +206,13 @@ pub fn gather_qmm(
     );
     let (lhs, rhs) = gather_indices("gather_qmm", &x, w, lhs_indices, rhs_indices)?;
     let mut inputs = vec![x.clone(), w.clone(), scales, biases, lhs, rhs.clone()];
-    if let Some(offsets) = sorted_offsets(&x, w, &rhs, lhs_indices.is_none() && sorted_indices)? {
+    // MLX's rule (`GatherQMM::eval_gpu`): the sorted kernel tiles each expert's rows, so it
+    // pays only with at least 16 rows and 4 per expert on average; fewer take one product
+    // per row.
+    let experts: usize = w.shape()[..w.ndim() - 2].iter().product();
+    let grouped = rhs.size() >= 16 && rhs.size() / experts.max(1) >= 4;
+    let sorted = lhs_indices.is_none() && sorted_indices && grouped;
+    if let Some(offsets) = sorted_offsets(&x, w, &rhs, sorted)? {
         inputs.push(offsets);
     }
     let op = crate::fast::FastOp::GatherQmm {

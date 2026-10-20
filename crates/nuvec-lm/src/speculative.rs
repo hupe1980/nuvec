@@ -1,7 +1,7 @@
 //! Speculative decoding: a drafter proposes the next tokens, one forward pass verifies them
 //! all, and the longest prefix the model agrees with is kept, plus the model's own next
-//! token. Decoding is bandwidth-bound, so verifying several tokens costs little more than
-//! generating one, and every accepted draft token saves a step. The output is the model's
+//! token. Verifying several tokens in one pass costs much less than generating them one by
+//! one, so every accepted draft token saves most of a step. The output is the model's
 //! greedy output (up to the rounding differences between one-row and several-row products).
 
 use nuvec::{Array, Result, argmax, async_eval, eval};
@@ -108,8 +108,8 @@ impl<D: Drafter> std::fmt::Debug for SpeculativeGeneration<'_, D> {
 
 /// Starts generating after `prompt` (at least one token) with speculative decoding:
 /// `drafter` proposes up to `draft_tokens` tokens per step. Greedy only (the sampler's
-/// temperature must be 0), and only for models whose layers are all attention (a Gated
-/// DeltaNet layer's state cannot be rolled back after a rejected draft).
+/// temperature must be 0). Gated DeltaNet layers keep every position's state while a draft
+/// is verified, and roll back to the last accepted one ([`KvCache::keep_steps`]).
 pub fn speculative_generate<'a, D: Drafter>(
     model: &'a Model,
     prompt: &[u32],
@@ -123,9 +123,6 @@ pub fn speculative_generate<'a, D: Drafter>(
     }
     if options.sampler.temperature != 0.0 {
         return invalid("only greedy decoding (temperature 0) is supported");
-    }
-    if model.config.linear_attention.is_some() {
-        return invalid("Gated DeltaNet layers cannot roll back rejected drafts");
     }
     let wired = WiredLimit::new();
     let mut cache = model.new_cache();
@@ -189,6 +186,9 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         input.push(last);
         input.extend(&draft);
         let l = input.len();
+        for cache in &mut self.cache {
+            cache.keep_steps(true);
+        }
         let logits = self
             .model
             .forward(&Array::from_slice(&input, &[1, l])?, &mut self.cache)?;
@@ -204,6 +204,7 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             .count();
         for cache in &mut self.cache {
             cache.trim(l - 1 - accepted)?;
+            cache.keep_steps(false);
         }
         self.stats.steps += 1;
         self.stats.drafted += draft.len();

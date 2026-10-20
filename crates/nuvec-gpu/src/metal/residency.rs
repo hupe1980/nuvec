@@ -6,7 +6,7 @@
 //! unwired list and join when the limit grows. A limit of 0 (MLX's default) wires nothing.
 //! Residency sets need macOS 15 and a Metal 3 GPU; without them nothing is wired.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -48,6 +48,25 @@ pub(crate) fn attach(
     Some(set)
 }
 
+/// Counts `size` bytes of buffer `k` as wired (`added`) or unwired, in the total and, for a
+/// mapped file's buffer, in the mapped part.
+fn count_wired(
+    mapped: &HashSet<usize>,
+    (total, of_mapped): (&mut usize, &mut usize),
+    k: usize,
+    size: usize,
+    added: bool,
+) {
+    let part = if mapped.contains(&k) { size } else { 0 };
+    if added {
+        *total += size;
+        *of_mapped += part;
+    } else {
+        *total -= size;
+        *of_mapped -= part;
+    }
+}
+
 /// The wired set and the buffers waiting outside it. Buffers are retained here until
 /// [`erase`](Self::erase)d, which the allocator does before releasing them.
 pub(crate) struct Residency {
@@ -56,6 +75,9 @@ pub(crate) struct Residency {
     wired: HashMap<usize, (Raw, usize)>,
     wired_bytes: usize,
     unwired: HashMap<usize, (Raw, usize)>,
+    /// The buffers made outside the pool (mapped files), and their wired bytes.
+    mapped: HashSet<usize>,
+    wired_mapped_bytes: usize,
 }
 
 // SAFETY: the residency set and the buffers are only retained, released and passed to
@@ -70,6 +92,8 @@ impl Residency {
             wired: HashMap::new(),
             wired_bytes: 0,
             unwired: HashMap::new(),
+            mapped: HashSet::new(),
+            wired_mapped_bytes: 0,
         }
     }
 
@@ -83,20 +107,34 @@ impl Residency {
         self.wired_bytes
     }
 
+    /// Bytes currently wired that belong to mapped files.
+    pub(crate) fn wired_mapped(&self) -> usize {
+        self.wired_mapped_bytes
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Tracks a new buffer: wired if it fits under the limit.
-    pub(crate) fn insert(&mut self, raw: &Raw) {
+    /// Tracks a new buffer (`mapped`: a mapped file's): wired if it fits under the limit.
+    pub(crate) fn insert(&mut self, raw: &Raw, mapped: bool) {
         let Some(set) = &self.set else { return };
         let size = raw.allocatedSize();
+        if mapped {
+            self.mapped.insert(key(raw));
+        }
         if self.wired_bytes + size <= self.capacity {
             set.addAllocation(allocation(raw));
             set.commit();
             set.requestResidency();
             self.wired.insert(key(raw), (raw.clone(), size));
-            self.wired_bytes += size;
+            count_wired(
+                &self.mapped,
+                (&mut self.wired_bytes, &mut self.wired_mapped_bytes),
+                key(raw),
+                size,
+                true,
+            );
         } else {
             self.unwired.insert(key(raw), (raw.clone(), size));
         }
@@ -104,15 +142,25 @@ impl Residency {
 
     /// Stops tracking a buffer that is about to be released.
     pub(crate) fn erase(&mut self, raw: &Raw) {
-        let Some(set) = &self.set else { return };
-        if self.unwired.remove(&key(raw)).is_some() {
+        if self.set.is_none() {
             return;
         }
-        if let Some((raw, size)) = self.wired.remove(&key(raw)) {
+        let k = key(raw);
+        if self.unwired.remove(&k).is_none()
+            && let Some((raw, size)) = self.wired.remove(&k)
+        {
+            let set = self.set.as_ref().expect("checked");
             set.removeAllocation(allocation(&raw));
             set.commit();
-            self.wired_bytes -= size;
+            count_wired(
+                &self.mapped,
+                (&mut self.wired_bytes, &mut self.wired_mapped_bytes),
+                k,
+                size,
+                false,
+            );
         }
+        self.mapped.remove(&k);
     }
 
     /// Sets the wired limit: waiting buffers join while they fit, or wired ones leave until
@@ -135,8 +183,14 @@ impl Residency {
             for k in fitting {
                 let (raw, size) = self.unwired.remove(&k).expect("listed above");
                 set.addAllocation(allocation(&raw));
-                self.wired_bytes += size;
                 self.wired.insert(k, (raw, size));
+                count_wired(
+                    &self.mapped,
+                    (&mut self.wired_bytes, &mut self.wired_mapped_bytes),
+                    k,
+                    size,
+                    true,
+                );
             }
             set.commit();
             set.requestResidency();
@@ -153,8 +207,14 @@ impl Residency {
             for k in leaving {
                 let (raw, size) = self.wired.remove(&k).expect("listed above");
                 set.removeAllocation(allocation(&raw));
-                self.wired_bytes -= size;
                 self.unwired.insert(k, (raw, size));
+                count_wired(
+                    &self.mapped,
+                    (&mut self.wired_bytes, &mut self.wired_mapped_bytes),
+                    k,
+                    size,
+                    false,
+                );
             }
             set.commit();
         }

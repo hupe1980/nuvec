@@ -1,6 +1,8 @@
 //! Token sampling, as mlx-lm's `sample_utils`: filters on log-probabilities (top-p,
 //! min-p, top-k; masked tokens get `-inf`) and categorical sampling at a temperature.
 
+use std::sync::LazyLock;
+
 use nuvec::{
     Array, DType, Error, Result, add, argmax, argpartition, cumsum, exp, greater_equal, less, log,
     max, multiply, negative, put_along_axis, random, slice, sort, sum, take_along_axis, where_,
@@ -72,12 +74,24 @@ pub fn apply_top_k(logprobs: &Array, top_k: usize) -> Result<Array> {
     put_along_axis(logprobs, &masked, &inf, -1)
 }
 
-/// A token drawn from `logits / temperature` (MLX's `random.categorical`, Gumbel-max).
+type Compiled = Box<dyn Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync>;
+
+/// A token drawn from `logits / temperature` (MLX's `random.categorical`, Gumbel-max), with
+/// the next key of this thread's sequence. Compiled, as mlx-lm's `categorical_sampling`:
+/// the noise, the scaling and the sum run as one kernel before the argmax.
 pub fn categorical(logits: &Array, temperature: f32) -> Result<Array> {
-    let u = random::uniform(1e-30, 1.0, logits.shape(), DType::F32, None)?;
-    let gumbel = negative(&log(&negative(&log(&u)?)?)?)?;
-    let scaled = multiply(logits.astype(DType::F32)?, 1.0 / f64::from(temperature))?;
-    argmax(&add(&scaled, &gumbel)?, Some(-1), false)
+    static DRAW: LazyLock<Compiled> = LazyLock::new(|| {
+        Box::new(nuvec::compile(|a: &[Array]| {
+            let (key, logits, inverse) = (&a[0], &a[1], &a[2]);
+            let u = random::uniform(1e-30, 1.0, logits.shape(), DType::F32, Some(key))?;
+            let gumbel = negative(&log(&negative(&log(&u)?)?)?)?;
+            let scaled = multiply(&logits.astype(DType::F32)?, inverse)?;
+            Ok(vec![argmax(&add(&scaled, &gumbel)?, Some(-1), false)?])
+        }))
+    });
+    // `1 / temperature` rounded to float32 once, as the weak scalar it replaces.
+    let inverse = Array::scalar((1.0 / f64::from(temperature)) as f32);
+    Ok(DRAW(&[random::next_key()?, logits.clone(), inverse])?.swap_remove(0))
 }
 
 /// How the next token is chosen (mlx-lm's `make_sampler`).

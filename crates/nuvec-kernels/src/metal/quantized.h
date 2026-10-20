@@ -1506,6 +1506,127 @@ METAL_FUNC void adjust_matrix_offsets(
 }
 
 
+// nuvec's own: 4-bit `qmv_fast` over `R` input rows. Each thread unpacks a weight row's
+// codes once and applies them to every input row with `qdot`'s expression; `qmv_fast`
+// unpacks them again per row, which bounds few-row products. Rows past `m` repeat the
+// last row and are not stored.
+template <typename T, int group_size, int bits, bool partial_rows, int R>
+[[kernel]] void affine_qmv_rows(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& m [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(bits == 4, "qmv_rows is instantiated for 4 bits");
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  thread U x_thread[R][values_per_thread];
+  thread U sum[R];
+  thread U q[values_per_thread];
+  thread U result[R][results_per_simdgroup];
+#pragma clang loop unroll(full)
+  for (int r = 0; r < R; r++) {
+#pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[r][row] = 0;
+    }
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  const int first = tid.x * R;
+  const int count = min(R, m - first);
+
+  int last_row = results_per_simdgroup - 1;
+  if constexpr (partial_rows) {
+    if (out_row >= out_vec_size) {
+      return;
+    }
+    last_row = min(last_row, out_vec_size - 1 - out_row);
+  }
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += first * in_vec_size + simd_lid * values_per_thread;
+  y += first * out_vec_size + out_row;
+
+  // `in_vec_size` is a multiple of `block_size` (the dispatch's condition).
+  for (int k = 0; k < in_vec_size; k += block_size) {
+#pragma clang loop unroll(full)
+    for (int r = 0; r < R; r++) {
+      sum[r] = load_vector<T, U, values_per_thread, bits>(
+          x + min(r, count - 1) * in_vec_size, x_thread[r]);
+    }
+#pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      int src = row;
+      if constexpr (partial_rows) {
+        src = min(row, last_row);
+      }
+      const device uint16_t* wl =
+          (const device uint16_t*)(ws + src * in_vec_size_w);
+#pragma clang loop unroll(full)
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        uint16_t code = wl[i];
+        q[4 * i] = code & 0x000f;
+        q[4 * i + 1] = code & 0x00f0;
+        q[4 * i + 2] = code & 0x0f00;
+        q[4 * i + 3] = code & 0xf000;
+      }
+      U s = scales[src * in_vec_size_g];
+      U b = biases[src * in_vec_size_g];
+#pragma clang loop unroll(full)
+      for (int r = 0; r < R; r++) {
+        U accum = 0;
+#pragma clang loop unroll(full)
+        for (int i = 0; i < values_per_thread / 4; i++) {
+          accum +=
+              (x_thread[r][4 * i] * q[4 * i] +
+               x_thread[r][4 * i + 1] * q[4 * i + 1] +
+               x_thread[r][4 * i + 2] * q[4 * i + 2] +
+               x_thread[r][4 * i + 3] * q[4 * i + 3]);
+        }
+        result[r][row] += s * accum + sum[r] * b;
+      }
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+
+#pragma clang loop unroll(full)
+  for (int r = 0; r < R; r++) {
+#pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U total = simd_sum(result[r][row]);
+      if (simd_lid == 0 && r < count && row <= last_row) {
+        y[r * out_vec_size + row] = static_cast<T>(total);
+      }
+    }
+  }
+}
+
 template <
     typename T,
     int group_size,

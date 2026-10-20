@@ -27,6 +27,33 @@ use crate::{DeviceInfo, GpuError, MemoryStats, Result};
 
 type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 
+/// nuvec's kernels: one precompiled library, or (runtime sources) one library per shader
+/// file, with the library of each kernel name.
+struct Libraries {
+    libraries: Vec<Library>,
+    by_name: HashMap<String, usize>,
+}
+
+impl Libraries {
+    fn new(libraries: Vec<Library>) -> Self {
+        let mut by_name = HashMap::new();
+        for (i, library) in libraries.iter().enumerate() {
+            for name in library.functionNames().iter() {
+                by_name.entry(name.to_string()).or_insert(i);
+            }
+        }
+        Libraries { libraries, by_name }
+    }
+
+    /// The library that defines kernel `name`.
+    fn get(&self, name: &str) -> Result<&Library> {
+        self.by_name
+            .get(name)
+            .map(|&i| &self.libraries[i])
+            .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))
+    }
+}
+
 /// A function constant value for [`Device::pipeline_with_constants`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Constant {
@@ -46,7 +73,7 @@ struct Inner {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     info: DeviceInfo,
-    library: OnceLock<Result<Library>>,
+    library: OnceLock<Result<Libraries>>,
     pipelines: Mutex<HashMap<String, Pipeline>>,
     pool: Arc<Pool>,
     in_flight: InFlight,
@@ -241,7 +268,7 @@ impl Device {
         if let Some(p) = cache.get(&key) {
             return Ok(p.clone());
         }
-        let library = self.library()?;
+        let library = self.library()?.get(name)?;
         let ns_name = NSString::from_str(name);
         let function = if constants.is_empty() {
             library
@@ -338,8 +365,8 @@ impl Device {
         Ok(pipeline)
     }
 
-    /// nuvec's kernel library, loaded once.
-    fn library(&self) -> Result<&Library> {
+    /// nuvec's kernel libraries, loaded once.
+    fn library(&self) -> Result<&Libraries> {
         self.inner
             .library
             .get_or_init(|| load_library(&self.inner.device))
@@ -364,33 +391,65 @@ impl std::fmt::Debug for Device {
     }
 }
 
-/// Loads the precompiled library, or compiles the embedded sources (with their headers
-/// inlined, as the runtime compiler has no include path for them).
-fn load_library(device: &ProtocolObject<dyn MTLDevice>) -> Result<Library> {
+/// Loads the precompiled library, or compiles the embedded sources as the build script
+/// would have: each shader file on its own (headers inlined, as the runtime compiler has no
+/// include path for them), with the same language version, IEEE-conformant math and
+/// floating-point contraction setting, so that both modes give the same results. The files
+/// compile in parallel.
+fn load_library(device: &ProtocolObject<dyn MTLDevice>) -> Result<Libraries> {
     let error = |e: Retained<objc2_foundation::NSError>| {
         GpuError::LibraryLoad(e.localizedDescription().to_string())
     };
     match nuvec_kernels::MODE {
         MetallibMode::Precompiled => {
             let bytes = nuvec_kernels::metallib().ok_or(GpuError::NoKernels)?;
-            device
+            let library = device
                 .newLibraryWithData_error(&dispatch2::DispatchData::from_static_bytes(bytes))
-                .map_err(error)
+                .map_err(error)?;
+            Ok(Libraries::new(vec![library]))
         }
         MetallibMode::RuntimeSource => {
-            let source = inline_sources(nuvec_kernels::sources());
-            // IEEE-conformant math, matching the precompiled library's `-fno-fast-math`.
-            let options = objc2_metal::MTLCompileOptions::new();
-            options.setMathMode(objc2_metal::MTLMathMode::Safe);
-            device
-                .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
-                .map_err(error)
+            let files: Vec<(&str, &str)> = nuvec_kernels::sources()
+                .iter()
+                .copied()
+                .filter(|(p, _)| p.ends_with(".metal"))
+                .collect();
+            let compile = |&(path, text): &(&str, &str)| -> Result<Library> {
+                let mut source = String::new();
+                if !nuvec_kernels::contracted(path) {
+                    // The build script's `-ffp-contract=off`.
+                    source.push_str("#pragma clang fp contract(off)\n");
+                }
+                source.push_str(&inline_sources(&[(path, text)]));
+                let options = objc2_metal::MTLCompileOptions::new();
+                options.setMathMode(objc2_metal::MTLMathMode::Safe);
+                options.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version3_2);
+                device
+                    .newLibraryWithSource_options_error(
+                        &NSString::from_str(&source),
+                        Some(&options),
+                    )
+                    .map_err(|e| {
+                        GpuError::LibraryLoad(format!("{path}: {}", e.localizedDescription()))
+                    })
+            };
+            let libraries = std::thread::scope(|scope| {
+                let handles: Vec<_> = files
+                    .iter()
+                    .map(|file| scope.spawn(move || compile(file)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("shader compilation does not panic"))
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            Ok(Libraries::new(libraries))
         }
         _ => Err(GpuError::NoKernels),
     }
 }
 
-/// All `.metal` sources as one translation unit, each `#include "header.h"` of one of
+/// The `.metal` sources as one translation unit, each `#include "header.h"` of one of
 /// nuvec's headers replaced by the header's text on first use.
 fn inline_sources(sources: &[(&str, &str)]) -> String {
     let headers: HashMap<&str, &str> = nuvec_kernels::sources()

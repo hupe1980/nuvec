@@ -15,7 +15,7 @@ Evaluating a graph encodes one Metal compute dispatch per node into command buff
 - **Ordering by fences.** Command buffers are ordered through per-buffer fences, so independent work from different evaluations can overlap on the GPU.
 - **Errors.** A GPU failure is reported by the first read of an affected array, and every later GPU result on the device reports it too, as in MLX.
 
-Kernels are compiled ahead of time into `nuvec.metallib` when Apple's Metal toolchain is installed; otherwise their sources are embedded and compiled when first used (`NUVEC_METALLIB=off` selects this mode).
+Kernels are compiled ahead of time into `nuvec.metallib` when Apple's Metal toolchain is installed. Otherwise their sources are embedded and compiled, with the same options, when the GPU is first used: about 20 seconds once, then cached by macOS (`NUVEC_METALLIB=off` selects this mode; `NUVEC_REQUIRE_METALLIB=1` makes it a build error).
 
 ## Unified memory, safely
 
@@ -34,13 +34,13 @@ The allocator follows MLX's rules (a size-bucketed cache, least-recently-used ev
 let gpu = nuvec::gpu::Device::shared().expect("a Metal GPU");
 gpu.set_memory_limit(24 << 30);  // allocations beyond fail instead of swapping
 gpu.set_cache_limit(4 << 30);    // trim the buffer cache
-let stats = gpu.memory();        // active, peak, cache, limits, wired bytes
+let stats = gpu.memory();        // active, peak, cache, limits, wired and mapped bytes
 gpu.clear_cache();
 ```
 
 ## Wired memory
 
-`set_wired_limit` keeps buffers resident while the GPU runs, through a Metal **residency set** attached to the command queue, instead of making them resident per command buffer (which can page memory back in under pressure). New buffers and memory-mapped checkpoints join the set up to the limit; raising the limit wires waiting buffers, lowering it unwires them. It needs macOS 15 and a Metal 3 GPU (`can_wire`), and the default is 0, as in MLX.
+`set_wired_limit` keeps buffers resident while the GPU runs, through a Metal **residency set** attached to the command queue, instead of making them resident per command buffer (which can page memory back in under pressure). New buffers and memory-mapped checkpoints join the set up to the limit; raising the limit wires waiting buffers, lowering it unwires them. Mapped checkpoints are not in `active` or `peak` (which count the allocator's buffers): `mapped` and `wired_mapped` report them. It needs macOS 15 and a Metal 3 GPU (`can_wire`), and the default is 0, as in MLX.
 
 ```rust
 gpu.set_wired_limit(gpu.info().recommended_working_set as usize)?;

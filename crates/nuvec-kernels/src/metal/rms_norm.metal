@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// RMS normalisation and its gradient, ported from MLX v0.32.4 (mlx/backend/metal/kernels/rms_norm.metal) into `mlx::rms`.
+// RMS normalisation and its gradient, ported from MLX v0.32.4 (mlx/backend/metal/kernels/rms_norm.metal) into `mlx::rms`,
+// and a residual-add variant (nuvec's own, `add_rms_*`).
 // 
 // Copyright © 2023-2026 Apple Inc. Licensed under the MIT License:
 // https://github.com/ml-explore/mlx/blob/main/LICENSE
@@ -416,6 +417,135 @@ template <typename T, int N_READS = RMS_N_READS>
   }
 }
 
+// nuvec's own: `h = x + r` (rounded to `T`, as the element-wise add) and the RMS
+// normalisation of `h`, in one pass over the row; a residual connection and the next
+// layer's norm without a dependent dispatch between them. The structure is
+// `rms_single_row`'s and `rms_looped`'s.
+template <typename T, int N_READS = RMS_N_READS>
+[[kernel]] void add_rms_single_row(
+    const device T* x,
+    const device T* r,
+    const device T* w,
+    device T* sum,
+    device T* out,
+    constant float& eps,
+    constant uint& axis_size,
+    constant uint& w_stride,
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+  constexpr int SIMD_SIZE = 32;
+
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[SIMD_SIZE];
+
+  float acc = 0;
+  float thread_x[N_READS];
+  size_t row = gid * size_t(axis_size) + lid * N_READS;
+  x += row;
+  r += row;
+  sum += row;
+  w += w_stride * lid * N_READS;
+  for (int i = 0; i < N_READS; i++) {
+    if (lid * N_READS + i < axis_size) {
+      T h = T(float(x[i]) + float(r[i]));
+      sum[i] = h;
+      thread_x[i] = h;
+    } else {
+      thread_x[i] = 0;
+    }
+    acc += thread_x[i] * thread_x[i];
+  }
+  acc = simd_sum(acc);
+  if (simd_group_id == 0) {
+    local_sums[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lane_id == 0) {
+    local_sums[simd_group_id] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    acc = simd_sum(local_sums[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  out += row;
+  for (int i = 0; i < N_READS; i++) {
+    if ((lid * N_READS + i) < axis_size) {
+      out[i] = w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+    }
+  }
+}
+
+template <typename T, int N_READS = RMS_N_READS>
+[[kernel]] void add_rms_looped(
+    const device T* x,
+    const device T* r,
+    const device T* w,
+    device T* sum,
+    device T* out,
+    constant float& eps,
+    constant uint& axis_size,
+    constant uint& w_stride,
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lsize [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+  constexpr int SIMD_SIZE = 32;
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[SIMD_SIZE];
+
+  float acc = 0;
+  size_t row = gid * size_t(axis_size) + lid * N_READS;
+  x += row;
+  r += row;
+  sum += row;
+  w += w_stride * lid * N_READS;
+  for (uint c = 0; c < axis_size; c += lsize * N_READS) {
+    for (int i = 0; i < N_READS; i++) {
+      if ((c + lid * N_READS + i) < axis_size) {
+        T h = T(float(x[i + c]) + float(r[i + c]));
+        sum[i + c] = h;
+        float hi = h;
+        acc += hi * hi;
+      }
+    }
+  }
+  acc = simd_sum(acc);
+  if (simd_group_id == 0) {
+    local_sums[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lane_id == 0) {
+    local_sums[simd_group_id] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    acc = simd_sum(local_sums[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Each thread reads back the sums it wrote itself.
+  out += row;
+  for (uint c = 0; c < axis_size; c += lsize * N_READS) {
+    for (int i = 0; i < N_READS; i++) {
+      if ((c + lid * N_READS + i) < axis_size) {
+        out[c + i] = w[w_stride * (i + c)] *
+            static_cast<T>(float(sum[c + i]) * local_inv_mean[0]);
+      }
+    }
+  }
+}
+
 } // namespace rms
 } // namespace mlx
 
@@ -431,3 +561,9 @@ template [[host_name("nuvec_rms_bfloat16")]] [[kernel]] decltype(mlx::rms::rms_s
 template [[host_name("nuvec_vjp_rms_bfloat16")]] [[kernel]] decltype(mlx::rms::vjp_rms_single_row<bfloat16_t>) mlx::rms::vjp_rms_single_row<bfloat16_t>;
 template [[host_name("nuvec_rms_looped_bfloat16")]] [[kernel]] decltype(mlx::rms::rms_looped<bfloat16_t>) mlx::rms::rms_looped<bfloat16_t>;
 template [[host_name("nuvec_vjp_rms_looped_bfloat16")]] [[kernel]] decltype(mlx::rms::vjp_rms_looped<bfloat16_t>) mlx::rms::vjp_rms_looped<bfloat16_t>;
+template [[host_name("nuvec_add_rms_float32")]] [[kernel]] decltype(mlx::rms::add_rms_single_row<float>) mlx::rms::add_rms_single_row<float>;
+template [[host_name("nuvec_add_rms_looped_float32")]] [[kernel]] decltype(mlx::rms::add_rms_looped<float>) mlx::rms::add_rms_looped<float>;
+template [[host_name("nuvec_add_rms_float16")]] [[kernel]] decltype(mlx::rms::add_rms_single_row<half>) mlx::rms::add_rms_single_row<half>;
+template [[host_name("nuvec_add_rms_looped_float16")]] [[kernel]] decltype(mlx::rms::add_rms_looped<half>) mlx::rms::add_rms_looped<half>;
+template [[host_name("nuvec_add_rms_bfloat16")]] [[kernel]] decltype(mlx::rms::add_rms_single_row<bfloat16_t>) mlx::rms::add_rms_single_row<bfloat16_t>;
+template [[host_name("nuvec_add_rms_looped_bfloat16")]] [[kernel]] decltype(mlx::rms::add_rms_looped<bfloat16_t>) mlx::rms::add_rms_looped<bfloat16_t>;

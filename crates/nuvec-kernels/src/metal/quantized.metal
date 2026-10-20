@@ -56,3 +56,14 @@
 NUVEC_Q_TYPE(float16, half)
 NUVEC_Q_TYPE(bfloat16, bfloat16_t)
 NUVEC_Q_TYPE(float32, float)
+
+// nuvec's few-row 4-bit products (quantized.h, `affine_qmv_rows`), two rows per
+// threadgroup (more are slower).
+#define NUVEC_QMV_ROWS(iname, T, gs)                                                     \
+    NUVEC_Q(qmv_rows, iname, T, gs, 4, "_pr0_r2", false, 2)                                \
+    NUVEC_Q(qmv_rows, iname, T, gs, 4, "_pr1_r2", true, 2)
+#define NUVEC_QMV_ROWS_GS(iname, T) \
+    NUVEC_QMV_ROWS(iname, T, 32) NUVEC_QMV_ROWS(iname, T, 64) NUVEC_QMV_ROWS(iname, T, 128)
+NUVEC_QMV_ROWS_GS(float32, float)
+NUVEC_QMV_ROWS_GS(float16, half)
+NUVEC_QMV_ROWS_GS(bfloat16, bfloat16_t)

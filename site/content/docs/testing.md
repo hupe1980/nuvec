@@ -28,6 +28,7 @@ Tolerances are derived per operation from the dtype's machine epsilon and the op
 
 - GPU kernels are checked against the CPU implementation on random shapes, including unaligned and transposed operands.
 - Memory behaviour (in-place updates, buffer reuse, wired memory) is checked through allocator statistics.
+- Results are bit-identical from run to run, also with memory reused under pending GPU work, and kernels compiled from embedded sources give the precompiled library's results.
 - The core runs under **Miri** to catch undefined behaviour, and Metal's API validation layer runs over the GPU runtime tests.
 
 `just ci` runs everything CI runs: formatting, clippy, tests on the minimum and latest Rust, docs, Miri, cargo-deny and the Metal library checks.

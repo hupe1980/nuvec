@@ -14,7 +14,9 @@
 //!   the mixture-of-experts gather kernels;
 //! - MLX's fused kernels: softmax, log-sum-exp, RMS and layer normalisation, RoPE, cross
 //!   entropy, scaled dot-product attention (vector, two-pass and tiled);
-//! - mlx-lm's Gated DeltaNet kernels.
+//! - mlx-lm's Gated DeltaNet kernels;
+//! - nuvec's own: residual add + RMS norm, norm + RoPE + cache write, few-row 4-bit
+//!   products, depthwise 1-D convolution and random bits.
 //!
 //! **Status:** pre-alpha.
 
@@ -46,6 +48,15 @@ const METALLIB: Option<&[u8]> = None;
 
 const KERNEL_NAMES: &[&str] = include!(concat!(env!("OUT_DIR"), "/kernel_names.rs"));
 const SOURCES: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/sources.rs"));
+
+include!("contracted.rs");
+
+/// Whether the shader file `path` (relative to `src/metal`) is compiled with floating-point
+/// contraction (MLX's default) rather than `-ffp-contract=off`, as the build script compiles
+/// it; a runtime compiler must do the same to get the same results.
+pub fn contracted(path: &str) -> bool {
+    CONTRACTED.contains(&path)
+}
 
 /// The precompiled library bytes, if [`MODE`] is [`MetallibMode::Precompiled`].
 pub fn metallib() -> Option<&'static [u8]> {

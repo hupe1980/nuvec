@@ -405,11 +405,15 @@ mod gpu {
         }
         let mut rng = Rng::new(0x57);
         // (x shape, w rows, w cols, transpose, bits, group): qmv_fast (aligned K, with and
-        // without partial rows), qmv (unaligned K), qvm, qmm_t (aligned and not), split-K,
+        // without partial rows), qmv_rows, qmv (unaligned K), qvm, qmm_t (aligned and not), split-K,
         // qmm_n, batched and broadcast weights.
         type Case = (&'static [usize], &'static [usize], usize, bool, u32, usize);
         let cases: &[Case] = &[
             (&[1, 512], &[64], 512, true, 4, 64),
+            // qmv_rows (4-bit, 4 or more rows): odd rows, partial rows, every group size.
+            (&[5, 512], &[64], 512, true, 4, 64),
+            (&[4, 1024], &[36], 1024, true, 4, 32),
+            (&[8, 512], &[16], 512, true, 4, 128),
             (&[3, 1024], &[36], 1024, true, 4, 32),
             (&[2, 192], &[40], 192, true, 3, 64),
             (&[1, 96], &[13], 96, true, 8, 32),
@@ -658,6 +662,7 @@ mod gather_gpu {
             (4, 64, 256, 40, 3, false), // qmm_t
             (4, 40, 128, 33, 2, false), // qmm_t, unaligned
             (8, 64, 256, 1, 100, true), // grouped, sorted rows
+            (8, 64, 256, 1, 20, true),  // sorted, too few rows per expert to group (MLX's rule)
             (16, 48, 192, 1, 70, true), // grouped, unaligned N
         ];
         for &(e, n, k, m, batches, sorted) in cases {

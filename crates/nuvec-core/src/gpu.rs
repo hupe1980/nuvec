@@ -81,6 +81,15 @@ mod stub {
         ) -> Result<Data> {
             unreachable!("nothing is writable without Metal")
         }
+        pub(crate) fn norm_rope_in_place(
+            &mut self,
+            _: Data,
+            _: &crate::fast::FastOp,
+            _: &[Operand<'_>],
+            _: &Output,
+        ) -> Result<Data> {
+            unreachable!("nothing is writable without Metal")
+        }
         pub(crate) fn commit(&mut self) {}
         pub(crate) fn depend_on(&mut self, _: &[&crate::Array]) {}
         pub(crate) fn lookup(&self, _: &Arc<Node>, _: u32) -> Option<Data> {
@@ -727,6 +736,47 @@ mod metal {
         }
 "#;
 
+    /// The final state store of [`GATED_DELTA`] and its output pointer.
+    const GENERIC_STORE: &str = "        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+";
+    const GENERIC_STATE: (&str, &str) = (
+        "auto o_state = state_out + (n * Dv + dv_idx) * Dk;",
+        "auto o_state = state_out + ((b_idx * T * Hv + hv_idx) * Dv + dv_idx) * Dk;",
+    );
+    /// The final state store of [`GATED_DELTA_PACKED`] and its output pointer.
+    const PACKED_STORE: &str = "        for (int i = 0; i < values_per_lane; ++i) {
+          o_state[i] = static_cast<StT>(state[i]);
+        }
+";
+    const PACKED_STATE: (&str, &str) = (
+        "auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;",
+        "auto o_state = state_out + ((b_idx * T * Hv + hv_idx) * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;",
+    );
+
+    /// A gated delta kernel body that stores the state after every step (`[B, T, Hv, Dv,
+    /// Dk]`) instead of once at the end: the final store moves into the step loop, before
+    /// the pointers advance, and the output pointer starts at step 0 of `[B, T, ...]`. The
+    /// arithmetic is untouched, so outputs and states equal the plain kernel's.
+    fn every_step(body: &str, store: &str, (state, state_steps): (&str, &str)) -> String {
+        let advance = "          q_ += Hk * Dk;";
+        assert!(
+            body.matches(store).count() == 1
+                && body.matches(state).count() == 1
+                && body.matches(advance).count() == 1,
+            "gated delta kernel source changed"
+        );
+        let in_loop = format!(
+            "  {}        o_state += Hv * Dv * Dk;\n",
+            store.replace("\n  ", "\n    ")
+        );
+        body.replace(store, "")
+            .replace(state, state_steps)
+            .replace(advance, &format!("{in_loop}{advance}"))
+    }
+
     impl Packed<'_> {
         fn arg(&self) -> Arg<'_> {
             match &self.buffer {
@@ -915,6 +965,7 @@ mod metal {
                         )
                 }
                 (Primitive::Dequantize { .. }, _) => outputs[0].size > 0,
+                (Primitive::RandomBits { .. }, _) => outputs[0].size > 0,
                 (Primitive::QuantizedMatmul { .. }, Some(d)) => is_float(d) && outputs[0].size > 0,
                 _ => false,
             }
@@ -987,6 +1038,10 @@ mod metal {
                     reverse,
                     inclusive,
                 } => self.scan(*op, operands[0], *axis, (*reverse, *inclusive), &mut buffer)?,
+                Primitive::RandomBits { shape, width } => {
+                    let per_key = shape.iter().product::<usize>() * usize::from(*width);
+                    self.random_bits(operands[0], per_key, &mut buffer)?;
+                }
                 Primitive::SliceUpdate { .. } => {
                     self.copy(operands[0], &mut buffer)?;
                     let slices = primitive.dim_slices(out.shape.len())?;
@@ -2264,8 +2319,8 @@ mod metal {
                 self.attention(operands, &outputs[0], flags, &mut out)?;
                 return Ok(vec![Data::new(out)]);
             }
-            if *op == FastOp::GatedDelta {
-                return self.gated_delta(operands, outputs);
+            if let FastOp::GatedDelta { steps } = *op {
+                return self.gated_delta(operands, outputs, steps);
             }
             if let FastOp::GatherQmm {
                 group_size, bits, ..
@@ -2278,6 +2333,50 @@ mod metal {
             if *op == FastOp::GatherMm {
                 let mut out = alloc(&outputs[0])?;
                 self.gather_mm(operands, &outputs[0], &mut out)?;
+                return Ok(vec![Data::new(out)]);
+            }
+            if let FastOp::AddRmsNorm { eps } = *op {
+                return self.add_rms_norm(operands, outputs, eps);
+            }
+            if let FastOp::DepthwiseConv1d {
+                stride,
+                padding,
+                dilation,
+            } = *op
+            {
+                let mut out = alloc(&outputs[0])?;
+                let x = self.packed(operands[0], true)?;
+                let w = self.packed(operands[1], true)?;
+                let (n, l, c) = (x.shape[0], x.shape[1], x.shape[2]);
+                let (k, l_out) = (w.shape[1], outputs[0].shape[1]);
+                let as_i32 = |v: usize| {
+                    i32::try_from(v).map_err(|_| Error::InvalidArgument("conv1d: too large".into()))
+                };
+                let sizes = [as_i32(l)?, as_i32(c)?, as_i32(k)?, as_i32(l_out)?];
+                let params = [as_i32(stride)?, as_i32(padding)?, as_i32(dilation)?];
+                let args = [
+                    x.arg(),
+                    w.arg(),
+                    Arg::write(out.metal_mut().expect("device storage")),
+                    Arg::bytes(bytemuck::bytes_of(&sizes)),
+                    Arg::bytes(bytemuck::bytes_of(&params)),
+                ];
+                let grid = [c, l_out, n];
+                let name = format!("nuvec_depthwise_conv1d_{}", operands[0].0.dtype.name());
+                let pipeline = self.pipeline(&name)?;
+                self.command_buffer()?
+                    .dispatch_threads(&pipeline, &args, grid, block_dims(grid))
+                    .map_err(backend)?;
+                self.counted()?;
+                return Ok(vec![Data::new(out)]);
+            }
+            if let FastOp::NormRope { cache, .. } = *op {
+                let mut out = alloc(&outputs[0])?;
+                if cache {
+                    self.copy(operands[0], &mut out)?;
+                }
+                let rest = &operands[usize::from(cache)..];
+                self.norm_rope_into(op, rest, &outputs[0].shape, &mut out)?;
                 return Ok(vec![Data::new(out)]);
             }
             let mut out = alloc(&outputs[0])?;
@@ -2512,7 +2611,10 @@ mod metal {
                     self.counted()?;
                 }
                 FastOp::Attention { .. }
-                | FastOp::GatedDelta
+                | FastOp::AddRmsNorm { .. }
+                | FastOp::NormRope { .. }
+                | FastOp::DepthwiseConv1d { .. }
+                | FastOp::GatedDelta { .. }
                 | FastOp::GatherQmm { .. }
                 | FastOp::GatherMm => {
                     unreachable!("handled above")
@@ -2617,10 +2719,146 @@ mod metal {
         /// dtypes as its `metal_kernel`s are: `(q, k, v, g, beta, state)` to `(y, state)`.
         /// One SIMD-group per value row, or, for `Dk = 128` with float32 gates and state,
         /// the packed kernel (eight rows per SIMD-group).
+        /// [`crate::fast::FastOp::AddRmsNorm`]: `x + r` and its RMS normalisation, one
+        /// threadgroup per row (looped over long rows, as the RMS kernels).
+        fn add_rms_norm(
+            &mut self,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+            eps: u32,
+        ) -> Result<Vec<Data>> {
+            let x = self.packed(operands[0], true)?;
+            let r = self.packed(operands[1], true)?;
+            let w = self.packed(operands[2], true)?;
+            let dtn = operands[0].0.dtype.name();
+            let axis = x.shape[x.shape.len() - 1];
+            let rows = x.shape.iter().product::<usize>() / axis;
+            let name = |looped: bool| {
+                format!("nuvec_add_rms{}_{dtn}", if looped { "_looped" } else { "" })
+            };
+            let mut looped = axis > 4096;
+            let mut pipeline = self.pipeline(&name(looped))?;
+            if !looped && row_threads(axis, 4) > pipeline.max_threads_per_threadgroup() {
+                looped = true;
+                pipeline = self.pipeline(&name(true))?;
+            }
+            let group = if looped {
+                pipeline.max_threads_per_threadgroup()
+            } else {
+                row_threads(axis, 4)
+            };
+            let alloc = |o: &Output| Buffer::try_alloc_gpu(o.size * o.dtype.size());
+            let (mut sum, mut out) = (alloc(&outputs[0])?, alloc(&outputs[1])?);
+            let e = eps.to_le_bytes();
+            let n = (axis as u32).to_le_bytes();
+            let ws = u32::from(!w.shape.is_empty()).to_le_bytes();
+            let args = [
+                x.arg(),
+                r.arg(),
+                w.arg(),
+                Arg::write(sum.metal_mut().expect("device storage")),
+                Arg::write(out.metal_mut().expect("device storage")),
+                Arg::bytes(&e),
+                Arg::bytes(&n),
+                Arg::bytes(&ws),
+            ];
+            self.dispatch_rows(&pipeline, &args, rows, group)?;
+            Ok(vec![Data::new(sum), Data::new(out)])
+        }
+
+        /// [`crate::fast::FastOp::NormRope`] into its cache's own buffer (`base`, donated
+        /// as for `slice_update`): only the new positions are written.
+        pub(crate) fn norm_rope_in_place(
+            &mut self,
+            mut base: Data,
+            op: &crate::fast::FastOp,
+            operands: &[Operand<'_>],
+            out: &Output,
+        ) -> Result<Data> {
+            let buffer = Arc::get_mut(&mut base.buffer).expect("donated data has one handle");
+            self.norm_rope_into(op, operands, &out.shape, buffer)?;
+            Ok(base)
+        }
+
+        /// [`crate::fast::FastOp::NormRope`]'s kernel over `(x, w[, freqs])`, writing rows of
+        /// a row-contiguous `[B, H, rows, D]` output (`out_shape`) from row `offset` (a
+        /// cache) or 0: one threadgroup per row, reading `x` through its strides.
+        fn norm_rope_into(
+            &mut self,
+            op: &crate::fast::FastOp,
+            operands: &[Operand<'_>],
+            out_shape: &[usize],
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let crate::fast::FastOp::NormRope {
+                eps,
+                dims,
+                traditional,
+                base,
+                scale,
+                offset,
+                cache,
+            } = *op
+            else {
+                unreachable!("a norm_rope")
+            };
+            let (meta, _) = operands[0];
+            let (b, h, l, d) = (meta.shape[0], meta.shape[1], meta.shape[2], meta.shape[3]);
+            if b * h * l == 0 {
+                return Ok(());
+            }
+            let x = self.view_if(operands[0], d == 1 || meta.strides[3] == 1)?;
+            let w = self.packed(operands[1], true)?;
+            let freqs = match operands.get(2) {
+                Some(&f) => Some(self.packed(f, true)?),
+                None => None,
+            };
+            let name = format!(
+                "nuvec_{}_rope_{}{}",
+                if eps.is_some() { "norm" } else { "plain" },
+                if freqs.is_some() { "freqs_" } else { "" },
+                meta.dtype.name()
+            );
+            let pipeline = self.pipeline_with(&name, &[(22, traditional)])?;
+            let rows = out_shape[2];
+            let x_strides: [i64; 3] = [
+                x.strides[0] as i64,
+                x.strides[1] as i64,
+                x.strides[2] as i64,
+            ];
+            let out_strides: [i64; 3] = [(h * rows * d) as i64, (rows * d) as i64, d as i64];
+            let sizes: [i32; 4] = [h as i32, l as i32, d as i32, dims as i32];
+            let e = f32::from_bits(eps.unwrap_or(0)).to_le_bytes();
+            let at = (offset as i32).to_le_bytes();
+            let write_at = (if cache { offset as i32 } else { 0 }).to_le_bytes();
+            let sc = scale.to_le_bytes();
+            let log_base = f32::from_bits(base).log2().to_le_bytes();
+            let unused = [0u8; 4];
+            let mut args = vec![
+                x.arg(),
+                w.arg(),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&e),
+                Arg::bytes(&at),
+                Arg::bytes(&write_at),
+                Arg::bytes(&sc),
+                Arg::bytes(bytemuck::bytes_of(&x_strides)),
+                Arg::bytes(bytemuck::bytes_of(&out_strides)),
+                Arg::bytes(bytemuck::bytes_of(&sizes)),
+                Arg::bytes(&log_base),
+            ];
+            args.push(match &freqs {
+                Some(f) => f.arg(),
+                None => Arg::bytes(&unused),
+            });
+            self.dispatch_rows(&pipeline, &args, b * h * l, row_threads(d, 4))
+        }
+
         fn gated_delta(
             &mut self,
             operands: &[Operand<'_>],
             outputs: &[Output],
+            steps: bool,
         ) -> Result<Vec<Data>> {
             let ins = operands
                 .iter()
@@ -2632,15 +2870,18 @@ mod metal {
             let mut y = Buffer::try_alloc_gpu(outputs[0].size * outputs[0].dtype.size())?;
             let mut s = Buffer::try_alloc_gpu(outputs[1].size * outputs[1].dtype.size())?;
             if t == 0 {
-                self.copy(operands[5], &mut s)?;
+                if !steps {
+                    self.copy(operands[5], &mut s)?;
+                }
                 return Ok(vec![Data::new(y), Data::new(s)]);
             }
             let packed =
                 dk == 128 && dv % 8 == 0 && g.dtype == DType::F32 && state.dtype == DType::F32;
             let types: Vec<&str> = operands.iter().map(|o| msl_type(o.0.dtype)).collect();
             let name = format!(
-                "nuvec_gated_delta{}_{}_{}_{}_{}_dk{dk}_dv{dv}_hk{hk}_hv{hv}",
+                "nuvec_gated_delta{}{}_{}_{}_{}_{}_dk{dk}_dv{dv}_hk{hk}_hv{hv}",
                 if packed { "_packed" } else { "" },
+                if steps { "_steps" } else { "" },
                 types[0],
                 types[3],
                 types[4],
@@ -2650,10 +2891,11 @@ mod metal {
                 .device()
                 .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
             let source = || {
-                let body = if packed {
-                    GATED_DELTA_PACKED
-                } else {
-                    GATED_DELTA
+                let body = match (packed, steps) {
+                    (true, false) => GATED_DELTA_PACKED.to_owned(),
+                    (false, false) => GATED_DELTA.to_owned(),
+                    (true, true) => every_step(GATED_DELTA_PACKED, PACKED_STORE, PACKED_STATE),
+                    (false, true) => every_step(GATED_DELTA, GENERIC_STORE, GENERIC_STATE),
                 };
                 format!(
                     "#include <metal_stdlib>\nusing namespace metal;\n\
@@ -3169,11 +3411,25 @@ mod metal {
                 );
             }
             args.extend([Arg::bytes(&kb), Arg::bytes(&nb)]);
+            let fast = k % (pack_factor(bits, 32) * if bits == 2 { 1 } else { 2 } * 32) == 0;
+            if transpose && fast && !batched && bits == 4 && m >= 4 {
+                // nuvec's few-row kernel: weights unpacked once for two rows.
+                args.push(Arg::bytes(&mb));
+                let name = format!(
+                    "nuvec_affine_qmv_rows_{base}_pr{}_r2",
+                    u8::from(!n.is_multiple_of(8))
+                );
+                return self.dispatch_groups(
+                    &name,
+                    &args,
+                    [m.div_ceil(2), n.div_ceil(8), 1],
+                    [32, 2, 1],
+                );
+            }
             if batched {
                 args.extend(batch_info.iter().map(|v| Arg::bytes(v)));
             }
             let (name, per_group) = if transpose {
-                let fast = k % (pack_factor(bits, 32) * if bits == 2 { 1 } else { 2 } * 32) == 0;
                 let name = if fast {
                     format!(
                         "nuvec_affine_qmv_fast_{base}_batch{}_pr{}",
@@ -3568,6 +3824,36 @@ mod metal {
                 .device()
                 .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
             device.pipeline(name).map_err(backend)
+        }
+
+        /// `bytes_per_key` random bytes per key (MLX's layout, as `kernels::random_bits`):
+        /// one thread per threefry counter.
+        fn random_bits(
+            &mut self,
+            keys: Operand<'_>,
+            bytes_per_key: usize,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let keys = self.packed(keys, true)?;
+            let num_keys = keys.shape.iter().product::<usize>() / 2;
+            let words = bytes_per_key.div_ceil(4);
+            if num_keys == 0 || words == 0 {
+                return Ok(());
+            }
+            let n = u32::try_from(bytes_per_key)
+                .map_err(|_| Error::InvalidArgument("random bits: too many per key".into()))?
+                .to_le_bytes();
+            let args = [
+                keys.arg(),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&n),
+            ];
+            let grid = [words / 2 + words % 2, num_keys, 1];
+            let pipeline = self.pipeline("nuvec_random_bits")?;
+            self.command_buffer()?
+                .dispatch_threads(&pipeline, &args, grid, block_dims(grid))
+                .map_err(backend)?;
+            self.counted()
         }
 
         fn dispatch(&mut self, name: &str, args: &[Arg<'_>], threads: usize) -> Result<()> {

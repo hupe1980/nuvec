@@ -1059,3 +1059,24 @@ fn sort_and_scan_kernels_match_the_cpu() {
         }
     }
 }
+
+#[test]
+fn random_bits_match_the_cpu() {
+    if !gpu_available() {
+        return;
+    }
+    // Every width, odd and even word counts, partial last words, batched keys.
+    let keys = random::split(&random::key(7), 3).unwrap();
+    for width in [1, 2, 4] {
+        for shape in [vec![1], vec![3], vec![5, 7], vec![151_936], vec![2, 1001]] {
+            let name = format!("width {width} shape {shape:?}");
+            let bits = |k: &Array| random::bits(&shape, width, Some(k))?.astype(DType::U32);
+            same_on_both::<u32>(&name, || bits(&random::key(42)));
+            for i in 0..3u32 {
+                let key = take(&keys, &Array::scalar(i), Some(0)).unwrap();
+                same_on_both::<u32>(&format!("{name} key {i}"), || bits(&key));
+            }
+        }
+    }
+    same_on_both::<u32>("split", || random::split(&random::key(3), 5));
+}

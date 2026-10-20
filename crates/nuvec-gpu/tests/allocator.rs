@@ -274,10 +274,25 @@ fn wired_limit_wires_buffers_up_to_it() {
     // Mapped files are wired too, and unwired when released.
     let path = std::env::temp_dir().join(format!("nuvec-wired-{}", std::process::id()));
     std::fs::write(&path, vec![1u8; 3 * PAGE]).unwrap();
+    let (mapped_before, active_before) = (device.memory().mapped, device.memory().active);
     let mapped = device.map_file(&path).unwrap();
     assert_eq!(wired(&device), 3 * PAGE);
+    // Reported apart: in `mapped` and `wired_mapped`, not in `active`.
+    let m = device.memory();
+    assert_eq!(m.mapped - mapped_before, 3 * PAGE);
+    assert_eq!((m.wired_mapped, m.active), (3 * PAGE, active_before));
+    // Unwired under a lower limit, still mapped.
+    device.set_wired_limit(2 * PAGE).unwrap();
+    let m = device.memory();
+    assert_eq!(
+        (m.wired, m.wired_mapped, m.mapped - mapped_before),
+        (0, 0, 3 * PAGE)
+    );
+    device.set_wired_limit(8 * PAGE).unwrap();
+    assert_eq!(device.memory().wired_mapped, 3 * PAGE);
     drop(mapped);
-    assert_eq!(wired(&device), 0);
+    let m = device.memory();
+    assert_eq!((m.wired, m.wired_mapped, m.mapped), (0, 0, mapped_before));
     std::fs::remove_file(&path).unwrap();
     device.set_wired_limit(0).unwrap();
 }

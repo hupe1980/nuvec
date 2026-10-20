@@ -43,5 +43,5 @@ The allocator rounds sizes into buckets, caches freed buffers, evicts least rece
 ## Design choices
 
 - **MLX semantics, Rust idioms.** Same promotion table, broadcasting, transforms and kernels as MLX; `Result` instead of exceptions, ownership instead of reference-count heuristics, `Send + Sync` arrays.
-- **Ported kernels, not reinvented ones.** MLX's Metal kernels are the reference for speed; nuvec ports them, keeps their attribution, and tests against MLX.
+- **Ported kernels first.** MLX's Metal kernels are the reference for speed; nuvec ports them, keeps their attribution, and tests against MLX. Its own kernels cover what MLX does not fuse or tile for (residual norms, norm + RoPE + cache writes, few-row quantized products).
 - **No C++.** Metal is reached through Apple's system frameworks via [`objc2-metal`](https://crates.io/crates/objc2-metal); the CPU path is pure Rust.

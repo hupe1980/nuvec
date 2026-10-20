@@ -181,6 +181,40 @@ fn hugging_face_qwen3_5_checkpoints_are_sanitized() {
 }
 
 #[test]
+fn logits_are_bit_identical_across_runs() {
+    if !gpu() {
+        return;
+    }
+    // Prefill and several decode steps (fused norms, cache writes in place, Gated
+    // DeltaNet, quantized experts), repeated: every run gives the same bits.
+    for name in ["qwen3_5_bf16", "qwen3_moe_q4", "llama_bf16"] {
+        let (dir, prompt, ..) = fixture(name);
+        let model = load_model(&dir).unwrap();
+        let run = || -> Vec<u32> {
+            let mut cache = model.new_cache();
+            let mut bits = Vec::new();
+            let mut tokens = Array::from_slice(&prompt, &[1, prompt.len()]).unwrap();
+            for _ in 0..6 {
+                let logits = model.forward(&tokens, &mut cache).unwrap();
+                let last = logits.astype(DType::F32).unwrap().to_vec::<f32>().unwrap();
+                bits.extend(last.iter().map(|v| v.to_bits()));
+                // Greedy: the last position's largest logit.
+                let row = &last[last.len() - logits.shape()[2]..];
+                let next = (0..row.len())
+                    .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+                    .unwrap() as u32;
+                tokens = Array::from_slice(&[next], &[1, 1]).unwrap();
+            }
+            bits
+        };
+        let first = run();
+        for i in 0..3 {
+            assert!(run() == first, "{name}: run {i} differs");
+        }
+    }
+}
+
+#[test]
 fn the_cache_grows_past_its_first_capacity() {
     if !gpu() {
         return;
@@ -268,6 +302,50 @@ fn sampler_filters_match_mlx_lm() {
     }
 }
 
+/// The compiled draw picks the token the uncompiled Gumbel-max formula picks with the same
+/// key, and each draw takes a new key from the thread's sequence.
+#[test]
+fn compiled_categorical_draws_equal_the_formula_with_fresh_keys() {
+    use nuvec::random;
+    use nuvec_lm::sample::categorical;
+    if !gpu() {
+        return;
+    }
+    let logits = (nuvec::sin(&nuvec::arange(0.0, 4096.0, 1.0, DType::F32).unwrap()).unwrap() * 3.0)
+        .reshape(&[1, 4096])
+        .unwrap()
+        .astype(DType::BF16)
+        .unwrap();
+    let formula = |key: &Array, t: f32| -> u32 {
+        let u = random::uniform(1e-30, 1.0, logits.shape(), DType::F32, Some(key)).unwrap();
+        let g = nuvec::negative(
+            &nuvec::log(&nuvec::negative(&nuvec::log(&u).unwrap()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let scaled =
+            nuvec::multiply(logits.astype(DType::F32).unwrap(), 1.0 / f64::from(t)).unwrap();
+        nuvec::argmax(&nuvec::add(&scaled, &g).unwrap(), Some(-1), false)
+            .unwrap()
+            .to_vec::<u32>()
+            .unwrap()[0]
+    };
+    for (i, t) in [0.7f32, 1.0, 1.3, 0.7, 2.0, 0.7].into_iter().enumerate() {
+        // The key the compiled draw will take next.
+        random::seed(100 + i as u64);
+        let key = random::next_key().unwrap();
+        random::seed(100 + i as u64);
+        let got = categorical(&logits, t).unwrap().to_vec::<u32>().unwrap()[0];
+        assert_eq!(got, formula(&key, t), "temperature {t}");
+    }
+    // Consecutive draws from one sequence use different keys: at temperature 2 over 4,096
+    // tokens, eight draws are not all equal.
+    random::seed(7);
+    let draws: Vec<u32> = (0..8)
+        .map(|_| categorical(&logits, 2.0).unwrap().to_vec::<u32>().unwrap()[0])
+        .collect();
+    assert!(draws.iter().any(|&d| d != draws[0]), "{draws:?}");
+}
+
 /// Sampling draws only kept tokens, and top-k 1 at any temperature is greedy.
 #[test]
 fn sampling_draws_only_kept_tokens() {
@@ -330,7 +408,8 @@ fn speculative_decoding_keeps_the_greedy_output() {
             self.tokens.iter().skip(done).take(max).copied().collect()
         }
     }
-    for name in ["qwen3_f32", "llama_bf16"] {
+    // Hybrids roll their Gated DeltaNet state back to the last accepted position.
+    for name in ["qwen3_f32", "llama_bf16", "qwen3_5_f32", "qwen3_5_moe_f32"] {
         let (dir, prompt, _, _, greedy) = fixture(name);
         let model = load_model(&dir).unwrap();
         let options = GenerateOptions {
@@ -360,17 +439,22 @@ fn speculative_decoding_keeps_the_greedy_output() {
         let (ids, stats) = run(Box::new(wrong));
         assert_eq!(ids, greedy, "{name}: wrong drafts");
         assert_eq!((stats.accepted, stats.steps), (0, greedy.len()), "{name}");
+        // Right for two tokens, then wrong: partial acceptance, a rollback mid-draft.
+        let half = Fixed {
+            prompt: prompt.len(),
+            tokens: greedy
+                .iter()
+                .enumerate()
+                .map(|(i, t)| if i % 4 < 2 { *t } else { (t + 1) % 128 })
+                .collect(),
+        };
+        let (ids, stats) = run(Box::new(half));
+        assert_eq!(ids, greedy, "{name}: partly right drafts");
+        assert!(
+            stats.accepted > 0 && stats.accepted < stats.drafted,
+            "{name}: {stats:?}"
+        );
         let (ids, _) = run(Box::<PromptLookup>::default());
         assert_eq!(ids, greedy, "{name}: prompt lookup");
     }
-    let (dir, prompt, _, _, _) = fixture("qwen3_5_f32");
-    let model = load_model(&dir).unwrap();
-    let hybrid = speculative_generate(
-        &model,
-        &prompt,
-        GenerateOptions::default(),
-        PromptLookup::default(),
-        4,
-    );
-    assert!(hybrid.is_err());
 }

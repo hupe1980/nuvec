@@ -1,10 +1,11 @@
 //! Fused operations with dedicated GPU kernels, as MLX's `mx.fast`: [`rms_norm`],
 //! [`layer_norm`], [`rope`], [`cross_entropy`], [`scaled_dot_product_attention`] and
-//! [`gated_delta`] (mlx-lm's Gated DeltaNet kernels) (and,
-//! through [`crate::softmax`] and
-//! [`crate::logsumexp`] over the last axis, MLX's softmax and log-sum-exp kernels).
+//! [`gated_delta`] (mlx-lm's Gated DeltaNet kernels); nuvec's [`add_rms_norm`] (a residual
+//! connection and its norm) and [`norm_rope`] (norm, RoPE and a cache write); and, through
+//! [`crate::softmax`] and [`crate::logsumexp`] over the last axis, MLX's softmax and
+//! log-sum-exp kernels.
 //!
-//! Each operation is one GPU kernel (MLX's, ported) with an equivalent graph of ordinary
+//! Each operation is one GPU kernel (MLX's, or nuvec's own) with an equivalent graph of ordinary
 //! operations, its *fallback*. As in MLX, the fallback runs on the CPU stream, and it
 //! defines the forward-mode derivative and batching; reverse mode uses dedicated kernels
 //! where MLX has them.
@@ -46,6 +47,11 @@ pub enum FastOp {
         /// `f32::to_bits` of epsilon.
         eps: u32,
     },
+    /// `(x, r, w)`: `h = x + r` and [`FastOp::RmsNorm`] of `h` (see [`add_rms_norm`]).
+    AddRmsNorm {
+        /// `f32::to_bits` of epsilon.
+        eps: u32,
+    },
     /// `(x, w, g)`: the gradients of [`FastOp::RmsNorm`] for `x` and `w`.
     RmsNormVjp {
         /// `f32::to_bits` of epsilon.
@@ -75,6 +81,34 @@ pub enum FastOp {
         /// Rotate forwards (`false`: the inverse rotation, the gradient).
         forward: bool,
     },
+    /// `([cache,] x, w[, freqs])`: [`norm_rope`]: each `[b, h, l]` row of `x` RMS-normalised
+    /// (with `eps`) and rotated as [`FastOp::Rope`] at position `offset + l`; written into
+    /// `cache` at the same positions, or returned as a new `[B, H, L, D]` array.
+    NormRope {
+        /// `f32::to_bits` of epsilon, or no normalisation.
+        eps: Option<u32>,
+        /// Rotated features (even).
+        dims: usize,
+        /// Rotate interleaved pairs instead of the two halves.
+        traditional: bool,
+        /// `f32::to_bits` of the frequency base (unused with `freqs`).
+        base: u32,
+        /// `f32::to_bits` of the position scale.
+        scale: u32,
+        /// The position of the first row.
+        offset: usize,
+        /// Whether the first input is a cache written at the rows' positions.
+        cache: bool,
+    },
+    /// `(x, w)`: [`crate::conv1d`] with `groups` equal to the channels (depthwise).
+    DepthwiseConv1d {
+        /// Positions between outputs.
+        stride: usize,
+        /// Zeros before and after the input.
+        padding: usize,
+        /// Positions between taps.
+        dilation: usize,
+    },
     /// `(x)`: softmax over the last axis, accumulated in float32.
     Softmax,
     /// `(x)`: `log(sum(exp(x)))` over the last axis, which becomes size 1.
@@ -96,8 +130,11 @@ pub enum FastOp {
         sinks: bool,
     },
     /// `(q, k, v, g, beta, state)`: the gated delta rule (see [`gated_delta`]), with the
-    /// outputs and the final state.
-    GatedDelta,
+    /// outputs and the final state (or every step's, [`gated_delta_steps`]).
+    GatedDelta {
+        /// The state after every step (`[B, T, Hv, Dv, Dk]`) instead of the final one.
+        steps: bool,
+    },
     /// `(a, b, lhs_indices, rhs_indices[, offsets])`: matrix products of gathered batches
     /// (see [`crate::gather_mm`]), as [`FastOp::GatherQmm`] in full precision.
     GatherMm,
@@ -210,6 +247,42 @@ pub fn rms_norm(x: &Array, weight: Option<&Array>, eps: f32) -> Result<Array> {
     };
     let op = FastOp::RmsNorm { eps: eps.to_bits() };
     one(op, vec![astype(x, dtype)?, w])
+}
+
+/// A residual connection followed by RMS normalisation: `h = x + residual` and
+/// [`rms_norm`]`(h, weight, eps)`, returned as `(h, normed)`, from one GPU kernel. The
+/// results equal [`crate::add`] then [`rms_norm`] exactly; a weight that would widen the
+/// sum's dtype runs the two operations.
+pub fn add_rms_norm(
+    x: &Array,
+    residual: &Array,
+    weight: Option<&Array>,
+    eps: f32,
+) -> Result<(Array, Array)> {
+    check_inputs(&[x, residual])?;
+    let dtype = crate::promote_types(x.dtype(), residual.dtype());
+    let fused = x.shape() == residual.shape()
+        && x.ndim() > 0
+        && dtype.category() == Category::Float
+        && weight.is_none_or(|w| {
+            w.error().is_none()
+                && w.ndim() == 1
+                && w.size() == x.shape()[x.ndim() - 1]
+                && crate::promote_types(dtype, w.dtype()) == dtype
+        });
+    if !fused {
+        let h = add(x, residual)?;
+        let y = rms_norm(&h, weight, eps)?;
+        return Ok((h, y));
+    }
+    let w = match weight {
+        Some(w) => astype(w, dtype)?,
+        None => scalar(1.0, dtype)?,
+    };
+    let op = FastOp::AddRmsNorm { eps: eps.to_bits() };
+    let mut out = record_or_fallback(op, vec![astype(x, dtype)?, astype(residual, dtype)?, w])?;
+    let y = out.pop().expect("two outputs");
+    Ok((out.pop().expect("two outputs"), y))
 }
 
 /// Layer normalisation over the last axis, `(x - mean) / sqrt(var + eps) · weight + bias`,
@@ -411,16 +484,19 @@ impl FastOp {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::RmsNorm { .. } => "rms_norm",
+            Self::AddRmsNorm { .. } => "add_rms_norm",
             Self::RmsNormVjp { .. } => "rms_norm_vjp",
             Self::LayerNorm { .. } => "layer_norm",
             Self::LayerNormVjp { .. } => "layer_norm_vjp",
             Self::Rope { .. } => "rope",
+            Self::NormRope { .. } => "norm_rope",
+            Self::DepthwiseConv1d { .. } => "conv1d",
             Self::Softmax => "softmax",
             Self::LogSumExp => "logsumexp",
             Self::CrossEntropy => "cross_entropy",
             Self::CrossEntropyVjp => "cross_entropy_vjp",
             Self::Attention { .. } => "scaled_dot_product_attention",
-            Self::GatedDelta => "gated_delta",
+            Self::GatedDelta { .. } => "gated_delta",
             Self::GatherQmm { .. } => "gather_qmm",
             Self::GatherMm => "gather_mm",
         }
@@ -430,12 +506,15 @@ impl FastOp {
     pub(crate) fn outputs(&self, inputs: &[Array]) -> Result<Vec<(DType, Vec<usize>)>> {
         let arity = match self {
             Self::Softmax | Self::LogSumExp => 1,
-            Self::RmsNorm { .. } | Self::CrossEntropy => 2,
-            Self::RmsNormVjp { .. } | Self::LayerNorm { .. } => 3,
+            Self::RmsNorm { .. } | Self::CrossEntropy | Self::DepthwiseConv1d { .. } => 2,
+            Self::AddRmsNorm { .. } | Self::RmsNormVjp { .. } | Self::LayerNorm { .. } => 3,
             Self::LayerNormVjp { .. } | Self::CrossEntropyVjp => 4,
             Self::Rope { .. } => inputs.len().clamp(2, 3),
+            Self::NormRope { cache, .. } => inputs
+                .len()
+                .clamp(2 + usize::from(*cache), 3 + usize::from(*cache)),
             Self::Attention { mask, sinks, .. } => 3 + usize::from(*mask) + usize::from(*sinks),
-            Self::GatedDelta => 6,
+            Self::GatedDelta { .. } => 6,
             Self::GatherQmm { .. } => inputs.len().clamp(6, 7),
             Self::GatherMm => inputs.len().clamp(4, 5),
         };
@@ -449,13 +528,27 @@ impl FastOp {
         let x = &inputs[0];
         let like = |a: &Array| (a.dtype(), a.shape().to_vec());
         Ok(match self {
-            Self::RmsNorm { .. } | Self::LayerNorm { .. } | Self::Rope { .. } | Self::Softmax => {
+            Self::RmsNorm { .. }
+            | Self::LayerNorm { .. }
+            | Self::Rope { .. }
+            | Self::NormRope { .. }
+            | Self::Softmax => {
                 vec![like(x)]
             }
             Self::LogSumExp => {
                 let mut shape = x.shape().to_vec();
                 *shape.last_mut().expect("1-D") = 1;
                 vec![(x.dtype(), shape)]
+            }
+            Self::AddRmsNorm { .. } => vec![like(x), like(x)],
+            Self::DepthwiseConv1d {
+                stride,
+                padding,
+                dilation,
+            } => {
+                let (l, k) = (x.shape()[1], inputs[1].shape()[1]);
+                let l_out = (l + 2 * padding - dilation * (k - 1) - 1) / stride + 1;
+                vec![(x.dtype(), vec![x.shape()[0], l_out, x.shape()[2]])]
             }
             Self::RmsNormVjp { .. } => vec![like(x), like(&inputs[1])],
             Self::LayerNormVjp { .. } => vec![like(x), like(&inputs[1]), like(&inputs[2])],
@@ -466,7 +559,20 @@ impl FastOp {
                 shape[3] = inputs[2].shape()[3];
                 vec![(x.dtype(), shape)]
             }
-            Self::GatedDelta => vec![(x.dtype(), inputs[2].shape().to_vec()), like(&inputs[5])],
+            Self::GatedDelta { steps } => {
+                let state = match steps {
+                    false => inputs[5].shape().to_vec(),
+                    true => {
+                        let mut shape = inputs[5].shape().to_vec();
+                        shape.insert(1, x.shape()[1]);
+                        shape
+                    }
+                };
+                vec![
+                    (x.dtype(), inputs[2].shape().to_vec()),
+                    (inputs[5].dtype(), state),
+                ]
+            }
             Self::GatherMm => {
                 let b = inputs[1].shape();
                 let mut shape = inputs[2].shape().to_vec();
@@ -499,6 +605,12 @@ impl FastOp {
                 let y = multiply(&xf, &n)?.astype(x.dtype())?;
                 let w = &inputs[1];
                 vec![if w.ndim() == 0 { y } else { multiply(&y, w)? }]
+            }
+            Self::AddRmsNorm { eps } => {
+                let h = add(x, &inputs[1])?;
+                let op = Self::RmsNorm { eps: *eps };
+                let y = record_or_fallback(op, vec![h.clone(), inputs[2].clone()])?;
+                vec![h, y.into_iter().next().expect("one output")]
             }
             Self::LayerNorm { eps } => {
                 let xf = f32x()?;
@@ -576,8 +688,56 @@ impl FastOp {
                 float(*scale),
                 *forward,
             )?],
+            Self::NormRope {
+                eps,
+                dims,
+                traditional,
+                base,
+                scale,
+                offset,
+                cache,
+            } => {
+                let at = usize::from(*cache);
+                let (x, w) = (&inputs[at], &inputs[at + 1]);
+                let mut h = x.clone();
+                if let Some(eps) = eps {
+                    let op = Self::RmsNorm { eps: *eps };
+                    h = record_or_fallback(op, vec![h, w.clone()])?.swap_remove(0);
+                }
+                let mut rope_inputs = vec![h, Array::scalar(*offset as i32)];
+                rope_inputs.extend(inputs.get(at + 2).cloned());
+                let op = Self::Rope {
+                    dims: *dims,
+                    traditional: *traditional,
+                    base: *base,
+                    scale: *scale,
+                    forward: true,
+                };
+                let r = record_or_fallback(op, rope_inputs)?.swap_remove(0);
+                vec![match cache {
+                    true => {
+                        let mut region = vec![SliceArg::full(); 4];
+                        let end = (offset + r.shape()[2]) as isize;
+                        region[2] = SliceArg::new(Some(*offset as isize), Some(end), 1);
+                        crate::slice_update(&inputs[0], &r, &region)?
+                    }
+                    false => r,
+                }]
+            }
+            Self::DepthwiseConv1d {
+                stride,
+                padding,
+                dilation,
+            } => {
+                let c = x.shape()[2];
+                vec![crate::conv::general(
+                    x,
+                    &inputs[1],
+                    (*stride, *padding, *dilation, c),
+                )?]
+            }
             Self::Softmax => vec![softmax_graph(x)?],
-            Self::GatedDelta => gated_delta_graph(inputs)?,
+            Self::GatedDelta { steps } => gated_delta_graph(inputs, *steps)?,
             Self::GatherMm => {
                 let rows = |a: &Array, indices: &Array| -> Result<Array> {
                     let nd = a.ndim();
@@ -706,11 +866,14 @@ impl FastOp {
                 ];
                 Ok(vec![Some(one(Self::CrossEntropyVjp, all)?), None])
             }
-            Self::RmsNormVjp { .. }
+            Self::AddRmsNorm { .. }
+            | Self::NormRope { .. }
+            | Self::DepthwiseConv1d { .. }
+            | Self::RmsNormVjp { .. }
             | Self::LayerNormVjp { .. }
             | Self::CrossEntropyVjp
             | Self::Attention { .. }
-            | Self::GatedDelta
+            | Self::GatedDelta { .. }
             | Self::GatherQmm { .. }
             | Self::GatherMm => self.fallback_vjp(inputs, cotangents, wanted),
         }
@@ -894,6 +1057,137 @@ fn rope_graph(
     let out = update_last(&x4, &full(r1)?, 0, step)?;
     let out = update_last(&out, &full(r2)?, start2, step)?;
     reshape(&out, &shape)
+}
+
+/// The rotation of [`norm_rope`]: [`rope`]'s parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct Rotation<'a> {
+    /// Rotated features (even, at most the head size).
+    pub dims: usize,
+    /// Rotate interleaved pairs instead of the two halves.
+    pub traditional: bool,
+    /// The frequency base (exactly one of `base` and `freqs`).
+    pub base: Option<f32>,
+    /// The position scale.
+    pub scale: f32,
+    /// Per-pair frequencies (`[dims / 2]`).
+    pub freqs: Option<&'a Array>,
+}
+
+/// The largest head size [`norm_rope`]'s kernel takes.
+const NORM_ROPE_MAX: usize = 1024;
+
+/// An attention layer's query or key preparation in one kernel: each head's features of
+/// `x` (`[B, H, L, D]`, any strides, as the transposed projection) optionally normalised
+/// as [`rms_norm`] with `norm = (weight, eps)` (Qwen 3's `q_norm` and `k_norm`), then
+/// rotated as [`rope`] at positions `offset..offset + L`.
+///
+/// Without `cache`, the result is a new `[B, H, L, D]` array. With `cache` (`[B, H, C, D]`,
+/// `C ≥ offset + L`), the result is `cache` with positions `offset..offset + L` replaced
+/// (as [`crate::slice_update`], and written in place when the evaluation owns the cache),
+/// so keys go into a key cache without a separate copy.
+///
+/// The results equal [`rms_norm`], [`rope`] and [`crate::slice_update`] composed (on the GPU,
+/// bit for bit); differing dtypes, other ranks and head sizes over 1024 run that composition.
+pub fn norm_rope(
+    x: &Array,
+    norm: Option<(&Array, f32)>,
+    rotation: Rotation<'_>,
+    offset: usize,
+    cache: Option<&Array>,
+) -> Result<Array> {
+    check_inputs(&[x])?;
+    let mut inputs = Vec::with_capacity(4);
+    let mut fused = x.ndim() == 4
+        && x.dtype().category() == Category::Float
+        && x.shape()[3] <= NORM_ROPE_MAX
+        && offset + x.shape()[2] <= i32::MAX as usize;
+    if let Some(c) = cache {
+        check_inputs(&[c])?;
+        let s = x.shape();
+        let fits = c.ndim() == 4
+            && c.shape()[..2] == s[..2]
+            && c.shape()[3] == s[3]
+            && c.shape()[2] >= offset + s[2];
+        if !fits {
+            return Err(Error::InvalidArgument(format!(
+                "norm_rope: a cache of shape {:?} cannot take {:?} at position {offset}",
+                c.shape(),
+                s
+            )));
+        }
+        fused &= c.dtype() == x.dtype();
+        inputs.push(c.clone());
+    }
+    if let Some((w, _)) = norm {
+        check_inputs(&[w])?;
+        fused &= w.dtype() == x.dtype() && w.ndim() == 1 && w.size() == x.shape()[x.ndim() - 1];
+    }
+    let freqs_valid = rotation
+        .freqs
+        .is_none_or(|f| f.error().is_none() && f.ndim() == 1 && f.size() == rotation.dims / 2);
+    let dims_valid = rotation.dims > 0
+        && rotation.dims.is_multiple_of(2)
+        && x.ndim() > 0
+        && rotation.dims <= x.shape()[x.ndim() - 1];
+    if !fused || !freqs_valid || !dims_valid || rotation.base.is_some() == rotation.freqs.is_some()
+    {
+        // The composition (which also reports invalid arguments).
+        return norm_rope_graph(x, norm, rotation, offset, cache);
+    }
+    inputs.push(x.clone());
+    inputs.push(match norm {
+        Some((w, _)) => w.clone(),
+        None => scalar(1.0, x.dtype())?,
+    });
+    if let Some(f) = rotation.freqs {
+        inputs.push(astype(f, DType::F32)?);
+    }
+    let op = FastOp::NormRope {
+        eps: norm.map(|(_, eps)| eps.to_bits()),
+        dims: rotation.dims,
+        traditional: rotation.traditional,
+        base: rotation.base.unwrap_or(1.0).to_bits(),
+        scale: rotation.scale.to_bits(),
+        offset,
+        cache: cache.is_some(),
+    };
+    one(op, inputs)
+}
+
+/// [`norm_rope`] composed of [`rms_norm`], [`rope`] and [`crate::slice_update`].
+fn norm_rope_graph(
+    x: &Array,
+    norm: Option<(&Array, f32)>,
+    rotation: Rotation<'_>,
+    offset: usize,
+    cache: Option<&Array>,
+) -> Result<Array> {
+    let x = match norm {
+        Some((w, eps)) => rms_norm(x, Some(w), eps)?,
+        None => x.clone(),
+    };
+    let r = rope(
+        &x,
+        rotation.dims,
+        rotation.traditional,
+        rotation.base,
+        rotation.scale,
+        &Array::scalar(offset as i32),
+        rotation.freqs,
+    )?;
+    match cache {
+        Some(c) => {
+            let mut region = vec![SliceArg::full(); 4];
+            region[2] = SliceArg::new(
+                Some(offset as isize),
+                Some((offset + r.shape()[2]) as isize),
+                1,
+            );
+            crate::slice_update(c, &r, &region)
+        }
+        None => Ok(r),
+    }
 }
 
 /// Scaled dot-product attention, as MLX's `fast.scaled_dot_product_attention`:
@@ -1131,6 +1425,34 @@ pub fn gated_delta(
     beta: &Array,
     state: &Array,
 ) -> Result<(Array, Array)> {
+    gated_delta_op(q, k, v, g, beta, state, false)
+}
+
+/// [`gated_delta`] returning the state after every step, `[B, T, Hv, Dv, Dk]` (step `t`'s
+/// state at index `t`; the last is [`gated_delta`]'s final state), so that a caller can
+/// roll the recurrence back to any step, as speculative decoding does after a rejected
+/// draft. The outputs equal [`gated_delta`]'s bit for bit; writing every step's state
+/// costs `T` times the state's bytes.
+pub fn gated_delta_steps(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+) -> Result<(Array, Array)> {
+    gated_delta_op(q, k, v, g, beta, state, true)
+}
+
+fn gated_delta_op(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    steps: bool,
+) -> Result<(Array, Array)> {
     check_inputs(&[q, k, v, g, beta, state])?;
     let op = "gated_delta";
     for a in [q, k, v, g, beta, state] {
@@ -1180,10 +1502,11 @@ pub fn gated_delta(
         && [g, beta, state]
             .iter()
             .all(|a| matches!(a.dtype(), DType::F16 | DType::BF16 | DType::F32));
+    let op = FastOp::GatedDelta { steps };
     let mut out = if kernel {
-        Array::from_op(Primitive::Fast(FastOp::GatedDelta), inputs)?
+        Array::from_op(Primitive::Fast(op), inputs)?
     } else {
-        FastOp::GatedDelta.fallback(&inputs)?
+        op.fallback(&inputs)?
     };
     let s = out.pop().expect("two outputs");
     Ok((out.pop().expect("two outputs"), s))
@@ -1191,7 +1514,7 @@ pub fn gated_delta(
 
 /// The gated delta rule step by step from ordinary operations (mlx-lm's
 /// `gated_delta_ops`).
-fn gated_delta_graph(inputs: &[Array]) -> Result<Vec<Array>> {
+fn gated_delta_graph(inputs: &[Array], steps: bool) -> Result<Vec<Array>> {
     let [q, k, v, g, beta, state] = inputs else {
         unreachable!("six inputs")
     };
@@ -1219,6 +1542,7 @@ fn gated_delta_graph(inputs: &[Array]) -> Result<Vec<Array>> {
     };
     let mut s = wide(state)?;
     let mut ys = Vec::with_capacity(t);
+    let mut states = Vec::with_capacity(if steps { t } else { 0 });
     for i in 0..t {
         let (qt, kt, vt) = (at(&qh, i)?, expand_dims(&at(&kh, i)?, 2)?, at(v, i)?);
         let decay = reshape(&at(g, i)?, &[b as isize, hv as isize, 1, 1])?;
@@ -1228,12 +1552,20 @@ fn gated_delta_graph(inputs: &[Array]) -> Result<Vec<Array>> {
         s = add(&s, multiply(&kt, expand_dims(&delta, -1)?)?)?;
         let y = sum(&multiply(&s, expand_dims(&qt, 2)?)?, &[-1], false)?;
         ys.push(astype(&y, q.dtype())?);
+        if steps {
+            states.push(astype(&s, state.dtype())?);
+        }
     }
     let y = match ys.is_empty() {
         true => zeros(&[b, 0, hv, dv], q.dtype())?,
         false => stack(&ys, 1)?,
     };
-    Ok(vec![y, astype(&s, state.dtype())?])
+    let s = match (steps, states.is_empty()) {
+        (false, _) => astype(&s, state.dtype())?,
+        (true, false) => stack(&states, 1)?,
+        (true, true) => zeros(&[b, 0, hv, dv, dk], state.dtype())?,
+    };
+    Ok(vec![y, s])
 }
 
 /// The gathered quantized products from ordinary operations: the indexed batches of `x` and

@@ -35,7 +35,7 @@
         {
           "@type": "Question",
           "name": "How fast is nuvec compared to MLX?",
-          "acceptedAnswer": { "@type": "Answer", "text": "On an Apple M4 Pro, nuvec-lm generates at 0.97–1.04× the decode speed of mlx-lm across seven models from 0.6B to 35B parameters, and prefills at a geometric mean of 1.04×." }
+          "acceptedAnswer": { "@type": "Answer", "text": "On an Apple M4 Pro, nuvec-lm generates at 0.99–1.09× the decode speed of mlx-lm across seven models from 0.6B to 35B parameters, and prefills at a geometric mean of 1.05×." }
         },
         {
           "@type": "Question",
@@ -82,9 +82,9 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
 
 <section class="stats" aria-label="Key numbers">
   <div class="wrap stats-grid">
-    <div><strong>1.00×</strong><span>mlx-lm decode speed<br>(geometric mean, 7 models)</span></div>
-    <div><strong>1.04×</strong><span>mlx-lm prefill speed<br>(geometric mean)</span></div>
-    <div><strong>2×</strong><span>decode with speculative<br>drafts on repetitive text</span></div>
+    <div><strong>1.02×</strong><span>mlx-lm decode speed<br>(geometric mean, 7 models)</span></div>
+    <div><strong>1.05×</strong><span>mlx-lm prefill speed<br>(geometric mean)</span></div>
+    <div><strong>2.2×</strong><span>decode with speculative<br>drafts on repetitive text</span></div>
     <div><strong>0</strong><span>C/C++ dependencies<br>or MLX bindings</span></div>
   </div>
 </section>
@@ -191,13 +191,13 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
       <a class="link-arrow" href="{{ get_url(path='@/docs/benchmarks.md') }}">Full tables and method</a>
     </div>
     <div class="bars" role="table" aria-label="Decode speed relative to mlx-lm">
-      <div class="bar-row" role="row"><span role="cell">Qwen3-0.6B</span><span class="bar" role="cell" style="--v:1.04"><b>1.04×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Llama-3.2-3B</span><span class="bar" role="cell" style="--v:0.98"><b>0.98×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3-8B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3.5-9B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3.8-27B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3-30B-A3B</span><span class="bar" role="cell" style="--v:1.02"><b>1.02×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3.6-35B-A3B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3-0.6B</span><span class="bar" role="cell" style="--v:1.07"><b>1.07×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Llama-3.2-3B</span><span class="bar" role="cell" style="--v:1.01"><b>1.01×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3-8B</span><span class="bar" role="cell" style="--v:1.01"><b>1.01×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3.5-9B</span><span class="bar" role="cell" style="--v:0.99"><b>0.99×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3.8-27B</span><span class="bar" role="cell" style="--v:0.99"><b>0.99×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3-30B-A3B</span><span class="bar" role="cell" style="--v:1.03"><b>1.03×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3.6-35B-A3B</span><span class="bar" role="cell" style="--v:1.01"><b>1.01×</b></span></div>
       <div class="bar-axis" aria-hidden="true"><span>mlx-lm = 1.00×</span></div>
     </div>
   </div>
@@ -235,7 +235,7 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
   <div class="wrap faq-short">
     <h2 class="section-title">Questions</h2>
     <details><summary>Is nuvec a binding to MLX?</summary><p>No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ library. It reaches Metal through Apple's system frameworks and compiles its own Metal kernels, several of them ported from MLX.</p></details>
-    <details><summary>How fast is it compared to MLX?</summary><p>On an Apple M4 Pro, nuvec-lm decodes at 0.97–1.04× the speed of mlx-lm across seven models from 0.6B to 35B parameters, and prefills at a geometric mean of 1.04×. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
+    <details><summary>How fast is it compared to MLX?</summary><p>On an Apple M4 Pro, nuvec-lm decodes at 0.99–1.09× the speed of mlx-lm across seven models from 0.6B to 35B parameters, and prefills at a geometric mean of 1.05×. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
     <details><summary>Which hardware does it support?</summary><p>Macs with Apple Silicon (M1 or later) on macOS 15 or newer. The core and CPU crates also build and run on Linux.</p></details>
     <a class="link-arrow" href="{{ get_url(path='@/docs/faq.md') }}">All questions</a>
   </div>

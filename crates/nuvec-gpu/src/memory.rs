@@ -18,6 +18,12 @@ pub struct MemoryStats {
     /// Buffers are kept resident up to this many bytes (see
     /// `Device::set_wired_limit`).
     pub wired_limit: usize,
-    /// Bytes currently wired.
+    /// Bytes currently wired, including `wired_mapped`.
     pub wired: usize,
+    /// Bytes of live memory-mapped files (checkpoints loaded without a copy). They are not
+    /// in `active` or `peak`, which count the allocator's own buffers only; MLX copies
+    /// weights into its allocator, so its `active` includes them.
+    pub mapped: usize,
+    /// The part of `wired` that belongs to memory-mapped files.
+    pub wired_mapped: usize,
 }

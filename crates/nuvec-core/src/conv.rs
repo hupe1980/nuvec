@@ -39,7 +39,7 @@ pub fn conv1d(
             weight.shape()
         ));
     }
-    let (n, l, c_in) = (input.shape()[0], input.shape()[1], input.shape()[2]);
+    let (l, c_in) = (input.shape()[1], input.shape()[2]);
     let (c_out, k, c_group) = (weight.shape()[0], weight.shape()[1], weight.shape()[2]);
     if stride == 0 || dilation == 0 || groups == 0 {
         return invalid("stride, dilation and groups must be positive".into());
@@ -65,6 +65,31 @@ pub fn conv1d(
             dtype,
         });
     }
+    if groups == c_in && c_out == c_in {
+        // Depthwise: one GPU kernel, with `general` as its fallback.
+        let op = crate::fast::FastOp::DepthwiseConv1d {
+            stride,
+            padding,
+            dilation,
+        };
+        let inputs = vec![input.astype(dtype)?, weight.astype(dtype)?];
+        return Ok(crate::fast::record_or_fallback(op, inputs)?.swap_remove(0));
+    }
+    general(input, weight, (stride, padding, dilation, groups))
+}
+
+/// [`conv1d`] composed of ordinary operations (the fallback of the depthwise kernel, and
+/// every grouped convolution): taps of the padded input in float32, weighted and summed
+/// in tap order, rounded once.
+pub(crate) fn general(
+    input: &Array,
+    weight: &Array,
+    (stride, padding, dilation, groups): (usize, usize, usize, usize),
+) -> Result<Array> {
+    let (n, l, c_in) = (input.shape()[0], input.shape()[1], input.shape()[2]);
+    let (c_out, k, c_group) = (weight.shape()[0], weight.shape()[1], weight.shape()[2]);
+    let span = dilation * (k - 1) + 1;
+    let dtype = promote_types(input.dtype(), weight.dtype());
     let acc = if dtype == DType::F64 {
         DType::F64
     } else {

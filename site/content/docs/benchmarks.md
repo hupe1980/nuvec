@@ -16,17 +16,17 @@ Apple M4 Pro, macOS 26.6:
 
 | Model | Kind | Prefill 25 / 961 / 3,841 tokens | Decode 25 / 961 / 3,841 tokens |
 |---|---|---|---|
-| Qwen3-0.6B 4-bit | dense | 1.26× / 1.03× / 1.01× | 1.04× / 1.04× / 1.03× |
-| Llama-3.2-3B-Instruct 4-bit | dense | 1.09× / 1.01× / 1.00× | 0.99× / 0.98× / 0.99× |
-| Qwen3-8B 4-bit | dense | 1.25× / 1.00× / 1.00× | 1.00× / 1.00× / 0.97× |
-| Qwen3.5-9B 4-bit | hybrid | 1.18× / 0.99× / 0.99× | 0.99× / 1.00× / 0.97× |
-| Qwen3.8-27B 4-bit | hybrid | 1.16× / 1.00× / 0.99× | 1.00× / 1.00× / 1.00× |
-| Qwen3-30B-A3B 4-bit | MoE | 1.10× / 0.99× / 0.98× | 1.02× / 1.02× / 1.02× |
-| Qwen3.6-35B-A3B 4-bit | hybrid MoE | 0.92× / 0.96× / 0.95× | 1.00× / 1.00× / 1.01× |
+| Qwen3-0.6B 4-bit | dense | 1.25× / 1.07× / 1.03× | 1.09× / 1.07× / 1.06× |
+| Llama-3.2-3B-Instruct 4-bit | dense | 1.08× / 1.00× / 1.00× | 1.01× / 1.01× / 1.01× |
+| Qwen3-8B 4-bit | dense | 1.18× / 1.01× / 1.00× | 1.03× / 1.01× / 1.02× |
+| Qwen3.5-9B 4-bit | hybrid | 1.20× / 1.00× / 0.99× | 0.99× / 0.99× / 0.99× |
+| Qwen3.8-27B 4-bit | hybrid | 1.17× / 1.00× / 1.00× | 1.00× / 0.99× / 1.00× |
+| Qwen3-30B-A3B 4-bit | MoE | 1.11× / 0.99× / 0.99× | 1.03× / 1.03× / 1.03× |
+| Qwen3.6-35B-A3B 4-bit | hybrid MoE | 1.14× / 0.98× / 0.97× | 1.02× / 1.01× / 1.02× |
 
-Geometric means: **prefill 1.04×, decode 1.00×.** Absolute speeds at 25 prompt tokens, nuvec / mlx-lm: Qwen3-0.6B 410 / 396 tok/s, Qwen3-8B 53.4 / 53.1, Qwen3-30B-A3B 95.7 / 94.1, Qwen3.6-35B-A3B 92.5 / 92.3.
+Geometric means: **prefill 1.05×, decode 1.02×.** Absolute speeds at 25 prompt tokens, nuvec / mlx-lm: Qwen3-0.6B 433 / 396 tok/s, Qwen3-8B 54.0 / 52.6, Qwen3-30B-A3B 96.0 / 93.1, Qwen3.6-35B-A3B 91.8 / 90.3.
 
-Speculative decoding adds up to **1.98×** on top for repetitive output; see [speculative decoding](@/docs/speculative-decoding.md).
+Speculative decoding adds up to **2.16×** on top for repetitive output; see [speculative decoding](@/docs/speculative-decoding.md).
 
 ## Kernels
 
@@ -34,6 +34,7 @@ Speculative decoding adds up to **1.98×** on top for repetitive output; see [sp
 
 - Quantized products at language-model shapes, dense (961 × 2048 × 8192) and mixture-of-experts gathers (7,688 rows over 256 experts): 1.00–1.02× MLX's time.
 - Prefill attention in bfloat16 (2,048 and 3,841 keys, grouped-query heads): 0.98–1.02×.
+- Quantized products of 4–12 rows (speculative verification): 12–22% faster than MLX's per-row kernel, through nuvec's own few-row kernel.
 - Decode attention in half precision with keys streamed from memory: about 9% slower than MLX with the same kernel, the one known gap.
 
 ## Run them yourself

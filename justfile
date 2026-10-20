@@ -45,6 +45,8 @@ metallib-check:
 metal-check:
     MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu
     NUVEC_METALLIB=off MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu --test runtime
+    # Runtime-compiled kernels give the precompiled results (MLX fixtures, bit-exact fused ops).
+    NUVEC_METALLIB=off cargo test -p nuvec-core --test gpu --test fast
 
 # Build the website (Zola) into site/public.
 site:
