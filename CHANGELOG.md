@@ -6,36 +6,36 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-21
+
+Batched decoding and serving over a paged KV cache, seeded sampling, and long-context
+prefill on hybrid MoE models.
+
 ### Added
-- `fast::paged_attention` and `fast::paged_write`: attention over a block-table KV cache
-  for a batch of sequences of different lengths, and the write of new positions into it.
-- `nuvec_lm::PagedCache` and `decode_batch`: several sequences of different lengths decode
-  in one forward pass over a paged KV cache, hybrid (Gated DeltaNet) models included, with
-  the same tokens each gets alone; at 8 sequences Qwen3-8B reaches 149 tok/s and
-  Qwen3.6-35B-A3B 223 tok/s in total.
-- `fast::gated_delta_slots`: the gated delta rule for a batch whose states live at slots of a
-  state pool, updated in place.
+- `nuvec_lm::Batcher`: serves many requests at once (admission, batched decoding, end of
+  sequence and token budgets, preemption when the cache is full); 16 requests on Qwen3-8B
+  finish 2.1× faster than one after another, with the same tokens.
+- `nuvec_lm::PagedCache` and `decode_batch`: sequences of different lengths decode in one
+  forward pass, hybrid models included, each with the tokens it gets alone; at 8 sequences
+  Qwen3-8B reaches 149 tok/s and Qwen3.6-35B-A3B 223 tok/s in total.
+- `fast::paged_attention`, `fast::paged_write` and `fast::gated_delta_slots`: attention,
+  cache writes and the gated delta rule over block tables and state pools.
+- `GenerateOptions::seed`: a seeded generation gives the same tokens every time, alone or
+  batched (`Sampler::sample_with` and `sample::categorical_with` take an explicit key).
 
 ### Changed
-- Element-wise operations and softmax write into an input buffer the evaluation owns, and
-  large intermediates are released as soon as nothing refers to them (as MLX): attention
-  without a fused kernel holds one score matrix instead of three, and Qwen3.6-35B-A3B
-  prefill at 32K tokens needs 5 GB of activations instead of 12 GB.
-- Element-wise and copy kernels over strided layouts use 32-bit offsets when they fit
-  (Apple GPUs emulate 64-bit integer products): a broadcast `where` over attention scores
-  is 1.5× faster.
+- **Breaking:** `GenerateOptions` has a new field, `seed`.
+- Element-wise operations, softmax and `slice_update` write into inputs the evaluation
+  owns, and large intermediates are released as soon as nothing refers to them (as MLX):
+  Qwen3.6-35B-A3B prefill at 32K tokens needs 5 GB of activations instead of 12 GB.
+- Strided element-wise and copy kernels use 32-bit offsets when they fit: a broadcast
+  `where` over attention scores is 1.5× faster.
 - Attention with head size 256 uses the tiled kernel for causal prefill chunks over up to
-  8,192 keys (measured faster), the composition beyond: Qwen3.6-35B-A3B prefill at 32K
-  tokens 0.89× → 0.96–0.97× mlx-lm.
+  8,192 keys: Qwen3.6-35B-A3B prefill at 32K tokens 0.89× → 0.96–0.97× mlx-lm.
 
 ### Fixed
-- Attention with head size 192 or 256 over very long caches ran out of memory (it
-  materialised scores of many gigabytes); it now uses the tiled kernel above 4 GiB of
-  scores. Qwen3.6-35B-A3B prefills a 252K-token prompt.
-- `slice_update` on the CPU reads a strided update in place instead of copying it first.
-- `slice_update` (and `norm_rope` into a cache) writes in place into a base computed
-  earlier in the same evaluation instead of copying it, so a chain of updates evaluated at
-  once holds one buffer.
+- Attention with head size 192 or 256 over very long caches ran out of memory; it now uses
+  the tiled kernel above 4 GiB of scores. Qwen3.6-35B-A3B prefills a 252K-token prompt.
 
 ## [0.2.0] - 2026-10-20
 
@@ -106,6 +106,7 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/hupe1980/nuvec/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/nuvec/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/nuvec/releases/tag/v0.1.0

@@ -8,6 +8,8 @@
 //!   place, mlx-lm's samplers (temperature, top-p, min-p, top-k), and [speculative
 //!   decoding](speculative) with pluggable drafters; memory is wired while generating
 //!   ([`WiredLimit`]).
+//! - **Serving:** batched decoding over a [paged KV cache](paged) and a [`Batcher`] that
+//!   serves many requests at once.
 //!
 //! ```no_run
 //! use nuvec_lm::{GenerateOptions, generate, load};
@@ -32,6 +34,7 @@ use std::path::{Path, PathBuf};
 use nuvec::{Array, Error, Result};
 use nuvec_nn::Module;
 
+pub mod batch;
 pub mod config;
 pub mod generate;
 pub mod model;
@@ -40,6 +43,7 @@ pub mod sample;
 pub mod speculative;
 pub mod tokenizer;
 
+pub use batch::{Batcher, Event, FinishReason, RequestId};
 pub use config::Config;
 pub use generate::{GenerateOptions, Generation, WiredLimit, generate};
 pub use model::{KvCache, Model};

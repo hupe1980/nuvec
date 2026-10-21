@@ -306,6 +306,143 @@ fn paged_batched_decoding_equals_decoding_each_sequence_alone() {
     }
 }
 
+/// A batcher serves more requests than its batch, each getting its solo greedy tokens (up
+/// to an end-of-sequence token), also when a small cache forces preemptions.
+#[test]
+fn batcher_serves_each_request_its_solo_tokens() {
+    use nuvec_lm::{Batcher, Event, FinishReason};
+    if !gpu() {
+        return;
+    }
+    for (name, blocks) in [
+        ("qwen3_f32", 64),
+        ("qwen3_f32", 9),
+        ("qwen3_moe_f32", 64),
+        ("qwen3_5_f32", 64),
+        ("qwen3_5_f32", 9),
+    ] {
+        let (dir, prompt, ..) = fixture(name);
+        let model = load_model(&dir).unwrap();
+        let eos = model.config.eos_token_ids.clone();
+        let requests: Vec<(Vec<u32>, usize)> = (0..6)
+            .map(|i| {
+                let n = 3 + (i * 5) % (prompt.len() + 4);
+                (
+                    prompt.iter().cycle().skip(i).take(n).copied().collect(),
+                    4 + i * 3,
+                )
+            })
+            .collect();
+        let mut batcher = Batcher::new(&model, blocks, 4, 3).unwrap();
+        for (p, max) in &requests {
+            let options = GenerateOptions {
+                max_tokens: *max,
+                ..Default::default()
+            };
+            batcher.submit(p.clone(), options).unwrap();
+        }
+        let mut got: Vec<Vec<u32>> = vec![Vec::new(); requests.len()];
+        let mut finished = vec![None; requests.len()];
+        let mut most = 0;
+        while batcher.is_busy() {
+            for event in batcher.step().unwrap() {
+                match event {
+                    Event::Token { id, token } => got[id].push(token),
+                    Event::Finished { id, reason } => finished[id] = Some(reason),
+                }
+            }
+            most = most.max(batcher.running());
+        }
+        assert!(most <= 3, "{name}: batch limit");
+        assert_eq!(
+            batcher.preemptions() > 0,
+            blocks < 64,
+            "{name} ({blocks} blocks): preemptions"
+        );
+        for (i, (p, max)) in requests.iter().enumerate() {
+            let options = GenerateOptions {
+                max_tokens: *max,
+                ..Default::default()
+            };
+            let alone: Vec<u32> = generate(&model, p, options)
+                .unwrap()
+                .collect::<nuvec::Result<_>>()
+                .unwrap();
+            let stop = alone
+                .iter()
+                .position(|t| eos.contains(t))
+                .map_or(*max, |e| e + 1);
+            assert_eq!(
+                got[i],
+                alone[..stop],
+                "{name} ({blocks} blocks): request {i}"
+            );
+            let reason = if stop < *max || eos.contains(&alone[stop - 1]) {
+                FinishReason::EndOfSequence
+            } else {
+                FinishReason::Length
+            };
+            assert_eq!(finished[i], Some(reason), "{name}: request {i} finish");
+        }
+    }
+}
+
+/// A seed reproduces sampled tokens, alone and in a batch with other requests.
+#[test]
+fn seeded_sampling_is_reproducible_alone_and_batched() {
+    use nuvec_lm::{Batcher, Event, Sampler};
+    if !gpu() {
+        return;
+    }
+    let (dir, prompt, ..) = fixture("qwen3_f32");
+    let model = load_model(&dir).unwrap();
+    let options = |seed: Option<u64>, temperature: f32| GenerateOptions {
+        max_tokens: 16,
+        sampler: Sampler {
+            temperature,
+            ..Default::default()
+        },
+        seed,
+        ..Default::default()
+    };
+    let alone = |p: &[u32], o: GenerateOptions| -> Vec<u32> {
+        generate(&model, p, o)
+            .unwrap()
+            .collect::<nuvec::Result<_>>()
+            .unwrap()
+    };
+    let a = alone(&prompt, options(Some(7), 1.5));
+    assert_eq!(a, alone(&prompt, options(Some(7), 1.5)), "same seed");
+    assert_ne!(a, alone(&prompt, options(Some(8), 1.5)), "another seed");
+    // Batched with others (greedy, another seed): each gets its solo tokens.
+    let requests = [
+        (prompt.clone(), options(Some(7), 1.5)),
+        (prompt[1..].to_vec(), options(None, 0.0)),
+        (prompt.clone(), options(Some(11), 1.0)),
+    ];
+    let mut batcher = Batcher::new(&model, 64, 8, 3).unwrap();
+    for (p, o) in &requests {
+        batcher.submit(p.clone(), *o).unwrap();
+    }
+    let mut got: Vec<Vec<u32>> = vec![Vec::new(); requests.len()];
+    while batcher.is_busy() {
+        for event in batcher.step().unwrap() {
+            if let Event::Token { id, token } = event {
+                got[id].push(token);
+            }
+        }
+    }
+    let eos = &model.config.eos_token_ids;
+    for (i, (p, o)) in requests.iter().enumerate() {
+        let want = alone(p, *o);
+        let stop = want
+            .iter()
+            .position(|t| eos.contains(t))
+            .map_or(want.len(), |e| e + 1);
+        assert_eq!(got[i], want[..stop], "request {i}");
+    }
+}
+
 #[test]
 fn the_cache_grows_past_its_first_capacity() {
     if !gpu() {

@@ -18,6 +18,30 @@ pub struct GenerateOptions {
     pub sampler: Sampler,
     /// Prompt tokens per prefill step (mlx-lm's 2048).
     pub prefill_step: usize,
+    /// Sampling keys from this seed (one per token), so that the same seed gives the same
+    /// tokens, alone or batched; without, the thread's key sequence ([`nuvec::random`]).
+    pub seed: Option<u64>,
+}
+
+/// The sampling keys of one generation: split from its seed, one per token, or none (the
+/// thread's sequence is used).
+#[derive(Debug, Clone)]
+pub(crate) struct Keys(Option<Array>);
+
+impl Keys {
+    pub(crate) fn new(seed: Option<u64>) -> Self {
+        Keys(seed.map(nuvec::random::key))
+    }
+
+    /// The key for the next token.
+    pub(crate) fn next(&mut self) -> Result<Option<Array>> {
+        let Some(key) = self.0.take() else {
+            return Ok(None);
+        };
+        let (keep, out) = nuvec::random::split_pair(&key)?;
+        self.0 = Some(keep);
+        Ok(Some(out))
+    }
 }
 
 impl Default for GenerateOptions {
@@ -26,6 +50,7 @@ impl Default for GenerateOptions {
             max_tokens: 256,
             sampler: Sampler::default(),
             prefill_step: 2048,
+            seed: None,
         }
     }
 }
@@ -40,6 +65,7 @@ pub struct Generation<'a> {
     next: Option<Array>,
     produced: usize,
     wired: WiredLimit,
+    keys: Keys,
 }
 
 /// mlx-lm's `wired_limit`: while it lives, the GPU keeps memory (the model's weights
@@ -112,6 +138,7 @@ pub fn generate<'a>(
         next: None,
         produced: 0,
         wired,
+        keys: Keys::new(options.seed),
     };
     if options.max_tokens > 0 {
         let first = g.step(&Array::from_slice(last, &[1])?)?;
@@ -155,13 +182,14 @@ impl Generation<'_> {
             ],
         )?
         .reshape(&[1, -1])?;
+        let key = self.keys.next()?;
         let sampler = &self.options.sampler;
         if sampler.temperature == 0.0 {
             return sampler.sample(&last);
         }
         // Log-probabilities, as mlx-lm samples from.
         let logprobs = subtract(&last, logsumexp(&last, &[-1], true)?)?;
-        sampler.sample(&logprobs)
+        sampler.sample_with(&logprobs, key.as_ref())
     }
 
     /// The cache (one per layer), for instance to continue a conversation.

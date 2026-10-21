@@ -27,7 +27,7 @@ nuvec brings [MLX](https://github.com/ml-explore/mlx)'s programming model to Rus
 - 🔁 **Composable transforms.** `grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`, `checkpoint` and `compile` nest in any order, through complex numbers too.
 - 🔥 **MLX's Metal kernels.** GEMM and GEMV, quantized products (1–8 bit), fused attention, RMSNorm, RoPE, sort, scan, mixture-of-experts gather kernels, plus your own kernels from source (`fast::MetalKernel`).
 - 🧪 **Tested against MLX.** Nearly a thousand cases replay results recorded from real MLX, with random layouts, gradients and every dtype.
-- 🤖 **LLM runtime.** Llama, Mistral and Qwen 2/3/3.5, dense, hybrid (Gated DeltaNet) or mixture-of-experts, straight from mlx-community or Hugging Face checkpoints; speculative decoding included.
+- 🤖 **LLM runtime.** Llama, Mistral and Qwen 2/3/3.5, dense, hybrid (Gated DeltaNet) or mixture-of-experts, straight from mlx-community or Hugging Face checkpoints; speculative decoding and batched serving included.
 - 💾 **Zero-copy weights.** safetensors and npy files are memory-mapped and handed to the GPU without a copy.
 
 ## 📊 Performance

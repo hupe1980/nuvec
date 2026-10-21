@@ -80,6 +80,11 @@ type Compiled = Box<dyn Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync>;
 /// the next key of this thread's sequence. Compiled, as mlx-lm's `categorical_sampling`:
 /// the noise, the scaling and the sum run as one kernel before the argmax.
 pub fn categorical(logits: &Array, temperature: f32) -> Result<Array> {
+    categorical_with(logits, temperature, None)
+}
+
+/// [`categorical`] with `key`, or the next key of this thread's sequence without.
+pub fn categorical_with(logits: &Array, temperature: f32, key: Option<&Array>) -> Result<Array> {
     static DRAW: LazyLock<Compiled> = LazyLock::new(|| {
         Box::new(nuvec::compile(|a: &[Array]| {
             let (key, logits, inverse) = (&a[0], &a[1], &a[2]);
@@ -91,7 +96,11 @@ pub fn categorical(logits: &Array, temperature: f32) -> Result<Array> {
     });
     // `1 / temperature` rounded to float32 once, as the weak scalar it replaces.
     let inverse = Array::scalar((1.0 / f64::from(temperature)) as f32);
-    Ok(DRAW(&[random::next_key()?, logits.clone(), inverse])?.swap_remove(0))
+    let key = match key {
+        Some(k) => k.clone(),
+        None => random::next_key()?,
+    };
+    Ok(DRAW(&[key, logits.clone(), inverse])?.swap_remove(0))
 }
 
 /// How the next token is chosen (mlx-lm's `make_sampler`).
@@ -126,6 +135,12 @@ impl Sampler {
     /// The next token for log-probabilities `[1, vocab]`: the filters in mlx-lm's order
     /// (top-p, min-p, top-k), then a categorical draw; greedy at temperature 0.
     pub fn sample(&self, logprobs: &Array) -> Result<Array> {
+        self.sample_with(logprobs, None)
+    }
+
+    /// [`Sampler::sample`] drawing with `key` (or, without, the next key of this thread's
+    /// sequence).
+    pub fn sample_with(&self, logprobs: &Array, key: Option<&Array>) -> Result<Array> {
         if self.temperature == 0.0 {
             return argmax(logprobs, Some(-1), false);
         }
@@ -139,6 +154,6 @@ impl Sampler {
         if self.top_k > 0 {
             lp = apply_top_k(&lp, self.top_k)?;
         }
-        categorical(&lp, self.temperature)
+        categorical_with(&lp, self.temperature, key)
     }
 }

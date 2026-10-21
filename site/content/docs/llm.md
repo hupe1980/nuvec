@@ -1,6 +1,6 @@
 +++
 title = "LLM runtime"
-description = "nuvec-lm runs Llama, Mistral and Qwen 2/3/3.5 models from mlx-community or Hugging Face checkpoints on Apple Silicon at mlx-lm's speed, with samplers and speculative decoding."
+description = "nuvec-lm runs Llama, Mistral and Qwen 2/3/3.5 models from mlx-community or Hugging Face checkpoints on Apple Silicon at mlx-lm's speed, with samplers, speculative decoding and batched serving."
 weight = 90
 [extra]
 group = "Libraries"
@@ -40,7 +40,7 @@ for id in generate(&model, &prompt, options)? {
 }
 ```
 
-- **Samplers:** greedy (temperature 0, the default), temperature, top-p, min-p and top-k, with mlx-lm's filters.
+- **Samplers:** greedy (temperature 0, the default), temperature, top-p, min-p and top-k, with mlx-lm's filters. With `GenerateOptions::seed`, sampled tokens are reproducible, also when batched with other requests.
 - **Tokenizer:** byte-level BPE read from `tokenizer.json`, special tokens included; `encode` adds the tokens the tokenizer's post-processor adds (Llama's `<|begin_of_text|>`), as mlx-lm does. `StreamDecoder` turns token ids into text without splitting multi-byte characters.
 - **Cache:** `Generation::cache()` exposes the KV cache (and Gated DeltaNet state) to continue a conversation.
 
@@ -69,6 +69,29 @@ paged.remove(id)?;                                     // its blocks are free ag
 ```
 
 Each sequence gets exactly the tokens it would get decoding alone. Hybrid models keep each sequence's Gated DeltaNet state in a slot of a state pool, updated in place.
+
+## Serving many requests
+
+`Batcher` puts it together: requests are queued, admitted while there is room, prefilled, and decoded together; each finishes at an end-of-sequence token or its `max_tokens`.
+
+```rust
+use nuvec_lm::{Batcher, Event, GenerateOptions};
+
+let mut batcher = Batcher::new(&model, 4096, 32, 8)?; // blocks, block size, batch
+for prompt in prompts {
+    batcher.submit(prompt, GenerateOptions::default())?;
+}
+while batcher.is_busy() {
+    for event in batcher.step()? {
+        match event {
+            Event::Token { id, token } => { /* stream it */ }
+            Event::Finished { id, reason } => { /* done */ }
+        }
+    }
+}
+```
+
+When the cache runs out of blocks, the most recently admitted request is preempted and later prefilled again with the tokens it has produced; its later tokens can then differ in low bits from an uninterrupted run.
 
 ## Command line
 
