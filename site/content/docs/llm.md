@@ -53,6 +53,23 @@ for id in generate(&model, &prompt, options)? {
 
 See [benchmarks](@/docs/benchmarks.md) for the numbers and [speculative decoding](@/docs/speculative-decoding.md) for going beyond them.
 
+## Batched decoding
+
+`PagedCache` holds the keys and values of many sequences in fixed-size blocks; `decode_batch` advances several of them, each at its own length, in one forward pass. Prefill each sequence as usual, then move it into the paged cache:
+
+```rust
+use nuvec_lm::{PagedCache, decode_batch};
+
+let mut paged = PagedCache::new(&model, 4096, 32, 8)?; // 32-position blocks, 8 sequences
+let mut kv = model.new_cache();
+model.forward(&prompt_without_last_token, &mut kv)?;  // [1, L] token ids
+let id = paged.insert(&kv)?;
+let logits = decode_batch(&model, &[last_token], &[id], &mut paged)?; // [B, vocab]
+paged.remove(id)?;                                     // its blocks are free again
+```
+
+Each sequence gets exactly the tokens it would get decoding alone. Hybrid models keep each sequence's Gated DeltaNet state in a slot of a state pool, updated in place.
+
 ## Command line
 
 ```sh

@@ -1289,6 +1289,76 @@ mod gated_delta_gpu {
     }
 
     #[test]
+    fn gated_delta_at_slots_equals_gated_delta_per_sequence() {
+        if cfg!(miri) || on(Device::gpu(0), || (Array::scalar(1.0f32) * 2.0).eval()).is_err() {
+            return;
+        }
+        let mut rng = Rng::new(0x6d);
+        // (T, Hk, Hv, Dk, Dv): packed and generic kernels.
+        for &(t, hk, hv, dk, dv) in &[(1, 2, 4, 128, 128), (3, 2, 4, 128, 64), (2, 1, 2, 64, 48)] {
+            let (b, slots_n) = (3, 5);
+            let q = random(&mut rng, &[b, t, hk, dk], DType::BF16);
+            let k = unit(&random(&mut rng, &[b, t, hk, dk], DType::F32), DType::BF16);
+            let v = random(&mut rng, &[b, t, hv, dv], DType::BF16);
+            let g = add(random(&mut rng, &[b, t, hv], DType::F32), 0.75).unwrap();
+            let beta = add(random(&mut rng, &[b, t, hv], DType::BF16), 0.5).unwrap();
+            let pool = random(&mut rng, &[slots_n, hv, dv, dk], DType::F32);
+            let slots = Array::from_slice(&[3i32, 0, 4], &[b]).unwrap();
+            let row = |a: &Array, i: usize| {
+                let mut args = vec![SliceArg::full(); a.ndim()];
+                args[0] = SliceArg::new(Some(i as isize), Some(i as isize + 1), 1);
+                slice(a, &args).unwrap()
+            };
+            let name = format!("{:?}", (t, hk, hv, dk, dv));
+            on(Device::gpu(0), || {
+                let before = values(&pool);
+                let (y, new_pool) =
+                    fast::gated_delta_slots(&q, &k, &v, &g, &beta, &pool, &slots).unwrap();
+                eval(&[y.clone(), new_pool.clone()]).unwrap();
+                assert_eq!(values(&pool), before, "{name}: a held pool changed");
+                for (i, &slot) in [3usize, 0, 4].iter().enumerate() {
+                    let (yi, si) = fast::gated_delta(
+                        &row(&q, i),
+                        &row(&k, i),
+                        &row(&v, i),
+                        &row(&g, i),
+                        &row(&beta, i),
+                        &row(&pool, slot),
+                    )
+                    .unwrap();
+                    assert_close(&format!("{name} y {i}"), &row(&y, i), &yi, 0.0);
+                    assert_close(
+                        &format!("{name} state {i}"),
+                        &row(&new_pool, slot),
+                        &si,
+                        0.0,
+                    );
+                }
+                for untouched in [1, 2] {
+                    assert_close(
+                        &format!("{name} slot {untouched}"),
+                        &row(&new_pool, untouched),
+                        &row(&pool, untouched),
+                        0.0,
+                    );
+                }
+            });
+            let run = || {
+                let (y, p) = fast::gated_delta_slots(&q, &k, &v, &g, &beta, &pool, &slots).unwrap();
+                vec![y, p]
+            };
+            let (gpu, cpu) = (on(Device::gpu(0), run), on(Device::cpu(), run));
+            assert_close(
+                &format!("{name} y cpu"),
+                &gpu[0],
+                &cpu[0],
+                tolerance(DType::BF16),
+            );
+            assert_close(&format!("{name} pool cpu"), &gpu[1], &cpu[1], 2e-4);
+        }
+    }
+
+    #[test]
     fn gated_delta_kernels_match_the_fallback() {
         if cfg!(miri) || on(Device::gpu(0), || (Array::scalar(1.0f32) * 2.0).eval()).is_err() {
             return;

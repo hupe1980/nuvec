@@ -101,6 +101,15 @@ mod stub {
         pub(crate) fn softmax_in_place(&mut self, _: Data, _: &Output) -> Result<Data> {
             unreachable!("nothing is writable without Metal")
         }
+        pub(crate) fn gated_delta_slots_in_place(
+            &mut self,
+            _: &[Operand<'_>],
+            _: &Output,
+            _: Data,
+            _: &[Output],
+        ) -> Result<Vec<Data>> {
+            unreachable!("nothing is writable without Metal")
+        }
         pub(crate) fn elementwise_in_place(
             &mut self,
             _: &Primitive,
@@ -119,6 +128,7 @@ mod stub {
         pub(crate) fn take_pending(
             &mut self,
             _: &Arc<Node>,
+            _: usize,
             _: impl Fn(&Data, usize) -> bool,
         ) -> Option<Data> {
             None
@@ -790,6 +800,30 @@ mod metal {
         "auto o_state = state_out + ((b_idx * T * Hv + hv_idx) * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;",
     );
 
+    /// The state handling of a gated delta kernel.
+    #[derive(Clone, Copy)]
+    enum DeltaMode {
+        /// The final state, from its own input.
+        Final,
+        /// Every step's state (`[B, T, ...]`).
+        Steps,
+        /// States at `slots[b]` of a pool, read and written in place.
+        Slots,
+    }
+
+    /// A gated delta kernel body reading and writing sequence `b`'s state at slot
+    /// `slots[b]` of a state pool (`[slots, Hv, Dv, Dk]`): each thread reads its state
+    /// elements first and writes the same ones last, so the pool is updated in place.
+    fn at_slots(body: &str) -> String {
+        let from = "(n * Dv + dv_idx) * Dk";
+        let to = "((slots[b_idx] * Hv + hv_idx) * Dv + dv_idx) * Dk";
+        assert!(
+            body.matches(from).count() == 2,
+            "gated delta kernel source changed"
+        );
+        body.replace(from, to)
+    }
+
     /// A gated delta kernel body that stores the state after every step (`[B, T, Hv, Dv,
     /// Dk]`) instead of once at the end: the final store moves into the step loop, before
     /// the pointers advance, and the output pointer starts at step 0 of `[B, T, ...]`. The
@@ -849,6 +883,23 @@ mod metal {
     /// `reads` values per thread.
     fn row_threads(axis: usize, reads: usize) -> usize {
         axis.div_ceil(reads).div_ceil(32) * 32
+    }
+
+    /// Whether a grid of `shape` (also the output's row-contiguous layout) and operands at
+    /// `(offset, strides)` (in elements) stay below 2^31 elements, for 32-bit offsets.
+    fn fits32(shape: &[usize], operands: &[(isize, &[isize])]) -> bool {
+        let limit = i32::MAX as usize;
+        let size: usize = shape.iter().product();
+        size < limit
+            && operands.iter().all(|(offset, strides)| {
+                offset.unsigned_abs()
+                    + strides
+                        .iter()
+                        .zip(shape)
+                        .map(|(s, &n)| s.unsigned_abs() * n.saturating_sub(1))
+                        .sum::<usize>()
+                    < limit
+            })
     }
 
     /// Whether MLX's vector attention takes two passes over `lk` keys on a GPU of `class`.
@@ -1193,10 +1244,31 @@ mod metal {
                     }
                     grid = Some([shape[2], shape[1], shape[0]]);
                 }
+                // 32-bit offsets when the output and every operand's reachable offsets
+                // stay below 2^31 (64-bit integer products are emulated on Apple GPUs).
+                let reach = |offset: isize, strides: &[isize]| -> usize {
+                    offset.unsigned_abs()
+                        + strides
+                            .iter()
+                            .zip(&shape)
+                            .map(|(s, &n)| s.unsigned_abs() * n.saturating_sub(1))
+                            .sum::<usize>()
+                };
+                let limit = i32::MAX as usize;
+                let fits32 = out.size < limit
+                    && collapsed
+                        .iter()
+                        .zip(datas)
+                        .all(|(st, d)| reach(d.map_or(0, |d| d.offset), st) < limit);
                 consts.push(shape_bytes(&shape));
                 consts.extend(collapsed.iter().map(|s| strides_bytes(s)));
                 consts.push(bytes(&(shape.len() as i32)));
-                format!("{base}_g{}", if small { "3" } else { "" })
+                let suffix = match (small, fits32) {
+                    (true, true) => "3s",
+                    (true, false) => "3",
+                    (false, _) => "",
+                };
+                format!("{base}_g{suffix}")
             } else {
                 let flags: u32 = modes
                     .iter()
@@ -1698,8 +1770,13 @@ mod metal {
             args.extend(consts.iter().map(|c| Arg::bytes(c)));
             let name = format!("nuvec_copy_into_{width}");
             if small {
+                let s = if fits32(&shape, &[(from_off, &from), (to_off, &to)]) {
+                    "s"
+                } else {
+                    ""
+                };
                 return self.dispatch_grid(
-                    &format!("{name}_g3"),
+                    &format!("{name}_g3{s}"),
                     &args,
                     [shape[2], shape[1], shape[0]],
                 );
@@ -1751,7 +1828,12 @@ mod metal {
                 strides_bytes(&strides),
                 bytes(&(shape.len() as i32)),
             ];
-            let name = format!("nuvec_copy_{width}_g{}", if small { "3" } else { "" });
+            let suffix = match small {
+                true if fits32(&shape, &[(from_off, &strides)]) => "3s",
+                true => "3",
+                false => "",
+            };
+            let name = format!("nuvec_copy_{width}_g{suffix}");
             let input = data.buffer.metal().expect("checked");
             let mut args = vec![
                 Arg::read(input),
@@ -2409,6 +2491,9 @@ mod metal {
             if let FastOp::GatedDelta { steps } = *op {
                 return self.gated_delta(operands, outputs, steps);
             }
+            if *op == FastOp::GatedDeltaSlots {
+                return self.gated_delta_slots(operands, outputs);
+            }
             if let FastOp::GatherQmm {
                 group_size, bits, ..
             } = *op
@@ -2690,6 +2775,7 @@ mod metal {
                 | FastOp::PagedAttention { .. }
                 | FastOp::PagedWrite
                 | FastOp::GatedDelta { .. }
+                | FastOp::GatedDeltaSlots
                 | FastOp::GatherQmm { .. }
                 | FastOp::GatherMm => {
                     unreachable!("handled above")
@@ -3125,24 +3211,118 @@ mod metal {
                 .iter()
                 .map(|&o| self.packed(o, true))
                 .collect::<Result<Vec<_>>>()?;
-            let (q, v, g, state) = (operands[0].0, operands[2].0, operands[3].0, operands[5].0);
-            let (b, t, hk, dk) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
-            let (hv, dv) = (v.shape[2], v.shape[3]);
             let mut y = Buffer::try_alloc_gpu(outputs[0].size * outputs[0].dtype.size())?;
             let mut s = Buffer::try_alloc_gpu(outputs[1].size * outputs[1].dtype.size())?;
-            if t == 0 {
+            if operands[0].0.shape[1] == 0 {
                 if !steps {
                     self.copy(operands[5], &mut s)?;
                 }
                 return Ok(vec![Data::new(y), Data::new(s)]);
             }
+            let mode = if steps {
+                DeltaMode::Steps
+            } else {
+                DeltaMode::Final
+            };
+            let metas: Vec<&Output> = operands.iter().map(|(m, _)| *m).collect();
+            self.gated_delta_into(
+                &ins[..5],
+                Some(&ins[5]),
+                &metas,
+                None,
+                mode,
+                (&mut y, &mut s),
+            )?;
+            Ok(vec![Data::new(y), Data::new(s)])
+        }
+
+        /// [`crate::fast::FastOp::GatedDeltaSlots`] into a copy of the state pool.
+        fn gated_delta_slots(
+            &mut self,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+        ) -> Result<Vec<Data>> {
+            let mut pool = Buffer::try_alloc_gpu(outputs[1].size * outputs[1].dtype.size())?;
+            self.copy(operands[5], &mut pool)?;
+            let y = self.gated_delta_slots_into(operands, outputs, &mut pool)?;
+            Ok(vec![y, Data::new(pool)])
+        }
+
+        /// [`crate::fast::FastOp::GatedDeltaSlots`] into its donated state pool (`base`):
+        /// `operands` are all inputs but the pool (its metadata is `pool_meta`).
+        pub(crate) fn gated_delta_slots_in_place(
+            &mut self,
+            operands: &[Operand<'_>],
+            pool_meta: &Output,
+            mut base: Data,
+            outputs: &[Output],
+        ) -> Result<Vec<Data>> {
+            let buffer = Arc::get_mut(&mut base.buffer).expect("donated data has one handle");
+            let mut all: Vec<Operand<'_>> = operands[..5].to_vec();
+            // The pool's metadata for the kernel's types; its data is the output buffer.
+            let empty = Data::new(Buffer::try_alloc(0)?);
+            all.push((pool_meta, &empty));
+            all.push(operands[5]);
+            let y = self.gated_delta_slots_into(&all, outputs, buffer)?;
+            Ok(vec![y, base])
+        }
+
+        /// The gated delta rule over the states at `slots` of `pool` (read and written in
+        /// place); returns the outputs. `operands[5]` gives only the pool's metadata.
+        fn gated_delta_slots_into(
+            &mut self,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+            pool: &mut Buffer,
+        ) -> Result<Data> {
+            let mut y = Buffer::try_alloc_gpu(outputs[0].size * outputs[0].dtype.size())?;
+            if operands[0].0.shape[1] == 0 {
+                return Ok(Data::new(y));
+            }
+            let ins = operands[..5]
+                .iter()
+                .map(|&o| self.packed(o, true))
+                .collect::<Result<Vec<_>>>()?;
+            let slots = self.packed(operands[6], true)?;
+            let metas: Vec<&Output> = operands[..6].iter().map(|(m, _)| *m).collect();
+            self.gated_delta_into(
+                &ins,
+                None,
+                &metas,
+                Some(&slots),
+                DeltaMode::Slots,
+                (&mut y, pool),
+            )?;
+            Ok(Data::new(y))
+        }
+
+        /// The gated delta kernel (mlx-lm's, generated per head size; transformed for every
+        /// step's state or for states at slots of a pool) over `ins` (q, k, v, g, beta),
+        /// with the state read from `state` (or, without, from `out.1` in place).
+        #[allow(clippy::too_many_arguments)]
+        fn gated_delta_into(
+            &mut self,
+            ins: &[Packed<'_>],
+            state: Option<&Packed<'_>>,
+            metas: &[&Output],
+            slots: Option<&Packed<'_>>,
+            mode: DeltaMode,
+            (y, s): (&mut Buffer, &mut Buffer),
+        ) -> Result<()> {
+            let (q, v, g, st) = (metas[0], metas[2], metas[3], metas[5]);
+            let (b, t, hk, dk) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
+            let (hv, dv) = (v.shape[2], v.shape[3]);
             let packed =
-                dk == 128 && dv % 8 == 0 && g.dtype == DType::F32 && state.dtype == DType::F32;
-            let types: Vec<&str> = operands.iter().map(|o| msl_type(o.0.dtype)).collect();
+                dk == 128 && dv % 8 == 0 && g.dtype == DType::F32 && st.dtype == DType::F32;
+            let types: Vec<&str> = metas.iter().map(|m| msl_type(m.dtype)).collect();
             let name = format!(
                 "nuvec_gated_delta{}{}_{}_{}_{}_{}_dk{dk}_dv{dv}_hk{hk}_hv{hv}",
                 if packed { "_packed" } else { "" },
-                if steps { "_steps" } else { "" },
+                match mode {
+                    DeltaMode::Final => "",
+                    DeltaMode::Steps => "_steps",
+                    DeltaMode::Slots => "_slots",
+                },
                 types[0],
                 types[3],
                 types[4],
@@ -3152,11 +3332,18 @@ mod metal {
                 .device()
                 .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
             let source = || {
-                let body = match (packed, steps) {
-                    (true, false) => GATED_DELTA_PACKED.to_owned(),
-                    (false, false) => GATED_DELTA.to_owned(),
-                    (true, true) => every_step(GATED_DELTA_PACKED, PACKED_STORE, PACKED_STATE),
-                    (false, true) => every_step(GATED_DELTA, GENERIC_STORE, GENERIC_STATE),
+                let (base, store, state_ptr) = match packed {
+                    true => (GATED_DELTA_PACKED, PACKED_STORE, PACKED_STATE),
+                    false => (GATED_DELTA, GENERIC_STORE, GENERIC_STATE),
+                };
+                let body = match mode {
+                    DeltaMode::Final => base.to_owned(),
+                    DeltaMode::Steps => every_step(base, store, state_ptr),
+                    DeltaMode::Slots => at_slots(base),
+                };
+                let slots_param = match mode {
+                    DeltaMode::Slots => "const device int* slots [[buffer(9)]],\n",
+                    _ => "",
                 };
                 format!(
                     "#include <metal_stdlib>\nusing namespace metal;\n\
@@ -3165,7 +3352,7 @@ mod metal {
                      const device {in_t}* v [[buffer(2)]], const device {g_t}* g [[buffer(3)]],\n\
                      const device {b_t}* beta [[buffer(4)]], const device {st_t}* state_in [[buffer(5)]],\n\
                      device {in_t}* y [[buffer(6)]], device {st_t}* state_out [[buffer(7)]],\n\
-                     constant int& T [[buffer(8)]],\n\
+                     constant int& T [[buffer(8)]],\n{slots_param}\
                      uint3 thread_position_in_grid [[thread_position_in_grid]],\n\
                      uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],\n\
                      uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {{\n\
@@ -3183,11 +3370,19 @@ mod metal {
                 .map_err(backend)?;
             let steps = (t as i32).to_le_bytes();
             let mut args: Vec<Arg<'_>> = ins.iter().map(Packed::arg).collect();
+            // The state input: its own buffer, or (slots) the pool written in place.
+            args.push(match state {
+                Some(state) => state.arg(),
+                None => Arg::Same(7, 0),
+            });
             args.extend([
                 Arg::write(y.metal_mut().expect("device storage")),
                 Arg::write(s.metal_mut().expect("device storage")),
                 Arg::bytes(&steps),
             ]);
+            if let Some(slots) = slots {
+                args.push(slots.arg());
+            }
             let (grid, group) = if packed {
                 ([32, dv / 8, b * hv], [32, 2, 1])
             } else {
@@ -3196,8 +3391,7 @@ mod metal {
             self.command_buffer()?
                 .dispatch_threads(&pipeline, &args, grid, group)
                 .map_err(backend)?;
-            self.counted()?;
-            Ok(vec![Data::new(y), Data::new(s)])
+            self.counted()
         }
 
         /// The operand as it is if `ok` (and its strides are non-negative), else a
@@ -4257,7 +4451,7 @@ mod metal {
             self.index.retain(|_, (node, _)| node.strong_count() > 0);
         }
 
-        /// Takes over `node`'s output (one output) when this evaluation produced it and
+        /// Takes over output `output` of `node` when this evaluation produced it and
         /// nothing but the caller's input refers to it (donation within an evaluation).
         /// In the open command buffer, the node is held by that input and the open chunk,
         /// and its data by the chunk and the index: both entries are removed and the data
@@ -4270,20 +4464,20 @@ mod metal {
         pub(crate) fn take_pending(
             &mut self,
             node: &Arc<Node>,
+            output: usize,
             usable: impl Fn(&Data, usize) -> bool,
         ) -> Option<Data> {
             let key = Arc::as_ptr(node);
             let (_, outputs) = self.index.get(&key)?;
-            let [data] = outputs.as_slice() else {
-                return None;
-            };
+            let data = outputs.get(output)?;
             match self.chunk.iter().position(|(n, _)| Arc::ptr_eq(n, node)) {
                 Some(at) => {
                     if Arc::strong_count(node) != 2 || !usable(data, 2) {
                         return None;
                     }
                     self.index.remove(&key);
-                    self.chunk.remove(at).1.pop()
+                    // The node's other outputs go too: nothing else refers to the node.
+                    Some(self.chunk.remove(at).1.swap_remove(output))
                 }
                 None => {
                     // The index's handle and the node's in-flight one.

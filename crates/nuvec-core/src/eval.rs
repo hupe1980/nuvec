@@ -266,14 +266,15 @@ fn donation(
     if node.tracer || device.kind == DeviceKind::Cpu || !gpu.available(device) {
         return None;
     }
-    let writes_base = matches!(
-        primitive,
+    let base = match primitive {
         Primitive::SliceUpdate { .. }
-            | Primitive::Fast(crate::fast::FastOp::NormRope { cache: true, .. })
-            | Primitive::Fast(crate::fast::FastOp::PagedWrite)
-    );
-    if writes_base {
-        return owned(&mut inputs[0], gpu).map(|data| (0, data));
+        | Primitive::Fast(crate::fast::FastOp::NormRope { cache: true, .. })
+        | Primitive::Fast(crate::fast::FastOp::PagedWrite) => Some(0),
+        Primitive::Fast(crate::fast::FastOp::GatedDeltaSlots) => Some(5),
+        _ => None,
+    };
+    if let Some(at) = base {
+        return owned(&mut inputs[at], gpu).map(|data| (at, data));
     }
     let [out] = node.outputs.as_slice() else {
         return None;
@@ -324,9 +325,9 @@ fn in_place_inputs(
 /// computed earlier in this evaluation. The buffer's fences and the encoder's barriers
 /// order the write after the work that produces and reads it.
 fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
-    if input.output != 0 {
-        return None;
-    }
+    // Output `at` of the node (another output, if any, has no holder either: the node's
+    // only strong handle is this input).
+    let at = input.output as usize;
     let base = &mut input.node;
     let usable = |data: &Data, out: &crate::array::Output, handles: usize| {
         out.flags.row_contiguous
@@ -334,8 +335,8 @@ fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
             && Arc::strong_count(&data.buffer) == handles
     };
     // Produced earlier in this evaluation: taken over from it if nothing else refers to it.
-    if let [out] = base.outputs.as_slice()
-        && let Some(data) = gpu.take_pending(base, |data, handles| usable(data, out, handles))
+    if let Some(out) = base.outputs.get(at)
+        && let Some(data) = gpu.take_pending(base, at, |data, handles| usable(data, out, handles))
     {
         return Some(data);
     }
@@ -344,9 +345,7 @@ fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
     }
     // Finished: no pending work refers to it any more, so it is owned outright.
     if let Some(base) = Arc::get_mut(base) {
-        let [out] = base.outputs.as_mut_slice() else {
-            return None;
-        };
+        let out = base.outputs.get_mut(at)?;
         if let Some(Ok(data)) = out.slot.get() {
             // The slot and (if it was published from in-flight work) the in-flight copy.
             let handles = 1 + usize::from(out.inflight.get().is_some());
@@ -361,9 +360,7 @@ fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
         }
     }
     // In flight: only weak references from pending work remain besides ours.
-    let [out] = base.outputs.as_slice() else {
-        return None;
-    };
+    let out = base.outputs.get(at)?;
     if out.slot.get().is_some() {
         return None;
     }
@@ -406,6 +403,12 @@ fn in_place(
             .filter_map(|(a, d)| d.as_ref().map(|d| (a.out(), d)))
             .collect()
     };
+    if let Primitive::Fast(crate::fast::FastOp::GatedDeltaSlots) = primitive {
+        let pool = inputs[at].out();
+        let all = operands(0);
+        let datas = gpu.gated_delta_slots_in_place(&all, pool, base, &node.outputs)?;
+        return Ok((datas, true));
+    }
     let data = match primitive {
         Primitive::Fast(crate::fast::FastOp::PagedWrite) => {
             gpu.paged_write_in_place(base, &operands(1), out)?

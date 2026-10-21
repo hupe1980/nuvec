@@ -214,6 +214,98 @@ fn logits_are_bit_identical_across_runs() {
     }
 }
 
+/// Batched greedy decoding over a paged cache gives each sequence the tokens it gets alone:
+/// sequences of different lengths, one leaving early, and its blocks (and state slot)
+/// reused by a new one.
+#[test]
+fn paged_batched_decoding_equals_decoding_each_sequence_alone() {
+    use nuvec_lm::{PagedCache, decode_batch};
+    if !gpu() {
+        return;
+    }
+    // Hybrids keep their Gated DeltaNet states at state slots.
+    for name in [
+        "qwen3_f32",
+        "llama_bf16",
+        "qwen3_moe_f32",
+        "qwen3_5_f32",
+        "qwen3_5_moe_f32",
+    ] {
+        let (dir, prompt, ..) = fixture(name);
+        let model = load_model(&dir).unwrap();
+        let prompts: Vec<Vec<u32>> = [prompt.len(), prompt.len() / 2, 3, prompt.len() * 2]
+            .iter()
+            .map(|&n| prompt.iter().cycle().take(n.max(2)).copied().collect())
+            .collect();
+        let steps = 12;
+        let alone: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| {
+                let options = GenerateOptions {
+                    max_tokens: steps,
+                    ..Default::default()
+                };
+                generate(&model, p, options)
+                    .unwrap()
+                    .collect::<nuvec::Result<_>>()
+                    .unwrap()
+            })
+            .collect();
+        // Prefill all but the last prompt token into a contiguous cache, then page it.
+        let mut cache = PagedCache::new(&model, 64, 8, 4).unwrap();
+        let add = |cache: &mut PagedCache, p: &[u32]| {
+            let mut kv = model.new_cache();
+            let head = Array::from_slice(&p[..p.len() - 1], &[1, p.len() - 1]).unwrap();
+            model.forward(&head, &mut kv).unwrap();
+            cache.insert(&kv).unwrap()
+        };
+        // The first three decode together; the fourth joins when the second leaves.
+        let mut live: Vec<(usize, usize, u32)> = (0..3)
+            .map(|i| (i, add(&mut cache, &prompts[i]), *prompts[i].last().unwrap()))
+            .collect();
+        let mut got: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+        while !live.is_empty() {
+            let tokens: Vec<u32> = live.iter().map(|&(_, _, t)| t).collect();
+            let ids: Vec<usize> = live.iter().map(|&(_, id, _)| id).collect();
+            let logits = decode_batch(&model, &tokens, &ids, &mut cache).unwrap();
+            let next = nuvec::argmax(&logits, Some(-1), false)
+                .unwrap()
+                .to_vec::<u32>()
+                .unwrap();
+            for (entry, &t) in live.iter_mut().zip(&next) {
+                got[entry.0].push(t);
+                entry.2 = t;
+            }
+            let mut finished = Vec::new();
+            for &(i, id, _) in &live {
+                let limit = if i == 1 { steps / 2 } else { steps };
+                if got[i].len() == limit {
+                    finished.push((i, id));
+                }
+            }
+            for (i, id) in finished {
+                cache.remove(id).unwrap();
+                live.retain(|&(j, _, _)| j != i);
+                if i == 1 {
+                    live.push((3, add(&mut cache, &prompts[3]), *prompts[3].last().unwrap()));
+                }
+            }
+        }
+        for (i, want) in alone.iter().enumerate() {
+            let want = if i == 1 {
+                &want[..steps / 2]
+            } else {
+                &want[..]
+            };
+            assert_eq!(got[i], want, "{name}: sequence {i}");
+        }
+        assert!(
+            cache.is_empty() && cache.free_blocks() == 64,
+            "{name}: blocks returned"
+        );
+    }
+}
+
 #[test]
 fn the_cache_grows_past_its_first_capacity() {
     if !gpu() {

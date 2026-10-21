@@ -9,14 +9,29 @@ All notable changes to nuvec are documented here. The format follows
 ### Added
 - `fast::paged_attention` and `fast::paged_write`: attention over a block-table KV cache
   for a batch of sequences of different lengths, and the write of new positions into it.
+- `nuvec_lm::PagedCache` and `decode_batch`: several sequences of different lengths decode
+  in one forward pass over a paged KV cache, hybrid (Gated DeltaNet) models included, with
+  the same tokens each gets alone; at 8 sequences Qwen3-8B reaches 149 tok/s and
+  Qwen3.6-35B-A3B 223 tok/s in total.
+- `fast::gated_delta_slots`: the gated delta rule for a batch whose states live at slots of a
+  state pool, updated in place.
 
 ### Changed
 - Element-wise operations and softmax write into an input buffer the evaluation owns, and
   large intermediates are released as soon as nothing refers to them (as MLX): attention
   without a fused kernel holds one score matrix instead of three, and Qwen3.6-35B-A3B
   prefill at 32K tokens needs 5 GB of activations instead of 12 GB.
+- Element-wise and copy kernels over strided layouts use 32-bit offsets when they fit
+  (Apple GPUs emulate 64-bit integer products): a broadcast `where` over attention scores
+  is 1.5× faster.
+- Attention with head size 256 uses the tiled kernel for causal prefill chunks over up to
+  8,192 keys (measured faster), the composition beyond: Qwen3.6-35B-A3B prefill at 32K
+  tokens 0.89× → 0.96–0.97× mlx-lm.
 
 ### Fixed
+- Attention with head size 192 or 256 over very long caches ran out of memory (it
+  materialised scores of many gigabytes); it now uses the tiled kernel above 4 GiB of
+  scores. Qwen3.6-35B-A3B prefills a 252K-token prompt.
 - `slice_update` on the CPU reads a strided update in place instead of copying it first.
 - `slice_update` (and `norm_rope` into a cache) writes in place into a base computed
   earlier in the same evaluation instead of copying it, so a chain of updates evaluated at

@@ -42,12 +42,27 @@ template <typename S, typename D>
     out[out3(p, shape)] = convert<S, D>(a[a_off + loc3(p, a_strides)]);
 }
 
+// `cast_g3` with 32-bit offsets (see elementwise.metal's `_g3s`).
+template <typename S, typename D>
+[[kernel]] void cast_g3s(
+    device const S* a [[buffer(0)]],
+    device D* out [[buffer(1)]],
+    constant long& a_off [[buffer(2)]],
+    constant int* shape [[buffer(3)]],
+    constant long* a_strides [[buffer(4)]],
+    constant int& ndim [[buffer(5)]],
+    uint3 p [[thread_position_in_grid]]) {
+    out[out3s(p, shape)] = convert<S, D>((a + a_off)[loc3s(p, a_strides)]);
+}
+
 #define NUVEC_CAST(sname, S, dname, D)                                                               \
     template [[host_name("nuvec_cast_" #sname "_" #dname "_c")]] [[kernel]] void cast_c<S, D>(       \
         device const S*, device D*, constant long&, constant uint&, uint);                          \
     template [[host_name("nuvec_cast_" #sname "_" #dname "_g")]] [[kernel]] void cast_g<S, D>(       \
         device const S*, device D*, constant long&, constant int*, constant long*, constant int&, uint); \
     template [[host_name("nuvec_cast_" #sname "_" #dname "_g3")]] [[kernel]] void cast_g3<S, D>(     \
+        device const S*, device D*, constant long&, constant int*, constant long*, constant int&, uint3); \
+    template [[host_name("nuvec_cast_" #sname "_" #dname "_g3s")]] [[kernel]] void cast_g3s<S, D>(   \
         device const S*, device D*, constant long&, constant int*, constant long*, constant int&, uint3);
 
 #define NUVEC_CAST_FROM(sname, S)                    \

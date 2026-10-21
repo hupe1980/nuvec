@@ -390,6 +390,24 @@ impl KvCache {
         Ok(())
     }
 
+    /// The cached keys and values of an attention layer, `[B, kv_heads, offset, head_dim]`
+    /// (views), if any.
+    pub(crate) fn keys_values(&self) -> Result<Option<(Array, Array)>> {
+        match (&self.keys, &self.values) {
+            (Some(k), Some(v)) => Ok(Some((
+                positions(k, self.offset)?,
+                positions(v, self.offset)?,
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    /// A Gated DeltaNet layer's convolution and recurrent states (`[B, kernel − 1,
+    /// channels]` and `[B, Hv, Dv, Dk]`), if any.
+    pub(crate) fn linear_state(&self) -> Option<(Array, Array)> {
+        Some((self.conv.clone()?, self.recurrent.clone()?))
+    }
+
     /// The cached arrays (to evaluate them).
     pub fn state(&self) -> Vec<Array> {
         [&self.keys, &self.values, &self.conv, &self.recurrent]
@@ -497,6 +515,96 @@ impl Attention {
         let (k, v) = cache.update(keys, v)?;
         let o = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None)?;
         let o = transpose(&o, &[0, 2, 1, 3])?.reshape(&[b, l, -1])?;
+        match gate {
+            Some(g) => self.o_proj.forward(&multiply(&o, sigmoid(&g)?)?),
+            None => self.o_proj.forward(&o),
+        }
+    }
+}
+
+/// One attention layer's paged keys and values, `[blocks, kv_heads, block_size,
+/// head_dim]` each ([`crate::PagedCache`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PagedLayer {
+    pub(crate) keys: Option<Array>,
+    pub(crate) values: Option<Array>,
+    /// A Gated DeltaNet layer's states, one slot per sequence: the convolution's last
+    /// inputs `[slots, kernel − 1, channels]` and the recurrent states `[slots, Hv, Dv, Dk]`.
+    pub(crate) conv: Option<Array>,
+    pub(crate) recurrent: Option<Array>,
+}
+
+/// What one batched decoding step writes and reads, per sequence (`[B]`, int32): the slot
+/// of its new position, its position (for RoPE), its length after the step, its block
+/// table (`[B, max_blocks]`) and its Gated DeltaNet state slot.
+#[derive(Debug, Clone)]
+pub(crate) struct PagedStep {
+    pub(crate) slots: Array,
+    pub(crate) positions: Array,
+    pub(crate) lengths: Array,
+    pub(crate) tables: Array,
+    pub(crate) state_slots: Array,
+}
+
+impl Attention {
+    /// One new position per sequence (`x` is `[B, 1, D]`) over a paged cache: the query
+    /// and key normalised and rotated at each sequence's position, the key and value
+    /// written into their slots, then attention through the block tables.
+    fn forward_paged(&self, x: &Array, layer: &mut PagedLayer, step: &PagedStep) -> Result<Array> {
+        let b = x.shape()[0] as isize;
+        // `[B, 1, H·D]` normalised per head, then as `[B, H, 1, D]` rotated at each
+        // sequence's position (as `norm_rope`, unfused: the positions differ).
+        let prepared = |h: Array, n: usize, norm: Option<&RmsNorm>| -> Result<Array> {
+            let h = h.reshape(&[b, 1, n as isize, -1])?;
+            let h = match norm {
+                Some(norm) => norm.forward(&h)?,
+                None => h,
+            };
+            let r = self.rope.rotation();
+            fast::rope(
+                &transpose(&h, &[0, 2, 1, 3])?,
+                r.dims,
+                r.traditional,
+                r.base,
+                r.scale,
+                &step.positions,
+                r.freqs,
+            )
+        };
+        // With an output gate, each head's projection is its query, then its gate.
+        let (q, gate) = match self.gate {
+            false => (self.q_proj.forward(x)?, None),
+            true => {
+                let qg = self
+                    .q_proj
+                    .forward(x)?
+                    .reshape(&[b, 1, self.heads as isize, -1])?;
+                let half = qg.shape()[3] / 2;
+                let mut parts = split_at(&qg, &[half], -1)?;
+                let g = parts.pop().expect("two parts").reshape(&[b, 1, -1])?;
+                (parts.pop().expect("two parts"), Some(g))
+            }
+        };
+        let q = prepared(q, self.heads, self.q_norm.as_ref())?;
+        let k = prepared(self.k_proj.forward(x)?, self.kv_heads, self.k_norm.as_ref())?;
+        let rows = |a: &Array| a.reshape(&[b, self.kv_heads as isize, -1]);
+        let v = self.v_proj.forward(x)?;
+        // The pools are taken out of the cache first, so the writes are done in place.
+        let missing = || nuvec::Error::InvalidArgument("paged decoding: no cache".into());
+        let keys = fast::paged_write(
+            &layer.keys.take().ok_or_else(missing)?,
+            &rows(&k)?,
+            &step.slots,
+        )?;
+        let values = fast::paged_write(
+            &layer.values.take().ok_or_else(missing)?,
+            &rows(&v)?,
+            &step.slots,
+        )?;
+        layer.keys = Some(keys.clone());
+        layer.values = Some(values.clone());
+        let o = fast::paged_attention(&q, &keys, &values, &step.tables, &step.lengths, self.scale)?;
+        let o = transpose(&o, &[0, 2, 1, 3])?.reshape(&[b, 1, -1])?;
         match gate {
             Some(g) => self.o_proj.forward(&multiply(&o, sigmoid(&g)?)?),
             None => self.o_proj.forward(&o),
@@ -679,6 +787,60 @@ impl GatedDeltaNet {
         let out = gated_norm(&out, &z, &self.norm)?;
         self.out_proj
             .forward(&out.reshape(&[b as isize, l as isize, -1])?)
+    }
+}
+
+impl GatedDeltaNet {
+    /// One new position per sequence (`x` is `[B, 1, D]`) with each sequence's states at
+    /// its slot of the layer's pools: the convolution's inputs gathered and written back,
+    /// the recurrent states updated in place ([`fast::gated_delta_slots`]).
+    fn forward_paged(&self, x: &Array, layer: &mut PagedLayer, step: &PagedStep) -> Result<Array> {
+        let LinearAttention {
+            key_heads: hk,
+            value_heads: hv,
+            key_head_dim: dk,
+            value_head_dim: dv,
+            conv_kernel: kernel,
+        } = self.sizes;
+        let b = x.shape()[0];
+        let missing = || nuvec::Error::InvalidArgument("paged decoding: no state pool".into());
+        let qkv = self.in_proj_qkv.forward(x)?;
+        let z = self.in_proj_z.forward(x)?;
+        let (beta, a) = (self.in_proj_b.forward(x)?, self.in_proj_a.forward(x)?);
+        // The convolution's last inputs of each sequence, then the new ones written back.
+        let conv_pool = layer.conv.take().ok_or_else(missing)?;
+        let state = take(&conv_pool, &step.state_slots, Some(0))?;
+        let input = concatenate(&[state, qkv], 1)?;
+        let kept = slice(
+            &input,
+            &[
+                SliceArg::full(),
+                SliceArg::new(Some(1), Some(kernel as isize), 1),
+                SliceArg::full(),
+            ],
+        )?;
+        let at = broadcast_to(&step.state_slots.reshape(&[-1, 1, 1])?, kept.shape())?;
+        layer.conv = Some(nuvec::put_along_axis(&conv_pool, &at, &kept, 0)?);
+        let conv = causal_conv_silu(&input, &self.conv1d)?;
+        let mut parts = split_at(&conv, &[hk * dk, 2 * hk * dk], -1)?;
+        let shaped =
+            |a: Array, h: usize, d: usize| a.reshape(&[b as isize, 1, h as isize, d as isize]);
+        let v = shaped(parts.pop().expect("three parts"), hv, dv)?;
+        let k = shaped(parts.pop().expect("three parts"), hk, dk)?;
+        let q = shaped(parts.pop().expect("three parts"), hk, dk)?;
+        let inv = (dk as f32).powf(-0.5);
+        let eps = 1e-6 * inv * inv;
+        let q = multiply(&nuvec::fast::rms_norm(&q, None, eps)?, f64::from(inv * inv))?;
+        let k = multiply(&nuvec::fast::rms_norm(&k, None, eps)?, f64::from(inv))?;
+        let g = decay(&a, &self.dt_bias, &self.a_log)?;
+        let beta = sigmoid(&beta)?;
+        let pool = layer.recurrent.take().ok_or_else(missing)?;
+        let (out, pool) =
+            nuvec::fast::gated_delta_slots(&q, &k, &v, &g, &beta, &pool, &step.state_slots)?;
+        layer.recurrent = Some(pool);
+        let z = z.reshape(&[b as isize, 1, hv as isize, dv as isize])?;
+        let out = gated_norm(&out, &z, &self.norm)?;
+        self.out_proj.forward(&out.reshape(&[b as isize, 1, -1])?)
     }
 }
 
@@ -995,6 +1157,29 @@ impl Block {
     }
 }
 
+impl Block {
+    /// [`Block::forward`] for one new position per sequence over a paged cache.
+    fn forward_paged(
+        &self,
+        x: &Array,
+        pending: Option<&Array>,
+        layer: &mut PagedLayer,
+        step: &PagedStep,
+    ) -> Result<(Array, Array)> {
+        let (x, n) = add_norm(x, pending, &self.input_layernorm)?;
+        let mixed = match &self.mixer {
+            Mixer::Attention(a) => a.forward_paged(&n, layer, step)?,
+            Mixer::Linear(l) => l.forward_paged(&n, layer, step)?,
+        };
+        let (h, n) = add_norm(&x, Some(&mixed), &self.post_attention_layernorm)?;
+        let mlp = match &self.mlp {
+            BlockMlp::Dense(m) => m.forward(&n)?,
+            BlockMlp::Moe(m) => m.forward(&n)?,
+        };
+        Ok((h, mlp))
+    }
+}
+
 impl Module for Block {
     fn visit(&mut self, p: &mut Parameters<'_>) {
         match &mut self.mixer {
@@ -1112,6 +1297,29 @@ impl Model {
         let mut pending = None;
         for (layer, c) in self.model.layers.iter().zip(cache) {
             let (next, mlp) = layer.forward(&h, pending.as_ref(), mask, c)?;
+            (h, pending) = (next, Some(mlp));
+        }
+        let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm)?;
+        match &self.lm_head {
+            Some(head) => head.forward(&h),
+            None => self.model.embed_tokens.as_linear(&h),
+        }
+    }
+}
+
+impl Model {
+    /// The logits `[B, 1, vocab]` for one new token per sequence (`tokens` `[B, 1]`) over
+    /// a paged cache (one [`PagedLayer`] per layer).
+    pub(crate) fn forward_paged(
+        &self,
+        tokens: &Array,
+        layers: &mut [PagedLayer],
+        step: &PagedStep,
+    ) -> Result<Array> {
+        let mut h = self.model.embed_tokens.forward(tokens)?;
+        let mut pending = None;
+        for (layer, pages) in self.model.layers.iter().zip(layers) {
+            let (next, mlp) = layer.forward_paged(&h, pending.as_ref(), pages, step)?;
             (h, pending) = (next, Some(mlp));
         }
         let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm)?;

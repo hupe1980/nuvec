@@ -35,6 +35,7 @@ use nuvec_nn::Module;
 pub mod config;
 pub mod generate;
 pub mod model;
+pub mod paged;
 pub mod sample;
 pub mod speculative;
 pub mod tokenizer;
@@ -42,6 +43,7 @@ pub mod tokenizer;
 pub use config::Config;
 pub use generate::{GenerateOptions, Generation, WiredLimit, generate};
 pub use model::{KvCache, Model};
+pub use paged::{PagedCache, SeqId, decode_batch};
 pub use sample::Sampler;
 pub use speculative::{
     Drafter, PromptLookup, SpeculativeGeneration, SpeculativeStats, speculative_generate,

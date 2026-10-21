@@ -274,4 +274,13 @@ inline long out3(uint3 p, constant int* shape) {
     return (long(p.z) * shape[1] + p.y) * shape[2] + p.x;
 }
 
+// `loc3` and `out3` in 32-bit arithmetic, for layouts whose offsets stay below 2^31: Apple
+// GPUs emulate 64-bit integer products (MLX's general kernels take `int` indices then).
+inline int loc3s(uint3 p, constant long* strides) {
+    return int(p.z) * int(strides[0]) + int(p.y) * int(strides[1]) + int(p.x) * int(strides[2]);
+}
+inline int out3s(uint3 p, constant int* shape) {
+    return (int(p.z) * shape[1] + int(p.y)) * shape[2] + int(p.x);
+}
+
 } // namespace nuvec

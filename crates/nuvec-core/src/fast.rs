@@ -143,6 +143,9 @@ pub enum FastOp {
         /// The state after every step (`[B, T, Hv, Dv, Dk]`) instead of the final one.
         steps: bool,
     },
+    /// `(q, k, v, g, beta, pool, slots)`: [`gated_delta_slots`], with the outputs and the
+    /// updated pool.
+    GatedDeltaSlots,
     /// `(a, b, lhs_indices, rhs_indices[, offsets])`: matrix products of gathered batches
     /// (see [`crate::gather_mm`]), as [`FastOp::GatherQmm`] in full precision.
     GatherMm,
@@ -506,7 +509,7 @@ impl FastOp {
             Self::CrossEntropy => "cross_entropy",
             Self::CrossEntropyVjp => "cross_entropy_vjp",
             Self::Attention { .. } => "scaled_dot_product_attention",
-            Self::GatedDelta { .. } => "gated_delta",
+            Self::GatedDelta { .. } | Self::GatedDeltaSlots => "gated_delta",
             Self::GatherQmm { .. } => "gather_qmm",
             Self::GatherMm => "gather_mm",
         }
@@ -527,6 +530,7 @@ impl FastOp {
                 .clamp(2 + usize::from(*cache), 3 + usize::from(*cache)),
             Self::Attention { mask, sinks, .. } => 3 + usize::from(*mask) + usize::from(*sinks),
             Self::GatedDelta { .. } => 6,
+            Self::GatedDeltaSlots => 7,
             Self::GatherQmm { .. } => inputs.len().clamp(6, 7),
             Self::GatherMm => inputs.len().clamp(4, 5),
         };
@@ -571,6 +575,9 @@ impl FastOp {
                 let mut shape = x.shape().to_vec();
                 shape[3] = inputs[2].shape()[3];
                 vec![(x.dtype(), shape)]
+            }
+            Self::GatedDeltaSlots => {
+                vec![(x.dtype(), inputs[2].shape().to_vec()), like(&inputs[5])]
             }
             Self::GatedDelta { steps } => {
                 let state = match steps {
@@ -753,6 +760,18 @@ impl FastOp {
             Self::PagedWrite => vec![paged_write_graph(inputs)?],
             Self::Softmax => vec![softmax_graph(x)?],
             Self::GatedDelta { steps } => gated_delta_graph(inputs, *steps)?,
+            Self::GatedDeltaSlots => {
+                // The states at the slots, the rule, then the new states back at the slots.
+                let (pool, slots) = (&inputs[5], &inputs[6]);
+                let states = crate::take(pool, slots, Some(0))?;
+                let mut args = inputs[..5].to_vec();
+                args.push(states);
+                let mut out = gated_delta_graph(&args, false)?;
+                let new = out.pop().expect("two outputs");
+                let at = broadcast_to(&reshape(slots, &[-1, 1, 1, 1])?, new.shape())?;
+                let pool = crate::put_along_axis(pool, &at, &new, 0)?;
+                vec![out.pop().expect("two outputs"), pool]
+            }
             Self::GatherMm => {
                 let rows = |a: &Array, indices: &Array| -> Result<Array> {
                     let nd = a.ndim();
@@ -891,6 +910,7 @@ impl FastOp {
             | Self::CrossEntropyVjp
             | Self::Attention { .. }
             | Self::GatedDelta { .. }
+            | Self::GatedDeltaSlots
             | Self::GatherQmm { .. }
             | Self::GatherMm => self.fallback_vjp(inputs, cotangents, wanted),
         }
@@ -1498,10 +1518,16 @@ fn attention_kernel(inputs: &[Array], causal: bool, has_mask: bool) -> bool {
             (d == dv && matches!(d, 64 | 72 | 80 | 96 | 128 | 192 | 256)) || (d, dv) == (96, 64);
         let causal_ok = !causal || lq <= lk;
         // MLX: the composition is faster for these head sizes, except long causal
-        // self-attention in half precision.
+        // self-attention in half precision. Measured on an M4 Pro, the tiled kernel is faster
+        // for causal chunks of 1,024 queries or more over up to 8,192 keys (prefill chunks;
+        // up to 21%, in every dtype), the composition beyond and for shorter chunks. The
+        // composition materialises the scores, so above 4 GiB of them (a 2,048-token chunk
+        // over ~64K keys and more) the tiled kernel runs anyway.
+        let scores = q.shape()[0] * q.shape()[1] * lq * lk * q.dtype().size();
+        let huge = scores > 4 << 30;
         let slow = match d {
-            192 => true,
-            256 => !(q.dtype() != DType::F32 && causal && lq >= 2048 && lq == lk),
+            192 => !huge,
+            256 => !(huge || (causal && lq >= 1024 && lk <= 8192)),
             _ => false,
         };
         head && causal_ok && !slow
@@ -1648,6 +1674,65 @@ pub fn gated_delta_steps(
     state: &Array,
 ) -> Result<(Array, Array)> {
     gated_delta_op(q, k, v, g, beta, state, true)
+}
+
+/// [`gated_delta`] for a batch of sequences whose states live in a pool: sequence `b`
+/// starts from `pool[slots[b]]` (`pool` is `[slots, Hv, Dv, Dk]`, `slots` `[B]` integers,
+/// distinct) and its final state replaces it. Returns the outputs and the updated pool,
+/// which is written in place when the evaluation owns it, so decoding many sequences
+/// moves no states. Each sequence's results equal [`gated_delta`]'s on its state alone.
+pub fn gated_delta_slots(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    pool: &Array,
+    slots: &Array,
+) -> Result<(Array, Array)> {
+    check_inputs(&[pool, slots])?;
+    let b = q.shape().first().copied().unwrap_or(0);
+    let fits = pool.ndim() == 4
+        && slots.shape() == [b]
+        && matches!(
+            slots.dtype().category(),
+            Category::Signed | Category::Unsigned
+        );
+    if !fits {
+        return Err(Error::InvalidArgument(format!(
+            "gated_delta_slots: pool must be [slots, Hv, Dv, Dk] and slots [{b}] integers, got \
+             {:?} and {} {:?}",
+            pool.shape(),
+            slots.dtype(),
+            slots.shape()
+        )));
+    }
+    // The checks of `gated_delta`, on one slot's state.
+    let one = crate::take(pool, &reshape(&astype(slots, DType::I32)?, &[-1])?, Some(0))?;
+    gated_delta_op(q, k, v, g, beta, &one, false)?;
+    let inputs = vec![
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        g.clone(),
+        beta.clone(),
+        pool.clone(),
+        astype(slots, DType::I32)?,
+    ];
+    let kernel = on_gpu(q.dtype(), q.size())
+        && q.dtype() == v.dtype()
+        && q.shape()[3].is_multiple_of(32)
+        && [g, beta, pool]
+            .iter()
+            .all(|a| matches!(a.dtype(), DType::F16 | DType::BF16 | DType::F32));
+    let op = FastOp::GatedDeltaSlots;
+    let mut out = if kernel {
+        Array::from_op(Primitive::Fast(op), inputs)?
+    } else {
+        op.fallback(&inputs)?
+    };
+    let pool = out.pop().expect("two outputs");
+    Ok((out.pop().expect("two outputs"), pool))
 }
 
 fn gated_delta_op(
