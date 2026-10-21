@@ -1,7 +1,8 @@
 //! Fused operations with dedicated GPU kernels, as MLX's `mx.fast`: [`rms_norm`],
 //! [`layer_norm`], [`rope`], [`cross_entropy`], [`scaled_dot_product_attention`] and
 //! [`gated_delta`] (mlx-lm's Gated DeltaNet kernels); nuvec's [`add_rms_norm`] (a residual
-//! connection and its norm) and [`norm_rope`] (norm, RoPE and a cache write); and, through
+//! connection and its norm), [`norm_rope`] (norm, RoPE and a cache write) and
+//! [`paged_attention`] with [`paged_write`] (a block-table KV cache); and, through
 //! [`crate::softmax`] and [`crate::logsumexp`] over the last axis, MLX's softmax and
 //! log-sum-exp kernels.
 //!
@@ -109,6 +110,13 @@ pub enum FastOp {
         /// Positions between taps.
         dilation: usize,
     },
+    /// `(q, k_cache, v_cache, block_tables, lengths)`: [`paged_attention`].
+    PagedAttention {
+        /// `f32::to_bits` of the score scale.
+        scale: u32,
+    },
+    /// `(cache, new, slots)`: [`paged_write`].
+    PagedWrite,
     /// `(x)`: softmax over the last axis, accumulated in float32.
     Softmax,
     /// `(x)`: `log(sum(exp(x)))` over the last axis, which becomes size 1.
@@ -491,6 +499,8 @@ impl FastOp {
             Self::Rope { .. } => "rope",
             Self::NormRope { .. } => "norm_rope",
             Self::DepthwiseConv1d { .. } => "conv1d",
+            Self::PagedAttention { .. } => "paged_attention",
+            Self::PagedWrite => "paged_write",
             Self::Softmax => "softmax",
             Self::LogSumExp => "logsumexp",
             Self::CrossEntropy => "cross_entropy",
@@ -507,6 +517,8 @@ impl FastOp {
         let arity = match self {
             Self::Softmax | Self::LogSumExp => 1,
             Self::RmsNorm { .. } | Self::CrossEntropy | Self::DepthwiseConv1d { .. } => 2,
+            Self::PagedAttention { .. } => 5,
+            Self::PagedWrite => 3,
             Self::AddRmsNorm { .. } | Self::RmsNormVjp { .. } | Self::LayerNorm { .. } => 3,
             Self::LayerNormVjp { .. } | Self::CrossEntropyVjp => 4,
             Self::Rope { .. } => inputs.len().clamp(2, 3),
@@ -541,6 +553,7 @@ impl FastOp {
                 vec![(x.dtype(), shape)]
             }
             Self::AddRmsNorm { .. } => vec![like(x), like(x)],
+            Self::PagedAttention { .. } | Self::PagedWrite => vec![like(x)],
             Self::DepthwiseConv1d {
                 stride,
                 padding,
@@ -736,6 +749,8 @@ impl FastOp {
                     (*stride, *padding, *dilation, c),
                 )?]
             }
+            Self::PagedAttention { scale } => vec![paged_attention_graph(inputs, float(*scale))?],
+            Self::PagedWrite => vec![paged_write_graph(inputs)?],
             Self::Softmax => vec![softmax_graph(x)?],
             Self::GatedDelta { steps } => gated_delta_graph(inputs, *steps)?,
             Self::GatherMm => {
@@ -868,6 +883,8 @@ impl FastOp {
             }
             Self::AddRmsNorm { .. }
             | Self::NormRope { .. }
+            | Self::PagedAttention { .. }
+            | Self::PagedWrite
             | Self::DepthwiseConv1d { .. }
             | Self::RmsNormVjp { .. }
             | Self::LayerNormVjp { .. }
@@ -1188,6 +1205,195 @@ fn norm_rope_graph(
         }
         None => Ok(r),
     }
+}
+
+/// Attention over a paged KV cache, for a batch of sequences of different lengths.
+///
+/// Keys and values live in blocks of positions, `k_cache` and `v_cache` being
+/// `[blocks, kv_heads, block_size, D]`; sequence `b` keeps its positions in the blocks
+/// `block_tables[b]` lists (`[B, max_blocks]`, integers; entries past the sequence's blocks
+/// are ignored but must be valid block indices). `q` is `[B, Hq, L, D]` (`Hq` a multiple of
+/// `kv_heads`): the last `L` positions of each sequence, whose keys are already in the
+/// cache. Query `l` of sequence `b` attends positions `0..=lengths[b] − L + l` (causal at
+/// the end; `lengths[b] ≥ L`). Returns `[B, Hq, L, D]`.
+///
+/// On the GPU this is MLX's vector attention (one pass, or two for long caches) reading
+/// keys through the block table, for head sizes 64, 128 and 256 and power-of-two block
+/// sizes (others run the composition). Each sequence's result equals
+/// [`scaled_dot_product_attention`]'s vector kernel over the same keys stored contiguously
+/// when both take the same number of passes.
+pub fn paged_attention(
+    q: &Array,
+    k_cache: &Array,
+    v_cache: &Array,
+    block_tables: &Array,
+    lengths: &Array,
+    scale: f32,
+) -> Result<Array> {
+    check_inputs(&[q, k_cache, v_cache, block_tables, lengths])?;
+    let invalid = |msg: String| Err(Error::InvalidArgument(format!("paged_attention: {msg}")));
+    floating("paged_attention", q.dtype())?;
+    if q.ndim() != 4 || k_cache.ndim() != 4 || k_cache.shape() != v_cache.shape() {
+        return invalid(format!(
+            "q must be [B, Hq, L, D] and the caches [blocks, Hkv, block_size, D], got {:?}, \
+             {:?}, {:?}",
+            q.shape(),
+            k_cache.shape(),
+            v_cache.shape()
+        ));
+    }
+    let (b, hq, d) = (q.shape()[0], q.shape()[1], q.shape()[3]);
+    let hkv = k_cache.shape()[1];
+    if k_cache.shape()[3] != d || hkv == 0 || hq % hkv != 0 {
+        return invalid(format!(
+            "q's heads ({hq}) must be a multiple of the caches' ({hkv}), with head size {d}"
+        ));
+    }
+    let integer = |a: &Array| matches!(a.dtype().category(), Category::Signed | Category::Unsigned);
+    if block_tables.ndim() != 2 || block_tables.shape()[0] != b || !integer(block_tables) {
+        return invalid(format!(
+            "block_tables must be [{b}, max_blocks] integers, got {} {:?}",
+            block_tables.dtype(),
+            block_tables.shape()
+        ));
+    }
+    if lengths.shape() != [b] || !integer(lengths) {
+        return invalid(format!(
+            "lengths must be [{b}] integers, got {} {:?}",
+            lengths.dtype(),
+            lengths.shape()
+        ));
+    }
+    let dtype = q.dtype();
+    let inputs = vec![
+        q.clone(),
+        astype(k_cache, dtype)?,
+        astype(v_cache, dtype)?,
+        astype(block_tables, DType::I32)?,
+        astype(lengths, DType::I32)?,
+    ];
+    let op = FastOp::PagedAttention {
+        scale: scale.to_bits(),
+    };
+    // The kernels use 32-bit offsets into the caches.
+    let small = k_cache.size() < u32::MAX as usize;
+    if matches!(d, 64 | 128 | 256) && k_cache.shape()[2].is_power_of_two() && small {
+        one(op, inputs)
+    } else {
+        Ok(op.fallback(&inputs)?.swap_remove(0))
+    }
+}
+
+/// `cache` (`[blocks, kv_heads, block_size, D]`) with the positions `new` holds
+/// (`[T, kv_heads, D]`) written into their slots: `slots[t]` (integers, `[T]`) is block
+/// `slots[t] / block_size`, position `slots[t] % block_size`. Slots must be distinct. In
+/// place when the evaluation owns the cache, as [`crate::slice_update`].
+pub fn paged_write(cache: &Array, new: &Array, slots: &Array) -> Result<Array> {
+    check_inputs(&[cache, new, slots])?;
+    let invalid = |msg: String| Err(Error::InvalidArgument(format!("paged_write: {msg}")));
+    let fits = cache.ndim() == 4
+        && new.ndim() == 3
+        && new.shape()[1] == cache.shape()[1]
+        && new.shape()[2] == cache.shape()[3];
+    if !fits || slots.shape() != [new.shape().first().copied().unwrap_or(0)] {
+        return invalid(format!(
+            "cache must be [blocks, Hkv, block_size, D], new [T, Hkv, D] and slots [T], got \
+             {:?}, {:?}, {:?}",
+            cache.shape(),
+            new.shape(),
+            slots.shape()
+        ));
+    }
+    if !matches!(
+        slots.dtype().category(),
+        Category::Signed | Category::Unsigned
+    ) {
+        return invalid(format!("slots must be integers, got {}", slots.dtype()));
+    }
+    let inputs = vec![
+        cache.clone(),
+        astype(new, cache.dtype())?,
+        astype(slots, DType::I32)?,
+    ];
+    one(FastOp::PagedWrite, inputs)
+}
+
+/// The keys of every listed block per sequence, `[B, Hkv, max_blocks · block_size, D]`.
+fn paged_keys(cache: &Array, tables: &Array) -> Result<Array> {
+    let (b, max_blocks) = (tables.shape()[0], tables.shape()[1]);
+    let (hkv, bs, d) = (cache.shape()[1], cache.shape()[2], cache.shape()[3]);
+    let gathered = crate::take(cache, &reshape(tables, &[-1])?, Some(0))?; // [B·M, Hkv, bs, D]
+    let gathered = reshape(
+        &gathered,
+        &[
+            b as isize,
+            max_blocks as isize,
+            hkv as isize,
+            bs as isize,
+            d as isize,
+        ],
+    )?;
+    let gathered = crate::transpose(&gathered, &[0, 2, 1, 3, 4])?;
+    reshape(
+        &gathered,
+        &[
+            b as isize,
+            hkv as isize,
+            (max_blocks * bs) as isize,
+            d as isize,
+        ],
+    )
+}
+
+/// [`paged_attention`] from ordinary operations: every listed block gathered, then
+/// attention with a mask of each sequence's positions.
+fn paged_attention_graph(inputs: &[Array], scale: f32) -> Result<Array> {
+    let [q, k_cache, v_cache, tables, lengths] = inputs else {
+        unreachable!("five inputs")
+    };
+    let (b, lq) = (q.shape()[0], q.shape()[2]);
+    let (k, v) = (paged_keys(k_cache, tables)?, paged_keys(v_cache, tables)?);
+    let s = k.shape()[2];
+    // Query `l` sees positions up to `lengths[b] − L + l`.
+    let positions = reshape(
+        &arange(0.0, s as f64, 1.0, DType::I32)?,
+        &[1, 1, 1, s as isize],
+    )?;
+    let queries = reshape(
+        &arange(0.0, lq as f64, 1.0, DType::I32)?,
+        &[1, 1, lq as isize, 1],
+    )?;
+    let end = add(
+        reshape(lengths, &[b as isize, 1, 1, 1])?,
+        subtract(&queries, (lq - 1) as f64)?,
+    )?;
+    let mask = less(&positions, &end)?;
+    scaled_dot_product_attention(q, &k, &v, scale, AttentionMask::Array(&mask), None)
+}
+
+/// [`paged_write`] from ordinary operations: the cache as one row per slot, the rows of
+/// `slots` replaced.
+fn paged_write_graph(inputs: &[Array]) -> Result<Array> {
+    let [cache, new, slots] = inputs else {
+        unreachable!("three inputs")
+    };
+    let (blocks, hkv, bs, d) = (
+        cache.shape()[0],
+        cache.shape()[1],
+        cache.shape()[2],
+        cache.shape()[3],
+    );
+    let rows = reshape(
+        &crate::transpose(cache, &[0, 2, 1, 3])?,
+        &[(blocks * bs) as isize, hkv as isize, d as isize],
+    )?;
+    let at = broadcast_to(&reshape(slots, &[-1, 1, 1])?, new.shape())?;
+    let rows = crate::put_along_axis(&rows, &at, new, 0)?;
+    let rows = reshape(
+        &rows,
+        &[blocks as isize, bs as isize, hkv as isize, d as isize],
+    )?;
+    crate::transpose(&rows, &[0, 2, 1, 3])
 }
 
 /// Scaled dot-product attention, as MLX's `fast.scaled_dot_product_attention`:

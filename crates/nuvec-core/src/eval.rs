@@ -252,33 +252,82 @@ fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
     drop(inputs); // detach: release the inputs outside the lock
 }
 
-/// The buffer of a `slice_update`'s base, taken over to be written in place (MLX's
-/// donation): only when the evaluation owns the base outright — its node has no other
-/// strong handle (so no other array, view or consumer refers to it) — and its data is the
-/// whole of a writable buffer with no other handle. Ownership proves the write exclusive,
-/// so no reference counting of other users is needed.
-///
-/// The base may be finished, or still in flight in an earlier evaluation: pending
-/// work holds nodes and data only weakly, so the in-flight copy is then the data's only
-/// handle; taking it over (under the lock that publishing takes) means it is never
-/// published. The buffer's fences order the write after the work that produces and reads
-/// it.
+/// An input to be written in place (MLX's donation), and its buffer: an update's base
+/// (`slice_update`, `norm_rope` or `paged_write` into a cache), or the input of an
+/// element-wise operation or softmax whose buffer can take the output (same dtype, shape
+/// and contiguous layout), as MLX's element-wise kernels reuse their inputs.
 fn donation(
     node: &Node,
     primitive: &Primitive,
     inputs: &mut [Array],
     gpu: &mut GpuEval,
-) -> Option<Data> {
+) -> Option<(usize, Data)> {
     let device = node.stream.device;
+    if node.tracer || device.kind == DeviceKind::Cpu || !gpu.available(device) {
+        return None;
+    }
     let writes_base = matches!(
         primitive,
         Primitive::SliceUpdate { .. }
             | Primitive::Fast(crate::fast::FastOp::NormRope { cache: true, .. })
+            | Primitive::Fast(crate::fast::FastOp::PagedWrite)
     );
-    if !writes_base || node.tracer || device.kind == DeviceKind::Cpu || !gpu.available(device) {
+    if writes_base {
+        return owned(&mut inputs[0], gpu).map(|data| (0, data));
+    }
+    let [out] = node.outputs.as_slice() else {
+        return None;
+    };
+    for i in in_place_inputs(primitive, inputs, out) {
+        if let Some(data) = owned(&mut inputs[i], gpu) {
+            return Some((i, data));
+        }
+    }
+    None
+}
+
+/// The inputs of an element-wise operation or softmax whose buffer the output may take:
+/// the output's dtype (float, where every such kernel exists on the GPU) and shape.
+fn in_place_inputs(
+    primitive: &Primitive,
+    inputs: &[Array],
+    out: &crate::array::Output,
+) -> Vec<usize> {
+    use crate::{DType, UnaryOp};
+    let candidates: &[usize] = match primitive {
+        Primitive::Unary(op) if *op != UnaryOp::Conjugate => &[0],
+        Primitive::Binary(_) => &[0, 1],
+        Primitive::Select => &[1, 2],
+        Primitive::Fast(crate::fast::FastOp::Softmax) => &[0],
+        _ => &[],
+    };
+    let float = matches!(out.dtype, DType::F16 | DType::BF16 | DType::F32);
+    if !float || out.size == 0 || out.size >= u32::MAX as usize {
+        return Vec::new();
+    }
+    candidates
+        .iter()
+        .copied()
+        .filter(|&i| inputs[i].dtype() == out.dtype && inputs[i].shape() == out.shape.as_slice())
+        .collect()
+}
+
+/// The buffer of `input`, taken over to be written in place: only when the evaluation owns
+/// it outright (its node has no other strong handle, so no other array, view or consumer
+/// refers to it) and its data is the whole of a writable buffer with no other handle.
+/// Ownership proves the write exclusive, so no reference counting of other users is
+/// needed.
+///
+/// The input may be finished, still in flight in an earlier evaluation (pending work holds
+/// nodes and data only weakly, so the in-flight copy is then the data's only handle;
+/// taking it over under the lock that publishing takes means it is never published), or
+/// computed earlier in this evaluation. The buffer's fences and the encoder's barriers
+/// order the write after the work that produces and reads it.
+fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
+    if input.output != 0 {
         return None;
     }
-    let base = &mut inputs[0].node;
+    let base = &mut input.node;
     let usable = |data: &Data, out: &crate::array::Output, handles: usize| {
         out.flags.row_contiguous
             && crate::gpu::writable(data, out)
@@ -331,26 +380,46 @@ fn donation(
     }
 }
 
-/// A `slice_update` (or a `norm_rope` into a cache) written into its donated base.
+/// An update written into its donated base (input 0), or an element-wise operation or
+/// softmax written into its donated input `at`.
 fn in_place(
     node: &Node,
     primitive: &Primitive,
     inputs: &[Array],
-    base: Data,
+    (at, base): (usize, Data),
     gpu: &mut GpuEval,
 ) -> Result<(Vec<Data>, bool)> {
     let (mut pending, mut foreign) = (false, Vec::new());
-    let rest = inputs[1..]
-        .iter()
-        .map(|a| input_data(a, gpu, &mut pending, &mut foreign))
-        .collect::<Result<Vec<_>>>()?;
-    let operands: Vec<Operand<'_>> = inputs[1..].iter().map(Array::out).zip(&rest).collect();
+    let mut rest = Vec::with_capacity(inputs.len());
+    for (i, a) in inputs.iter().enumerate() {
+        rest.push(match i == at {
+            true => None,
+            false => Some(input_data(a, gpu, &mut pending, &mut foreign)?),
+        });
+    }
     let out = &node.outputs[0];
+    let operands = |skip: usize| -> Vec<Operand<'_>> {
+        inputs
+            .iter()
+            .zip(&rest)
+            .skip(skip)
+            .filter_map(|(a, d)| d.as_ref().map(|d| (a.out(), d)))
+            .collect()
+    };
     let data = match primitive {
-        Primitive::Fast(op) => gpu.norm_rope_in_place(base, op, &operands, out)?,
-        _ => {
+        Primitive::Fast(crate::fast::FastOp::PagedWrite) => {
+            gpu.paged_write_in_place(base, &operands(1), out)?
+        }
+        Primitive::Fast(crate::fast::FastOp::Softmax) => gpu.softmax_in_place(base, out)?,
+        Primitive::Fast(op) => gpu.norm_rope_in_place(base, op, &operands(1), out)?,
+        Primitive::SliceUpdate { .. } => {
             let slices = primitive.dim_slices(out.shape.len())?;
-            gpu.slice_update_in_place(base, out, operands[0], &slices)?
+            gpu.slice_update_in_place(base, out, operands(1)[0], &slices)?
+        }
+        _ => {
+            let metas: Vec<&crate::array::Output> = inputs.iter().map(Array::out).collect();
+            let datas: Vec<Option<&Data>> = rest.iter().map(Option::as_ref).collect();
+            gpu.elementwise_in_place(primitive, &metas, &datas, base, out)?
         }
     };
     Ok((vec![data], true))

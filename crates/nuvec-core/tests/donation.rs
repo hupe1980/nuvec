@@ -316,3 +316,130 @@ fn same_evaluation_donation_respects_holders_and_earlier_readers() {
         }
     });
 }
+
+/// The elements as float64 (exact for float32).
+fn values(a: &Array) -> Vec<f64> {
+    a.astype(DType::F64).unwrap().to_vec::<f64>().unwrap()
+}
+
+/// Element-wise operations and softmax write into an input they own (MLX's donation), never
+/// into one another array holds, with the same results either way.
+#[test]
+fn element_wise_operations_write_into_owned_inputs() {
+    if !gpu_available() {
+        return;
+    }
+    let _serial = PEAK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    on(Device::gpu(0), || {
+        let n = 4 << 20; // 16 MiB of float32
+        let make = || {
+            let a = sin(&arange(0.0, n as f64, 1.0, DType::F32).unwrap()).unwrap();
+            a.reshape(&[64, (n / 64) as isize]).unwrap()
+        };
+        // References computed with the input held (no donation possible).
+        let held = make();
+        held.eval().unwrap();
+        let reference = |f: &dyn Fn(&Array) -> Array| values(&f(&held));
+        type Op = (&'static str, Box<dyn Fn(&Array) -> Array>);
+        let ops: [Op; 4] = [
+            ("exp", Box::new(|a: &Array| exp(a).unwrap())),
+            (
+                "a * 3 + 1",
+                Box::new(|a: &Array| add(multiply(a, 3.0).unwrap(), 1.0).unwrap()),
+            ),
+            (
+                "where",
+                Box::new(|a: &Array| {
+                    let m = greater(a, 0.0).unwrap();
+                    where_(&m, a, 0.0).unwrap()
+                }),
+            ),
+            ("softmax", Box::new(|a: &Array| softmax(a, &[-1]).unwrap())),
+        ];
+        for (name, f) in &ops {
+            let want = reference(f.as_ref());
+            assert_eq!(
+                values(&held),
+                values(&make()),
+                "{name}: the held input changed"
+            );
+            let a = make();
+            a.eval().unwrap();
+            gpu_peak_since_reset();
+            let resident = nuvec_gpu::Device::shared().map_or(0, |d| d.memory().active);
+            let y = f(&a);
+            drop(a);
+            y.eval().unwrap();
+            let peak = gpu_peak_since_reset();
+            assert!(
+                peak < resident + n * 4 / 2,
+                "{name}: peak {peak}, before {resident}"
+            );
+            assert_eq!(values(&y), want, "{name}: in place differs");
+        }
+        // One array as both operands: never written while it is still read.
+        let a = make();
+        a.eval().unwrap();
+        let want: Vec<f64> = values(&a).iter().map(|x| x * x).collect();
+        let sq = multiply(&a, &a).unwrap();
+        drop(a);
+        let got = values(&sq);
+        assert!(
+            got.iter()
+                .zip(&want)
+                .all(|(g, w)| (g - w).abs() <= 1e-6 * w.abs().max(1.0))
+        );
+    });
+}
+
+/// Attention without a fused kernel (head size 256 over a longer cache, as Qwen 3.5 prefill
+/// chunks) holds one score matrix, as MLX: the mask and the softmax write into it.
+#[test]
+fn composed_attention_holds_one_score_matrix() {
+    if !gpu_available() {
+        return;
+    }
+    let _serial = PEAK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    on(Device::gpu(0), || {
+        let (hq, hkv, lq, lk, d) = (16, 2, 256, 4096, 256);
+        let q = random::normal(
+            &[1, hq, lq, d],
+            DType::BF16,
+            None,
+            None,
+            Some(&random::key(1)),
+        )
+        .unwrap();
+        let k = random::normal(
+            &[1, hkv, lk, d],
+            DType::BF16,
+            None,
+            None,
+            Some(&random::key(2)),
+        )
+        .unwrap();
+        eval(&[q.clone(), k.clone()]).unwrap();
+        gpu_peak_since_reset();
+        let resident = nuvec_gpu::Device::shared().map_or(0, |dv| dv.memory().active);
+        let o = fast::scaled_dot_product_attention(
+            &q,
+            &k,
+            &k,
+            0.0625,
+            fast::AttentionMask::Causal,
+            None,
+        )
+        .unwrap();
+        o.eval().unwrap();
+        let scores = hq * lq * lk * 2;
+        let peak = gpu_peak_since_reset();
+        assert!(
+            peak < resident + scores * 3 / 2,
+            "peak {peak}, before {resident}, scores {scores}"
+        );
+    });
+}

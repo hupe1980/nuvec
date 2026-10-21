@@ -603,6 +603,210 @@ mod gpu {
         });
     }
 
+    /// Paged caches holding `keys` and `values` (`[B, Hkv, N, D]`) in blocks of `bs`
+    /// positions placed in a shuffled order (with a few unused blocks), and the block table.
+    fn paged(keys: &Array, values: &Array, bs: usize, rng: &mut Rng) -> (Array, Array, Array) {
+        let (b, hkv, n, d) = (
+            keys.shape()[0],
+            keys.shape()[1],
+            keys.shape()[2],
+            keys.shape()[3],
+        );
+        let per = n.div_ceil(bs);
+        let blocks = b * per + 3;
+        let mut order: Vec<usize> = (0..blocks).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, (rng.f64().abs() * 1e6) as usize % (i + 1));
+        }
+        let mut caches =
+            [keys, values].map(|_| zeros(&[blocks, hkv, bs, d], keys.dtype()).unwrap());
+        let range = |a: usize, b: usize| SliceArg::new(Some(a as isize), Some(b as isize), 1);
+        for s in 0..b {
+            for j in 0..per {
+                let (block, len) = (order[s * per + j], bs.min(n - j * bs));
+                for (cache, src) in caches.iter_mut().zip([keys, values]) {
+                    let part = slice(
+                        src,
+                        &[
+                            range(s, s + 1),
+                            SliceArg::full(),
+                            range(j * bs, j * bs + len),
+                            SliceArg::full(),
+                        ],
+                    )
+                    .unwrap();
+                    *cache = slice_update(
+                        cache,
+                        &part,
+                        &[
+                            range(block, block + 1),
+                            SliceArg::full(),
+                            range(0, len),
+                            SliceArg::full(),
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let table: Vec<i32> = order[..b * per].iter().map(|&x| x as i32).collect();
+        let [kc, vc] = caches;
+        (kc, vc, Array::from_slice(&table, &[b, per]).unwrap())
+    }
+
+    #[test]
+    fn paged_attention_equals_contiguous_attention() {
+        if !gpu_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x6b);
+        // (batch, query heads, kv heads, queries, head size, block size, lengths)
+        type Case = (usize, usize, usize, usize, usize, usize, &'static [usize]);
+        let cases: &[Case] = &[
+            (1, 4, 4, 1, 128, 16, &[37]),
+            (3, 8, 2, 1, 128, 32, &[1, 64, 300]),
+            (2, 4, 1, 4, 64, 16, &[4, 77]),
+            (2, 2, 2, 1, 256, 8, &[9, 513]),
+            // Long caches: two passes.
+            (2, 8, 2, 1, 128, 32, &[1500, 3000]),
+            (1, 8, 2, 4, 128, 64, &[2100]),
+            (1, 4, 2, 1, 256, 16, &[1100]),
+        ];
+        for &(b, hq, hkv, lq, d, bs, lengths) in cases {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let n = *lengths.iter().max().unwrap();
+                let keys = random(&mut rng, &[b, hkv, n, d], dtype);
+                let values = random(&mut rng, &[b, hkv, n, d], dtype);
+                let q = random(&mut rng, &[b, hq, lq, d], dtype);
+                let (kc, vc, vtable) = paged(&keys, &values, bs, &mut rng);
+                let lens =
+                    Array::from_slice(&lengths.iter().map(|&l| l as i32).collect::<Vec<_>>(), &[b])
+                        .unwrap();
+                let scale = (d as f32).powf(-0.5);
+                let name = format!("{dtype} {:?}", (b, hq, hkv, lq, d, bs, lengths));
+                on(Device::gpu(0), || {
+                    let got = fast::paged_attention(&q, &kc, &vc, &vtable, &lens, scale).unwrap();
+                    for (s, &len) in lengths.iter().enumerate() {
+                        let pick = |a: &Array, end: usize| {
+                            slice(
+                                a,
+                                &[
+                                    SliceArg::new(Some(s as isize), Some(s as isize + 1), 1),
+                                    SliceArg::full(),
+                                    SliceArg::new(Some(0), Some(end as isize), 1),
+                                    SliceArg::full(),
+                                ],
+                            )
+                            .unwrap()
+                        };
+                        let mask = if lq > 1 {
+                            fast::AttentionMask::Causal
+                        } else {
+                            fast::AttentionMask::None
+                        };
+                        let want = fast::scaled_dot_product_attention(
+                            &pick(&q, lq),
+                            &pick(&keys, len),
+                            &pick(&values, len),
+                            scale,
+                            mask,
+                            None,
+                        )
+                        .unwrap();
+                        // Below 1,024 keys the contiguous path is the same single-pass kernel;
+                        // with two passes, the key partitions may differ (they follow the
+                        // table's capacity here, the keys there).
+                        let exact = lengths.iter().all(|&l| l < 1024);
+                        let tol = if exact { 0.0 } else { tolerance(dtype) };
+                        assert_close(&format!("{name} seq {s}"), &pick(&got, lq), &want, tol);
+                    }
+                });
+                // The kernel against the CPU fallback, with gradients for q and the caches.
+                let g = random(&mut rng, &[b, hq, lq, d], dtype);
+                both(
+                    &format!("paged grads {name}"),
+                    tolerance(dtype) * 4.0,
+                    || {
+                        let f = |xs: &[Array]| {
+                            Ok(vec![fast::paged_attention(
+                                &xs[0], &xs[1], &xs[2], &vtable, &lens, scale,
+                            )?])
+                        };
+                        with_grads(f, &[q.clone(), kc.clone(), vc.clone()], &g)
+                    },
+                );
+            }
+        }
+        // Invalid arguments.
+        let q = random(&mut rng, &[1, 4, 1, 64], DType::F32);
+        let c = zeros(&[4, 2, 8, 64], DType::F32).unwrap();
+        let t = Array::from_slice(&[0i32, 1], &[1, 2]).unwrap();
+        let l = Array::from_slice(&[9i32], &[1]).unwrap();
+        assert!(fast::paged_attention(&q, &c, &c, &t, &l, 1.0).is_ok());
+        let c3 = zeros(&[4, 3, 8, 64], DType::F32).unwrap();
+        assert!(
+            fast::paged_attention(&q, &c3, &c3, &t, &l, 1.0).is_err(),
+            "4 heads over 3"
+        );
+        assert!(
+            fast::paged_attention(&q, &c, &c, &l, &l, 1.0).is_err(),
+            "1-D table"
+        );
+        let lf = Array::from_slice(&[9.0f32], &[1]).unwrap();
+        assert!(
+            fast::paged_attention(&q, &c, &c, &t, &lf, 1.0).is_err(),
+            "float lengths"
+        );
+    }
+
+    #[test]
+    fn paged_write_matches_the_fallback_and_writes_in_place() {
+        if !gpu_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x6c);
+        let cache = random(&mut rng, &[6, 2, 4, 64], DType::BF16);
+        let new = random(&mut rng, &[5, 2, 64], DType::BF16);
+        let slots = Array::from_slice(&[23i32, 0, 5, 17, 6], &[5]).unwrap();
+        both("paged_write", 0.0, || {
+            Ok(vec![fast::paged_write(&cache, &new, &slots)?])
+        });
+        // Slot 5 is block 1, position 1; written in place when owned, never into a cache
+        // another array holds.
+        on(Device::gpu(0), || {
+            let before = values(&cache);
+            let out = fast::paged_write(&cache, &new, &slots).unwrap();
+            out.eval().unwrap();
+            assert_eq!(values(&cache), before, "a held cache changed");
+            let block1 = slice(
+                &out,
+                &[
+                    SliceArg::new(Some(1), Some(2), 1),
+                    SliceArg::full(),
+                    SliceArg::new(Some(1), Some(2), 1),
+                    SliceArg::full(),
+                ],
+            )
+            .unwrap();
+            let third = slice(
+                &new,
+                &[
+                    SliceArg::new(Some(2), Some(3), 1),
+                    SliceArg::full(),
+                    SliceArg::full(),
+                ],
+            )
+            .unwrap();
+            assert_eq!(values(&block1), values(&third));
+        });
+        assert!(
+            fast::paged_write(&cache, &random(&mut rng, &[5, 3, 64], DType::BF16), &slots).is_err()
+        );
+        assert!(
+            fast::paged_write(&cache, &new, &Array::from_slice(&[1i32, 2], &[2]).unwrap()).is_err()
+        );
+    }
+
     #[test]
     fn softmax_logsumexp_and_cross_entropy_match_the_fallback() {
         if !gpu_available() {

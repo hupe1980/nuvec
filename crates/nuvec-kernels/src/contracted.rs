@@ -4,6 +4,7 @@
 /// `quantize`/`dequantize`) turn it off with `#pragma clang fp contract(off)`.
 const CONTRACTED: &[&str] = &[
     "sdpa.metal",
+    "paged_attention.metal",
     "quantized.metal",
     "gemm.metal",
     "gemv.metal",

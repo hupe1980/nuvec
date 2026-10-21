@@ -21,6 +21,8 @@ The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each 
 | `cross_entropy(logits, targets)` | Fused log-softmax and negative log-likelihood |
 | `gated_delta(q, k, v, g, beta, state)` | The Gated DeltaNet recurrence (Qwen 3.5's linear attention), returning the outputs and the new state |
 | `gated_delta_steps(q, k, v, g, beta, state)` | The same, returning the state after every step (to roll the recurrence back) |
+| `paged_attention(q, k_cache, v_cache, block_tables, lengths, scale)` | Attention for a batch of sequences of different lengths over a KV cache stored in fixed-size blocks |
+| `paged_write(cache, new, slots)` | Writes new keys or values into their blocks, in place when the cache is owned |
 
 Attention picks MLX's kernel for the shape: vector kernels for short queries (decode), a two-pass split-K kernel for long contexts, and the tiled flash-style kernel for prefill. `softmax` and `logsumexp` over the last axis use fused kernels too.
 

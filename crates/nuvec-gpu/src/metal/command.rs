@@ -30,6 +30,10 @@ pub enum Arg<'a> {
     Write(&'a mut Buffer, usize),
     /// Small constant data copied into the command stream (at most 4 KiB).
     Bytes(&'a [u8]),
+    /// The buffer of the buffer argument at this index bound again, from byte `offset` on:
+    /// an in-place kernel reading and writing one buffer through two slots. Hazards are
+    /// those of that argument (bind it as [`Arg::Write`]).
+    Same(usize, usize),
 }
 
 impl<'a> Arg<'a> {
@@ -52,7 +56,7 @@ impl<'a> Arg<'a> {
         match self {
             Self::Read(b, offset) => Some((b, *offset, false)),
             Self::Write(b, offset) => Some((b, *offset, true)),
-            Self::Bytes(_) => None,
+            Self::Bytes(_) | Self::Same(..) => None,
         }
     }
 }
@@ -307,6 +311,12 @@ impl CommandBuffer {
                     // command buffer until the GPU has finished.
                     unsafe { encoder.setBuffer_offset_atIndex(buffer.raw(), offset, index) };
                 }
+                Arg::Same(earlier, offset) => {
+                    let (buffer, _, _) = args[*earlier].buffer().expect("validated");
+                    // SAFETY: as above: `validate` checked that `earlier` names another
+                    // buffer argument and `offset <= buffer.len()`.
+                    unsafe { encoder.setBuffer_offset_atIndex(buffer.raw(), *offset, index) };
+                }
             }
         }
         for (buffer, _, write) in args.iter().filter_map(Arg::buffer) {
@@ -472,6 +482,18 @@ fn validate(args: &[Arg<'_>]) -> Result<()> {
                 )));
             }
             Arg::Write(b, _) if b.is_mapped() => return Err(GpuError::ReadOnly),
+            Arg::Same(earlier, offset) => {
+                let target = args.get(*earlier).and_then(Arg::buffer);
+                match target {
+                    Some((b, ..)) if *offset <= b.len() => {}
+                    _ => {
+                        return Err(GpuError::InvalidArgument(format!(
+                            "argument {index}: `Same({earlier}, {offset})` needs another \
+                             buffer argument and an offset within it"
+                        )));
+                    }
+                }
+            }
             Arg::Read(..) | Arg::Write(..)
                 if arg.buffer().is_some_and(|(b, offset, _)| offset > b.len()) =>
             {

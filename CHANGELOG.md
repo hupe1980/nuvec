@@ -6,6 +6,16 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `fast::paged_attention` and `fast::paged_write`: attention over a block-table KV cache
+  for a batch of sequences of different lengths, and the write of new positions into it.
+
+### Changed
+- Element-wise operations and softmax write into an input buffer the evaluation owns, and
+  large intermediates are released as soon as nothing refers to them (as MLX): attention
+  without a fused kernel holds one score matrix instead of three, and Qwen3.6-35B-A3B
+  prefill at 32K tokens needs 5 GB of activations instead of 12 GB.
+
 ### Fixed
 - `slice_update` on the CPU reads a strided update in place instead of copying it first.
 - `slice_update` (and `norm_rope` into a cache) writes in place into a base computed
