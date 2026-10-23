@@ -7,6 +7,24 @@ use nuvec_gpu::{Arg, Device, GpuError};
 
 const PAGE: usize = 16 * 1024;
 
+/// GPU errors reported by completion handlers, which run on Metal's threads (a panic there
+/// would only be reported, so tests record errors here and check them at the end).
+static GPU_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// A completion handler that records a GPU error for [`assert_gpu_ok`].
+fn record_failure(result: nuvec_gpu::Result<()>) {
+    if let Err(e) = result {
+        GPU_FAILURES.lock().unwrap().push(e.to_string());
+    }
+}
+
+/// Fails the test if a completion handler recorded a GPU error.
+#[track_caller]
+fn assert_gpu_ok() {
+    let failures = std::mem::take(&mut *GPU_FAILURES.lock().unwrap());
+    assert!(failures.is_empty(), "GPU errors: {failures:?}");
+}
+
 /// The Metal device, or `None` (the test skips) without one. With `NUVEC_REQUIRE_GPU=1` a
 /// missing device fails the test instead of skipping it.
 fn device() -> Option<Device> {
@@ -177,7 +195,7 @@ fn memory_in_use_is_reused_only_by_gpu_work_ordered_after_it() {
     device.clear_cache();
     let mut out = device.new_buffer(n * 4).unwrap();
     drop(cmd); // abandoned: never submitted
-    let pending = encode(&mut out).commit_then(|r| r.unwrap());
+    let pending = encode(&mut out).commit_then(record_failure);
     drop(out);
     let allocations = device.memory().system_allocations;
     let reused = device.new_gpu_buffer(n * 4).unwrap();
@@ -190,6 +208,7 @@ fn memory_in_use_is_reused_only_by_gpu_work_ordered_after_it() {
     assert_eq!(reused.contents().unwrap().len(), n * 4);
     drop(reused);
     pending.wait();
+    assert_gpu_ok();
 }
 
 #[test]

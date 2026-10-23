@@ -438,6 +438,8 @@ impl CommandBuffer {
     /// `on_complete` must not block, in particular not on other GPU work: Metal runs a
     /// queue's completion handlers one at a time, so waiting there for another command
     /// buffer's completion can deadlock.
+    /// A panic in `on_complete` on Metal's thread is caught and reported on standard error,
+    /// so it never aborts the process; the result is still published to [`Pending::wait`].
     #[must_use = "dropping `Pending` does not wait; keep it to `wait`, or drop it explicitly"]
     pub fn commit_then(mut self, on_complete: impl FnOnce(Result<()>) + Send + 'static) -> Pending {
         self.close();
@@ -457,8 +459,15 @@ impl CommandBuffer {
         });
         let shared = finish.clone();
         let handler = RcBlock::new(move |raw: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-            // SAFETY: Metal passes the completed command buffer, valid for this call.
-            complete(&shared, unsafe { raw.as_ref() });
+            // A panic must not unwind into Metal's Objective-C caller, which aborts the
+            // process: report it instead (the result is published either way).
+            let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: Metal passes the completed command buffer, valid for this call.
+                complete(&shared, unsafe { raw.as_ref() });
+            }));
+            if completed.is_err() {
+                eprintln!("nuvec-gpu: a command buffer's completion handler panicked");
+            }
         });
         autoreleasepool(|_| {
             // SAFETY: the block is valid, and Metal copies it before this call returns. It

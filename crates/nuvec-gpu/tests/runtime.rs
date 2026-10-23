@@ -4,6 +4,24 @@
 
 use nuvec_gpu::{Arg, Buffer, Device, GpuError};
 
+/// GPU errors reported by completion handlers, which run on Metal's threads (a panic there
+/// would only be reported, so tests record errors here and check them at the end).
+static GPU_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// A completion handler that records a GPU error for [`assert_gpu_ok`].
+fn record_failure(result: nuvec_gpu::Result<()>) {
+    if let Err(e) = result {
+        GPU_FAILURES.lock().unwrap().push(e.to_string());
+    }
+}
+
+/// Fails the test if a completion handler recorded a GPU error.
+#[track_caller]
+fn assert_gpu_ok() {
+    let failures = std::mem::take(&mut *GPU_FAILURES.lock().unwrap());
+    assert!(failures.is_empty(), "GPU errors: {failures:?}");
+}
+
 /// The Metal device, or `None` (the test skips) without one. With `NUVEC_REQUIRE_GPU=1` a
 /// missing device fails the test instead of skipping it.
 fn device() -> Option<Device> {
@@ -353,7 +371,7 @@ fn ordered_command_buffers_read_in_flight_results_across_threads() {
             (&y, &mut x)
         };
         add(&mut cmd, &device, src, &ones, dst, n as u32);
-        drop(cmd.commit_then(|r| r.unwrap()));
+        drop(cmd.commit_then(record_failure));
     }
     let (d, o) = (device.clone(), ones.clone());
     let reader = std::thread::spawn(move || {
@@ -365,6 +383,7 @@ fn ordered_command_buffers_read_in_flight_results_across_threads() {
     });
     let v = reader.join().unwrap();
     assert!(v.iter().all(|&e| e == 51.0), "{}", v[0]);
+    assert_gpu_ok();
 }
 
 #[test]
@@ -423,20 +442,21 @@ fn ordered_command_buffers_wait_only_for_their_writers_and_overlap_otherwise() {
             let mut next = device.new_buffer(n * 4).unwrap();
             let mut cmd = device.ordered_command_buffer().unwrap();
             add(&mut cmd, &device, acc, step, &mut next, n as u32);
-            pending.push(cmd.commit_then(|r| r.unwrap()));
+            pending.push(cmd.commit_then(record_failure));
             *acc = next;
         }
     }
     let mut sum = device.new_buffer(n * 4).unwrap();
     let mut cmd = device.ordered_command_buffer().unwrap();
     add(&mut cmd, &device, &x, &y, &mut sum, n as u32);
-    cmd.commit_then(|r| r.unwrap()).wait();
+    cmd.commit_then(record_failure).wait();
     for p in pending {
         p.wait();
     }
     let want = 3.0 * steps as f32;
     assert!(read_f32(&sum).iter().all(|&v| v == want));
     assert!(read_f32(&x).iter().all(|&v| v == steps as f32));
+    assert_gpu_ok();
 }
 
 #[test]
@@ -454,18 +474,19 @@ fn ordered_writes_wait_for_in_flight_readers() {
         let mut next = device.new_buffer(n * 4).unwrap();
         let mut cmd = device.ordered_command_buffer().unwrap();
         add(&mut cmd, &device, &acc, &a, &mut next, n as u32);
-        pending.push(cmd.commit_then(|r| r.unwrap()));
+        pending.push(cmd.commit_then(record_failure));
         acc = next;
     }
     // Overwrite `a` with zeros while the chain may still be reading it.
     let mut cmd = device.ordered_command_buffer().unwrap();
     add(&mut cmd, &device, &zeros, &zeros, &mut a, n as u32);
-    cmd.commit_then(|r| r.unwrap()).wait();
+    cmd.commit_then(record_failure).wait();
     for p in pending {
         p.wait();
     }
     assert!(read_f32(&a).iter().all(|&v| v == 0.0));
     assert!(read_f32(&acc).iter().all(|&v| v == 200.0));
+    assert_gpu_ok();
 }
 
 #[test]
@@ -482,7 +503,7 @@ fn reused_memory_is_written_after_in_flight_readers() {
         let mut next = device.new_buffer(n * 4).unwrap();
         let mut cmd = device.ordered_command_buffer().unwrap();
         add(&mut cmd, &device, &acc, &a, &mut next, n as u32);
-        pending.push(cmd.commit_then(|r| r.unwrap()));
+        pending.push(cmd.commit_then(record_failure));
         acc = next;
     }
     let before = device.memory().system_allocations;
@@ -491,13 +512,14 @@ fn reused_memory_is_written_after_in_flight_readers() {
     let reused_a = device.memory().system_allocations == before;
     let mut cmd = device.ordered_command_buffer().unwrap();
     add(&mut cmd, &device, &zeros, &zeros, &mut reused, n as u32);
-    cmd.commit_then(|r| r.unwrap()).wait();
+    cmd.commit_then(record_failure).wait();
     for p in pending {
         p.wait();
     }
     assert!(reused_a, "`a`'s memory is reused");
     assert!(read_f32(&reused).iter().all(|&v| v == 0.0));
     assert!(read_f32(&acc).iter().all(|&v| v == 200.0));
+    assert_gpu_ok();
 }
 
 #[test]
@@ -576,11 +598,30 @@ fn wait_returns_after_the_completion_has_run() {
     for _ in 0..10_000 {
         let mut cmd = device.ordered_command_buffer().unwrap();
         add(&mut cmd, &device, &a, &a, &mut out, 64);
-        cmd.commit_then(|r| r.unwrap()).wait();
+        cmd.commit_then(record_failure).wait();
         assert_eq!(device.in_flight(), 0);
         assert!(!out.in_use());
         assert_eq!(out.contents().unwrap().len(), 64 * 4);
     }
+    assert_gpu_ok();
+}
+
+/// A completion handler that panics on Metal's thread is reported, not unwound into Metal
+/// (which would abort the process), and the command buffer still completes.
+#[test]
+fn a_panicking_completion_handler_does_not_abort() {
+    let Some(device) = device() else { return };
+    let a = device.buffer_from(&f32s(&[1.0; 64])).unwrap();
+    let mut out = device.new_buffer(64 * 4).unwrap();
+    let mut cmd = device.ordered_command_buffer().unwrap();
+    add(&mut cmd, &device, &a, &a, &mut out, 64);
+    drop(cmd.commit_then(|_| panic!("a handler panic")));
+    with_timeout(std::time::Duration::from_secs(30), {
+        let device = device.clone();
+        move || device.wait_for_capacity(1)
+    });
+    assert_eq!(device.in_flight(), 0);
+    assert_eq!(read_f32(&out), [2.0; 64]);
 }
 
 #[test]
@@ -638,7 +679,7 @@ fn unordered_work_on_busy_memory_and_reads_of_unsubmitted_writes_are_refused() {
         add(&mut cmd, &device, &acc, &ones, &mut chain, n as u32);
         std::mem::swap(&mut acc, &mut chain);
     }
-    let pending = cmd.commit_then(|r| r.unwrap());
+    let pending = cmd.commit_then(record_failure);
     device.clear_cache();
     drop(chain);
     let before = device.memory().system_allocations;
@@ -662,6 +703,7 @@ fn unordered_work_on_busy_memory_and_reads_of_unsubmitted_writes_are_refused() {
     }
     drop(unordered);
     assert!(read_f32(&acc).iter().all(|&v| v == 50.0));
+    assert_gpu_ok();
 }
 
 /// Metal source for kernel `name` (`out[i] = 7`) with `count` distinct helper functions,
@@ -783,9 +825,12 @@ fn ordered_command_buffers_from_two_threads_stay_ordered() {
     let acc = std::sync::Arc::new(std::sync::Mutex::new(
         device.buffer_from(&f32s(&vec![0.0; n])).unwrap(),
     ));
+    // The first error a completion reports (the handlers run on Metal's threads).
+    let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
     let threads: Vec<_> = (0..2)
         .map(|_| {
             let (device, ones, acc) = (device.clone(), ones.clone(), acc.clone());
+            let failure = failure.clone();
             std::thread::spawn(move || {
                 for _ in 0..steps / 2 {
                     device.wait_for_capacity(64);
@@ -793,7 +838,12 @@ fn ordered_command_buffers_from_two_threads_stay_ordered() {
                     let mut next = device.new_gpu_buffer(n * 4).unwrap();
                     let mut cmd = device.ordered_command_buffer().unwrap();
                     add(&mut cmd, &device, &acc, &ones, &mut next, n as u32);
-                    drop(cmd.commit_then(|r| r.unwrap()));
+                    let failure = failure.clone();
+                    drop(cmd.commit_then(move |r| {
+                        if let Err(e) = r {
+                            failure.lock().unwrap().get_or_insert(e);
+                        }
+                    }));
                     *acc = next;
                 }
             })
@@ -806,6 +856,9 @@ fn ordered_command_buffers_from_two_threads_stay_ordered() {
         let device = device.clone();
         move || device.wait_for_capacity(1)
     });
+    if let Some(e) = failure.lock().unwrap().take() {
+        panic!("a command buffer failed: {e}");
+    }
     let acc = acc.lock().unwrap();
     assert!(read_f32(&acc).iter().all(|&v| v == steps as f32));
 }
