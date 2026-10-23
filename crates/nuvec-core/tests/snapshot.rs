@@ -29,7 +29,7 @@ fn bits(a: &Array) -> Vec<u64> {
 
 fn devices() -> Vec<Device> {
     let mut d = vec![Device::cpu()];
-    if !cfg!(miri) && with_stream(Device::gpu(0), || Array::from(1.0f32).eval()).is_ok() {
+    if common::require_gpu().is_some() {
         d.push(Device::gpu(0));
     }
     d
