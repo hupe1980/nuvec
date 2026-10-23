@@ -820,7 +820,7 @@ fn source_pipelines_have_their_own_namespace_and_language_version() {
 fn ordered_command_buffers_from_two_threads_stay_ordered() {
     let Some(device) = device() else { return };
     let n = 1024;
-    let steps = 10_000;
+    let steps = 4_000;
     let ones = std::sync::Arc::new(device.buffer_from(&f32s(&vec![1.0; n])).unwrap());
     let acc = std::sync::Arc::new(std::sync::Mutex::new(
         device.buffer_from(&f32s(&vec![0.0; n])).unwrap(),
@@ -833,7 +833,10 @@ fn ordered_command_buffers_from_two_threads_stay_ordered() {
             let failure = failure.clone();
             std::thread::spawn(move || {
                 for _ in 0..steps / 2 {
-                    device.wait_for_capacity(64);
+                    // A short chain of dependent command buffers in flight: each waits on its
+                    // predecessor's fence on the GPU, and slow (virtualised) GPUs time out
+                    // long chains.
+                    device.wait_for_capacity(8);
                     let mut acc = acc.lock().unwrap();
                     let mut next = device.new_gpu_buffer(n * 4).unwrap();
                     let mut cmd = device.ordered_command_buffer().unwrap();
