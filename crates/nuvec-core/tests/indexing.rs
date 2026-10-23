@@ -140,10 +140,12 @@ fn indexing_matches_mlx_on_the_gpu() {
 fn updates_match_mlx() {
     let mut failures = Vec::new();
     let mut n = 0;
+    let mut devices = 0;
     for device in [Device::cpu(), Device::gpu(0)] {
         if device != Device::cpu() && !gpu_available() {
             continue;
         }
+        devices += 1;
         run_on(device, || {
             for case in api::cases("set").into_iter().chain(api::cases("add")) {
                 let xs = api::inputs(&case);
@@ -159,7 +161,7 @@ fn updates_match_mlx() {
             }
         });
     }
-    assert!(n >= 48, "{n} cases");
+    assert!(n >= 24 * devices, "{n} cases on {devices} devices");
     assert!(
         failures.is_empty(),
         "{} failures:\n{}",
