@@ -194,6 +194,12 @@ internal-paths:
     echo "✓ no internal planning paths in tracked files"
 
 # Crate dependencies follow the layering: lower layers never depend on higher ones.
+
+# The crates CI builds on Linux (no Metal) compile without warnings there.
+portable-check:
+    rustup target add x86_64-unknown-linux-gnu >/dev/null 2>&1 || true
+    RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-gnu -p nuvec-core -p nuvec-cpu -p nuvec-io -p nuvec-kernels -p nuvec-gpu --all-targets
+
 layering:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -307,4 +313,4 @@ api-check:
 
 # GPU tests fail instead of skipping without a Metal device (`NUVEC_REQUIRE_GPU=1`).
 ci:
-    NUVEC_REQUIRE_GPU=1 just fmt-check lint test doc miri deny metallib-check metal-check internal-paths layering api-hygiene no-hand-visits notices docs-rs docs-claims
+    NUVEC_REQUIRE_GPU=1 just fmt-check lint test doc miri deny metallib-check metal-check internal-paths layering api-hygiene no-hand-visits notices docs-rs docs-claims portable-check

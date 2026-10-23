@@ -33,6 +33,8 @@ pub(crate) fn class() -> char {
 }
 
 /// The function constants that specialise the vector attention kernels' pipelines.
+// Read only by the Metal encoder.
+#[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VectorFlags {
     pub(crate) has_mask: bool,
@@ -1173,11 +1175,11 @@ mod metal {
                         && operands[0].0.size < i32::MAX as usize
                 }
                 (Primitive::Scan { op, .. }, Some(d)) => match op {
-                    crate::ScanOp::LogAddExp => is_float(d),
+                    crate::graph::ScanOp::LogAddExp => is_float(d),
                     _ => !matches!(d, DType::Bool | DType::F64 | DType::Complex64),
                 },
                 (Primitive::ScatterAxis { reduce, .. }, Some(d)) => {
-                    *reduce == crate::ScatterReduce::None
+                    *reduce == crate::graph::ScatterReduce::None
                         || matches!(
                             d,
                             DType::F32 | DType::F16 | DType::BF16 | DType::I32 | DType::U32
@@ -1419,7 +1421,7 @@ mod metal {
         /// `8 / itemsize` elements of arrays of at least 65,536 (MLX's rule).
         fn fused(
             &mut self,
-            fused: &crate::Fused,
+            fused: &crate::graph::Fused,
             operands: &[Operand<'_>],
             outputs: &[Output],
         ) -> Result<Vec<Data>> {
@@ -1549,13 +1551,13 @@ mod metal {
             &mut self,
             operands: &[Operand<'_>],
             axis: usize,
-            reduce: crate::ScatterReduce,
+            reduce: crate::graph::ScatterReduce,
             buffer: &mut Buffer,
         ) -> Result<()> {
             let ((dst, _), (ind, ind_data), (upd, upd_data)) =
                 (operands[0], operands[1], operands[2]);
             let name = match reduce {
-                crate::ScatterReduce::None => format!(
+                crate::graph::ScatterReduce::None => format!(
                     "nuvec_scatter_{}_{}",
                     bits(dst.dtype.size()),
                     ind.dtype.name()
@@ -1762,7 +1764,7 @@ mod metal {
         /// needed).
         fn scan(
             &mut self,
-            op: crate::ScanOp,
+            op: crate::graph::ScanOp,
             operand: Operand<'_>,
             axis: usize,
             (reverse, inclusive): (bool, bool),
@@ -1785,11 +1787,11 @@ mod metal {
             let strides = crate::shape::row_contiguous_strides(&meta.shape);
             let stride = strides[axis] as usize;
             let op_name = match op {
-                crate::ScanOp::Sum => "sum",
-                crate::ScanOp::Prod => "prod",
-                crate::ScanOp::Max => "max",
-                crate::ScanOp::Min => "min",
-                crate::ScanOp::LogAddExp => "logaddexp",
+                crate::graph::ScanOp::Sum => "sum",
+                crate::graph::ScanOp::Prod => "prod",
+                crate::graph::ScanOp::Max => "max",
+                crate::graph::ScanOp::Min => "min",
+                crate::graph::ScanOp::LogAddExp => "logaddexp",
             };
             let variant = format!(
                 "{}{}_{op_name}_{}",

@@ -138,9 +138,6 @@ pub use tree::{
 };
 
 // Graph-level items, public in `graph`, used across the crate by their short paths.
-pub(crate) use graph::Fused;
-pub(crate) use graph::ScanOp;
-pub(crate) use graph::ScatterReduce;
 pub(crate) use graph::SliceArg;
 pub(crate) use graph::UnaryOp;
 

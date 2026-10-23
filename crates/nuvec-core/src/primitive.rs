@@ -353,7 +353,7 @@ pub enum Primitive {
     },
     /// A fused operation with a dedicated GPU kernel ([`crate::fast`]).
     Fast(crate::fast::imp::FastOp),
-    /// Element-wise operations fused into one generated kernel ([`crate::Fused`]), as
+    /// Element-wise operations fused into one generated kernel ([`crate::graph::Fused`]), as
     /// `compile` builds them. The inputs share the output's shape.
     Compiled(crate::fused::Fused),
     /// Random bits from threefry2x32 keys of shape `[..., 2]` (uint32): the output has shape

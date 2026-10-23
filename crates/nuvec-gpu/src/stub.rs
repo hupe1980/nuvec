@@ -31,6 +31,21 @@ impl Device {
     pub fn set_wired_limit(&self, _bytes: usize) -> crate::Result<usize> {
         match self.0 {}
     }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    pub fn set_memory_limit(&self, _bytes: usize) -> usize {
+        match self.0 {}
+    }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    pub fn set_cache_limit(&self, _bytes: usize) -> usize {
+        match self.0 {}
+    }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    pub fn reset_peak(&self) {
+        match self.0 {}
+    }
 }
 
 /// GPU profiling: never enabled without Metal.
