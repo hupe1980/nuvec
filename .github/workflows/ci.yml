@@ -20,27 +20,34 @@ env:
 
 # Each gate runs the same command as its `just` recipe, so a green `just ci` predicts
 # a green run here. Gates run on Apple Silicon (`macos-latest` is arm64); `portable`
-# proves the non-GPU crates still build off macOS.
+# proves the non-GPU crates still build off macOS. Actions are pinned by commit SHA.
 jobs:
   fmt:
     name: Rustfmt
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install # from rust-toolchain.toml
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.0" # = rust-toolchain.toml
+          components: rustfmt, clippy
       - run: cargo fmt --all --check
 
   clippy:
     name: Clippy + docs
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install # from rust-toolchain.toml
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.0" # = rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --workspace --no-deps --all-features
 
-  # rust-toolchain.toml pins the MSRV; RUSTUP_TOOLCHAIN overrides it for the stable leg.
+  # rust-toolchain.toml pins the MSRV (`rust-version`); RUSTUP_TOOLCHAIN overrides it for
+  # the stable leg.
   test:
     name: Test (${{ matrix.rust }})
     runs-on: macos-latest
@@ -51,24 +58,34 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.rust }}
+      # GPU tests fail instead of skipping when the runner exposes a Metal device.
+      - name: Metal device
+        run: |
+          if system_profiler SPDisplaysDataType | grep -qE 'Metal (Support|Family):'; then
+            echo "NUVEC_REQUIRE_GPU=1" >> "${GITHUB_ENV}"
+          else
+            echo "No Metal device on this runner: GPU numerics verified locally only." >> "${GITHUB_STEP_SUMMARY}"
+          fi
       - run: cargo test --workspace --all-targets --all-features
+      - run: cargo test --workspace --doc --all-features # `--all-targets` skips doctests
 
   miri:
-    name: Miri (nuvec-core)
+    name: Miri (nuvec-core, nuvec-io, nuvec-cpu)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: nightly
           components: miri
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just
       - run: just miri
@@ -77,49 +94,99 @@ jobs:
     name: cargo-deny
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install # from rust-toolchain.toml
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.0" # = rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-deny,just
       - run: just deny
 
-  # The Metal toolchain ships separately from Xcode; install it if the image lacks it.
+  # The Metal toolchain ships separately from Xcode; install it if the image lacks it. The
+  # probe is build.rs's: the `metal` shim exists even without the toolchain, so run it.
   # NUVEC_REQUIRE_METALLIB turns the runtime-source fallback into a hard error.
+  # `metal-check` runs the GPU suites under the Metal API validation layer
+  # (`MTL_DEBUG_LAYER=1`) and the shader-validation run (`MTL_SHADER_VALIDATION=1`).
   metallib:
     name: Metal kernel library
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install # from rust-toolchain.toml
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.0" # = rust-toolchain.toml
+          components: rustfmt, clippy
       - name: Metal toolchain
         run: |
           xcodebuild -version
-          xcrun -sdk macosx -f metal || xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
           xcrun -sdk macosx metal --version
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # GPU tests fail instead of skipping when the runner exposes a Metal device.
+      - name: Metal device
+        run: |
+          if system_profiler SPDisplaysDataType | grep -qE 'Metal (Support|Family):'; then
+            echo "NUVEC_REQUIRE_GPU=1" >> "${GITHUB_ENV}"
+          else
+            echo "No Metal device on this runner: GPU numerics verified locally only." >> "${GITHUB_STEP_SUMMARY}"
+          fi
       - run: just metallib-check
-      - run: just metal-check # skips GPU tests if the runner exposes no Metal device
+      - run: just metal-check
 
-  hygiene:
-    name: Layering + internal paths
+  # Builds mrun (the inference server built on nuvec) at the commit pinned in ci/mrun.ref
+  # against this tree, with its nuvec backend, and runs its tiny-model exactness suites
+  # (CPU here; the GPU suites run locally with `just mrun-exactness`). While ci/mrun.ref is
+  # marked `pre-port` (mrun not yet ported to the 0.4 API), a failed build is reported and
+  # does not fail the job. Moving the pin, or removing `pre-port`, is a reviewed change to
+  # ci/mrun.ref.
+  downstream-mrun:
+    name: mrun exactness (nuvec backend)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install # from rust-toolchain.toml
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.0" # = rust-toolchain.toml (and mrun's)
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: just
-      - run: just layering internal-paths
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: mrun exactness
+        env:
+          DEVICES: cpu
+        shell: bash
+        run: |
+          set -o pipefail
+          just mrun-exactness | tee -a "${GITHUB_STEP_SUMMARY}"
+
+  hygiene:
+    name: Hygiene (layering, paths, API, notices, docs.rs, docs claims)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.0" # = rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: just,ripgrep
+      - run: just layering internal-paths api-hygiene no-hand-visits notices docs-claims
+      - run: just docs-rs
 
   portable:
     name: Portable crates (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install # from rust-toolchain.toml
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p nuvec-core -p nuvec-cpu -p nuvec-kernels -p nuvec-gpu
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.0" # = rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test -p nuvec-core -p nuvec-cpu -p nuvec-io -p nuvec-kernels -p nuvec-gpu

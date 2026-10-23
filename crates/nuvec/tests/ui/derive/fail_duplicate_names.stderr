@@ -1,0 +1,5 @@
+error: two fields have the path segment "a": rename one
+ --> tests/ui/derive/fail_duplicate_names.rs:6:5
+  |
+6 |     #[tree(rename = "a")]
+  |     ^

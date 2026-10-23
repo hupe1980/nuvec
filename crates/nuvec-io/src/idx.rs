@@ -36,19 +36,21 @@ pub fn parse_idx(bytes: &[u8]) -> Result<Array> {
     let data = &bytes[dims_end..];
     macro_rules! decode {
         ($t:ty) => {{
-            let size = std::mem::size_of::<$t>();
-            if data.len() != count * size {
+            let nbytes = count
+                .checked_mul(std::mem::size_of::<$t>())
+                .ok_or_else(|| invalid("dimensions overflow"))?;
+            if data.len() != nbytes {
                 return Err(invalid(format!(
-                    "expected {} data bytes for shape {shape:?}, got {}",
-                    count * size,
+                    "expected {nbytes} data bytes for shape {shape:?}, got {}",
                     data.len()
                 )));
             }
+            let size = std::mem::size_of::<$t>();
             let values: Vec<$t> = data
                 .chunks_exact(size)
                 .map(|c| <$t>::from_be_bytes(c.try_into().expect("element bytes")))
                 .collect();
-            Array::from_slice(&values, &shape)
+            Array::from_slice(&values, &shape[..]).check()
         }};
     }
     match header[2] {
@@ -90,7 +92,7 @@ mod tests {
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 255],
         ))
         .unwrap();
-        assert_eq!(images.shape(), &[2, 2, 3]);
+        assert_eq!(images.shape(), [2, 2, 3]);
         assert_eq!(images.to_vec::<u8>().unwrap()[11], 255);
         let labels = parse_idx(&file(0x08, &[3], &[7, 2, 1])).unwrap();
         assert_eq!(labels.to_vec::<u8>().unwrap(), [7, 2, 1]);

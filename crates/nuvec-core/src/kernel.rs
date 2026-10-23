@@ -12,7 +12,7 @@
 //! - template arguments become `constexpr` values and `typedef`s at the top of the body.
 //!
 //! The kernel runs on the GPU only, with one thread per grid position (`dispatchThreads`).
-//! It has no derivative or batching rule; wrap it in [`crate::custom_function`] to give it
+//! It has no derivative or batching rule; wrap it in [`crate::custom_function`] (or [`crate::custom_function_flat`]) to give it
 //! one.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -57,23 +57,29 @@ pub(crate) struct KernelSpec {
 ///   MLX's type names (`bfloat16_t`, `float16_t`) and `elem_to_loc` are defined.
 ///
 /// It runs on the GPU only, one thread per grid position (`dispatchThreads`), and has no
-/// derivative or batching rule; wrap it in [`crate::custom_function`] to give it one.
+/// derivative or batching rule; wrap it in [`crate::custom_function`] (or [`crate::custom_function_flat`]) to give it one.
+///
+/// The source is trusted code, run as written: nuvec checks the inputs, outputs and
+/// launch configuration, but not what the body does with them. A body that reads or
+/// writes outside its inputs' and outputs' elements accesses other GPU memory, which is
+/// undefined behaviour (as with any `unsafe` code); pass only source you would compile
+/// into your program.
 ///
 /// ```
 /// use nuvec_core::fast::{KernelConfig, MetalKernel};
-/// use nuvec_core::{Array, DType, Device, Result, Stream, default_stream};
+/// use nuvec_core::{Array, DType, Device, Result, array, default_stream};
 ///
 /// # fn main() -> Result<()> {
-/// # if default_stream().device != Device::gpu(0) || (Array::scalar(1.0f32) * 2.0).eval().is_err() { return Ok(()); }
+/// # if default_stream().device != Device::gpu(0) || (Array::from(1.0f32) * 2.0).eval().is_err() { return Ok(()); }
 /// let exp = MetalKernel::new(
 ///     "myexp",
 ///     &["inp"],
 ///     &["out"],
 ///     "uint elem = thread_position_in_grid.x;\nout[elem] = metal::exp(inp[elem]);",
 /// );
-/// let x = Array::from_slice(&[0.0f32, 1.0], &[2])?;
+/// let x = array![0.0, 1.0];
 /// let config = KernelConfig { grid: [2, 1, 1], threadgroup: [2, 1, 1], ..Default::default() };
-/// let y = exp.call(&[x], &[(&[2], DType::F32)], &config)?.remove(0);
+/// let y = exp.call(&[x], &[(&[2], DType::F32)], &config).remove(0);
 /// assert!((y.to_vec::<f32>()?[1] - std::f32::consts::E).abs() < 1e-6);
 /// # Ok(())
 /// # }
@@ -135,6 +141,11 @@ impl Hash for KernelCall {
 impl MetalKernel {
     /// A kernel named `name` (letters, digits and underscores) whose body `source` reads
     /// `inputs` and writes `outputs` (in this order).
+    ///
+    /// Each distinct instantiation (source, template arguments, input and output types and
+    /// layouts) compiles one pipeline, cached for the life of the process: call a kernel
+    /// with a bounded set of template arguments (not, say, a sequence length) to keep the
+    /// cache bounded.
     pub fn new(name: &str, inputs: &[&str], outputs: &[&str], source: &str) -> Self {
         Self {
             spec: KernelSpec {
@@ -168,8 +179,42 @@ impl MetalKernel {
         self
     }
 
-    /// Runs the kernel on `inputs`, producing arrays of the given shapes and dtypes.
+    /// Runs the kernel on `inputs`, producing one array per output of the given shape and
+    /// dtype. Invalid arguments (names, counts, dtypes, sizes) give failed arrays.
+    #[track_caller]
     pub fn call(
+        &self,
+        inputs: &[Array],
+        outputs: &[(&[i32], DType)],
+        config: &KernelConfig,
+    ) -> Vec<Array> {
+        let ins: Vec<&Array> = inputs.iter().collect();
+        Array::sticky_vec(
+            "metal_kernel",
+            std::panic::Location::caller(),
+            &ins,
+            outputs.len().max(1),
+            || {
+                let shapes = outputs
+                    .iter()
+                    .map(|(shape, _)| {
+                        let spec: Vec<i64> = shape.iter().map(|&d| i64::from(d)).collect();
+                        crate::axes::dims(&spec)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let outs: Vec<(&[usize], DType)> = shapes
+                    .iter()
+                    .zip(outputs)
+                    .map(|(s, (_, d))| (s.as_slice(), *d))
+                    .collect();
+                self.call_impl(inputs, &outs, config)
+            },
+        )
+    }
+
+    /// Runs the kernel on `inputs`, producing arrays of the given shapes and dtypes (`usize`
+    /// shapes; the implementation behind [`MetalKernel::call`]).
+    pub(crate) fn call_impl(
         &self,
         inputs: &[Array],
         outputs: &[(&[usize], DType)],
@@ -214,10 +259,7 @@ impl MetalKernel {
             }))
             .find(|&d| msl_type(d).is_none())
         {
-            return Err(Error::UnsupportedDType {
-                op: "metal_kernel",
-                dtype,
-            });
+            return Err(Error::unsupported_dtype("metal_kernel", dtype));
         }
         if default_stream().device.kind != DeviceKind::Gpu {
             return Err(Error::UnsupportedDevice(default_stream().device));
@@ -225,8 +267,8 @@ impl MetalKernel {
         let mut operands = inputs.to_vec();
         if let Some(v) = config.init_value {
             for &(shape, dtype) in outputs {
-                operands.push(crate::broadcast_to(
-                    &Array::scalar(v).astype(dtype)?,
+                operands.push(crate::ops::imp::broadcast_to(
+                    &Array::from(v).try_astype(dtype)?,
                     shape,
                 )?);
             }

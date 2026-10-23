@@ -14,7 +14,7 @@ use allocator::Pool;
 pub use buffer::Buffer;
 pub use command::{Arg, CommandBuffer, Pending, Submitted, Timeline};
 use nuvec_kernels::MetallibMode;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -54,6 +54,9 @@ impl Libraries {
     }
 }
 
+/// A pipeline cache entry: empty until compiled (a failed compilation leaves it empty).
+type Slot = Arc<Mutex<Option<Pipeline>>>;
+
 /// A function constant value for [`Device::pipeline_with_constants`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Constant {
@@ -74,9 +77,21 @@ struct Inner {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     info: DeviceInfo,
     library: OnceLock<Result<Libraries>>,
-    pipelines: Mutex<HashMap<String, Pipeline>>,
+    /// Compiled pipelines by key: library kernels by name (and function constants), source
+    /// kernels by `src:{name}`. The map's lock is held only to find a key's slot; a slot's
+    /// lock is held while that one pipeline compiles, so a thread asking for the same key
+    /// waits for that compilation (one compilation per key) and other keys are not blocked.
+    pipelines: Mutex<HashMap<String, Slot>>,
     pool: Arc<Pool>,
     in_flight: InFlight,
+}
+
+impl Drop for Inner {
+    /// Releases the cached buffers in an autorelease pool (a Metal object's deallocation
+    /// may autorelease others, and the last device handle may be dropped on any thread).
+    fn drop(&mut self) {
+        autoreleasepool(|_| self.pool.clear_cache());
+    }
 }
 
 /// The number of committed command buffers that have not completed yet.
@@ -116,6 +131,10 @@ impl Device {
     /// The system's default Metal device, or `None` if there is none (for example in some
     /// virtual machines).
     pub fn system_default() -> Option<Device> {
+        autoreleasepool(|_| Self::create())
+    }
+
+    fn create() -> Option<Device> {
         let device = MTLCreateSystemDefaultDevice()?;
         let queue = device.newCommandQueue()?;
         let architecture = device.architecture().name().to_string();
@@ -163,23 +182,31 @@ impl Device {
         self.inner.pool.stats()
     }
 
-    /// Sets the memory limit (allocations beyond it fail) and returns the previous one.
+    /// Sets the memory limit and returns the previous one (as MLX's `set_memory_limit`).
+    ///
+    /// The limit bounds `active + mapped` ([`MemoryStats::active_with_mapped`]): an
+    /// allocation or a file mapping that would pass it fails with
+    /// [`GpuError::OutOfMemory`] before anything is wired, so a server's memory budget can
+    /// refuse work instead of swapping. This deliberately differs from MLX 0.32.4, whose
+    /// limit is "a guideline for the maximum amount of memory to use during graph
+    /// evaluation" (allocations fail there only when no RAM or swap is left). A limit below
+    /// what is already in use is accepted; the next allocation or mapping then fails. The
+    /// default is `min(1.5 × recommended working set, 0.95 × RAM)`, as MLX.
     pub fn set_memory_limit(&self, bytes: usize) -> usize {
-        self.inner.pool.set_memory_limit(bytes)
+        autoreleasepool(|_| self.inner.pool.set_memory_limit(bytes))
     }
 
     /// Sets the cache limit, trimming the cache to it, and returns the previous one.
     pub fn set_cache_limit(&self, bytes: usize) -> usize {
-        self.inner.pool.set_cache_limit(bytes)
+        autoreleasepool(|_| self.inner.pool.set_cache_limit(bytes))
     }
 
     /// Sets the wired limit and returns the previous one (MLX's `set_wired_limit`; 0 by
     /// default). Buffers, mapped files included, are kept resident up to this many bytes
     /// while GPU work runs, instead of being made resident per command buffer, which can
     /// page memory in again under pressure. Lowering it unwires buffers until the wired set
-    /// fits. A limit above the recommended working set is an error. Without residency sets
-    /// (before macOS 15, or on GPUs before Metal 3) the limit is recorded but nothing is
-    /// wired.
+    /// fits. A limit above the recommended working set is an error. On a GPU without
+    /// residency sets (before Metal 3) the limit is recorded but nothing is wired.
     pub fn set_wired_limit(&self, bytes: usize) -> Result<usize> {
         if bytes as u64 > self.inner.info.recommended_working_set {
             return Err(GpuError::InvalidArgument(format!(
@@ -187,18 +214,17 @@ impl Device {
                 self.inner.info.recommended_working_set
             )));
         }
-        Ok(self.inner.pool.set_wired_limit(bytes))
+        Ok(autoreleasepool(|_| self.inner.pool.set_wired_limit(bytes)))
     }
 
-    /// Whether buffers can be wired on this system (residency sets: macOS 15 and a Metal 3
-    /// GPU).
+    /// Whether buffers can be wired on this system (residency sets: a Metal 3 GPU).
     pub fn can_wire(&self) -> bool {
         self.inner.pool.can_wire()
     }
 
     /// Releases every cached buffer.
     pub fn clear_cache(&self) {
-        self.inner.pool.clear_cache();
+        autoreleasepool(|_| self.inner.pool.clear_cache());
     }
 
     /// Command buffers committed on this device that have not completed yet.
@@ -216,7 +242,8 @@ impl Device {
         &self.inner.in_flight
     }
 
-    /// Resets the peak to the current active memory.
+    /// Resets the peaks to the current use: `peak` to `active`, `peak_with_mapped` to
+    /// `active + mapped`.
     pub fn reset_peak(&self) {
         self.inner.pool.reset_peak();
     }
@@ -231,7 +258,10 @@ impl Device {
     }
 
     /// The compute pipeline for the kernel `name` from nuvec's kernel library, compiled on
-    /// first use and cached.
+    /// first use and cached for the life of the device. The cache is keyed by kernel name
+    /// and function constants, so it is bounded by the library's kernels times the constant
+    /// combinations the operations use (a few thousand at most); pipelines from source are
+    /// keyed by their name (one entry per distinct custom kernel instantiation).
     pub fn pipeline(&self, name: &str) -> Result<Pipeline> {
         self.pipeline_with(name, &[])
     }
@@ -260,108 +290,122 @@ impl Device {
             }
             k
         });
-        let mut cache = self
-            .inner
-            .pipelines
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(p) = cache.get(&key) {
-            return Ok(p.clone());
-        }
+        // Loaded (or compiled, from runtime sources) before any cache lock is taken.
         let library = self.library()?.get(name)?;
-        let ns_name = NSString::from_str(name);
-        let function = if constants.is_empty() {
-            library
-                .newFunctionWithName(&ns_name)
-                .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))?
-        } else {
-            let values = MTLFunctionConstantValues::new();
-            for &(index, value) in constants {
-                match value {
-                    // SAFETY: `b` is a live local, which Metal copies during the call; `bool`
-                    // matches `MTLDataType::Bool` (one byte).
-                    Constant::Bool(b) => unsafe {
-                        values.setConstantValue_type_atIndex(
-                            NonNull::from(&b).cast(),
-                            MTLDataType::Bool,
-                            index,
-                        );
-                    },
-                    // SAFETY: as above; `i32` matches `MTLDataType::Int`.
-                    Constant::Int(n) => unsafe {
-                        values.setConstantValue_type_atIndex(
-                            NonNull::from(&n).cast(),
-                            MTLDataType::Int,
-                            index,
-                        );
-                    },
+        self.cached(key.clone(), || {
+            let ns_name = NSString::from_str(name);
+            let function = if constants.is_empty() {
+                library
+                    .newFunctionWithName(&ns_name)
+                    .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))?
+            } else {
+                let values = MTLFunctionConstantValues::new();
+                for &(index, value) in constants {
+                    match value {
+                        // SAFETY: `b` is a live local, which Metal copies during the call;
+                        // `bool` matches `MTLDataType::Bool` (one byte).
+                        Constant::Bool(b) => unsafe {
+                            values.setConstantValue_type_atIndex(
+                                NonNull::from(&b).cast(),
+                                MTLDataType::Bool,
+                                index,
+                            );
+                        },
+                        // SAFETY: as above; `i32` matches `MTLDataType::Int`.
+                        Constant::Int(n) => unsafe {
+                            values.setConstantValue_type_atIndex(
+                                NonNull::from(&n).cast(),
+                                MTLDataType::Int,
+                                index,
+                            );
+                        },
+                    }
                 }
-            }
-            library
-                .newFunctionWithName_constantValues_error(&ns_name, &values)
+                library
+                    .newFunctionWithName_constantValues_error(&ns_name, &values)
+                    .map_err(|e| GpuError::Pipeline {
+                        name: key.clone(),
+                        message: e.localizedDescription().to_string(),
+                    })?
+            };
+            let state = self
+                .inner
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|e| GpuError::Pipeline {
                     name: key.clone(),
                     message: e.localizedDescription().to_string(),
-                })?
-        };
-        let state = self
-            .inner
-            .device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|e| GpuError::Pipeline {
-                name: key.clone(),
-                message: e.localizedDescription().to_string(),
-            })?;
-        let pipeline = Pipeline {
-            state,
-            name: key.as_str().into(),
-        };
-        cache.insert(key, pipeline.clone());
-        Ok(pipeline)
+                })?;
+            Ok(Pipeline {
+                state,
+                name: key.as_str().into(),
+            })
+        })
     }
 
     /// The pipeline for kernel `name` from Metal source that `source` generates, compiled
     /// at runtime on first use and cached by name (so a name must always mean the same
-    /// source). The source may include nuvec's headers (`#include "common.h"`); it is
-    /// compiled with IEEE-conformant math, as nuvec's own kernels are.
+    /// source; `source` runs only on a cache miss). Source kernels have their own namespace:
+    /// a source kernel named like one of nuvec's library kernels is a different pipeline.
+    /// The source may include nuvec's headers (`#include "common.h"`); it is compiled as
+    /// nuvec's own kernels are, with Metal 3.2 and IEEE-conformant math.
+    ///
+    /// The source is trusted code: the pipeline is run with the `unsafe`
+    /// [`CommandBuffer::dispatch`] family, whose contract (in-bounds accesses only) the
+    /// kernel must keep.
     pub fn pipeline_from_source(
         &self,
         name: &str,
         source: impl FnOnce() -> String,
     ) -> Result<Pipeline> {
-        let mut cache = self
-            .inner
-            .pipelines
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(p) = cache.get(name) {
+        self.cached(format!("src:{name}"), || {
+            let failed = |message: String| GpuError::Pipeline {
+                name: name.to_owned(),
+                message,
+            };
+            let source = inline_sources(&[("generated.metal", &source())]);
+            let options = objc2_metal::MTLCompileOptions::new();
+            options.setMathMode(objc2_metal::MTLMathMode::Safe);
+            options.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version3_2);
+            let library = self
+                .inner
+                .device
+                .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
+                .map_err(|e| failed(e.localizedDescription().to_string()))?;
+            let function = library
+                .newFunctionWithName(&NSString::from_str(name))
+                .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))?;
+            let state = self
+                .inner
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|e| failed(e.localizedDescription().to_string()))?;
+            Ok(Pipeline {
+                state,
+                name: name.into(),
+            })
+        })
+    }
+
+    /// The cached pipeline for `key`, compiled by `compile` on a miss. The cache's lock is
+    /// not held while compiling (only the key's own slot is); compilation runs in an
+    /// autorelease pool, so the temporary Objective-C objects it creates are released on
+    /// long-lived threads too.
+    fn cached(&self, key: String, compile: impl FnOnce() -> Result<Pipeline>) -> Result<Pipeline> {
+        let slot = {
+            let mut cache = self
+                .inner
+                .pipelines
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            cache.entry(key).or_default().clone()
+        };
+        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(p) = &*slot {
             return Ok(p.clone());
         }
-        let failed = |message: String| GpuError::Pipeline {
-            name: name.to_owned(),
-            message,
-        };
-        let source = inline_sources(&[("generated.metal", &source())]);
-        let options = objc2_metal::MTLCompileOptions::new();
-        options.setMathMode(objc2_metal::MTLMathMode::Safe);
-        let library = self
-            .inner
-            .device
-            .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
-            .map_err(|e| failed(e.localizedDescription().to_string()))?;
-        let function = library
-            .newFunctionWithName(&NSString::from_str(name))
-            .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))?;
-        let state = self
-            .inner
-            .device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|e| failed(e.localizedDescription().to_string()))?;
-        let pipeline = Pipeline {
-            state,
-            name: name.into(),
-        };
-        cache.insert(name.to_owned(), pipeline.clone());
+        let pipeline = autoreleasepool(|_| compile())?;
+        *slot = Some(pipeline.clone());
         Ok(pipeline)
     }
 
@@ -369,7 +413,7 @@ impl Device {
     fn library(&self) -> Result<&Libraries> {
         self.inner
             .library
-            .get_or_init(|| load_library(&self.inner.device))
+            .get_or_init(|| autoreleasepool(|_| load_library(&self.inner.device)))
             .as_ref()
             .map_err(Clone::clone)
     }

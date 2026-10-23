@@ -2,7 +2,8 @@
 //!
 //! Freed buffers are cached and handed back for similar sizes, so steady-state loops make
 //! almost no system allocations. The cache is bounded (least-recently-used eviction), and
-//! allocations beyond the memory limit fail instead of exhausting shared system RAM.
+//! allocations or mappings that would push `active + mapped` beyond the memory limit fail
+//! instead of exhausting shared system RAM (MLX treats its limit as a guideline).
 //!
 //! As in MLX, a buffer freed while submitted GPU work still uses it is cached at once: GPU
 //! work encoded later may reuse it, ordered after those uses by the buffer's fences (its
@@ -69,13 +70,9 @@ unsafe impl Send for Cached {}
 // never read or written through a shared reference.
 unsafe impl Sync for Cached {}
 
-/// The size an allocation of `len` bytes is rounded up to.
-pub(crate) fn rounded(len: usize) -> usize {
-    match len {
-        0 => 0,
-        n if n > PAGE => n.div_ceil(PAGE) * PAGE,
-        n => n.div_ceil(SMALL) * SMALL,
-    }
+/// The size an allocation of `len` bytes is rounded up to; `None` if that overflows.
+pub(crate) fn rounded(len: usize) -> Option<usize> {
+    crate::memory::allocation_size(len)
 }
 
 pub(crate) struct Pool {
@@ -96,6 +93,8 @@ struct State {
     cached: usize,
     active: usize,
     peak: usize,
+    /// The highest `active + mapped`.
+    peak_with_mapped: usize,
     memory_limit: usize,
     cache_limit: usize,
     working_set: usize,
@@ -106,11 +105,17 @@ struct State {
 }
 
 impl State {
+    /// Records `active` and `mapped` in both peaks (after every change of either).
+    fn note_peaks(&mut self) {
+        self.peak = self.peak.max(self.active);
+        self.peak_with_mapped = self.peak_with_mapped.max(self.active + self.mapped);
+    }
+
     /// A cached buffer of at least `size` bytes within MLX's slack (smaller than
     /// `min(2·size, size + 2 pages)`) that an allocation for the GPU (or the CPU) may take,
     /// its size and its pending hazard state.
     fn take(&mut self, size: usize, gpu: bool) -> Option<Allocation> {
-        let limit = (2 * size).min(size + 2 * PAGE);
+        let limit = size.saturating_mul(2).min(size.saturating_add(2 * PAGE));
         let found = if size <= PAGE {
             let last = ((limit - 1) / SMALL).min(SMALL_CLASSES - 1);
             (size / SMALL..=last).find_map(|c| {
@@ -200,7 +205,7 @@ impl State {
         self.large.retain(|&(_, stamp), e| keep(&stamp, e));
     }
 
-    /// GC threshold: cached memory is released before active + cached reaches it.
+    /// GC threshold: cached memory is released before active + mapped + cached reaches it.
     fn gc_limit(&self) -> usize {
         ((self.working_set as f64 * 0.95) as usize).min(self.memory_limit)
     }
@@ -223,6 +228,7 @@ impl Pool {
                 cached: 0,
                 active: 0,
                 peak: 0,
+                peak_with_mapped: 0,
                 memory_limit,
                 cache_limit: memory_limit,
                 working_set: working_set as usize,
@@ -252,28 +258,47 @@ impl Pool {
         len: usize,
         gpu: bool,
     ) -> Result<Option<Allocation>> {
-        let size = rounded(len);
+        let size = rounded(len).ok_or(GpuError::OutOfMemory(len))?;
         if size == 0 {
             return Ok(None);
         }
-        let mut s = self.lock();
-        if s.active + size > s.memory_limit {
-            s.evict_to(0);
+        // Metal refuses (and its validation layer aborts on) lengths above the device's
+        // maximum, whatever the memory limit says.
+        if size > device.maxBufferLength() {
             return Err(GpuError::OutOfMemory(len));
         }
+        let mut s = self.lock();
+        // Checked: `active + mapped + size` must not pass the limit (nor wrap); the
+        // result is the new `active`.
+        let fits = |s: &State, size: usize| {
+            s.active
+                .checked_add(size)
+                .filter(|&total| total.saturating_add(s.mapped) <= s.memory_limit)
+        };
+        let Some(after) = fits(&s, size) else {
+            s.evict_to(0);
+            return Err(GpuError::OutOfMemory(len));
+        };
         if let Some((raw, bucket, busy)) = s.take(size, gpu) {
-            s.active += bucket;
-            s.peak = s.peak.max(s.active);
-            return Ok(Some((raw, bucket, busy)));
+            // The limit applies to what is charged: the cached bucket, possibly larger
+            // than `size`. One that does not fit goes back; a new buffer of `size` may.
+            if let Some(total) = fits(&s, bucket) {
+                s.active = total;
+                s.note_peaks();
+                return Ok(Some((raw, bucket, busy)));
+            }
+            s.put(raw, bucket, busy);
         }
+        // Mapped files count: they are resident too (MLX loads weights as active memory).
         let gc = s.gc_limit();
-        if s.active + s.cached + size >= gc {
-            let target = gc.saturating_sub(s.active + size);
+        let used = after.saturating_add(s.mapped);
+        if used.saturating_add(s.cached) >= gc {
+            let target = gc.saturating_sub(used);
             s.evict_to(target);
         }
         // Reserve before the system call so concurrent allocations respect the limit.
-        s.active += size;
-        s.peak = s.peak.max(s.active);
+        s.active = after;
+        s.note_peaks();
         drop(s);
         let options =
             MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
@@ -306,6 +331,8 @@ impl Pool {
         MemoryStats {
             active: s.active,
             peak: s.peak,
+            active_with_mapped: s.active + s.mapped,
+            peak_with_mapped: s.peak_with_mapped,
             cache: s.cached,
             memory_limit: s.memory_limit,
             cache_limit: s.cache_limit,
@@ -317,11 +344,20 @@ impl Pool {
         }
     }
 
-    /// Wires a buffer made outside the pool (a mapped file) while it fits under the limit.
-    pub(crate) fn track(&self, raw: &Raw) {
+    /// Counts a buffer made outside the pool (a mapped file) in `mapped` and wires it
+    /// while it fits under the wired limit, or refuses it (`OutOfMemory`, nothing wired)
+    /// when `active + mapped` would pass the memory limit.
+    pub(crate) fn track(&self, raw: &Raw) -> Result<()> {
+        let size = objc2_metal::MTLResource::allocatedSize(&**raw);
         let mut s = self.lock();
-        s.mapped += objc2_metal::MTLResource::allocatedSize(&**raw);
+        let total = s.active.saturating_add(s.mapped).saturating_add(size);
+        if total > s.memory_limit {
+            return Err(GpuError::OutOfMemory(size));
+        }
+        s.mapped += size;
+        s.note_peaks();
         s.residency.insert(raw, true);
+        Ok(())
     }
 
     /// Unwires a buffer made outside the pool before it is released.
@@ -331,7 +367,7 @@ impl Pool {
         s.residency.erase(raw);
     }
 
-    /// Whether buffers can be wired on this system (residency sets: macOS 15, Metal 3).
+    /// Whether buffers can be wired on this system (residency sets: a Metal 3 GPU).
     pub(crate) fn can_wire(&self) -> bool {
         self.lock().residency.supported()
     }
@@ -361,6 +397,7 @@ impl Pool {
     pub(crate) fn reset_peak(&self) {
         let mut s = self.lock();
         s.peak = s.active;
+        s.peak_with_mapped = s.active + s.mapped;
     }
 }
 
@@ -370,12 +407,14 @@ mod tests {
 
     #[test]
     fn rounding() {
-        assert_eq!(rounded(0), 0);
-        assert_eq!(rounded(1), 256);
-        assert_eq!(rounded(256), 256);
-        assert_eq!(rounded(257), 512);
-        assert_eq!(rounded(PAGE), PAGE);
-        assert_eq!(rounded(PAGE + 1), 2 * PAGE);
+        assert_eq!(rounded(0), Some(0));
+        assert_eq!(rounded(1), Some(256));
+        assert_eq!(rounded(256), Some(256));
+        assert_eq!(rounded(257), Some(512));
+        assert_eq!(rounded(PAGE), Some(PAGE));
+        assert_eq!(rounded(PAGE + 1), Some(2 * PAGE));
+        assert_eq!(rounded(usize::MAX - PAGE + 1), Some(usize::MAX - PAGE + 1));
+        assert_eq!(rounded(usize::MAX - PAGE + 2), None);
     }
 
     #[test]

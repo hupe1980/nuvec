@@ -2,18 +2,23 @@
 //!
 //! Selects one of three modes and reports it to the crate as `cfg(nuvec_metallib)`:
 //!
-//! - `precompiled`: the toolchain is available, so `$OUT_DIR/nuvec.metallib` is built.
+//! - `precompiled`: the toolchain works (`xcrun metal --version` succeeds), so
+//!   `$OUT_DIR/nuvec.metallib` is built. The `.metal` files compile in parallel.
 //! - `source`: precompilation is disabled (`NUVEC_METALLIB=off`) or the toolchain is
 //!   missing. Shader sources are embedded for runtime compilation, and one warning is printed.
 //! - `unavailable`: the target is not macOS. No tools run.
 //!
-//! `NUVEC_REQUIRE_METALLIB=1` turns every fallback into a build error (used by CI).
+//! Under docs.rs (`DOCS_RS` set) no tool runs either: the mode is `source` with no shaders.
+//!
+//! `NUVEC_REQUIRE_METALLIB=1` turns every fallback into a build error (used by CI). Any
+//! `NUVEC_METALLIB` value other than `off` is ignored with a warning.
 
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
 
 const OPT_OUT: &str = "NUVEC_METALLIB";
 const REQUIRE: &str = "NUVEC_REQUIRE_METALLIB";
@@ -39,15 +44,21 @@ fn main() {
     println!("cargo::rerun-if-env-changed={OPT_OUT}");
     println!("cargo::rerun-if-env-changed={REQUIRE}");
     println!("cargo::rerun-if-env-changed=DEVELOPER_DIR");
+    println!("cargo::rerun-if-env-changed=DOCS_RS");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
     let src_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
             .join("src/metal");
+    // docs.rs has no Metal toolchain (and its sandbox has no `xcrun`).
+    if env::var_os("DOCS_RS").is_some() {
+        println!("cargo::rustc-cfg=nuvec_metallib=\"source\"");
+        write_sources(&out_dir, &src_dir, &[]);
+        return;
+    }
     let files = shader_files(&src_dir);
     let require = env::var(REQUIRE).is_ok_and(|v| v == "1");
 
-    let mut names: Vec<String> = Vec::new();
     let mut embedded: &[PathBuf] = &[];
     let mode = if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         "unavailable"
@@ -56,29 +67,41 @@ fn main() {
         embedded = &files;
         "source"
     } else {
-        names = precompile(&files, &out_dir);
+        precompile(&files, &out_dir);
         "precompiled"
     };
 
     println!("cargo::rustc-cfg=nuvec_metallib=\"{mode}\"");
-    write_kernel_names(&out_dir, &names);
     write_sources(&out_dir, &src_dir, embedded);
 }
 
 /// Why precompilation cannot run, or `None` if it can. Panics if `require` forbids a fallback.
 fn fallback_reason(require: bool) -> Option<String> {
-    let reason = if env::var(OPT_OUT).is_ok_and(|v| v == "off") {
+    let opt_out = env::var(OPT_OUT).unwrap_or_default();
+    if !matches!(opt_out.as_str(), "" | "off") {
+        println!(
+            "cargo::warning=ignoring unknown {OPT_OUT}={opt_out:?} (only `off` is recognised)"
+        );
+    }
+    let reason = if opt_out == "off" {
         format!("precompilation disabled by {OPT_OUT}=off")
+    } else if !compiler_works() {
+        format!("the Metal toolchain (`xcrun metal --version`) is not usable; {INSTALL_HINT}")
+    } else if !tool_exists("metallib") {
+        format!("the Metal toolchain (`metallib`) was not found; {INSTALL_HINT}")
     } else {
-        let tool = ["metal", "metallib", "metal-nm"]
-            .into_iter()
-            .find(|t| !tool_exists(t))?;
-        format!("the Metal toolchain (`{tool}`) was not found; {INSTALL_HINT}")
+        return None;
     };
     if require {
         panic!("{REQUIRE}=1 but {reason}");
     }
     Some(reason)
+}
+
+/// Whether the Metal compiler runs. `xcrun -f metal` is not enough: the `metal` shim exists
+/// even when the Metal Toolchain component is not downloaded, and then fails when invoked.
+fn compiler_works() -> bool {
+    xcrun(&["metal", "--version"]).is_ok_and(|o| o.status.success())
 }
 
 fn tool_exists(tool: &str) -> bool {
@@ -93,14 +116,10 @@ fn xcrun(args: &[&str]) -> std::io::Result<Output> {
         .output()
 }
 
-/// Compiles every `.metal` file to AIR, links `nuvec.metallib`, and returns its kernel names.
-fn precompile(files: &[PathBuf], out_dir: &Path) -> Vec<String> {
+/// Compiles every `.metal` file to AIR, in parallel, and links `nuvec.metallib`.
+fn precompile(files: &[PathBuf], out_dir: &Path) {
     let debug = env::var("PROFILE").as_deref() == Ok("debug");
-    let mut airs = Vec::new();
-    for src in files
-        .iter()
-        .filter(|f| f.extension().is_some_and(|e| e == "metal"))
-    {
+    let compile = |src: &PathBuf| -> PathBuf {
         let air = out_dir
             .join(src.file_stem().expect("shader file has a name"))
             .with_extension("air");
@@ -114,25 +133,25 @@ fn precompile(files: &[PathBuf], out_dir: &Path) -> Vec<String> {
         let (src_s, air_s) = (path_str(src), path_str(&air));
         args.extend(["-c", src_s, "-o", air_s]);
         run("metal", &args);
-        airs.push(air);
-    }
+        air
+    };
+    // One thread per file; `run` panics on failure and the panic is re-raised by `join`.
+    let airs: Vec<PathBuf> = thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .iter()
+            .filter(|f| f.extension().is_some_and(|e| e == "metal"))
+            .map(|src| scope.spawn(move || compile(src)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
 
     let lib = out_dir.join("nuvec.metallib");
     let mut args: Vec<&str> = airs.iter().map(|p| path_str(p)).collect();
     args.extend(["-o", path_str(&lib)]);
     run("metallib", &args);
-
-    // `metal-nm` lists exported functions as `<addr> T <name>`.
-    let nm = run("metal-nm", &[path_str(&lib)]);
-    let mut names: Vec<String> = String::from_utf8_lossy(&nm.stdout)
-        .lines()
-        .filter_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
-            [_, "T", name] => Some(name.to_owned()),
-            _ => None,
-        })
-        .collect();
-    names.sort();
-    names
 }
 
 /// Runs an `xcrun` tool. On failure, forwards its output verbatim and fails the build.
@@ -164,15 +183,6 @@ fn shader_files(dir: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
-}
-
-fn write_kernel_names(out_dir: &Path, names: &[String]) {
-    let mut code = String::from("&[");
-    for name in names {
-        write!(code, "{name:?}, ").expect("writing to a String");
-    }
-    code.push(']');
-    fs::write(out_dir.join("kernel_names.rs"), code).expect("writing kernel_names.rs");
 }
 
 fn write_sources(out_dir: &Path, src_dir: &Path, files: &[PathBuf]) {

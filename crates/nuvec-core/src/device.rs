@@ -92,6 +92,50 @@ pub fn set_default_stream(stream: Stream) {
     DEFAULT_STREAM.set(Some(stream));
 }
 
+/// Runs `f` with `stream` as this thread's default stream, and restores the previous
+/// default afterwards, also when `f` panics. A device stands for its first stream.
+///
+/// This replaces per-operation stream arguments: every operation `f` records goes on
+/// `stream`.
+///
+/// ```
+/// use nuvec_core::{Device, array, default_stream, with_stream};
+///
+/// let x = array![1.0, 2.0];
+/// let y = with_stream(Device::cpu(), || x.exp().sum(..));
+/// assert_eq!(y.device(), Device::cpu());
+/// assert_eq!(default_stream(), nuvec_core::default_stream()); // restored
+/// ```
+pub fn with_stream<R>(stream: impl Into<Stream>, f: impl FnOnce() -> R) -> R {
+    let _guard = StreamGuard::set(stream.into());
+    f()
+}
+
+/// Restores the thread's default stream when dropped, also when unwinding.
+pub(crate) struct StreamGuard(Option<Stream>);
+
+impl StreamGuard {
+    /// Makes `stream` the default until the guard is dropped.
+    pub(crate) fn set(stream: Stream) -> Self {
+        let guard = Self(DEFAULT_STREAM.get());
+        DEFAULT_STREAM.set(Some(stream));
+        guard
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        DEFAULT_STREAM.set(self.0);
+    }
+}
+
+/// A device's first stream.
+impl From<Device> for Stream {
+    fn from(device: Device) -> Self {
+        Self::default_for(device)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

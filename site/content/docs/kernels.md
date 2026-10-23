@@ -17,7 +17,7 @@ The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each 
 | `layer_norm(x, weight, bias, eps)` | Layer normalization |
 | `rope(x, dims, traditional, base, scale, offset, freqs)` | Rotary position embeddings, optionally on the first `dims` features only |
 | `norm_rope(x, norm, rotation, offset, cache)` | Per-head RMS normalization and RoPE, optionally written straight into a KV cache |
-| `scaled_dot_product_attention(q, k, v, scale, mask, sinks)` | Attention with grouped-query heads, causal, boolean or additive masks and attention sinks |
+| `scaled_dot_product_attention(q, k, v, scale, &options)` | Attention with grouped-query heads; `AttentionOptions` holds the mask (causal, boolean or additive), attention sinks, a sliding window and a cap on score memory |
 | `cross_entropy(logits, targets)` | Fused log-softmax and negative log-likelihood |
 | `gated_delta(q, k, v, g, beta, state)` | The Gated DeltaNet recurrence (Qwen 3.5's linear attention), returning the outputs and the new state |
 | `gated_delta_steps(q, k, v, g, beta, state)` | The same, returning the state after every step (to roll the recurrence back) |
@@ -25,14 +25,32 @@ The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each 
 | `paged_attention(q, k_cache, v_cache, block_tables, lengths, scale)` | Attention for a batch of sequences of different lengths over a KV cache stored in fixed-size blocks |
 | `paged_write(cache, new, slots)` | Writes new keys or values into their blocks, in place when the cache is owned |
 
-Attention picks MLX's kernel for the shape: vector kernels for short queries (decode), a two-pass split-K kernel for long contexts, and the tiled flash-style kernel for prefill. `softmax` and `logsumexp` over the last axis use fused kernels too.
+Attention picks MLX's kernel for the shape: vector kernels for short queries (decode), a two-pass split-K kernel for long contexts, and the tiled flash-style kernel or the composition for prefill. `plan_attention` reports the choice, and the scratch memory it holds, from the shapes alone; `max_score_bytes` bounds every score-sized intermediate (the tiled kernel, or the composition in blocks of queries). With 2 to 8 causal queries (speculative verification), each row gives the bits of the same row decoded alone. `softmax` and `logsumexp` over the last axis use fused kernels too.
+
+```rust
+use nuvec::fast::{AttentionOptions, plan_attention};
+use nuvec::DType;
+
+# fn main() -> nuvec::Result<()> {
+let opts = AttentionOptions::causal().max_score_bytes(512 << 20);
+let plan = plan_attention(&[1, 16, 1024, 256], &[1, 2, 33_792, 256], &[1, 2, 33_792, 256], DType::BF16, &opts)?;
+assert!(plan.max_intermediate_bytes <= 512 << 20);
+# Ok(())
+# }
+```
 
 ## Custom kernels
 
 `MetalKernel` runs your own kernel body, written in Metal Shading Language, the way MLX's `mx.fast.metal_kernel` does. You give a name, the input and output names and the body; nuvec generates the function signature:
 
 ```rust
+use nuvec::prelude::*;
 use nuvec::fast::{KernelConfig, MetalKernel, TemplateArg};
+
+# fn main() -> Result<()> {
+# if nuvec::gpu::Device::shared().is_none() { return Ok(()); } // needs a Metal GPU
+# let n = 1024;
+# let x = nuvec::ops::ones([n], DType::F16);
 
 let scale = MetalKernel::new(
     "scale",
@@ -41,12 +59,15 @@ let scale = MetalKernel::new(
     "uint i = thread_position_in_grid.x;\nout[i] = static_cast<T>(inp[i] * N);",
 );
 let config = KernelConfig {
-    grid: [n, 1, 1],
+    grid: [n as usize, 1, 1],
     threadgroup: [256, 1, 1],
     template: vec![("T".into(), TemplateArg::DType(DType::F16)), ("N".into(), TemplateArg::Int(3))],
     ..Default::default()
 };
-let y = scale.call(&[x], &[(&[n], DType::F16)], &config)?.remove(0);
+let y = scale.call(&[x], &[(&[n], DType::F16)], &config).remove(0);
+# assert_eq!(y.astype(DType::F32).sum(..).item::<f32>()?, 3072.0);
+# Ok(())
+# }
 ```
 
 Signature rules, as in MLX:

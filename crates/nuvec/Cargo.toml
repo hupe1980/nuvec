@@ -1,7 +1,7 @@
 [package]
 name = "nuvec"
 description = "Pure-Rust array framework for Apple Silicon in the spirit of MLX: lazy arrays, unified memory, composable transforms"
-exclude = ["tests/fixtures"]
+exclude.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,7 +19,14 @@ nuvec-compile.workspace = true
 nuvec-cpu.workspace = true
 nuvec-gpu.workspace = true
 nuvec-io.workspace = true
-nuvec-distributed.workspace = true
+nuvec-macros.workspace = true
+
+[dev-dependencies]
+trybuild.workspace = true
+# `tests/api_surface.rs` pins the surfaces of nuvec-nn and nuvec-lm reached through the
+# facade. Path-only (no version), so the published package has no dependency cycle.
+nuvec-lm = { path = "../nuvec-lm" }
+nuvec-nn = { path = "../nuvec-nn" }
 
 # Document the Metal API, which only exists on Apple targets.
 [package.metadata.docs.rs]

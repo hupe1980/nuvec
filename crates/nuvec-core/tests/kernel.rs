@@ -8,11 +8,17 @@ mod common;
 
 use common::Rng;
 use nuvec_core::fast::{self, KernelConfig, MetalKernel, TemplateArg};
+use nuvec_core::ops;
 use nuvec_core::*;
 
 fn gpu() -> bool {
     set_default_stream(Stream::default_for(Device::gpu(0)));
-    !cfg!(miri) && (Array::scalar(1.0f32) * 2.0).eval().is_ok()
+    !cfg!(miri) && (Array::from(1.0f32) * 2.0).eval().is_ok()
+}
+
+/// Whether a call failed: every output is a failed array.
+fn failed(outs: &[Array]) -> bool {
+    !outs.is_empty() && outs.iter().all(Array::is_failed)
 }
 
 fn launch(n: usize) -> KernelConfig {
@@ -36,22 +42,20 @@ fn templates_scalars_and_multiple_outputs() {
          out[i] = static_cast<T>(inp[i] * N) + static_cast<T>(offset);\n\
          twice[i] = 2 * inp[i];",
     );
-    let x = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
-    let offset = Array::scalar(0.5f32);
+    let x = array![1.0, 2.0, 3.0];
+    let offset = Array::from(0.5f32);
     let mut config = launch(3);
     config.template = vec![
         ("T".into(), TemplateArg::DType(DType::F16)),
         ("N".into(), TemplateArg::Int(3)),
     ];
-    let outs = k
-        .call(
-            &[x, offset],
-            &[(&[3], DType::F16), (&[3], DType::F32)],
-            &config,
-        )
-        .unwrap();
+    let outs = k.call(
+        &[x, offset],
+        &[(&[3], DType::F16), (&[3], DType::F32)],
+        &config,
+    );
     assert_eq!(outs[0].dtype(), DType::F16);
-    let v = outs[0].astype(DType::F32).unwrap().to_vec::<f32>().unwrap();
+    let v = outs[0].astype(DType::F32).to_vec::<f32>().unwrap();
     assert_eq!(v, [3.5, 6.5, 9.5]);
     assert_eq!(outs[1].to_vec::<f32>().unwrap(), [2.0, 4.0, 6.0]);
 }
@@ -69,15 +73,13 @@ fn strided_inputs_are_read_through_their_strides() {
          out[i] = inp[elem_to_loc(i, inp_shape, inp_strides, inp_ndim)];",
     )
     .ensure_row_contiguous(false);
-    let a = Array::from_slice(&(0..6).map(|i| i as f32).collect::<Vec<_>>(), &[2, 3]).unwrap();
-    let t = transpose(&a, &[1, 0]).unwrap();
-    let out = k
-        .call(
-            std::slice::from_ref(&t),
-            &[(&[3, 2], DType::F32)],
-            &launch(6),
-        )
-        .unwrap();
+    let a = Array::from_slice(&(0..6).map(|i| i as f32).collect::<Vec<_>>(), [2, 3]);
+    let t = a.transpose([1, 0]);
+    let out = k.call(
+        std::slice::from_ref(&t),
+        &[(&[3, 2], DType::F32)],
+        &launch(6),
+    );
     assert_eq!(out[0].to_vec::<f32>().unwrap(), t.to_vec::<f32>().unwrap());
 }
 
@@ -93,10 +95,10 @@ fn atomic_outputs_start_from_their_initial_value() {
         "atomic_fetch_add_explicit(&out[0], inp[thread_position_in_grid.x], memory_order_relaxed);",
     )
     .atomic_outputs(true);
-    let x = Array::full(&[1000], 0.5f32).unwrap();
+    let x = ops::full([1000], 0.5f32);
     let mut config = launch(1000);
     config.init_value = Some(1.0);
-    let out = k.call(&[x], &[(&[1], DType::F32)], &config).unwrap();
+    let out = k.call(&[x], &[(&[1], DType::F32)], &config);
     assert_eq!(out[0].to_vec::<f32>().unwrap(), [501.0]);
 }
 
@@ -169,17 +171,17 @@ fn mlx_lm_gated_delta_kernel_runs_unchanged() {
     let r = |rng: &mut Rng, s: &[usize]| {
         let n: usize = s.iter().product();
         let v: Vec<f32> = (0..n).map(|_| rng.f64() as f32 / 8.0).collect();
-        Array::from_slice(&v, s).unwrap()
+        Array::from_slice(&v, s)
     };
     let unit = |a: Array| {
-        let n = sqrt(&sum(&multiply(&a, &a).unwrap(), &[-1], true).unwrap()).unwrap();
-        divide(&a, &n).unwrap()
+        let n = (&a * &a).sum_keepdims(-1).sqrt();
+        &a / &n
     };
     let q = r(&mut rng, &[b, t, hk, dk]);
     let k = unit(r(&mut rng, &[b, t, hk, dk]));
     let v = r(&mut rng, &[b, t, hv, dv]);
-    let g = add(r(&mut rng, &[b, t, hv]), 0.8).unwrap();
-    let beta = add(r(&mut rng, &[b, t, hv]), 0.5).unwrap();
+    let g = r(&mut rng, &[b, t, hv]) + 0.8;
+    let beta = r(&mut rng, &[b, t, hv]) + 0.5;
     let state = r(&mut rng, &[b, hv, dv, dk]);
     let config = KernelConfig {
         grid: [32, dv, b * hv],
@@ -201,19 +203,18 @@ fn mlx_lm_gated_delta_kernel_runs_unchanged() {
         g.clone(),
         beta.clone(),
         state.clone(),
-        Array::scalar(t as i32),
+        Array::from(t as i32),
     ];
-    let outs = kernel
-        .call(
-            &inputs,
-            &[
-                (&[b, t, hv, dv], DType::F32),
-                (&[b, hv, dv, dk], DType::F32),
-            ],
-            &config,
-        )
-        .unwrap();
-    let (y, s) = fast::gated_delta(&q, &k, &v, &g, &beta, &state).unwrap();
+    let (b, t, hv, dv, dk) = (b as i32, t as i32, hv as i32, dv as i32, dk as i32);
+    let outs = kernel.call(
+        &inputs,
+        &[
+            (&[b, t, hv, dv], DType::F32),
+            (&[b, hv, dv, dk], DType::F32),
+        ],
+        &config,
+    );
+    let (y, s) = fast::gated_delta(&q, &k, &v, &g, &beta, &state);
     for (got, want) in outs.iter().zip([y, s]) {
         let (a, w) = (got.to_vec::<f32>().unwrap(), want.to_vec::<f32>().unwrap());
         for (i, (x, z)) in a.iter().zip(&w).enumerate() {
@@ -228,19 +229,18 @@ fn invalid_calls_are_rejected() {
         return;
     }
     let k = MetalKernel::new("copy1", &["inp"], &["out"], "out[0] = inp[0];");
-    let x = Array::from_slice(&[1.0f32], &[1]).unwrap();
+    let x = array![1.0];
     let one = launch(1);
     assert!(
-        k.call(&[], &[(&[1], DType::F32)], &one).is_err(),
+        failed(&k.call(&[], &[(&[1], DType::F32)], &one)),
         "input count"
     );
     assert!(
-        k.call(std::slice::from_ref(&x), &[], &one).is_err(),
+        failed(&k.call(std::slice::from_ref(&x), &[], &one)),
         "output count"
     );
     assert!(
-        k.call(std::slice::from_ref(&x), &[(&[1], DType::F64)], &one)
-            .is_err(),
+        failed(&k.call(std::slice::from_ref(&x), &[(&[1], DType::F64)], &one)),
         "float64"
     );
     let big = KernelConfig {
@@ -248,29 +248,26 @@ fn invalid_calls_are_rejected() {
         threadgroup: [2048, 1, 1],
         ..Default::default()
     };
-    assert!(
-        k.call(std::slice::from_ref(&x), &[(&[1], DType::F32)], &big)
-            .is_err()
-    );
-    assert!(
-        MetalKernel::new("bad name", &["inp"], &["out"], "")
-            .call(std::slice::from_ref(&x), &[(&[1], DType::F32)], &one)
-            .is_err()
-    );
-    // No derivative: an error, not a silent zero.
-    let f = |xs: &[Array]| k.call(xs, &[(&[1], DType::F32)], &one);
-    assert!(
-        vjp(
-            f,
+    assert!(failed(&k.call(
+        std::slice::from_ref(&x),
+        &[(&[1], DType::F32)],
+        &big
+    )));
+    assert!(failed(
+        &MetalKernel::new("bad name", &["inp"], &["out"], "").call(
             std::slice::from_ref(&x),
-            &[Array::from_slice(&[1.0f32], &[1]).unwrap()]
+            &[(&[1], DType::F32)],
+            &one
         )
-        .is_err()
-    );
+    ));
+    // No derivative: an error, not a silent zero.
+    let f = |xs: &[Array]| Ok(k.call(xs, &[(&[1], DType::F32)], &one));
+    assert!(vjp_flat(f, std::slice::from_ref(&x), &[array![1.0]]).is_err());
     // GPU only.
     set_default_stream(Stream::default_for(Device::cpu()));
+    let outs = k.call(std::slice::from_ref(&x), &[(&[1], DType::F32)], &one);
     assert!(matches!(
-        k.call(std::slice::from_ref(&x), &[(&[1], DType::F32)], &one),
+        outs[0].clone().check(),
         Err(Error::UnsupportedDevice(_))
     ));
     set_default_stream(Stream::default_for(Device::gpu(0)));

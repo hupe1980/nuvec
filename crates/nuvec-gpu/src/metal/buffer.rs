@@ -2,9 +2,9 @@
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice};
 
@@ -64,15 +64,19 @@ impl Device {
         self.alloc_buffer(len, true)
     }
 
+    /// Runs in an autorelease pool: Metal may autorelease objects while allocating or
+    /// wiring.
     fn alloc_buffer(&self, len: usize, gpu: bool) -> Result<Buffer> {
         let pool = self.pool().clone();
-        let (raw, size, busy) = match pool.alloc(self.raw(), len, gpu)? {
-            Some((raw, size, busy)) => (Some(raw), size, busy),
-            None => (None, 0, None),
-        };
-        let ptr = raw
-            .as_ref()
-            .map_or(NonNull::dangling(), |r| r.contents().cast());
+        let (raw, size, busy, ptr) = autoreleasepool(|_| {
+            Ok::<_, GpuError>(match pool.alloc(self.raw(), len, gpu)? {
+                Some((raw, size, busy)) => {
+                    let ptr = raw.contents().cast();
+                    (Some(raw), size, busy, ptr)
+                }
+                None => (None, 0, None, NonNull::dangling()),
+            })
+        })?;
         Ok(Buffer {
             raw,
             ptr,
@@ -93,7 +97,16 @@ impl Device {
     ///
     /// A shared read-only mapping is used because a private (copy-on-write) one costs
     /// about 4× more to fault in on first use.
+    ///
+    /// The file must not be modified (written or truncated, by this or another process)
+    /// while it is mapped: the bytes [`Buffer::contents`] returns would change underneath
+    /// a `&[u8]` (undefined behaviour), and access past a truncated end raises `SIGBUS`.
+    /// Map only files nothing writes while they are in use, such as model weights.
     pub fn map_file(&self, path: &std::path::Path) -> Result<Buffer> {
+        autoreleasepool(|_| self.map_file_now(path))
+    }
+
+    fn map_file_now(&self, path: &std::path::Path) -> Result<Buffer> {
         use std::os::fd::AsRawFd;
         let io = |e: std::io::Error| GpuError::Io(format!("{}: {e}", path.display()));
         let file = std::fs::File::open(path).map_err(io)?;
@@ -102,9 +115,7 @@ impl Device {
         if len == 0 {
             return self.new_buffer(0);
         }
-        // SAFETY: `sysconf` has no preconditions.
-        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(16384);
-        let map_len = len.div_ceil(page) * page;
+        let map_len = crate::memory::mapping_size(len);
         // SAFETY: a fresh read-only mapping of an open file descriptor; the result is
         // checked below. The descriptor may be closed afterwards (the mapping keeps the file).
         let ptr = unsafe {
@@ -144,7 +155,9 @@ impl Device {
             unsafe { libc::munmap(ptr, map_len) };
             return Err(GpuError::OutOfMemory(len));
         };
-        self.pool().track(&raw);
+        // Over the memory limit: refused before anything is wired; dropping `raw`
+        // unmaps the file.
+        self.pool().track(&raw)?;
         Ok(Buffer {
             raw: Some(raw),
             ptr: start,
@@ -182,16 +195,21 @@ impl Buffer {
     }
 
     /// Waits until the previous owner's GPU work on reused memory has completed (it is
-    /// committed, so it does).
+    /// committed, so it does): blocks until its completion releases the last use.
     fn wait_for_previous(&self) {
         if let Some(previous) = &self.previous {
-            while !previous.idle() {
-                std::thread::yield_now();
-            }
+            previous.wait_idle();
         }
     }
 
+    /// Whether the previous owner's GPU work on reused memory is still pending.
+    pub(crate) fn previous_busy(&self) -> bool {
+        self.previous.as_ref().is_some_and(|p| !p.idle())
+    }
+
     /// The bytes, if no submitted GPU work writes the buffer (concurrent GPU reads are fine).
+    /// For reused memory ([`Device::new_gpu_buffer`]) whose previous owner's GPU work is
+    /// still running, it first blocks until that work has completed.
     pub fn contents(&self) -> Result<&[u8]> {
         self.wait_for_previous();
         if self.in_flight.writers.load(Ordering::Acquire) != 0 {
@@ -249,6 +267,12 @@ impl Buffer {
         self.in_flight.clone()
     }
 
+    /// GPU uses of the buffer encoded in command buffers not submitted yet, all and the
+    /// writing ones.
+    pub(crate) fn unsubmitted(&self) -> (usize, usize) {
+        self.in_flight.unsubmitted()
+    }
+
     /// The fences GPU work using the buffer waits for: its own pending uses' and, for reused
     /// memory, the previous owner's.
     pub(crate) fn pending_fences(&self, write: bool) -> Vec<Fence> {
@@ -275,7 +299,14 @@ pub(crate) struct Guard {
     /// Uses encoded in command buffers not committed yet: their fences cannot order other
     /// work yet.
     uncommitted: AtomicUsize,
+    /// Uses encoded in command buffers not submitted yet, all and the writing ones: work
+    /// in other command buffers cannot be ordered after them (their fences are not recorded
+    /// yet).
+    unsubmitted: AtomicUsize,
+    unsubmitted_writers: AtomicUsize,
     fences: Mutex<Fences>,
+    /// Signalled (under `fences`) when the last pending use is released.
+    idle: Condvar,
 }
 
 impl std::fmt::Debug for Guard {
@@ -329,6 +360,31 @@ impl Guard {
         self.users.load(Ordering::Acquire) == 0
     }
 
+    /// Blocks until no submitted GPU work uses the buffer. Only for committed uses: those
+    /// are released by their command buffer's completion.
+    pub(crate) fn wait_idle(&self) {
+        if self.idle() {
+            return;
+        }
+        let mut fences = self.fences.lock().unwrap_or_else(PoisonError::into_inner);
+        // `release` takes this lock after the last use leaves, before notifying: no lost
+        // wake-up.
+        while !self.idle() {
+            fences = self
+                .idle
+                .wait(fences)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Uses encoded in command buffers not submitted yet, all and the writing ones.
+    pub(crate) fn unsubmitted(&self) -> (usize, usize) {
+        (
+            self.unsubmitted.load(Ordering::Acquire),
+            self.unsubmitted_writers.load(Ordering::Acquire),
+        )
+    }
+
     /// Whether every pending use is committed (so its fence orders later work after it).
     pub(crate) fn committed_uses(&self) -> bool {
         self.uncommitted.load(Ordering::Acquire) == 0
@@ -339,10 +395,20 @@ impl Guard {
         self.uncommitted.fetch_sub(1, Ordering::AcqRel);
     }
 
+    /// A use's command buffer was submitted to the GPU (or abandoned).
+    pub(crate) fn submitted(&self, write: bool) {
+        if write {
+            self.unsubmitted_writers.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.unsubmitted.fetch_sub(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn acquire(&self, write: bool) {
         self.uncommitted.fetch_add(1, Ordering::AcqRel);
+        self.unsubmitted.fetch_add(1, Ordering::AcqRel);
         self.users.fetch_add(1, Ordering::AcqRel);
         if write {
+            self.unsubmitted_writers.fetch_add(1, Ordering::AcqRel);
             self.writers.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -369,6 +435,7 @@ impl Guard {
             let mut fences = self.fences.lock().unwrap_or_else(PoisonError::into_inner);
             if self.users.load(Ordering::Acquire) == 0 {
                 *fences = Fences::default();
+                self.idle.notify_all();
             }
             drop(fences);
         }
@@ -377,9 +444,13 @@ impl Guard {
 
 impl Drop for Buffer {
     /// Returns the memory to the allocator's cache at once, with the hazard state of GPU
-    /// work that still uses it (only GPU work reuses it before that work completes).
+    /// work that still uses it (only GPU work reuses it before that work completes). Runs
+    /// in an autorelease pool: a Metal buffer's deallocation autoreleases objects.
     fn drop(&mut self) {
-        if let Some(raw) = self.raw.take() {
+        let Some(raw) = self.raw.take() else {
+            return;
+        };
+        autoreleasepool(|_| {
             if self.mapped {
                 // Metal unmaps the file once the last reference (ours or a command
                 // buffer's) is released.
@@ -395,7 +466,7 @@ impl Drop for Buffer {
                 self.previous.take().filter(|p| !p.idle())
             };
             self.pool.free(raw, self.size, busy);
-        }
+        });
     }
 }
 
@@ -428,11 +499,13 @@ mod tests {
         guard.acquire(false);
         guard.record(&long, false);
         guard.committed();
+        guard.submitted(false);
         for _ in 0..1000 {
             let fence = new_fence();
             guard.acquire(true);
             guard.record(&fence, true);
             guard.committed();
+            guard.submitted(true);
             guard.release(true, Some(&fence));
         }
         let fences = guard.fences.lock().unwrap();

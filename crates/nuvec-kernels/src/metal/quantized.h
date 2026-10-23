@@ -1506,10 +1506,12 @@ METAL_FUNC void adjust_matrix_offsets(
 }
 
 
-// nuvec's own: 4-bit `qmv_fast` over `R` input rows. Each thread unpacks a weight row's
-// codes once and applies them to every input row with `qdot`'s expression; `qmv_fast`
-// unpacks them again per row, which bounds few-row products. Each row's result equals
-// `qmv_fast`'s bit for bit (tested). Rows past `m` repeat the last row and are not stored.
+// nuvec's own: `qmv_fast` over `R` input rows. Each thread loads a weight row's codes once
+// and applies them to every input row; for 4 bits it unpacks them once with `qdot`'s
+// expression, for the other widths it applies `qdot` itself per row (the codes then come
+// from the thread's cache). `qmv_fast` reloads them per row, which bounds few-row
+// products. Each row's result equals `qmv_fast`'s bit for bit (tested). Rows past `m`
+// repeat the last row and are not stored.
 template <typename T, int group_size, int bits, bool partial_rows, int R>
 [[kernel]] void affine_qmv_rows(
     const device uint32_t* w [[buffer(0)]],
@@ -1523,8 +1525,8 @@ template <typename T, int group_size, int bits, bool partial_rows, int R>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  static_assert(bits == 4, "qmv_rows is instantiated for 4 bits");
-  constexpr int packs_per_thread = 2;
+  // As `qmv_fast_impl`.
+  constexpr int packs_per_thread = bits <= 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -1583,30 +1585,39 @@ template <typename T, int group_size, int bits, bool partial_rows, int R>
       if constexpr (partial_rows) {
         src = min(row, last_row);
       }
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + src * in_vec_size_w);
-#pragma clang loop unroll(full)
-      for (int i = 0; i < values_per_thread / 4; i++) {
-        uint16_t code = wl[i];
-        q[4 * i] = code & 0x000f;
-        q[4 * i + 1] = code & 0x00f0;
-        q[4 * i + 2] = code & 0x0f00;
-        q[4 * i + 3] = code & 0xf000;
-      }
       U s = scales[src * in_vec_size_g];
       U b = biases[src * in_vec_size_g];
-#pragma clang loop unroll(full)
-      for (int r = 0; r < R; r++) {
-        U accum = 0;
+      if constexpr (bits == 4) {
+        const device uint16_t* wl =
+            (const device uint16_t*)(ws + src * in_vec_size_w);
 #pragma clang loop unroll(full)
         for (int i = 0; i < values_per_thread / 4; i++) {
-          accum +=
-              (x_thread[r][4 * i] * q[4 * i] +
-               x_thread[r][4 * i + 1] * q[4 * i + 1] +
-               x_thread[r][4 * i + 2] * q[4 * i + 2] +
-               x_thread[r][4 * i + 3] * q[4 * i + 3]);
+          uint16_t code = wl[i];
+          q[4 * i] = code & 0x000f;
+          q[4 * i + 1] = code & 0x00f0;
+          q[4 * i + 2] = code & 0x0f00;
+          q[4 * i + 3] = code & 0xf000;
         }
-        result[r][row] += s * accum + sum[r] * b;
+#pragma clang loop unroll(full)
+        for (int r = 0; r < R; r++) {
+          U accum = 0;
+#pragma clang loop unroll(full)
+          for (int i = 0; i < values_per_thread / 4; i++) {
+            accum +=
+                (x_thread[r][4 * i] * q[4 * i] +
+                 x_thread[r][4 * i + 1] * q[4 * i + 1] +
+                 x_thread[r][4 * i + 2] * q[4 * i + 2] +
+                 x_thread[r][4 * i + 3] * q[4 * i + 3]);
+          }
+          result[r][row] += s * accum + sum[r] * b;
+        }
+      } else {
+        auto wl = (const device uint8_t*)(ws + src * in_vec_size_w);
+#pragma clang loop unroll(full)
+        for (int r = 0; r < R; r++) {
+          result[r][row] +=
+              qdot<U, values_per_thread, bits>(wl, x_thread[r], s, b, sum[r]);
+        }
       }
     }
     ws += block_size * bytes_per_pack / pack_factor;

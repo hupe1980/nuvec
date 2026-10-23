@@ -4,7 +4,7 @@
 //! one, so every accepted draft token saves most of a step. The output is the model's
 //! greedy output (up to the rounding differences between one-row and several-row products).
 
-use nuvec::{Array, Result, argmax, async_eval, eval};
+use nuvec::{Array, Result, async_eval, eval};
 
 use crate::generate::{GenerateOptions, WiredLimit, prefill};
 use crate::model::{KvCache, Model};
@@ -107,8 +107,8 @@ impl<D: Drafter> std::fmt::Debug for SpeculativeGeneration<'_, D> {
 }
 
 /// Starts generating after `prompt` (at least one token) with speculative decoding:
-/// `drafter` proposes up to `draft_tokens` tokens per step. Greedy only (the sampler's
-/// temperature must be 0). Gated DeltaNet layers keep every position's state while a draft
+/// `drafter` proposes up to `draft_tokens` tokens per step (a longer draft is cut). Greedy
+/// only (the sampler's temperature must be 0, and its settings valid). Gated DeltaNet layers keep every position's state while a draft
 /// is verified, and roll back to the last accepted one ([`KvCache::keep_steps`]).
 pub fn speculative_generate<'a, D: Drafter>(
     model: &'a Model,
@@ -121,6 +121,7 @@ pub fn speculative_generate<'a, D: Drafter>(
     if prompt.is_empty() {
         return invalid("empty prompt");
     }
+    options.sampler.validate()?;
     if options.sampler.temperature != 0.0 {
         return invalid("only greedy decoding (temperature 0) is supported");
     }
@@ -158,10 +159,8 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
     /// Submits a single-token step after `token` (`[1]`, maybe not computed yet) and
     /// returns its token, not read.
     fn submit(&mut self, token: &Array) -> Result<Array> {
-        let logits = self
-            .model
-            .forward(&token.reshape(&[1, 1])?, &mut self.cache)?;
-        let next = argmax(&logits, Some(-1), false)?.reshape(&[1])?;
+        let logits = self.model.forward(&token.reshape([1, 1]), &mut self.cache);
+        let next = logits.argmax(-1).reshape([1]);
         async_eval(std::slice::from_ref(&next))?;
         self.stats.steps += 1;
         Ok(next)
@@ -189,11 +188,8 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         for cache in &mut self.cache {
             cache.keep_steps(true);
         }
-        let logits = self
-            .model
-            .forward(&Array::from_slice(&input, &[1, l])?, &mut self.cache)?;
-        let choice = argmax(&logits, Some(-1), false)?;
-        eval(std::slice::from_ref(&choice))?;
+        let input = Array::from_slice(&input, [1, l]);
+        let choice = self.model.forward(&input, &mut self.cache).argmax(-1);
         let choice = choice.to_vec::<u32>()?;
         // The model's tokens after each input position: the drafts it agrees with, then its
         // own next token.
@@ -242,19 +238,33 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         }
         let left = self.options.max_tokens - self.produced;
         let draft = match self.pause.0 {
-            0 => self
-                .drafter
-                .draft(&self.context, self.draft_tokens.min(left.saturating_sub(1))),
+            0 => {
+                let max = self.draft_tokens.min(left.saturating_sub(1));
+                let mut draft = self.drafter.draft(&self.context, max);
+                // A drafter may propose more than asked: the rest is not verified.
+                draft.truncate(max);
+                draft
+            }
             _ => Vec::new(),
         };
         if draft.is_empty() {
-            let last = Array::from_slice(&[*self.context.last().expect("never empty")], &[1])?;
+            let last = Array::from_slice(&[*self.context.last().expect("never empty")], [1]);
             self.inflight = Some(self.submit(&last)?);
             self.draft_due = false;
             return self.advance();
         }
         self.verify(draft)?;
         Ok(self.pending.pop_front().expect("verification adds a token"))
+    }
+}
+
+impl<D: Drafter> Drop for SpeculativeGeneration<'_, D> {
+    /// Waits for the submitted step before its memory is unwired (errors were or would
+    /// have been reported by `next`), as [`crate::Generation`] does.
+    fn drop(&mut self) {
+        if let (true, Some(y)) = (self._wired.active, self.inflight.take()) {
+            let _ = eval(std::slice::from_ref(&y));
+        }
     }
 }
 
@@ -270,6 +280,13 @@ impl<D: Drafter> Iterator for SpeculativeGeneration<'_, D> {
             Ok(_) => self.produced + 1,
             Err(_) => self.options.max_tokens,
         };
+        // An end-of-sequence token ends the generation (not yielded), as in `generate`.
+        if let Ok(t) = token
+            && self.model.config.eos_token_ids.contains(&t)
+        {
+            self.produced = self.options.max_tokens;
+            return None;
+        }
         Some(token)
     }
 }

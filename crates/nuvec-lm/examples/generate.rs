@@ -44,25 +44,22 @@ fn main() -> nuvec::Result<()> {
 
     let (model, tokenizer) = load(&model_id)?;
     let ids = tokenizer.encode(&prompt);
-    let eos = model.config.eos_token_ids.clone();
 
     println!("==========");
     // Wired before the clock starts, as mlx-lm's `stream_generate` does.
     let _wired = WiredLimit::new();
     let start = Instant::now();
     let mut generation = generate(&model, &ids, options)?;
-    let first = generation.next().transpose()?;
+    let first = generation.next().map_or(Ok(None), |t| t.map(Some))?;
     let prompt_seconds = start.elapsed().as_secs_f64();
     let decode_start = Instant::now();
     let mut decoder = StreamDecoder::default();
-    let mut count = 0;
+    let mut count = 0usize;
     let mut out = std::io::stdout();
+    // Generation ends at an end-of-sequence token (not yielded) or `--max-tokens`.
     for id in first.into_iter().map(Ok).chain(generation) {
         let id = id?;
         count += 1;
-        if eos.contains(&id) {
-            break;
-        }
         write!(out, "{}", decoder.push(&tokenizer, id)).ok();
         out.flush().ok();
     }
@@ -74,9 +71,10 @@ fn main() -> nuvec::Result<()> {
         ids.len(),
         ids.len() as f64 / prompt_seconds
     );
+    // The first token's time counts as the prompt's (as mlx-lm reports it).
     println!(
         "Generation: {count} tokens, {:.3} tokens-per-sec",
-        (count - 1) as f64 / decode_seconds
+        count.saturating_sub(1) as f64 / decode_seconds
     );
     if let Some(d) = nuvec::gpu::Device::shared() {
         println!(

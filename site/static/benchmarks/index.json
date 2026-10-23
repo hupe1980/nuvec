@@ -1,0 +1,20 @@
+{
+ "schema": "nuvec-parity-index",
+ "releases": [
+  {
+   "version": "0.4.0",
+   "records": [
+    {
+     "machine": "m4-pro-48gb",
+     "path": "0.4.0/mrun-canary-m4-pro-48gb.json",
+     "kind": "mrun-canary"
+    },
+    {
+     "machine": "m4-pro-48gb",
+     "path": "0.4.0/m4-pro-48gb.json",
+     "kind": "parity"
+    }
+   ]
+  }
+ ]
+}

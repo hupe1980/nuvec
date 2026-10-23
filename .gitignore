@@ -38,7 +38,7 @@ rustc-ice-*.txt
 # crate makes to its users, and nothing in the build reads them.
 /concepts/
 
-# Local Spec Kit planning, matching billing and sepa: one `specs/NNN-slug/` per
+# Local Spec Kit planning: one `specs/NNN-slug/` per
 # roadmap item, `.specify/` (constitution, templates, scripts) and the
 # `/speckit-*` skills. Agent guidance in CLAUDE.md points into these, so it
 # stays local too.
@@ -47,9 +47,6 @@ rustc-ice-*.txt
 /.claude/
 /.github/skills/speckit-*/
 /CLAUDE.md
-
-# Python placeholder package build output
-/python/dist/
 
 # Python bytecode (from running scripts/)
 __pycache__/

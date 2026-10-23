@@ -1,9 +1,6 @@
 //! Loss functions, as in MLX's `nn.losses`.
 
-use nuvec::{
-    Array, DType, Error, Result, arange, expand_dims, logsumexp, max, mean, stop_gradient,
-    subtract, sum, where_,
-};
+use nuvec::{Array, DType, fast, ops};
 
 /// How per-example losses are combined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,38 +17,30 @@ pub enum Reduction {
 /// `targets` (the logits' shape without the last axis), as MLX's `nn.losses.cross_entropy`:
 /// `logsumexp(z) − z[target]` with `z = logits − max(logits)` (the maximum without
 /// gradient); on the GPU, the fused [`nuvec::fast::cross_entropy`] in the logits' dtype.
-pub fn cross_entropy(logits: &Array, targets: &Array, reduction: Reduction) -> Result<Array> {
-    let classes = *logits
-        .shape()
-        .last()
-        .ok_or_else(|| Error::InvalidArgument("cross_entropy: logits need a class axis".into()))?;
-    if targets.shape() != &logits.shape()[..logits.ndim() - 1] {
-        return Err(Error::InvalidArgument(format!(
-            "cross_entropy: targets shape {:?} does not match logits shape {:?}",
-            targets.shape(),
-            logits.shape()
-        )));
-    }
-    if !is_index_dtype(targets.dtype()) {
-        return Err(Error::InvalidArgument(format!(
-            "cross_entropy: targets must be integer class indices, got {}",
-            targets.dtype()
-        )));
-    }
-    let loss = if nuvec::default_device().kind == nuvec::DeviceKind::Gpu {
-        // One fused kernel (and one for the gradient), as MLX on the GPU.
-        nuvec::fast::cross_entropy(logits, targets)?.astype(logits.dtype())?
+///
+/// Mismatched shapes or non-integer targets give a failed array (with the error of
+/// [`nuvec::fast::cross_entropy`]).
+#[track_caller]
+pub fn cross_entropy(logits: &Array, targets: &Array, reduction: Reduction) -> Array {
+    let valid = logits.ndim() > 0
+        && targets.shape() == &logits.shape()[..logits.ndim() - 1]
+        && is_index_dtype(targets.dtype());
+    let loss = if !valid || nuvec::default_device().kind == nuvec::DeviceKind::Gpu {
+        // One fused kernel (and one for the gradient), as MLX on the GPU; it also reports
+        // invalid arguments as a failed array.
+        fast::cross_entropy(logits, targets).astype(logits.dtype())
     } else {
-        let z = subtract(logits, stop_gradient(&max(logits, &[-1], true)?)?)?;
-        let positions = arange(0.0, classes as f64, 1.0, targets.dtype())?;
-        let hit = nuvec::equal(&positions, expand_dims(targets, -1)?)?;
-        let score = sum(&where_(&hit, &z, 0.0)?, &[-1], false)?;
-        subtract(logsumexp(&z, &[-1], false)?, &score)?
+        let classes = logits.shape()[logits.ndim() - 1];
+        let z = logits.subtract(logits.max_keepdims(-1).stop_gradient());
+        let positions = ops::arange(0, classes, 1).astype(targets.dtype());
+        let hit = positions.equal(targets.expand_dims(-1));
+        let score = hit.select(&z, 0.0).sum(-1);
+        z.logsumexp(-1).subtract(&score)
     };
     match reduction {
-        Reduction::None => Ok(loss),
-        Reduction::Mean => mean(&loss, &[], false),
-        Reduction::Sum => sum(&loss, &[], false),
+        Reduction::None => loss,
+        Reduction::Mean => loss.mean(..),
+        Reduction::Sum => loss.sum(..),
     }
 }
 

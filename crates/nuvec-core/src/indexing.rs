@@ -4,7 +4,7 @@
 //! Indices are integer arrays. As in MLX, negative indices count from the end of the
 //! axis; out-of-range indices (which MLX leaves unspecified) are clamped to the axis.
 
-use crate::ops::{broadcast_to, expand_dims, reshape, slice};
+use crate::ops::imp::{broadcast_to, expand_dims, reshape, slice};
 use crate::primitive::{Primitive, ScatterReduce};
 use crate::view::normalize_axis;
 use crate::{Array, Error, Result, SliceArg, promote_types};
@@ -33,17 +33,17 @@ fn broadcast_except(
         )));
     }
     let mut common = Vec::with_capacity(a.ndim());
-    for (d, (&x, &i)) in a.shape().iter().zip(indices.shape()).enumerate() {
+    for (d, (&x, &i)) in a.dims().iter().zip(indices.dims()).enumerate() {
         common.push(match (d == axis, x, i) {
             (true, _, _) => 0,
             (_, x, i) if x == i || i == 1 => x,
             (_, 1, i) if a_too => i,
             _ => {
-                return Err(Error::ShapeMismatch {
-                    op: "take_along_axis",
-                    lhs: a.shape().to_vec(),
-                    rhs: indices.shape().to_vec(),
-                });
+                return Err(Error::shape_mismatch(
+                    "take_along_axis",
+                    a.dims(),
+                    indices.dims(),
+                ));
             }
         });
     }
@@ -53,28 +53,17 @@ fn broadcast_except(
         s
     };
     let a = if a_too {
-        broadcast_to(a, &with(a.shape()[axis]))?
+        broadcast_to(a, &with(a.dims()[axis]))?
     } else {
         a.clone()
     };
-    let indices = broadcast_to(indices, &with(indices.shape()[axis]))?;
+    let indices = broadcast_to(indices, &with(indices.dims()[axis]))?;
     Ok((a, indices))
 }
 
 /// The elements of `a` at `indices` along `axis` (MLX's `take_along_axis`): `indices`
 /// has `a`'s number of dimensions, and both broadcast on the other axes.
-///
-/// ```
-/// use nuvec_core::{Array, Result, take_along_axis};
-///
-/// # fn main() -> Result<()> {
-/// let a = Array::from_slice(&[10.0f32, 20.0, 30.0, 40.0], &[2, 2])?;
-/// let i = Array::from_slice(&[1i32, 0], &[2, 1])?;
-/// assert_eq!(take_along_axis(&a, &i, 1)?.to_vec::<f32>()?, [20.0, 30.0]);
-/// # Ok(())
-/// # }
-/// ```
-pub fn take_along_axis(a: &Array, indices: &Array, axis: isize) -> Result<Array> {
+pub(crate) fn take_along_axis(a: &Array, indices: &Array, axis: isize) -> Result<Array> {
     let axis = normalize_axis(axis, a.ndim())?;
     let (a, indices) = broadcast_except(a, indices, axis, true)?;
     single(Primitive::GatherAxis { axis }, vec![a, indices])
@@ -82,21 +71,7 @@ pub fn take_along_axis(a: &Array, indices: &Array, axis: isize) -> Result<Array>
 
 /// The elements of `a` at `indices` along `axis` (MLX's `take`): the axis is replaced by
 /// `indices`' dimensions. Without an axis, `a` is flattened first.
-///
-/// ```
-/// use nuvec_core::{Array, Result, take};
-///
-/// # fn main() -> Result<()> {
-/// // An embedding lookup: rows of a table.
-/// let table = Array::from_slice(&[0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[3, 2])?;
-/// let tokens = Array::from_slice(&[2u32, 0, 2], &[3])?;
-/// let rows = take(&table, &tokens, Some(0))?;
-/// assert_eq!(rows.shape(), [3, 2]);
-/// assert_eq!(rows.to_vec::<f32>()?, [2.0, 2.5, 0.0, 0.5, 2.0, 2.5]);
-/// # Ok(())
-/// # }
-/// ```
-pub fn take(a: &Array, indices: &Array, axis: Option<isize>) -> Result<Array> {
+pub(crate) fn take(a: &Array, indices: &Array, axis: Option<isize>) -> Result<Array> {
     let (a, axis) = match axis {
         Some(axis) => (a.clone(), normalize_axis(axis, a.ndim())?),
         None => (reshape(a, &[-1])?, 0),
@@ -105,13 +80,13 @@ pub fn take(a: &Array, indices: &Array, axis: Option<isize>) -> Result<Array> {
     // Flat indices along `axis`, broadcast over the other axes.
     let mut along = vec![1; a.ndim()];
     along[axis] = m as isize;
-    let mut full = a.shape().to_vec();
+    let mut full = a.dims().to_vec();
     full[axis] = m;
     let flat = broadcast_to(&reshape(indices, &along)?, &full)?;
     let out = single(Primitive::GatherAxis { axis }, vec![a.clone(), flat])?;
-    let mut shape = isize_shape(&a.shape()[..axis]);
-    shape.extend(isize_shape(indices.shape()));
-    shape.extend(isize_shape(&a.shape()[axis + 1..]));
+    let mut shape = isize_shape(&a.dims()[..axis]);
+    shape.extend(isize_shape(indices.dims()));
+    shape.extend(isize_shape(&a.dims()[axis + 1..]));
     reshape(&out, &shape)
 }
 
@@ -124,7 +99,7 @@ fn scatter(
 ) -> Result<Array> {
     let axis = normalize_axis(axis, a.ndim())?;
     let (_, indices) = broadcast_except(a, indices, axis, false)?;
-    let values = broadcast_to(&values.astype(a.dtype())?, indices.shape())?;
+    let values = broadcast_to(&values.try_astype(a.dtype())?, indices.dims())?;
     single(
         Primitive::ScatterAxis { axis, reduce },
         vec![a.clone(), indices, values],
@@ -134,25 +109,18 @@ fn scatter(
 /// A copy of `a` with `values` placed at `indices` along `axis` (MLX's `put_along_axis`).
 /// `indices` broadcasts against `a` on the other axes, `values` against `indices`; with
 /// repeated indices, one of the values wins.
-///
-/// ```
-/// use nuvec_core::{Array, Result, put_along_axis};
-///
-/// # fn main() -> Result<()> {
-/// let a = Array::from_slice(&[0i32; 4], &[4])?;
-/// let i = Array::from_slice(&[3i32, -4], &[2])?;
-/// let v = Array::from_slice(&[7i32, 9], &[2])?;
-/// assert_eq!(put_along_axis(&a, &i, &v, 0)?.to_vec::<i32>()?, [9, 0, 0, 7]);
-/// # Ok(())
-/// # }
-/// ```
-pub fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: isize) -> Result<Array> {
+pub(crate) fn put_along_axis(
+    a: &Array,
+    indices: &Array,
+    values: &Array,
+    axis: isize,
+) -> Result<Array> {
     scatter(a, indices, values, axis, ScatterReduce::None)
 }
 
 /// A copy of `a` with `values` added at `indices` along `axis`; repeated indices
 /// accumulate (MLX's `scatter_add_axis`, the gradient of `take_along_axis`).
-pub fn scatter_add_along_axis(
+pub(crate) fn scatter_add_along_axis(
     a: &Array,
     indices: &Array,
     values: &Array,
@@ -163,20 +131,7 @@ pub fn scatter_add_along_axis(
 
 /// `arrays` joined along `axis` (MLX's `concatenate`): equal shapes except along `axis`,
 /// with dtypes promoted to a common one.
-///
-/// ```
-/// use nuvec_core::{Array, Result, concatenate};
-///
-/// # fn main() -> Result<()> {
-/// let a = Array::from_slice(&[1.0f32, 2.0], &[1, 2])?;
-/// let b = Array::from_slice(&[3i32, 4, 5, 6], &[2, 2])?;
-/// let c = concatenate(&[a, b], 0)?;
-/// assert_eq!(c.shape(), [3, 2]);
-/// assert_eq!(c.to_vec::<f32>()?, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-/// # Ok(())
-/// # }
-/// ```
-pub fn concatenate(arrays: &[Array], axis: isize) -> Result<Array> {
+pub(crate) fn concatenate(arrays: &[Array], axis: isize) -> Result<Array> {
     let first = arrays
         .first()
         .ok_or_else(|| Error::InvalidArgument("concatenate: no arrays to join".into()))?;
@@ -187,23 +142,19 @@ pub fn concatenate(arrays: &[Array], axis: isize) -> Result<Array> {
         .fold(first.dtype(), |d, a| promote_types(d, a.dtype()));
     let arrays = arrays
         .iter()
-        .map(|a| a.astype(dtype))
+        .map(|a| a.try_astype(dtype))
         .collect::<Result<Vec<_>>>()?;
     single(Primitive::Concatenate { axis }, arrays)
 }
 
 /// `arrays` (one shape) stacked along a new axis `axis` (MLX's `stack`).
-pub fn stack(arrays: &[Array], axis: isize) -> Result<Array> {
+pub(crate) fn stack(arrays: &[Array], axis: isize) -> Result<Array> {
     let first = arrays
         .first()
         .ok_or_else(|| Error::InvalidArgument("stack: no arrays to stack".into()))?;
     let axis = normalize_axis(axis, first.ndim() + 1)? as isize;
-    if let Some(other) = arrays.iter().find(|a| a.shape() != first.shape()) {
-        return Err(Error::ShapeMismatch {
-            op: "stack",
-            lhs: first.shape().to_vec(),
-            rhs: other.shape().to_vec(),
-        });
+    if let Some(other) = arrays.iter().find(|a| a.dims() != first.dims()) {
+        return Err(Error::shape_mismatch("stack", first.dims(), other.dims()));
     }
     let expanded = arrays
         .iter()
@@ -213,9 +164,9 @@ pub fn stack(arrays: &[Array], axis: isize) -> Result<Array> {
 }
 
 /// `a` split into `parts` equal parts along `axis` (MLX's `split` with a count); views.
-pub fn split(a: &Array, parts: usize, axis: isize) -> Result<Vec<Array>> {
+pub(crate) fn split(a: &Array, parts: usize, axis: isize) -> Result<Vec<Array>> {
     let d = normalize_axis(axis, a.ndim())?;
-    let n = a.shape()[d];
+    let n = a.dims()[d];
     if parts == 0 || !n.is_multiple_of(parts) {
         return Err(Error::InvalidArgument(format!(
             "split: an axis of length {n} cannot be split into {parts} equal parts"
@@ -228,9 +179,9 @@ pub fn split(a: &Array, parts: usize, axis: isize) -> Result<Vec<Array>> {
 
 /// `a` split along `axis` before each of the (non-decreasing) positions `indices`, as
 /// MLX's `split` with indices: `indices.len() + 1` views.
-pub fn split_at(a: &Array, indices: &[usize], axis: isize) -> Result<Vec<Array>> {
+pub(crate) fn split_at(a: &Array, indices: &[usize], axis: isize) -> Result<Vec<Array>> {
     let d = normalize_axis(axis, a.ndim())?;
-    let n = a.shape()[d];
+    let n = a.dims()[d];
     let mut bounds = vec![0];
     bounds.extend(indices.iter().map(|&i| i.min(n)));
     bounds.push(n);

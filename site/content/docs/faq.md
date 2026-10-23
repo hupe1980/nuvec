@@ -20,7 +20,7 @@ No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ 
 
 ## How fast is it?
 
-On par with MLX: nuvec-lm decodes at 0.99–1.09× and prefills at a geometric mean of 1.05× the speed of mlx-lm across seven models on an M4 Pro. See [benchmarks](@/docs/benchmarks.md).
+On par with MLX for one request: on an M4 Pro (nuvec 0.4.0), nuvec-lm decodes at 0.99–1.10× the speed of mlx-lm across eight models (geometric mean 1.02×), and its time to first token is 1.01× at 2,048 tokens. Serving several requests at once is on par (0.99× at 4 and 8 requests), and models load faster (1.63×). See [benchmarks](@/docs/benchmarks.md).
 
 ## Which Macs are supported?
 
@@ -32,11 +32,11 @@ Not today; nuvec is a Rust library. The `nuvec` name on PyPI is reserved.
 
 ## Can I train models?
 
-Yes: autodiff covers every operation, `nuvec-nn` has layers, LoRA and optimizers, and quantized layers support QLoRA-style fine-tuning. The repository trains MLX's MNIST example and matches MLX's accuracy.
+Yes: autodiff covers every operation, models are structs with `#[derive(Module)]` whose gradients have the model's type, `nuvec-nn` has layers, dropout, LoRA and optimizers (with parameter groups), quantized layers support QLoRA-style fine-tuning, nuvec-lm applies LoRA to loaded models by path and reads and writes mlx-lm's adapter directories, and a whole training step compiles with `compile_mut`. The repository trains MLX's MNIST example and matches MLX's accuracy.
 
 ## Is the API stable?
 
-Not yet. nuvec is pre-alpha (0.x): minor versions may change the API. Changes are listed in the changelog.
+Not yet. nuvec is pre-alpha (0.x): minor versions may change the API; patch versions do not. Semantic versioning covers every item reachable through `nuvec::` paths, and `nuvec-lm`; the other crates make no promise when depended on directly, so depend on `nuvec`. Changes are listed in the [changelog](https://github.com/hupe1980/nuvec/blob/main/CHANGELOG.md).
 
 ## What is the license?
 

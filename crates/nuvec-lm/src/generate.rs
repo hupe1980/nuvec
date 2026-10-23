@@ -2,9 +2,12 @@
 //! each step is built and submitted while the GPU runs the previous one, and the previous
 //! token is read afterwards; the KV cache is updated in place. While it runs,
 //! the GPU keeps memory resident up to its recommended working set (mlx-lm's
-//! `wired_limit`).
+//! `wired_limit`). Generation ends at the model's end-of-sequence tokens, as mlx-lm's
+//! `stream_generate` (they are not yielded).
 
-use nuvec::{Array, DeviceKind, Result, async_eval, default_device, eval, logsumexp, subtract};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use nuvec::{Array, DeviceKind, Result, async_eval, default_device, eval};
 
 use crate::model::{KvCache, Model};
 use crate::sample::Sampler;
@@ -38,9 +41,9 @@ impl Keys {
         let Some(key) = self.0.take() else {
             return Ok(None);
         };
-        let (keep, out) = nuvec::random::split_pair(&key)?;
+        let [keep, out] = nuvec::random::split_n::<2>(&key);
         self.0 = Some(keep);
-        Ok(Some(out))
+        Ok(Some(out.check()?))
     }
 }
 
@@ -73,21 +76,67 @@ pub struct Generation<'a> {
 /// dropped. [`generate`] holds one; holding one around it moves the cost of wiring out of
 /// the generation (as mlx-lm's benchmarks do). Does nothing off the GPU, or when the limit
 /// is already as high.
+///
+/// The limit is shared by the process: overlapping `WiredLimit`s (concurrent generations)
+/// raise it once, and the previous limit returns when the last one is dropped.
 #[derive(Debug)]
-pub struct WiredLimit(Option<usize>);
+pub struct WiredLimit {
+    /// Whether this one counts as a holder (on the GPU).
+    pub(crate) active: bool,
+}
+
+/// The live [`WiredLimit`]s of the process, and the limit to restore after the last.
+#[derive(Debug)]
+struct Wired {
+    holders: usize,
+    previous: Option<usize>,
+}
+
+impl Wired {
+    /// A new holder; the first raises the limit (`raise` returns the limit to restore).
+    fn acquire(&mut self, raise: impl FnOnce() -> Option<usize>) {
+        if self.holders == 0 {
+            self.previous = raise();
+        }
+        self.holders += 1;
+    }
+
+    /// A holder ends; after the last, the previous limit is restored.
+    fn release(&mut self, restore: impl FnOnce(usize)) {
+        self.holders -= 1;
+        if self.holders == 0
+            && let Some(previous) = self.previous.take()
+        {
+            restore(previous);
+        }
+    }
+}
+
+static WIRED: Mutex<Wired> = Mutex::new(Wired {
+    holders: 0,
+    previous: None,
+});
+
+fn wired() -> MutexGuard<'static, Wired> {
+    WIRED.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 impl WiredLimit {
     /// Raises the wired limit to the recommended working set.
     pub fn new() -> Self {
         let device =
             nuvec::gpu::Device::shared().filter(|_| default_device().kind == DeviceKind::Gpu);
-        WiredLimit(device.and_then(|d| {
+        let Some(d) = device else {
+            return WiredLimit { active: false };
+        };
+        wired().acquire(|| {
             let limit = d.info().recommended_working_set as usize;
-            // Already as high (an outer `WiredLimit`): nothing to restore.
+            // Already as high (set by the caller): nothing to restore.
             d.set_wired_limit(limit)
                 .ok()
                 .filter(|&previous| previous < limit)
-        }))
+        });
+        WiredLimit { active: true }
     }
 }
 
@@ -99,8 +148,12 @@ impl Default for WiredLimit {
 
 impl Drop for WiredLimit {
     fn drop(&mut self) {
-        if let (Some(previous), Some(d)) = (self.0, nuvec::gpu::Device::shared()) {
-            let _ = d.set_wired_limit(previous);
+        if self.active {
+            wired().release(|previous| {
+                if let Some(d) = nuvec::gpu::Device::shared() {
+                    let _ = d.set_wired_limit(previous);
+                }
+            });
         }
     }
 }
@@ -109,14 +162,16 @@ impl Drop for Generation<'_> {
     /// Waits for the submitted step before its memory is unwired (errors were or would
     /// have been reported by `next`).
     fn drop(&mut self) {
-        if let (Some(_), Some(y)) = (self.wired.0, self.next.take()) {
+        if let (true, Some(y)) = (self.wired.active, self.next.take()) {
             let _ = eval(std::slice::from_ref(&y));
         }
     }
 }
 
 /// Starts generating after `prompt` (at least one token): prefills it and submits the
-/// first step. Tokens are produced by iterating.
+/// first step. Tokens are produced by iterating, up to `max_tokens`; an end-of-sequence
+/// token of the model ([`crate::Config::eos_token_ids`]) ends the generation and is not
+/// yielded. The sampler's settings are checked first ([`crate::Sampler::validate`]).
 pub fn generate<'a>(
     model: &'a Model,
     prompt: &[u32],
@@ -127,6 +182,7 @@ pub fn generate<'a>(
             "generate: empty prompt".into(),
         ));
     }
+    options.sampler.validate()?;
     let wired = WiredLimit::new();
     let mut cache = model.new_cache();
     let (rest, last) = prompt.split_at(prompt.len() - 1);
@@ -141,7 +197,7 @@ pub fn generate<'a>(
         keys: Keys::new(options.seed),
     };
     if options.max_tokens > 0 {
-        let first = g.step(&Array::from_slice(last, &[1])?)?;
+        let first = g.step(&Array::from_slice(last, [1]))?;
         async_eval(std::slice::from_ref(&first))?;
         g.next = Some(first);
     }
@@ -153,15 +209,41 @@ pub fn generate<'a>(
 pub(crate) fn prefill(
     model: &Model,
     cache: &mut [KvCache],
-    mut tokens: &[u32],
+    tokens: &[u32],
     step: usize,
 ) -> Result<()> {
-    while !tokens.is_empty() {
-        let n = tokens.len().min(step.max(1));
-        let chunk = Array::from_slice(&tokens[..n], &[1, n])?;
-        model.forward(&chunk, cache)?;
+    prefill_rows(model, cache, &[tokens], step)
+}
+
+/// [`prefill`] for several sequences of the same length at once (`cache` holds a batch of
+/// `rows.len()`): each chunk is one `[B, n]` forward pass, chunked as `prefill` chunks one
+/// sequence.
+pub(crate) fn prefill_rows(
+    model: &Model,
+    cache: &mut [KvCache],
+    rows: &[&[u32]],
+    step: usize,
+) -> Result<()> {
+    let len = rows.first().map_or(0, |r| r.len());
+    if rows.iter().any(|r| r.len() != len) {
+        return Err(nuvec::Error::InvalidArgument(
+            "prefill: sequences of different lengths".into(),
+        ));
+    }
+    let b = i32::try_from(rows.len())
+        .map_err(|_| nuvec::Error::InvalidArgument("prefill: too many sequences".into()))?;
+    let mut start = 0;
+    while start < len {
+        let n = (len - start).min(step.max(1));
+        let chunk: Vec<u32> = rows
+            .iter()
+            .flat_map(|r| &r[start..start + n])
+            .copied()
+            .collect();
+        let chunk = Array::from_slice(&chunk, [b, n as i32]);
+        let _ = model.forward(&chunk, cache).check()?;
         eval(&cache.iter().flat_map(KvCache::state).collect::<Vec<_>>())?;
-        tokens = &tokens[n..];
+        start += n;
     }
     Ok(())
 }
@@ -169,30 +251,22 @@ pub(crate) fn prefill(
 impl Generation<'_> {
     /// The token following `input` (`[L]` ids), not evaluated.
     fn step(&mut self, input: &Array) -> Result<Array> {
-        let l = input.shape()[0] as isize;
-        let logits = self
-            .model
-            .forward(&input.reshape(&[1, l])?, &mut self.cache)?;
-        let last = nuvec::slice(
-            &logits,
-            &[
-                nuvec::SliceArg::full(),
-                nuvec::SliceArg::new(Some(l - 1), None, 1),
-                nuvec::SliceArg::full(),
-            ],
-        )?
-        .reshape(&[1, -1])?;
+        let logits = self.model.forward(&input.reshape([1, -1]), &mut self.cache);
+        let last = logits.i((.., -1..)).reshape([1, -1]);
         let key = self.keys.next()?;
         let sampler = &self.options.sampler;
         if sampler.temperature == 0.0 {
             return sampler.sample(&last);
         }
         // Log-probabilities, as mlx-lm samples from.
-        let logprobs = subtract(&last, logsumexp(&last, &[-1], true)?)?;
+        let logprobs = last.subtract(last.logsumexp_keepdims(-1));
         sampler.sample_with(&logprobs, key.as_ref())
     }
 
-    /// The cache (one per layer), for instance to continue a conversation.
+    /// The cache (one per layer), for inspection (its length, its memory): the positions
+    /// the model has been fed, that is the prompt and the tokens yielded so far, the last
+    /// one only if the step after it was submitted (it is unless the generation ended).
+    /// Nothing in this crate continues a generation from it.
     pub fn cache(&self) -> &[KvCache] {
         &self.cache
     }
@@ -204,20 +278,64 @@ impl Iterator for Generation<'_> {
     fn next(&mut self) -> Option<Result<u32>> {
         let y = self.next.take()?;
         self.produced += 1;
+        let mut next = None;
         if self.produced < self.options.max_tokens {
             // Submit the following step, then wait for this token (mlx-lm's order): the GPU
             // never waits for the host between steps. The cache the step writes is still in
             // flight; nothing else refers to it, so it is updated in place.
-            let next = match self.step(&y) {
-                Ok(next) => next,
+            let step = match self.step(&y) {
+                Ok(step) => step,
                 Err(e) => return Some(Err(e)),
             };
-            if let Err(e) = async_eval(std::slice::from_ref(&next)) {
+            if let Err(e) = async_eval(std::slice::from_ref(&step)) {
                 return Some(Err(e));
             }
-            self.next = Some(next);
-            return Some(y.item::<u32>());
+            next = Some(step);
         }
-        Some(y.item::<u32>())
+        let token = match y.item::<u32>() {
+            Ok(token) => token,
+            Err(e) => return Some(Err(e)),
+        };
+        if self.model.config.eos_token_ids.contains(&token) {
+            // The end: the step submitted after it is waited for and dropped.
+            if let Some(step) = next {
+                let _ = eval(std::slice::from_ref(&step));
+            }
+            return None;
+        }
+        self.next = next;
+        Some(Ok(token))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::Wired;
+
+    /// Two overlapping holders raise the limit once and restore the original only after
+    /// both ended, whatever order they end in.
+    #[test]
+    fn overlapping_wired_limits_restore_after_the_last() {
+        let limit = Cell::new(100usize);
+        let raise = || Some(limit.replace(1000)).filter(|&previous| previous < 1000);
+        let restore = |previous| limit.set(previous);
+        let mut wired = Wired {
+            holders: 0,
+            previous: None,
+        };
+        wired.acquire(raise);
+        wired.acquire(|| unreachable!("raised once"));
+        assert_eq!(limit.get(), 1000);
+        wired.release(restore);
+        assert_eq!(limit.get(), 1000, "the other generation still runs");
+        wired.release(restore);
+        assert_eq!(limit.get(), 100, "restored after the last");
+        // A limit already as high is left alone.
+        limit.set(1000);
+        wired.acquire(raise);
+        wired.release(|_| unreachable!("nothing to restore"));
+        assert_eq!(limit.get(), 1000);
     }
 }

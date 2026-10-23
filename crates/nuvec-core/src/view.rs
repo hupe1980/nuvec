@@ -66,7 +66,8 @@ impl From<std::ops::RangeFull> for SliceArg {
 /// `-1`).
 impl From<isize> for SliceArg {
     fn from(i: isize) -> Self {
-        Self::new(Some(i), if i == -1 { None } else { Some(i + 1) }, 1)
+        // `i + 1` past `isize::MAX` is the end, as `-1 + 1` is.
+        Self::new(Some(i), if i == -1 { None } else { i.checked_add(1) }, 1)
     }
 }
 
@@ -134,10 +135,12 @@ pub(crate) fn normalize_slice(shape: &[usize], args: &[SliceArg]) -> Result<Vec<
 
 /// Strides and offset delta of a slice of a layout with `strides`.
 pub(crate) fn slice_geometry(strides: &[isize], slices: &[DimSlice]) -> (Strides, isize) {
+    // The step of a dimension of at most one index is never applied, and may be any
+    // value (a validated slice of more indices stays within the buffer).
     let out = strides
         .iter()
         .zip(slices)
-        .map(|(&s, d)| s * d.step)
+        .map(|(&s, d)| if d.len <= 1 { s } else { s * d.step })
         .collect();
     let delta = strides
         .iter()
@@ -162,11 +165,7 @@ pub(crate) fn broadcast_shapes(op: &'static str, a: &[usize], b: &[usize]) -> Re
             (x, y) if x == y => Ok(x),
             (1, y) => Ok(y),
             (x, 1) => Ok(x),
-            _ => Err(Error::ShapeMismatch {
-                op,
-                lhs: a.to_vec(),
-                rhs: b.to_vec(),
-            }),
+            _ => Err(Error::shape_mismatch(op, a, b)),
         })
         .collect()
 }
@@ -178,11 +177,7 @@ pub(crate) fn broadcast_strides(
     strides: &[isize],
     out: &[usize],
 ) -> Result<Strides> {
-    let mismatch = || Error::ShapeMismatch {
-        op: "broadcast_to",
-        lhs: shape.to_vec(),
-        rhs: out.to_vec(),
-    };
+    let mismatch = || Error::shape_mismatch("broadcast_to", shape, out);
     if shape.len() > out.len() {
         return Err(mismatch());
     }
@@ -253,11 +248,7 @@ pub(crate) fn nocopy_reshape(
 
 /// Element count of `requested` with at most one `-1` inferred to give `size` elements.
 pub(crate) fn infer_shape(size: usize, requested: &[isize]) -> Result<Shape> {
-    let invalid = || {
-        Error::InvalidArgument(format!(
-            "cannot reshape {size} elements into shape {requested:?}"
-        ))
-    };
+    let invalid = || Error::invalid_shape("reshape", requested.iter().map(|&d| d as i64));
     if requested.iter().filter(|&&d| d == -1).count() > 1 || requested.iter().any(|&d| d < -1) {
         return Err(invalid());
     }
@@ -311,9 +302,7 @@ pub(crate) fn normalize_axis(axis: isize, ndim: usize) -> Result<usize> {
     if (0..ndim as isize).contains(&a) {
         Ok(a as usize)
     } else {
-        Err(Error::InvalidArgument(format!(
-            "axis {axis} is out of range for {ndim} dimensions"
-        )))
+        Err(Error::invalid_axis("axis", axis as i64, ndim))
     }
 }
 

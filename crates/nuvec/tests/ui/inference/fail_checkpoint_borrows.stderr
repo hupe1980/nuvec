@@ -1,0 +1,17 @@
+error[E0373]: closure may outlive the current function, but it borrows `w`, which is owned by the current function
+ --> tests/ui/inference/fail_checkpoint_borrows.rs:8:28
+  |
+8 |     let block = checkpoint(|x: &Array| x.matmul(&w));
+  |                            ^^^^^^^^^^^           - `w` is borrowed here
+  |                            |
+  |                            may outlive borrowed value `w`
+  |
+note: function requires argument type to outlive `'static`
+ --> tests/ui/inference/fail_checkpoint_borrows.rs:8:17
+  |
+8 |     let block = checkpoint(|x: &Array| x.matmul(&w));
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: to force the closure to take ownership of `w` (and any other referenced variables), use the `move` keyword
+  |
+8 |     let block = checkpoint(move |x: &Array| x.matmul(&w));
+  |                            ++++

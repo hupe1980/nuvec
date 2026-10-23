@@ -1,29 +1,16 @@
 //! Convolutions, as MLX's `conv1d`.
 
-use crate::ops::{add, matmul, multiply, reshape, slice, transpose};
-use crate::{
-    Array, Category, DType, Error, Result, SliceArg, concatenate, promote_types, stack, zeros,
-};
+use crate::indexing::{concatenate, stack};
+use crate::ops::imp::zeros;
+use crate::ops::imp::{add, matmul, multiply, reshape, slice, transpose};
+use crate::{Array, Category, DType, Error, Result, SliceArg, promote_types};
 
 /// The 1-D convolution (cross-correlation) of `input` (`[N, L, C_in]`) with `weight`
 /// (`[C_out, K, C_in / groups]`), as MLX's `conv1d`: output `[N, L_out, C_out]` with
 /// `L_out = (L + 2·padding − dilation·(K − 1) − 1) / stride + 1`. Channels split into
 /// `groups` independent groups (`groups = C_in = C_out` is a depthwise convolution).
 /// Products accumulate in float32 and round once, as MLX's kernels.
-///
-/// ```
-/// use nuvec_core::{Array, Result, conv1d};
-///
-/// # fn main() -> Result<()> {
-/// // A moving sum of three, one channel.
-/// let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0], &[1, 5, 1])?;
-/// let w = Array::from_slice(&[1.0f32, 1.0, 1.0], &[1, 3, 1])?;
-/// assert_eq!(conv1d(&x, &w, 1, 0, 1, 1)?.to_vec::<f32>()?, [6.0, 9.0, 12.0]);
-/// assert_eq!(conv1d(&x, &w, 2, 1, 1, 1)?.to_vec::<f32>()?, [3.0, 9.0, 9.0]);
-/// # Ok(())
-/// # }
-/// ```
-pub fn conv1d(
+pub(crate) fn conv1d(
     input: &Array,
     weight: &Array,
     stride: usize,
@@ -35,12 +22,12 @@ pub fn conv1d(
     if input.ndim() != 3 || weight.ndim() != 3 {
         return invalid(format!(
             "input must be [N, L, C_in] and weight [C_out, K, C_in / groups], got {:?} and {:?}",
-            input.shape(),
-            weight.shape()
+            input.dims(),
+            weight.dims()
         ));
     }
-    let (l, c_in) = (input.shape()[1], input.shape()[2]);
-    let (c_out, k, c_group) = (weight.shape()[0], weight.shape()[1], weight.shape()[2]);
+    let (l, c_in) = (input.dims()[1], input.dims()[2]);
+    let (c_out, k, c_group) = (weight.dims()[0], weight.dims()[1], weight.dims()[2]);
     if stride == 0 || dilation == 0 || groups == 0 {
         return invalid("stride, dilation and groups must be positive".into());
     }
@@ -49,7 +36,7 @@ pub fn conv1d(
             "{c_in} input and {c_out} output channels in {groups} groups need weights \
              [C_out, K, {}], got {:?}",
             c_in / groups.max(1),
-            weight.shape()
+            weight.dims()
         ));
     }
     let span = dilation * (k.max(1) - 1) + 1;
@@ -60,20 +47,17 @@ pub fn conv1d(
     }
     let dtype = promote_types(input.dtype(), weight.dtype());
     if dtype.category() != Category::Float {
-        return Err(Error::UnsupportedDType {
-            op: "conv1d",
-            dtype,
-        });
+        return Err(Error::unsupported_dtype("conv1d", dtype));
     }
     if groups == c_in && c_out == c_in {
         // Depthwise: one GPU kernel, with `general` as its fallback.
-        let op = crate::fast::FastOp::DepthwiseConv1d {
+        let op = crate::fast::imp::FastOp::DepthwiseConv1d {
             stride,
             padding,
             dilation,
         };
-        let inputs = vec![input.astype(dtype)?, weight.astype(dtype)?];
-        return Ok(crate::fast::record_or_fallback(op, inputs)?.swap_remove(0));
+        let inputs = vec![input.try_astype(dtype)?, weight.try_astype(dtype)?];
+        return Ok(crate::fast::imp::record_or_fallback(op, inputs)?.swap_remove(0));
     }
     general(input, weight, (stride, padding, dilation, groups))
 }
@@ -86,8 +70,8 @@ pub(crate) fn general(
     weight: &Array,
     (stride, padding, dilation, groups): (usize, usize, usize, usize),
 ) -> Result<Array> {
-    let (n, l, c_in) = (input.shape()[0], input.shape()[1], input.shape()[2]);
-    let (c_out, k, c_group) = (weight.shape()[0], weight.shape()[1], weight.shape()[2]);
+    let (n, l, c_in) = (input.dims()[0], input.dims()[1], input.dims()[2]);
+    let (c_out, k, c_group) = (weight.dims()[0], weight.dims()[1], weight.dims()[2]);
     let span = dilation * (k - 1) + 1;
     let dtype = promote_types(input.dtype(), weight.dtype());
     let acc = if dtype == DType::F64 {
@@ -96,7 +80,7 @@ pub(crate) fn general(
         DType::F32
     };
     let l_out = (l + 2 * padding - span) / stride + 1;
-    let mut x = input.astype(acc)?;
+    let mut x = input.try_astype(acc)?;
     if padding > 0 {
         let pad = zeros(&[n, padding, c_in], acc)?;
         x = concatenate(&[pad.clone(), x, pad], 1)?;
@@ -114,7 +98,7 @@ pub(crate) fn general(
             ],
         )
     };
-    let w = weight.astype(acc)?;
+    let w = weight.try_astype(acc)?;
     let out = if groups == c_in && c_out == c_in {
         // Depthwise: each channel's taps weighted by its own kernel.
         let mut sum: Option<Array> = None;
@@ -178,5 +162,5 @@ pub(crate) fn general(
         };
         reshape(&y, &[n as isize, l_out as isize, c_out as isize])?
     };
-    out.astype(dtype)
+    out.try_astype(dtype)
 }

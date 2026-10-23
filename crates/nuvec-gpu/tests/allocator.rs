@@ -7,9 +7,15 @@ use nuvec_gpu::{Arg, Device, GpuError};
 
 const PAGE: usize = 16 * 1024;
 
+/// The Metal device, or `None` (the test skips) without one. With `NUVEC_REQUIRE_GPU=1` a
+/// missing device fails the test instead of skipping it.
 fn device() -> Option<Device> {
     let device = Device::system_default();
     if device.is_none() {
+        assert!(
+            std::env::var("NUVEC_REQUIRE_GPU").as_deref() != Ok("1"),
+            "NUVEC_REQUIRE_GPU=1 but no Metal device is available"
+        );
         eprintln!("skipped: no Metal device");
     }
     device
@@ -142,17 +148,16 @@ fn memory_in_use_is_reused_only_by_gpu_work_ordered_after_it() {
     let add = device.pipeline("nuvec_add_f32").unwrap();
     let encode = |out: &mut nuvec_gpu::Buffer| {
         let mut cmd = device.ordered_command_buffer().unwrap();
-        cmd.dispatch(
-            &add,
-            &[
-                Arg::read(&a),
-                Arg::read(&a),
-                Arg::write(out),
-                Arg::bytes(&(n as u32).to_le_bytes()),
-            ],
-            n,
-        )
-        .unwrap();
+        let count = (n as u32).to_le_bytes();
+        let args = [
+            Arg::read(&a),
+            Arg::read(&a),
+            Arg::write(out),
+            Arg::bytes(&count),
+        ];
+        // SAFETY: `nuvec_add_f32` touches the first `n` floats of each buffer, which
+        // all hold `n` floats.
+        unsafe { cmd.dispatch(&add, &args, n) }.unwrap();
         cmd
     };
     device.clear_cache();
@@ -252,19 +257,17 @@ fn wired_limit_wires_buffers_up_to_it() {
     let (a, b) = (buffers.pop().unwrap(), buffers.pop().unwrap());
     let (offset, scalars) = (0i64.to_le_bytes(), 0u32.to_le_bytes());
     let mut cmd = device.command_buffer().unwrap();
-    cmd.dispatch(
-        &add,
-        &[
-            Arg::read(&a),
-            Arg::read(&b),
-            Arg::write(&mut buffers[0]),
-            Arg::bytes(&offset),
-            Arg::bytes(&offset),
-            Arg::bytes(&scalars),
-        ],
-        n,
-    )
-    .unwrap();
+    let args = [
+        Arg::read(&a),
+        Arg::read(&b),
+        Arg::write(&mut buffers[0]),
+        Arg::bytes(&offset),
+        Arg::bytes(&offset),
+        Arg::bytes(&scalars),
+    ];
+    // SAFETY: the contiguous binary kernel touches element `i < n` of each buffer (offset
+    // 0, no scalar operands); every buffer holds `n` floats.
+    unsafe { cmd.dispatch(&add, &args, n) }.unwrap();
     cmd.commit().wait().unwrap();
     // Cached buffers stay wired; released ones leave the set.
     drop((a, b, buffers));
@@ -295,4 +298,184 @@ fn wired_limit_wires_buffers_up_to_it() {
     assert_eq!((m.wired, m.wired_mapped, m.mapped), (0, 0, mapped_before));
     std::fs::remove_file(&path).unwrap();
     device.set_wired_limit(0).unwrap();
+}
+
+#[test]
+fn sizes_near_usize_max_are_out_of_memory() {
+    let Some(device) = device() else { return };
+    // Rounding up to a page used to wrap to 0: a bogus empty buffer.
+    for len in [usize::MAX - 10, usize::MAX - PAGE + 2, usize::MAX] {
+        assert!(
+            matches!(device.new_buffer(len), Err(GpuError::OutOfMemory(_))),
+            "{len}"
+        );
+    }
+    // With no limit, `active + size` must not wrap either.
+    device.set_memory_limit(usize::MAX);
+    let held = device.new_buffer(1000).unwrap();
+    let active = device.memory().active;
+    assert!(matches!(
+        device.new_buffer(usize::MAX - 2 * PAGE),
+        Err(GpuError::OutOfMemory(_))
+    ));
+    assert_eq!(device.memory().active, active);
+    drop(held);
+}
+
+#[test]
+fn the_limit_applies_to_the_charged_bucket() {
+    let Some(device) = device() else { return };
+    // A cached 3-page buffer is within the slack of a 2-page request, but charging it
+    // would exceed a limit just above 2 pages.
+    drop(device.new_buffer(3 * PAGE).unwrap());
+    assert_eq!(device.memory().cache, 3 * PAGE);
+    let limit = 2 * PAGE + 1;
+    device.set_memory_limit(limit);
+    match device.new_buffer(2 * PAGE) {
+        Ok(buffer) => {
+            assert!(device.memory().active <= limit, "{:?}", device.memory());
+            drop(buffer);
+        }
+        Err(e) => assert!(matches!(e, GpuError::OutOfMemory(_)), "{e}"),
+    }
+    assert_eq!(device.memory().active, 0);
+}
+
+/// A temporary file of `len` bytes, removed on drop.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn new(tag: &str, len: usize) -> Self {
+        let path = std::env::temp_dir().join(format!("nuvec-{tag}-{}", std::process::id()));
+        std::fs::write(&path, vec![7u8; len]).unwrap();
+        TempFile(path)
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `active_with_mapped` is `active + mapped`; `peak_with_mapped` is the highest
+/// `active + mapped` (not the highest `active` plus `mapped`); `reset_peak` resets both.
+#[test]
+fn peak_with_mapped_tracks_active_plus_mapped() {
+    let Some(device) = device() else { return };
+    let file = TempFile::new("peak", 64 * PAGE - 5); // mapped page-rounded: 64 pages
+    let a = device.new_buffer(32 * PAGE).unwrap();
+    drop(a); // peak 32 pages, nothing mapped yet
+    let mapped = device.map_file(&file.0).unwrap();
+    let m = device.memory();
+    assert_eq!(m.mapped, 64 * PAGE);
+    assert_eq!(m.active_with_mapped, m.active + m.mapped);
+    // max(active) + mapped would be 96 pages; the high-water mark of the sum is 64.
+    assert_eq!((m.peak, m.peak_with_mapped), (32 * PAGE, 64 * PAGE));
+    let b = device.new_buffer(8 * PAGE).unwrap();
+    assert_eq!(device.memory().peak_with_mapped, 72 * PAGE);
+    drop(b);
+    device.reset_peak();
+    let m = device.memory();
+    assert_eq!(
+        (m.peak, m.peak_with_mapped),
+        (m.active, m.active + m.mapped)
+    );
+    assert_eq!(m.peak_with_mapped, 64 * PAGE);
+    drop(mapped);
+    let m = device.memory();
+    assert_eq!((m.mapped, m.active_with_mapped), (0, m.active));
+}
+
+/// The memory limit bounds `active + mapped`: an allocation or a mapping past it is
+/// `OutOfMemory`, and a refused mapping is neither counted nor wired.
+#[test]
+fn memory_limit_counts_mapped_files() {
+    let Some(device) = device() else { return };
+    let file = TempFile::new("limit", 16 * PAGE);
+    device.set_wired_limit(64 * PAGE).unwrap();
+    device.set_memory_limit(20 * PAGE);
+    let mapped = device.map_file(&file.0).unwrap();
+    // 16 pages mapped: 4 pages fit, 5 do not.
+    assert_eq!(
+        device.new_buffer(5 * PAGE).unwrap_err(),
+        GpuError::OutOfMemory(5 * PAGE)
+    );
+    let small = device.new_buffer(4 * PAGE).unwrap();
+    // A second mapping would pass the limit.
+    let before = device.memory();
+    assert!(matches!(
+        device.map_file(&file.0),
+        Err(GpuError::OutOfMemory(_))
+    ));
+    let after = device.memory();
+    assert_eq!((after.mapped, after.wired), (before.mapped, before.wired));
+    // A limit below what is in use is accepted; the next allocation fails.
+    assert_eq!(device.set_memory_limit(PAGE), 20 * PAGE);
+    assert!(device.new_buffer(256).is_err());
+    drop((small, mapped));
+    device.set_memory_limit(1 << 40);
+    device.set_wired_limit(0).unwrap();
+}
+
+/// Wired bytes never pass the wired limit (mapped files count against it), mapping never
+/// changes the limit, and a limit of 0 wires nothing; without residency sets nothing is
+/// wired at all.
+#[test]
+fn wired_limit_invariants_hold_with_mapped_files() {
+    let Some(device) = device() else { return };
+    let file = TempFile::new("wired", 6 * PAGE);
+    let check = |d: &Device| {
+        let m = d.memory();
+        assert!(m.wired <= m.wired_limit, "{m:?}");
+        assert!(m.wired_mapped <= m.wired.min(m.mapped), "{m:?}");
+        if !d.can_wire() {
+            assert_eq!(m.wired, 0);
+        }
+    };
+    // Limit 0: nothing is wired.
+    let a = device.map_file(&file.0).unwrap();
+    let b = device.new_buffer(4 * PAGE).unwrap();
+    assert_eq!(device.memory().wired, 0);
+    assert_eq!(
+        device.memory().wired_limit,
+        0,
+        "mapping never changes the limit"
+    );
+    check(&device);
+    // A limit set after mapping: the mapped file and buffers fill it, never past it.
+    device.set_wired_limit(8 * PAGE).unwrap();
+    check(&device);
+    let c = device.map_file(&file.0).unwrap();
+    assert_eq!(device.memory().wired_limit, 8 * PAGE);
+    check(&device);
+    if device.can_wire() {
+        // The file (6 pages) or the buffer (4) fits, not both; the second file neither.
+        assert!(device.memory().wired >= 4 * PAGE);
+    }
+    device.set_wired_limit(3 * PAGE).unwrap();
+    check(&device);
+    drop((a, b, c));
+    device.clear_cache();
+    check(&device);
+    device.set_wired_limit(0).unwrap();
+    assert_eq!(device.memory().wired, 0);
+}
+
+/// Mapped files count toward the GC threshold: a model's mapped weights plus active and
+/// cached buffers must not grow past the working set (a 32K-token prefill of
+/// Qwen3-30B-A3B failed with a command-buffer out-of-memory error before).
+#[test]
+fn gc_threshold_counts_mapped_files() {
+    let Some(device) = device() else { return };
+    let file = TempFile::new("gc", 16 * PAGE);
+    device.set_memory_limit(20 * PAGE);
+    let mapped = device.map_file(&file.0).unwrap();
+    drop(device.new_buffer(2 * PAGE).unwrap());
+    assert_eq!(device.memory().cache, 2 * PAGE);
+    // 3 active + 16 mapped + 2 cached >= 20: the cache is released first.
+    let big = device.new_buffer(3 * PAGE).unwrap();
+    let m = device.memory();
+    assert_eq!((m.active, m.mapped, m.cache), (3 * PAGE, 16 * PAGE, 0));
+    drop((big, mapped));
 }

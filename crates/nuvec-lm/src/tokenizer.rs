@@ -1,14 +1,18 @@
-//! Byte-level BPE tokenizers read from Hugging Face `tokenizer.json` files (the family of
-//! GPT-2, Llama 3, Qwen 2/3 and Mistral's Tekken).
+//! Byte-level BPE tokenizers read from Hugging Face `tokenizer.json` files: those whose
+//! pre-tokenizer splits by the GPT-2 pattern or a GPT-4-style one (GPT-2, Llama 3, Qwen
+//! 2/3/3.5). Other split patterns (Mistral's Tekken among them) and SentencePiece-style
+//! byte-fallback BPE (Llama 2, Mistral v0.1–v0.3) are rejected when the file is read.
 //!
-//! Encoding follows the `tokenizers` library: added tokens are split off first; the rest
-//! is normalized (NFC, when the file says so), split by the pre-tokenizer's pattern (the
-//! GPT-2 and GPT-4-style patterns, matched by a hand-written scanner with the same
-//! leftmost-first semantics as the regular expression), mapped to byte-level characters and
-//! merged by rank.
+//! Encoding follows the `tokenizers` library: added tokens are split off first (in one
+//! pass, the longest match at the earliest position); the rest is normalized (NFC, when
+//! the file says so), split by the pre-tokenizer's pattern (matched by a hand-written
+//! scanner with the same leftmost-first semantics as the regular expression), mapped to
+//! byte-level characters and merged by rank (lowest first, with a priority queue, and a
+//! cache of recent words), so encoding time grows about linearly with the text.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
 use nuvec::io::json::{self, Json};
 use nuvec::{Error, Result};
@@ -235,6 +239,10 @@ pub struct Tokenizer {
     merges: HashMap<(u32, u32), (u32, u32)>,
     /// Added tokens (special or not), longest first, with whether they are special.
     added: Vec<(String, u32, bool)>,
+    /// The added tokens (indices into `added`, longest first) by their first byte.
+    added_by_byte: HashMap<u8, Vec<usize>>,
+    /// The added tokens' ids.
+    added_ids: HashSet<u32>,
     nfc: bool,
     pattern: Pattern,
     ignore_merges: bool,
@@ -243,6 +251,71 @@ pub struct Tokenizer {
     /// Special tokens the post-processor puts around a single sequence (Llama's
     /// `<|begin_of_text|>`): before and after it.
     template: Template,
+    /// The ids of recently encoded words.
+    words: WordCache,
+}
+
+/// Words cached at most (as the `tokenizers` library's BPE cache).
+const WORD_CACHE_CAPACITY: usize = 10_000;
+/// Longer words (in bytes) are not cached.
+const WORD_CACHE_LONGEST: usize = 256;
+
+/// The ids of the most recently used words (least recently used evicted first), shared
+/// by the threads encoding with one tokenizer. A clone starts empty.
+#[derive(Default)]
+struct WordCache(Mutex<Lru>);
+
+#[derive(Default)]
+struct Lru {
+    /// Each word's ids and when it was last used.
+    words: HashMap<String, (Vec<u32>, u64)>,
+    /// The words by when they were last used.
+    order: BTreeMap<u64, String>,
+    clock: u64,
+}
+
+impl Lru {
+    fn get(&mut self, word: &str) -> Option<Vec<u32>> {
+        let (ids, used) = self.words.get_mut(word)?;
+        let key = self.order.remove(used).expect("ordered");
+        self.clock += 1;
+        *used = self.clock;
+        self.order.insert(self.clock, key);
+        Some(ids.clone())
+    }
+
+    fn insert(&mut self, word: &str, ids: &[u32]) {
+        if word.len() > WORD_CACHE_LONGEST || self.words.contains_key(word) {
+            return;
+        }
+        if self.words.len() >= WORD_CACHE_CAPACITY
+            && let Some((_, oldest)) = self.order.pop_first()
+        {
+            self.words.remove(&oldest);
+        }
+        self.clock += 1;
+        self.words
+            .insert(word.to_owned(), (ids.to_vec(), self.clock));
+        self.order.insert(self.clock, word.to_owned());
+    }
+}
+
+impl Clone for WordCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for WordCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let words = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .words
+            .len();
+        f.debug_struct("WordCache").field("words", &words).finish()
+    }
 }
 
 /// Special tokens (text and id) before and after a sequence.
@@ -286,13 +359,26 @@ fn template(post: Option<&Json>) -> Template {
                 .and_then(|t| t.get("ids"))
                 .and_then(Json::as_array)
                 .unwrap_or_default();
-            for id in ids.iter().filter_map(Json::as_i64) {
+            for id in ids.iter().filter_map(|id| token_id(id.as_i64()?).ok()) {
                 let side = if seen { &mut after } else { &mut before };
-                side.push((name.to_owned(), id as u32));
+                side.push((name.to_owned(), id));
             }
         }
     }
     (before, after)
+}
+
+/// The largest token id a `tokenizer.json` may use. Real vocabularies stay below 2^20;
+/// the cap keeps a hostile file from sizing the id table to gigabytes.
+const MAX_TOKEN_ID: i64 = (1 << 24) - 1;
+
+/// A token id from `tokenizer.json`, checked to lie in `0..=MAX_TOKEN_ID`.
+fn token_id(id: i64) -> Result<u32> {
+    if (0..=MAX_TOKEN_ID).contains(&id) {
+        Ok(id as u32)
+    } else {
+        Err(invalid(format!("token id {id} out of range")))
+    }
 }
 
 impl Tokenizer {
@@ -328,7 +414,7 @@ impl Tokenizer {
             .and_then(Json::as_object)
             .ok_or_else(|| invalid("no vocab"))?
         {
-            let id = id.as_i64().ok_or_else(|| invalid("bad id"))? as u32;
+            let id = token_id(id.as_i64().ok_or_else(|| invalid("bad id"))?)?;
             vocab.insert(token.clone(), id);
             put(&mut tokens, token, id);
         }
@@ -361,13 +447,24 @@ impl Tokenizer {
         {
             let content = t.get("content").and_then(Json::as_str);
             let id = t.get("id").and_then(Json::as_i64);
-            if let (Some(content), Some(id)) = (content, id) {
+            if let (Some(content), Some(id)) = (content, id)
+                && !content.is_empty()
+            {
                 let special = t.get("special").and_then(Json::as_bool).unwrap_or(false);
-                added.push((content.to_owned(), id as u32, special));
-                put(&mut tokens, content, id as u32);
+                let id = token_id(id)?;
+                added.push((content.to_owned(), id, special));
+                put(&mut tokens, content, id);
             }
         }
         added.sort_by_key(|(c, _, _)| std::cmp::Reverse(c.len()));
+        let mut added_by_byte: HashMap<u8, Vec<usize>> = HashMap::new();
+        for (i, (content, _, _)) in added.iter().enumerate() {
+            added_by_byte
+                .entry(content.as_bytes()[0])
+                .or_default()
+                .push(i);
+        }
+        let added_ids = added.iter().map(|&(_, id, _)| id).collect();
         let nfc = match file.get("normalizer") {
             None | Some(Json::Null) => false,
             Some(n) => match n.get("type").and_then(Json::as_str) {
@@ -387,6 +484,8 @@ impl Tokenizer {
             tokens,
             merges,
             added,
+            added_by_byte,
+            added_ids,
             nfc,
             pattern,
             ignore_merges: model
@@ -396,6 +495,7 @@ impl Tokenizer {
             to_char,
             to_byte,
             template: template(file.get("post_processor")),
+            words: WordCache::default(),
         })
     }
 
@@ -482,28 +582,29 @@ impl Tokenizer {
     /// The ids of `text` alone, without the post-processor's special tokens.
     pub fn encode_text(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
-        let mut rest = text;
-        while !rest.is_empty() {
-            // The earliest added token (the longest at a position).
-            let next = self
-                .added
-                .iter()
-                .filter_map(|(c, id, _)| rest.find(c.as_str()).map(|at| (at, c.len(), *id)))
-                .min_by_key(|&(at, len, _)| (at, std::cmp::Reverse(len)));
-            let (plain, after) = match next {
-                Some((at, len, id)) => {
-                    let plain = &rest[..at];
-                    self.encode_plain(plain, &mut ids);
-                    ids.push(id);
-                    (None, &rest[at + len..])
+        let bytes = text.as_bytes();
+        // One pass: at each position, the longest added token starting there (the earliest
+        // match wins). A match starts at a character boundary: its first byte begins a
+        // character.
+        let (mut plain, mut i) = (0, 0);
+        while i < bytes.len() {
+            let found = self.added_by_byte.get(&bytes[i]).and_then(|candidates| {
+                candidates
+                    .iter()
+                    .map(|&k| &self.added[k])
+                    .find(|(c, _, _)| bytes[i..].starts_with(c.as_bytes()))
+            });
+            match found {
+                Some((content, id, _)) => {
+                    self.encode_plain(&text[plain..i], &mut ids);
+                    ids.push(*id);
+                    i += content.len();
+                    plain = i;
                 }
-                None => (Some(rest), ""),
-            };
-            if let Some(plain) = plain {
-                self.encode_plain(plain, &mut ids);
+                None => i += 1,
             }
-            rest = after;
         }
+        self.encode_plain(&text[plain..], &mut ids);
         ids
     }
 
@@ -518,6 +619,7 @@ impl Tokenizer {
         } else {
             text
         };
+        let mut words = self.words.0.lock().unwrap_or_else(PoisonError::into_inner);
         for piece in self.pattern.split(text) {
             let word: String = piece.bytes().map(|b| self.to_char[b as usize]).collect();
             if self.ignore_merges
@@ -526,28 +628,73 @@ impl Tokenizer {
                 ids.push(id);
                 continue;
             }
-            ids.extend(self.bpe(&word));
+            if let Some(cached) = words.get(&word) {
+                ids.extend(cached);
+                continue;
+            }
+            let merged = self.bpe(&word);
+            words.insert(&word, &merged);
+            ids.extend(merged);
         }
     }
 
-    /// Merges a word's byte-level characters by rank (lowest first, leftmost on ties).
+    /// Merges a word's byte-level characters by rank (lowest first, leftmost on ties):
+    /// the candidate merges in a priority queue over a linked list of symbols, so a word
+    /// of n characters takes O(n log n) (a merge that no longer applies is skipped when
+    /// it comes up).
     fn bpe(&self, word: &str) -> Vec<u32> {
         let mut symbols: Vec<u32> = word
             .chars()
             .filter_map(|c| self.vocab.get(c.encode_utf8(&mut [0; 4]) as &str).copied())
             .collect();
-        loop {
-            let best = symbols
-                .windows(2)
-                .enumerate()
-                .filter_map(|(i, w)| self.merges.get(&(w[0], w[1])).map(|&(r, m)| (r, i, m)))
-                .min();
-            let Some((_, i, merged)) = best else {
-                return symbols;
-            };
-            symbols[i] = merged;
-            symbols.remove(i + 1);
+        let n = symbols.len();
+        if n < 2 {
+            return symbols;
         }
+        const NONE: usize = usize::MAX;
+        // Neighbours in the list (`NONE` at the ends); merged-away symbols are dead.
+        let mut prev: Vec<usize> = (0..n).map(|i| i.checked_sub(1).unwrap_or(NONE)).collect();
+        let mut next: Vec<usize> = (1..=n).map(|i| if i < n { i } else { NONE }).collect();
+        let mut alive = vec![true; n];
+        let mut queue = BinaryHeap::new();
+        let rank = |symbols: &[u32], i: usize, j: usize| {
+            self.merges.get(&(symbols[i], symbols[j])).map(|&(r, _)| r)
+        };
+        for i in 0..n - 1 {
+            if let Some(r) = rank(&symbols, i, i + 1) {
+                queue.push(std::cmp::Reverse((r, i)));
+            }
+        }
+        while let Some(std::cmp::Reverse((r, i))) = queue.pop() {
+            let j = next[i];
+            // Stale: `i` was merged away, or its pair changed since.
+            if !alive[i] || j == NONE || rank(&symbols, i, j) != Some(r) {
+                continue;
+            }
+            symbols[i] = self.merges[&(symbols[i], symbols[j])].1;
+            alive[j] = false;
+            next[i] = next[j];
+            if next[i] != NONE {
+                prev[next[i]] = i;
+            }
+            if prev[i] != NONE
+                && let Some(r) = rank(&symbols, prev[i], i)
+            {
+                queue.push(std::cmp::Reverse((r, prev[i])));
+            }
+            if next[i] != NONE
+                && let Some(r) = rank(&symbols, i, next[i])
+            {
+                queue.push(std::cmp::Reverse((r, i)));
+            }
+        }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i != NONE {
+            out.push(symbols[i]);
+            i = next[i];
+        }
+        out
     }
 
     /// The bytes of `ids` (added tokens as their text).
@@ -557,7 +704,7 @@ impl Tokenizer {
             let Some(Some(token)) = self.tokens.get(id as usize) else {
                 continue;
             };
-            if self.added.iter().any(|(_, a, _)| *a == id) {
+            if self.added_ids.contains(&id) {
                 out.extend_from_slice(token.as_bytes());
             } else {
                 out.extend(token.chars().filter_map(|c| self.to_byte.get(&c)));
@@ -579,17 +726,38 @@ pub struct StreamDecoder {
 }
 
 impl StreamDecoder {
-    /// The text completed by `id`.
+    /// The text completed by `id`: whole characters, an invalid byte sequence as one
+    /// U+FFFD, and an unfinished character at the end held back.
     pub fn push(&mut self, tokenizer: &Tokenizer, id: u32) -> String {
         self.pending.extend(tokenizer.decode_bytes(&[id]));
-        let valid = match std::str::from_utf8(&self.pending) {
-            Ok(_) => self.pending.len(),
-            Err(e) if e.error_len().is_none() => e.valid_up_to(),
-            // An invalid sequence (not just an unfinished one): emit it replaced.
-            Err(_) => self.pending.len(),
-        };
-        let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
-        self.pending.drain(..valid);
+        let mut text = String::new();
+        let mut done = 0;
+        loop {
+            match std::str::from_utf8(&self.pending[done..]) {
+                Ok(s) => {
+                    text.push_str(s);
+                    done = self.pending.len();
+                    break;
+                }
+                Err(e) => {
+                    let valid = done + e.valid_up_to();
+                    text.push_str(
+                        std::str::from_utf8(&self.pending[done..valid]).expect("valid up to"),
+                    );
+                    done = valid;
+                    match e.error_len() {
+                        // An invalid sequence: replaced, then the rest.
+                        Some(n) => {
+                            text.push(char::REPLACEMENT_CHARACTER);
+                            done += n;
+                        }
+                        // An unfinished character: held back.
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.pending.drain(..done);
         text
     }
 
@@ -756,6 +924,22 @@ mod tests {
         assert_eq!(t.encode("<|bos|>hi"), t.encode("hi"));
         assert_eq!(t.encode_text("hi").len(), 2);
         assert_eq!(tiny().encode("hello"), tiny().encode_text("hello"));
+    }
+
+    #[test]
+    fn out_of_range_token_ids_are_errors() {
+        for id in ["-1", "4294967296", "16777216"] {
+            for text in [
+                format!(r#"{{"model":{{"type":"BPE","vocab":{{"a":{id}}},"merges":[]}}}}"#),
+                format!(
+                    r#"{{"added_tokens":[{{"id":{id},"content":"<x>"}}],
+                       "model":{{"type":"BPE","vocab":{{"a":0}},"merges":[]}}}}"#
+                ),
+            ] {
+                let file = json::parse(text.as_bytes()).unwrap();
+                assert!(Tokenizer::from_json(&file).is_err(), "{text}");
+            }
+        }
     }
 
     #[test]

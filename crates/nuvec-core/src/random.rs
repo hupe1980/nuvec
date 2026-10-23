@@ -6,244 +6,221 @@
 //! Normal samples agree within a few ulps: `erfinv` needs a logarithm, whose last bits
 //! differ between implementations.
 //!
-//! Without a key, functions draw the next key from this thread's sequence, which starts from
-//! a per-process time seed until [`seed`] is called (as in MLX).
+//! Without a key, functions draw the next key from this thread's sequence. Each thread's
+//! sequence starts from a key derived from the process seed (a time seed until [`seed`]
+//! is called) and the thread's ordinal, the order in which threads first draw:
+//!
+//! - ordinal 0 starts from `key(process_seed)`, so a single-threaded program seeded with
+//!   `seed(s)` draws exactly MLX's values for `s`;
+//! - ordinal `n > 0` starts from `key(splitmix64(process_seed ^ n))`.
+//!
+//! So threads that never called [`seed`] draw distinct streams. [`seed`] sets the process
+//! seed, restarts the calling thread's sequence as ordinal 0 and makes every other thread
+//! derive its sequence again (with the next ordinals, in the order they draw next); a
+//! thread that called [`seed`] itself keeps its own sequence until it calls [`seed`] again.
+//! Draws are reproducible across runs when threads start drawing in a fixed order; for
+//! exact reproducibility of worker threads whatever their order, pass explicit keys
+//! ([`key`], [`split`], [`split_n`]).
+//!
+//! Like every operation, these return arrays: invalid arguments give a failed array that
+//! carries the error and the caller's location (see [`crate::Array::check`]).
 
-use std::cell::RefCell;
-use std::sync::OnceLock;
+pub(crate) mod imp;
 
-use crate::ops::{add, divide, erfinv, minimum, multiply, slice, subtract};
-use crate::primitive::Primitive;
-use crate::{Array, DType, Error, Result, SliceArg, bf16, f16};
+use std::panic::Location;
 
-/// A key for `seed`: `[seed >> 32, seed & 0xffffffff]`.
-pub fn key(seed: u64) -> Array {
-    Array::from_slice(&[(seed >> 32) as u32, seed as u32], &[2]).expect("two elements")
-}
+use crate::axes::{Axis, IntoShape};
+use crate::{Array, DType, Error};
 
-fn time_seed() -> u64 {
-    static SEED: OnceLock<u64> = OnceLock::new();
-    *SEED.get_or_init(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64)
-    })
-}
-
-thread_local!(static SEQUENCE: RefCell<Option<Array>> = const { RefCell::new(None) });
-
-/// Restarts this thread's key sequence from `seed`.
-pub fn seed(seed: u64) {
-    SEQUENCE.set(Some(key(seed)));
-}
+pub use imp::{key, seed};
 
 /// The next key of this thread's sequence (`split` the current key; keep the first half),
 /// the key that functions called without one use. Useful to pass the sequence's state into
 /// a compiled function, where keys drawn inside would be frozen at the first trace.
-pub fn next_key() -> Result<Array> {
-    let current = SEQUENCE.with_borrow_mut(|k| k.get_or_insert_with(|| key(time_seed())).clone());
-    let (keep, out) = split_pair(&current)?;
-    SEQUENCE.set(Some(keep));
-    Ok(out)
+#[track_caller]
+pub fn next_key() -> Array {
+    Array::sticky("next_key", Location::caller(), &[], imp::next_key)
 }
 
-fn key_or_next(key: Option<&Array>) -> Result<Array> {
-    match key {
-        Some(k) => Ok(k.clone()),
-        None => next_key(),
-    }
+/// The current key of this thread's sequence, without advancing it. An internal hook for
+/// `compile_mut` and `checkpoint`, which thread the sequence through traces and
+/// recomputations; not part of the stable API.
+#[doc(hidden)]
+pub fn sequence_key() -> Array {
+    imp::sequence_key()
+}
+
+/// Replaces the current key of this thread's sequence (see [`sequence_key`]). Internal.
+#[doc(hidden)]
+pub fn set_sequence_key(key: Array) {
+    imp::set_sequence_key(key);
 }
 
 /// Random bits of `shape`, `width` bytes per element (1, 2 or 4 → uint8, uint16, uint32).
-pub fn bits(shape: &[usize], width: usize, key: Option<&Array>) -> Result<Array> {
-    let key = key_or_next(key)?;
-    if key.dtype() != DType::U32 || key.shape() != [2] {
-        return Err(Error::InvalidArgument(format!(
-            "bits: expected a uint32 key of shape [2], got {} {:?}",
-            key.dtype(),
-            key.shape()
-        )));
-    }
-    let width = u8::try_from(width)
-        .map_err(|_| Error::InvalidArgument(format!("bits: width {width} not in {{1, 2, 4}}")))?;
-    let primitive = Primitive::RandomBits {
-        shape: shape.to_vec(),
-        width,
+#[track_caller]
+pub fn bits<'a>(shape: impl IntoShape, width: i32, key: impl Into<Option<&'a Array>>) -> Array {
+    let key = key.into();
+    let spec = shape.shape_spec();
+    let dtype = match width {
+        1 => DType::U8,
+        2 => DType::U16,
+        _ => DType::U32,
     };
-    Ok(Array::from_op(primitive, vec![key])?.swap_remove(0))
+    Array::constructor("bits", Location::caller(), dtype, &spec, |shape| {
+        let width = usize::try_from(width)
+            .map_err(|_| Error::InvalidArgument(format!("bits: invalid width {width}")))?;
+        imp::bits(shape, width, key)
+    })
 }
 
 /// `num` new keys from `key`, as an array of shape `[num, 2]`.
-pub fn split(key: &Array, num: usize) -> Result<Array> {
-    bits(&[num, 2], 4, Some(key))
+#[track_caller]
+pub fn split(key: &Array, num: usize) -> Array {
+    Array::sticky("split", Location::caller(), &[key], || imp::split(key, num))
 }
 
-/// Two new keys from `key`.
-pub fn split_pair(key: &Array) -> Result<(Array, Array)> {
-    let both = split(key, 2)?;
-    let row = |i: isize| {
-        let args = [SliceArg::new(Some(i), Some(i + 1), 1), SliceArg::full()];
-        slice(&both, &args)?.reshape(&[2])
-    };
-    Ok((row(0)?, row(1)?))
-}
-
-/// The largest value below 1 in `dtype`, as float32 (samples stay in `[low, high)`).
-fn below_one(dtype: DType) -> Result<f32> {
-    Ok(match dtype {
-        DType::F32 => f32::from_bits(1.0f32.to_bits() - 1),
-        DType::F16 => f16::from_bits(f16::ONE.to_bits() - 1).to_f32(),
-        DType::BF16 => bf16::from_bits(bf16::ONE.to_bits() - 1).to_f32(),
-        _ => {
-            return Err(Error::UnsupportedDType {
-                op: "uniform",
-                dtype,
-            });
+/// `N` new keys from `key`, for destructuring: `let [k1, k2] = random::split_n::<2>(&key);`.
+///
+/// ```
+/// use nuvec_core::random;
+///
+/// let [a, b] = random::split_n::<2>(&random::key(0));
+/// assert_eq!((a.shape(), b.shape()), (&[2][..], &[2][..]));
+/// ```
+#[track_caller]
+pub fn split_n<const N: usize>(key: &Array) -> [Array; N] {
+    Array::sticky_n("split", Location::caller(), &[key], || {
+        let all = imp::split(key, N)?;
+        let mut out = Vec::with_capacity(N);
+        for i in 0..N {
+            let row = crate::ops::imp::slice(
+                &all,
+                &[
+                    crate::SliceArg::new(Some(i as isize), Some(i as isize + 1), 1),
+                    crate::SliceArg::full(),
+                ],
+            )?;
+            out.push(crate::ops::imp::reshape(&row, &[2])?);
         }
+        Ok(out
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("N keys were split")))
     })
 }
 
 /// Uniform samples in `[low, high)` of `shape` and floating-point `dtype` (float16,
 /// bfloat16 or float32), as MLX: 32 random bits divided by `u32::MAX`, clamped below 1.
-pub fn uniform(
+///
+/// ```
+/// use nuvec_core::{DType, random};
+///
+/// let u = random::uniform(0.0, 1.0, [2, 3], DType::F32, Some(&random::key(1)));
+/// assert_eq!(u.shape(), [2, 3]);
+/// assert!(u.to_vec::<f32>().unwrap().iter().all(|&x| (0.0..1.0).contains(&x)));
+/// ```
+#[track_caller]
+pub fn uniform<'a>(
     low: f64,
     high: f64,
-    shape: &[usize],
+    shape: impl IntoShape,
     dtype: DType,
-    key: Option<&Array>,
-) -> Result<Array> {
-    let upper = below_one(dtype)?;
-    let lo = Array::scalar(low).astype(dtype)?;
-    let hi = Array::scalar(high).astype(dtype)?;
-    let range = subtract(&hi, &lo)?;
-    let out = divide(&bits(shape, 4, key)?, Array::scalar(u32::MAX as f32))?;
-    let out = minimum(&out, Array::scalar(upper))?.astype(dtype)?;
-    add(multiply(&range, &out)?, &lo)
+    key: impl Into<Option<&'a Array>>,
+) -> Array {
+    let key = key.into();
+    let spec = shape.shape_spec();
+    Array::constructor("uniform", Location::caller(), dtype, &spec, |shape| {
+        imp::uniform(low, high, shape, dtype, key)
+    })
 }
 
-/// Normal samples (mean `loc`, standard deviation `scale`) of `shape` and floating-point
-/// `dtype`, as MLX: `√2 · erfinv(u)` for `u` uniform in `(-1, 1)`.
-pub fn normal(
-    shape: &[usize],
+/// Normal samples (mean `loc`, standard deviation `scale`; MLX's defaults are 0 and 1) of
+/// `shape` and floating-point `dtype`, as MLX: `√2 · erfinv(u)` for `u` uniform in `(-1, 1)`.
+#[track_caller]
+pub fn normal<'a>(
+    shape: impl IntoShape,
     dtype: DType,
-    loc: Option<f64>,
-    scale: Option<f64>,
-    key: Option<&Array>,
-) -> Result<Array> {
-    if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
-        return Err(Error::UnsupportedDType {
-            op: "normal",
-            dtype,
-        });
-    }
-    let low = f64::from(f32::from_bits((-1.0f32).to_bits() - 1));
-    let samples = uniform(low, 1.0, shape, DType::F32, key)?;
-    let mut applied = Array::scalar(2f64.sqrt()).astype(dtype)?;
-    if let Some(scale) = scale {
-        applied = multiply(&applied, Array::scalar(scale).astype(dtype)?)?;
-    }
-    let samples = multiply(&applied, erfinv(&samples)?.astype(dtype)?)?;
-    match loc {
-        Some(loc) => add(Array::scalar(loc).astype(dtype)?, &samples),
-        None => Ok(samples),
-    }
+    loc: f64,
+    scale: f64,
+    key: impl Into<Option<&'a Array>>,
+) -> Array {
+    let key = key.into();
+    let spec = shape.shape_spec();
+    Array::constructor("normal", Location::caller(), dtype, &spec, |shape| {
+        imp::normal(shape, dtype, Some(loc), Some(scale), key)
+    })
 }
 
 /// Gumbel samples of `shape` and floating-point `dtype`, as MLX: `−log(−log(u))` for `u`
 /// uniform in `[0, 1)`.
-pub fn gumbel(shape: &[usize], dtype: DType, key: Option<&Array>) -> Result<Array> {
-    let u = uniform(0.0, 1.0, shape, dtype, key)?;
-    crate::ops::negative(&crate::ops::log(&crate::ops::negative(&crate::ops::log(
-        &u,
-    )?)?)?)
+#[track_caller]
+pub fn gumbel<'a>(shape: impl IntoShape, dtype: DType, key: impl Into<Option<&'a Array>>) -> Array {
+    let key = key.into();
+    let spec = shape.shape_spec();
+    Array::constructor("gumbel", Location::caller(), dtype, &spec, |shape| {
+        imp::gumbel(shape, dtype, key)
+    })
 }
 
 /// Indices (uint32) drawn from the categorical distributions whose unnormalised log
-/// probabilities run along `axis` of `logits`, as MLX: the argmax of `logits` plus Gumbel
-/// noise. The result has `logits`' shape without `axis`.
+/// probabilities run along one `axis` of `logits` (`..`: the flattened array), as MLX: the
+/// argmax of `logits` plus Gumbel noise. The result has `logits`' shape without `axis`.
 ///
 /// ```
-/// use nuvec_core::{Array, Result, random};
+/// use nuvec_core::{array, random};
 ///
-/// # fn main() -> Result<()> {
 /// // One certain outcome per row.
-/// let logits = Array::from_slice(&[0.0f32, -1e9, -1e9, -1e9, -1e9, 0.0], &[2, 3])?;
-/// let draws = random::categorical(&logits, -1, Some(&random::key(7)))?;
-/// assert_eq!(draws.to_vec::<u32>()?, [0, 2]);
-/// # Ok(())
-/// # }
+/// let logits = array![[0.0, -1e9, -1e9], [-1e9, -1e9, 0.0]];
+/// let draws = random::categorical(&logits, -1, Some(&random::key(7)));
+/// assert_eq!(draws.to_vec::<u32>().unwrap(), [0, 2]);
 /// ```
-pub fn categorical(logits: &Array, axis: isize, key: Option<&Array>) -> Result<Array> {
-    let noise = gumbel(logits.shape(), logits.dtype(), key)?;
-    crate::ops::argmax(&add(&noise, logits)?, Some(axis), false)
+#[track_caller]
+pub fn categorical<'a>(
+    logits: &Array,
+    axis: impl Axis,
+    key: impl Into<Option<&'a Array>>,
+) -> Array {
+    let key = key.into();
+    let spec = axis.axis_spec();
+    let mut ins = vec![logits];
+    ins.extend(key);
+    Array::sticky(
+        "categorical",
+        Location::caller(),
+        &ins,
+        || match crate::axes::one_axis(spec, logits.ndim())? {
+            Some(axis) => imp::categorical(logits, axis as isize, key),
+            None => imp::categorical(&crate::ops::imp::reshape(logits, &[-1])?, 0, key),
+        },
+    )
 }
 
 /// Integers in `[low, high)` of `shape` and integer `dtype`, as MLX: uniform floats in
 /// `[low, high)` rounded down.
-pub fn randint(
+#[track_caller]
+pub fn randint<'a>(
     low: i64,
     high: i64,
-    shape: &[usize],
+    shape: impl IntoShape,
     dtype: DType,
-    key: Option<&Array>,
-) -> Result<Array> {
-    if dtype.category() == crate::Category::Float || dtype == DType::Complex64 {
-        return Err(Error::UnsupportedDType {
-            op: "randint",
-            dtype,
-        });
-    }
-    let u = uniform(low as f64, high as f64, shape, DType::F32, key)?;
-    let u = crate::ops::maximum(&u, Array::scalar(low as f32))?;
-    // floor(u): truncation, one less where it rounded a negative value up.
-    let t = u.astype(DType::I64)?;
-    let up = crate::ops::less(&u, &t.astype(DType::F32)?)?;
-    subtract(&t, up.astype(DType::I64)?)?.astype(dtype)
+    key: impl Into<Option<&'a Array>>,
+) -> Array {
+    let key = key.into();
+    let spec = shape.shape_spec();
+    Array::constructor("randint", Location::caller(), dtype, &spec, |shape| {
+        imp::randint(low, high, shape, dtype, key)
+    })
 }
 
 /// Booleans of `shape` that are true with probability `p`, as MLX: `uniform < p`.
-pub fn bernoulli(p: f64, shape: &[usize], key: Option<&Array>) -> Result<Array> {
-    crate::ops::less(&uniform(0.0, 1.0, shape, DType::F32, key)?, p)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::kernels::threefry2x32;
-
-    #[test]
-    fn threefry_known_answer() {
-        // Random123's known-answer vector for threefry2x32-20 with a zero key and counter.
-        assert_eq!(threefry2x32((0, 0), (0, 0)), (0x6b20_0159, 0x99ba_4efe));
-    }
-
-    #[test]
-    fn keys_and_layout() {
-        assert_eq!(key(1 << 32 | 7).to_vec::<u32>().unwrap(), [1, 7]);
-        // An odd word count and a partial final word use the tail paths.
-        let k = key(3);
-        for (n, width) in [(5, 4), (3, 2), (7, 1), (0, 4)] {
-            let b = bits(&[n], width, Some(&k)).unwrap();
-            b.eval().unwrap();
-            assert_eq!(b.size(), n);
-        }
-        assert!(bits(&[2], 3, Some(&k)).is_err());
-        assert!(bits(&[2], 4, Some(&Array::scalar(1u32))).is_err());
-    }
-
-    #[test]
-    fn sequences_are_per_thread_and_reproducible() {
-        seed(42);
-        let a = uniform(0.0, 1.0, &[4], DType::F32, None)
-            .unwrap()
-            .to_vec::<f32>()
-            .unwrap();
-        seed(42);
-        let b = uniform(0.0, 1.0, &[4], DType::F32, None)
-            .unwrap()
-            .to_vec::<f32>()
-            .unwrap();
-        assert_eq!(a, b);
-        assert!(a.iter().all(|&x| (0.0..1.0).contains(&x)));
-    }
+#[track_caller]
+pub fn bernoulli<'a>(p: f64, shape: impl IntoShape, key: impl Into<Option<&'a Array>>) -> Array {
+    let key = key.into();
+    let spec = shape.shape_spec();
+    Array::constructor(
+        "bernoulli",
+        Location::caller(),
+        DType::Bool,
+        &spec,
+        |shape| imp::bernoulli(p, shape, key),
+    )
 }

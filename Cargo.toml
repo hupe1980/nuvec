@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -13,18 +13,19 @@ readme = "README.md"
 authors = ["hupe1980"]
 keywords = ["mlx", "metal", "apple-silicon", "machine-learning", "llm"]
 categories = ["science", "mathematics"]
+exclude = ["tests/fixtures"]
 
 [workspace.dependencies]
-nuvec = { path = "crates/nuvec", version = "0.3.0" }
-nuvec-core = { path = "crates/nuvec-core", version = "0.3.0" }
-nuvec-compile = { path = "crates/nuvec-compile", version = "0.3.0" }
-nuvec-cpu = { path = "crates/nuvec-cpu", version = "0.3.0" }
-nuvec-distributed = { path = "crates/nuvec-distributed", version = "0.3.0" }
-nuvec-gpu = { path = "crates/nuvec-gpu", version = "0.3.0" }
-nuvec-io = { path = "crates/nuvec-io", version = "0.3.0" }
-nuvec-kernels = { path = "crates/nuvec-kernels", version = "0.3.0" }
-nuvec-lm = { path = "crates/nuvec-lm", version = "0.3.0" }
-nuvec-nn = { path = "crates/nuvec-nn", version = "0.3.0" }
+nuvec = { path = "crates/nuvec", version = "0.4.0" }
+nuvec-core = { path = "crates/nuvec-core", version = "0.4.0" }
+nuvec-compile = { path = "crates/nuvec-compile", version = "0.4.0" }
+nuvec-cpu = { path = "crates/nuvec-cpu", version = "0.4.0" }
+nuvec-gpu = { path = "crates/nuvec-gpu", version = "0.4.0" }
+nuvec-io = { path = "crates/nuvec-io", version = "0.4.0" }
+nuvec-kernels = { path = "crates/nuvec-kernels", version = "0.4.0" }
+nuvec-lm = { path = "crates/nuvec-lm", version = "0.4.0" }
+nuvec-nn = { path = "crates/nuvec-nn", version = "0.4.0" }
+nuvec-macros = { path = "crates/nuvec-macros", version = "0.4.0" }
 
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2", "block2"] }
@@ -58,6 +59,12 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 half = { version = "2.7", features = ["bytemuck"] }
 smallvec = { version = "1", features = ["union", "const_generics"] }
+# The derive macros (nuvec-macros); already in the graph through `thiserror`.
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "visit"] }
+# Compile-fail and inference tests (dev-only).
+trybuild = "1"
 
 [workspace.lints.rust]
 missing_docs = "warn"

@@ -72,9 +72,12 @@ impl Buffer {
     pub(crate) fn map_file(path: &std::path::Path) -> Result<Self> {
         #[cfg(all(target_os = "macos", not(miri)))]
         if let Some(device) = device() {
-            let buffer = device
-                .map_file(path)
-                .map_err(|e| Error::Io(e.to_string()))?;
+            let buffer = device.map_file(path).map_err(|e| match e {
+                // Over the memory limit (`active + mapped`): refused before anything is
+                // wired.
+                nuvec_gpu::GpuError::OutOfMemory(n) => Error::OutOfMemory(n),
+                e => Error::Io(e.to_string()),
+            })?;
             let len = buffer.len();
             return Ok(Self::new(Storage::Metal(buffer), len));
         }
@@ -229,7 +232,7 @@ mod tests {
     fn arrays_live_in_unified_memory() {
         let Some(device) = device() else { return };
         let before = device.memory();
-        let a = crate::zeros(&[1 << 18], crate::DType::F32).unwrap(); // 1 MiB
+        let a = crate::ops::imp::zeros(&[1 << 18], crate::DType::F32).unwrap(); // 1 MiB
         let storage = a.data().expect("leaf data");
         assert!(storage.buffer.is_metal());
         assert!(

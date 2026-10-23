@@ -1,7 +1,7 @@
 [package]
 name = "nuvec-compile"
-description = "Function compilation for nuvec: tracing, graph simplification and kernel fusion"
-exclude = ["tests/fixtures"]
+description = "Function compilation for nuvec: tracing, graph simplification, kernel fusion and compiled training steps"
+exclude.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,9 +16,22 @@ categories.workspace = true
 [dependencies]
 nuvec-core.workspace = true
 
+[dev-dependencies]
+# Peak memory of compiled checkpointed graphs (tests/checkpoint_memory.rs).
+nuvec-gpu.workspace = true
+# `#[derive(Tree)]` for the tests over trees (`#[tree(crate = "nuvec_core")]`).
+nuvec-macros.workspace = true
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
+
 [lints]
 workspace = true
 
 [[bench]]
 name = "compile"
+harness = false
+
+[[bench]]
+name = "tree"
 harness = false

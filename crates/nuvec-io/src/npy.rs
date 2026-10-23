@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use nuvec_core::{Array, DType, Error, MappedFile, Result, transpose};
+use nuvec_core::{Array, DType, Error, MappedFile, Result};
 
 use crate::safetensors::array_bytes;
 
@@ -97,9 +97,12 @@ pub fn load_npy(path: impl AsRef<Path>) -> Result<Array> {
         .ok_or_else(|| invalid("bad descr"))?;
     let dtype = dtype_of(descr).ok_or_else(|| invalid(format!("unsupported type {descr}")))?;
     let fortran = field(header, "fortran_order")?.starts_with("True");
-    let shape_text = field(header, "shape")?;
-    let close = shape_text.find(')').ok_or_else(|| invalid("bad shape"))?;
-    let shape = shape_text[1..close]
+    // `(d0, d1, ...)`; sliced by pattern, never by byte index (the header may be any UTF-8).
+    let (dims, _) = field(header, "shape")?
+        .strip_prefix('(')
+        .and_then(|s| s.split_once(')'))
+        .ok_or_else(|| invalid("bad shape"))?;
+    let shape = dims
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -108,9 +111,7 @@ pub fn load_npy(path: impl AsRef<Path>) -> Result<Array> {
     let data = start + len;
     if fortran && shape.len() > 1 {
         let reversed: Vec<usize> = shape.iter().rev().copied().collect();
-        let a = file.array(data, dtype, &reversed)?;
-        let axes: Vec<usize> = (0..shape.len()).rev().collect();
-        transpose(&a, &axes)
+        Ok(file.array(data, dtype, &reversed)?.t())
     } else {
         file.array(data, dtype, &shape)
     }
@@ -125,10 +126,7 @@ pub fn save_npy(path: impl AsRef<Path>, a: &Array) -> Result<()> {
         [n] => format!("({n},)"),
         s => format!(
             "({})",
-            s.iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+            s.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")
         ),
     };
     let mut header = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape}, }}");

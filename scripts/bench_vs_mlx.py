@@ -50,6 +50,15 @@ def mlx_results(device=mx.cpu, prefix: str = "") -> dict[str, float]:
         mx.eval(x)
 
     out[prefix + "dispatch_10k"] = bench(20 if not prefix else 10, dispatch)
+
+    def dispatch_named() -> None:
+        x = mx.array(0.0, dtype=mx.float32)
+        for _ in range(10_000):
+            x = mx.add(x, one)
+        mx.eval(x)
+
+    if not prefix:
+        out["dispatch_10k_named"] = bench(20, dispatch_named)
     a = mx.arange(0, 1e6, 1, dtype=mx.float32)
     b = mx.ones((1_000_000,), dtype=mx.float32)
     mx.eval(a, b)

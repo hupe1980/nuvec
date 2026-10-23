@@ -339,9 +339,7 @@ impl GpuEval {
                 Arg::bytes(&a),
                 Arg::bytes(&b),
             ];
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, &args, [threads, 1, 1], [threads, 1, 1])
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, &args, [threads, 1, 1], [threads, 1, 1])?;
             return self.counted();
         }
         // Two passes: rows of the input into an intermediate, then the intermediate.
@@ -361,9 +359,7 @@ impl GpuEval {
                 Arg::bytes(&a),
                 Arg::bytes(&b),
             ];
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, &args, [threads, rows, 1], [threads, 1, 1])
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, &args, [threads, rows, 1], [threads, 1, 1])?;
             self.counted()?;
         }
         let pipeline = self.pipeline(&format!("nuvec_all_reduce_{second_tag}"))?;
@@ -374,9 +370,7 @@ impl GpuEval {
             Arg::bytes(&a),
             Arg::bytes(&b),
         ];
-        self.command_buffer()?
-            .dispatch_threads(&pipeline, &args, [second, 1, 1], [second, 1, 1])
-            .map_err(backend)?;
+        self.encode_threads(&pipeline, &args, [second, 1, 1], [second, 1, 1])?;
         self.counted()
     }
 
@@ -412,14 +406,12 @@ impl GpuEval {
                 Arg::bytes(&a),
                 Arg::bytes(&b),
             ];
-            self.command_buffer()?
-                .dispatch_threads(
-                    &pipeline,
-                    &args,
-                    [threads, out_size.div_ceil(N_WRITES), 1],
-                    [threads, 1, 1],
-                )
-                .map_err(backend)?;
+            self.encode_threads(
+                &pipeline,
+                &args,
+                [threads, out_size.div_ceil(N_WRITES), 1],
+                [threads, 1, 1],
+            )?;
             return self.counted();
         }
         let args = Args::new(row as i64, non_row as i64, (&ks, &kt), (rs, rt), non_row);
@@ -440,9 +432,7 @@ impl GpuEval {
         } else {
             ([32, out_size, 1], [32, 1, 1])
         };
-        self.command_buffer()?
-            .dispatch_threads(&pipeline, &list, grid, group)
-            .map_err(backend)?;
+        self.encode_threads(&pipeline, &list, grid, group)?;
         self.counted()
     }
 
@@ -496,14 +486,12 @@ impl GpuEval {
                 .min(total);
             let mut list = vec![Arg::Read(input, offset), Arg::write(out)];
             args.push(&mut list, true);
-            self.command_buffer()?
-                .dispatch_groups(
-                    &pipeline,
-                    &list,
-                    [blocks.div_ceil(tx), grid_out, 1],
-                    [tx, ty, 1],
-                )
-                .map_err(backend)?;
+            self.encode_groups(
+                &pipeline,
+                &list,
+                [blocks.div_ceil(tx), grid_out, 1],
+                [tx, ty, 1],
+            )?;
             return self.counted();
         }
         if stride < 32 && total >= 1024 {
@@ -520,14 +508,12 @@ impl GpuEval {
                 ];
                 args.push(&mut list, true);
                 list.push(Arg::bytes(&os));
-                self.command_buffer()?
-                    .dispatch_groups(
-                        &pipeline,
-                        &list,
-                        [grid_out, 1, outer],
-                        [stride as usize, ty, 1],
-                    )
-                    .map_err(backend)?;
+                self.encode_groups(
+                    &pipeline,
+                    &list,
+                    [grid_out, 1, outer],
+                    [stride as usize, ty, 1],
+                )?;
                 self.counted()?;
             }
             return self.col_second_pass(second_tag, partial, outer, out_size, out);
@@ -591,9 +577,7 @@ impl GpuEval {
             if let Some(e) = extra {
                 list.push(Arg::bytes(e));
             }
-            self.command_buffer()?
-                .dispatch_threads(pipeline, &list, [threads * count, gy, gz], [threads, 1, 1])
-                .map_err(backend)?;
+            self.encode_threads(pipeline, &list, [threads * count, gy, gz], [threads, 1, 1])?;
             self.counted()?;
             start += count;
         }

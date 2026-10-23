@@ -4,14 +4,13 @@
 //! runs, instead of being made resident (and possibly paged back in) per command buffer.
 //! New buffers join the set while it holds less than the wired limit; the rest wait in an
 //! unwired list and join when the limit grows. A limit of 0 (MLX's default) wires nothing.
-//! Residency sets need macOS 15 and a Metal 3 GPU; without them nothing is wired.
+//! Residency sets exist on macOS 15 (nuvec's floor) for Metal 3 GPUs; on other GPUs nothing
+//! is wired.
 
 use std::collections::{HashMap, HashSet};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::sel;
-use objc2_foundation::NSObjectProtocol;
 use objc2_metal::{
     MTLAllocation, MTLCommandQueue, MTLDevice, MTLGPUFamily, MTLResidencySet,
     MTLResidencySetDescriptor,
@@ -35,10 +34,8 @@ pub(crate) fn attach(
     device: &ProtocolObject<dyn MTLDevice>,
     queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Option<Set> {
-    // Residency sets exist from macOS 15 on (the selector is absent before).
-    if !device.respondsToSelector(sel!(newResidencySetWithDescriptor:error:))
-        || !device.supportsFamily(MTLGPUFamily::Metal3)
-    {
+    // macOS 15 (nuvec's floor) has residency sets, for Metal 3 GPUs.
+    if !device.supportsFamily(MTLGPUFamily::Metal3) {
         return None;
     }
     let set = device

@@ -16,15 +16,16 @@ group = "Libraries"
 | Qwen 2 | `qwen2` | q/k/v biases |
 | Qwen 3 | `qwen3` | per-head q/k norms |
 | Qwen 3 MoE | `qwen3_moe` | sparse layers per `decoder_sparse_step`, dense `mlp_only_layers` |
-| Qwen 3.5 / 3.6 | `qwen3_5`, `qwen3_5_moe` | hybrid Gated DeltaNet and gated attention, partial RoPE, dense or mixture-of-experts |
+| Qwen 3.5 / 3.6 | `qwen3_5`, `qwen3_5_text`, `qwen3_5_moe`, `qwen3_5_moe_text` | hybrid Gated DeltaNet and gated attention, partial RoPE, dense or mixture-of-experts |
 
-Checkpoints load from a directory or a Hugging Face repository id found in the local cache — mlx-community's quantized checkpoints as well as original Hugging Face ones (fused or per-expert MoE weights, multimodal wrappers). Weights are memory-mapped, not copied; nothing is downloaded.
+Checkpoints load from a directory or a Hugging Face repository id found in the local cache — mlx-community's quantized checkpoints as well as original Hugging Face ones (fused or per-expert MoE weights, multimodal wrappers). Checkpoints whose tensors are aligned (files nuvec writes are) are memory-mapped without a copy; mlx-community checkpoints have unpadded headers and are read once at load, in parallel, without the vision and multi-token-prediction weights the language model does not use (as mlx-lm). Loading runs nothing through the model; `Model::warm_up` builds its kernels ahead of a first request. Nothing is downloaded.
 
 ## Generating
 
-```rust
+```rust,no_run
 use nuvec_lm::{GenerateOptions, Sampler, StreamDecoder, generate, load};
 
+# fn main() -> nuvec::Result<()> {
 let (model, tokenizer) = load("mlx-community/Qwen3-8B-4bit")?;
 let prompt = tokenizer.encode("<|im_start|>user\nWhat is unified memory?<|im_end|>\n<|im_start|>assistant\n");
 let options = GenerateOptions {
@@ -34,15 +35,16 @@ let options = GenerateOptions {
 };
 let mut out = StreamDecoder::default();
 for id in generate(&model, &prompt, options)? {
-    let id = id?;
-    if model.config.eos_token_ids.contains(&id) { break; }
-    print!("{}", out.push(&tokenizer, id));
+    print!("{}", out.push(&tokenizer, id?));
 }
+# Ok(())
+# }
 ```
 
-- **Samplers:** greedy (temperature 0, the default), temperature, top-p, min-p and top-k, with mlx-lm's filters. With `GenerateOptions::seed`, sampled tokens are reproducible, also when batched with other requests.
-- **Tokenizer:** byte-level BPE read from `tokenizer.json`, special tokens included; `encode` adds the tokens the tokenizer's post-processor adds (Llama's `<|begin_of_text|>`), as mlx-lm does. `StreamDecoder` turns token ids into text without splitting multi-byte characters.
-- **Cache:** `Generation::cache()` exposes the KV cache (and Gated DeltaNet state) to continue a conversation.
+- **End of sequence:** generation stops at the model's end-of-sequence ids (those of `config.json` and `generation_config.json`, as mlx-lm) without yielding them, or at `max_tokens`.
+- **Samplers:** greedy (temperature 0, the default), temperature, top-p, min-p and top-k, with mlx-lm's filters chained in mlx-lm's order. Settings are checked when generation starts (`Sampler::validate`). With `GenerateOptions::seed`, sampled tokens are reproducible, also when batched with other requests.
+- **Tokenizer:** byte-level BPE read from `tokenizer.json` (GPT-2, Llama 3, Qwen 2/3/3.5 split patterns), special tokens included; `encode` adds the tokens the tokenizer's post-processor adds (Llama's `<|begin_of_text|>`), as mlx-lm does. SentencePiece-style tokenizers (Llama 2, Mistral v0.1–v0.3) and other split patterns are not supported. `StreamDecoder` turns token ids into text without splitting multi-byte characters.
+- **Cache:** `Generation::cache()` exposes the KV cache (and Gated DeltaNet state) for inspection.
 
 ## How generation is fast
 
@@ -57,26 +59,37 @@ See [benchmarks](@/docs/benchmarks.md) for the numbers and [speculative decoding
 
 `PagedCache` holds the keys and values of many sequences in fixed-size blocks; `decode_batch` advances several of them, each at its own length, in one forward pass. Prefill each sequence as usual, then move it into the paged cache:
 
-```rust
-use nuvec_lm::{PagedCache, decode_batch};
+```rust,no_run
+use nuvec::prelude::*;
+use nuvec_lm::{PagedCache, decode_batch, load};
 
+# fn main() -> Result<()> {
+let (model, _tokenizer) = load("mlx-community/Qwen3-0.6B-4bit")?;
+# let prompt_without_last_token = Array::from_slice(&[9707u32, 11], [1, 2]);
+# let last_token = 1879u32;
 let mut paged = PagedCache::new(&model, 4096, 32, 8)?; // 32-position blocks, 8 sequences
 let mut kv = model.new_cache();
-model.forward(&prompt_without_last_token, &mut kv)?;  // [1, L] token ids
+model.forward(&prompt_without_last_token, &mut kv).eval()?; // [1, L] token ids
 let id = paged.insert(&kv)?;
 let logits = decode_batch(&model, &[last_token], &[id], &mut paged)?; // [B, vocab]
+let next = logits.argmax(-1);                          // the next token of each sequence
 paged.remove(id)?;                                     // its blocks are free again
+# Ok(())
+# }
 ```
 
 Each sequence gets exactly the tokens it would get decoding alone. Hybrid models keep each sequence's Gated DeltaNet state in a slot of a state pool, updated in place.
 
 ## Serving many requests
 
-`Batcher` puts it together: requests are queued, admitted while there is room, prefilled, and decoded together; each finishes at an end-of-sequence token or its `max_tokens`.
+`Batcher` puts it together: requests are queued, admitted while there is room, prefilled (on quantized models, prompts of the same length over 64 tokens admitted together in one batch, each with its solo tokens), and decoded together; each finishes at an end-of-sequence token or its `max_tokens`. Decoding is pipelined as `generate`: each `step` submits the next step before reading the previous one's tokens, so one step can be in flight between calls; a request that ends meanwhile emits nothing more.
 
-```rust
-use nuvec_lm::{Batcher, Event, GenerateOptions};
+```rust,no_run
+use nuvec_lm::{Batcher, Event, GenerateOptions, load};
 
+# fn main() -> nuvec::Result<()> {
+let (model, _tokenizer) = load("mlx-community/Qwen3-0.6B-4bit")?;
+# let prompts: Vec<Vec<u32>> = vec![vec![9707, 11], vec![785, 6722, 315]];
 let mut batcher = Batcher::new(&model, 4096, 32, 8)?; // blocks, block size, batch
 for prompt in prompts {
     batcher.submit(prompt, GenerateOptions::default())?;
@@ -89,9 +102,13 @@ while batcher.is_busy() {
         }
     }
 }
+# Ok(())
+# }
 ```
 
 When the cache runs out of blocks, the most recently admitted request is preempted and later prefilled again with the tokens it has produced; its later tokens can then differ in low bits from an uninterrupted run.
+
+`submit` rejects empty prompts, prompts that could never fit in the cache and invalid sampler settings. `cancel(id)` finishes a waiting or running request with `FinishReason::Cancelled` at the next step. A request that outgrows the whole cache finishes with `CacheFull`; one whose prefill or decoding step fails finishes with `Error`, while the others go on (a step commits its cache positions only after its forward pass succeeded).
 
 ## Command line
 

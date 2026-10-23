@@ -5,9 +5,7 @@
 
 use std::time::Instant;
 
-use nuvec_core::{
-    Array, DType, Device, Result, Stream, async_eval, matmul, random, set_default_stream,
-};
+use nuvec_core::{Array, DType, Device, Result, Stream, async_eval, random, set_default_stream};
 
 /// (name, batch, M, K, N, B transposed)
 const SHAPES: &[(&str, usize, usize, usize, usize, bool)] = &[
@@ -50,10 +48,10 @@ fn main() -> Result<()> {
                 (false, true) => vec![n, k],
                 (false, false) => vec![k, n],
             };
-            let a = random::uniform(-1.0, 1.0, &a_shape, DType::F32, None)?.astype(dtype)?;
-            let b = random::uniform(-1.0, 1.0, &b_shape, DType::F32, None)?.astype(dtype)?;
+            let a = random::uniform(-1.0, 1.0, &a_shape[..], DType::F32, None).astype(dtype);
+            let b = random::uniform(-1.0, 1.0, &b_shape[..], DType::F32, None).astype(dtype);
             nuvec_core::eval(&[a.clone(), b.clone()])?;
-            let b = if bt && batch == 1 { b.t()? } else { b };
+            let b = if bt && batch == 1 { b.t() } else { b };
             let flops = 2 * batch * m * n * k;
             // About 0.1 s of work per measurement (at least 20 products).
             let reps = (2_000_000_000_000 / 10 / flops.max(1)).clamp(20, 2000);
@@ -61,7 +59,7 @@ fn main() -> Result<()> {
                 let t = Instant::now();
                 let mut last: Option<Array> = None;
                 for _ in 0..count {
-                    let y = matmul(&a, &b)?;
+                    let y = a.matmul(&b);
                     async_eval(std::slice::from_ref(&y))?;
                     last = Some(y);
                 }

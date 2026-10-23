@@ -1,0 +1,10 @@
+error[E0282]: type annotations needed for `&_`
+ --> tests/ui/inference/fail_unannotated_tuple.rs:7:29
+  |
+7 |     let _ = value_and_grad(|p| p.0.matmul(&p.1).sum())(&(Array, Array));
+  |                             ^  --- type must be known at this point
+  |
+help: consider giving this closure parameter an explicit type, where the type for type parameter `P` is specified
+  |
+7 |     let _ = value_and_grad(|p: &P| p.0.matmul(&p.1).sum())(&(Array, Array));
+  |                              ++++

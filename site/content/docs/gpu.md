@@ -31,20 +31,27 @@ Three techniques keep memory low:
 
 The allocator follows MLX's rules (a size-bucketed cache, least-recently-used eviction, a memory limit at 1.5× the GPU's recommended working set capped at 95% of RAM). Limits and statistics live on the process-wide device:
 
-```rust
+```rust,no_run
 let gpu = nuvec::gpu::Device::shared().expect("a Metal GPU");
-gpu.set_memory_limit(24 << 30);  // allocations beyond fail instead of swapping
+gpu.set_memory_limit(24 << 30);  // allocations and mappings beyond fail instead of swapping
 gpu.set_cache_limit(4 << 30);    // trim the buffer cache
 let stats = gpu.memory();        // active, peak, cache, limits, wired and mapped bytes
+println!("{}", stats.peak_with_mapped); // the peak to compare with MLX's get_peak_memory
 gpu.clear_cache();
 ```
 
+The memory limit bounds `active + mapped` and refuses with `OutOfMemory`; MLX treats its limit as a guideline. `peak_with_mapped` is the high-water mark of `active + mapped`, the counterpart of MLX's `get_peak_memory()` (which includes its copied weights); `reset_peak` resets both peaks.
+
 ## Wired memory
 
-`set_wired_limit` keeps buffers resident while the GPU runs, through a Metal **residency set** attached to the command queue, instead of making them resident per command buffer (which can page memory back in under pressure). New buffers and memory-mapped checkpoints join the set up to the limit; raising the limit wires waiting buffers, lowering it unwires them. Mapped checkpoints are not in `active` or `peak` (which count the allocator's buffers): `mapped` and `wired_mapped` report them. It needs macOS 15 and a Metal 3 GPU (`can_wire`), and the default is 0, as in MLX.
+`set_wired_limit` keeps buffers resident while the GPU runs, through a Metal **residency set** attached to the command queue, instead of making them resident per command buffer (which can page memory back in under pressure). New buffers and memory-mapped checkpoints join the set up to the limit; raising the limit wires waiting buffers, lowering it unwires them. Mapped checkpoints are not in `active` or `peak` (which count the allocator's buffers): `mapped`, `wired_mapped`, `active_with_mapped` and `peak_with_mapped` include them. It needs macOS 15 and a Metal 3 GPU (`can_wire`), and the default is 0, as in MLX.
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let gpu = nuvec::gpu::Device::shared().expect("a Metal GPU");
 gpu.set_wired_limit(gpu.info().recommended_working_set as usize)?;
+# Ok(())
+# }
 ```
 
 `nuvec_lm::WiredLimit` does this for the duration of a generation, as mlx-lm does.

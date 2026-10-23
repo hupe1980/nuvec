@@ -1,0 +1,5 @@
+error: trait objects are not trees; use an enum of the concrete types (or `#[tree(skip, static_unchecked)]` for host-side data)
+ --> tests/ui/derive/fail_dyn_field.rs:8:12
+  |
+8 |     layer: Box<dyn Layer>,
+  |            ^^^

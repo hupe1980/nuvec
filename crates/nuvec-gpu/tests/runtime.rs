@@ -4,9 +4,15 @@
 
 use nuvec_gpu::{Arg, Buffer, Device, GpuError};
 
+/// The Metal device, or `None` (the test skips) without one. With `NUVEC_REQUIRE_GPU=1` a
+/// missing device fails the test instead of skipping it.
 fn device() -> Option<Device> {
     let device = Device::system_default();
     if device.is_none() {
+        assert!(
+            std::env::var("NUVEC_REQUIRE_GPU").as_deref() != Ok("1"),
+            "NUVEC_REQUIRE_GPU=1 but no Metal device is available"
+        );
         eprintln!("skipped: no Metal device");
     }
     device
@@ -37,17 +43,44 @@ fn add(
     n: u32,
 ) {
     let pipeline = device.pipeline("nuvec_add_f32").unwrap();
-    cmd.dispatch(
-        &pipeline,
-        &[
-            Arg::read(a),
-            Arg::read(b),
-            Arg::write(out),
-            Arg::bytes(&n.to_le_bytes()),
-        ],
-        n as usize,
-    )
-    .unwrap();
+    try_add(cmd, &pipeline, a, b, out, n).unwrap();
+}
+
+/// `out = a + b` over `n` floats, reporting a rejected dispatch.
+fn try_add(
+    cmd: &mut nuvec_gpu::CommandBuffer,
+    pipeline: &nuvec_gpu::Pipeline,
+    a: &Buffer,
+    b: &Buffer,
+    out: &mut Buffer,
+    n: u32,
+) -> nuvec_gpu::Result<()> {
+    let threads = (n as usize)
+        .min(a.len() / 4)
+        .min(b.len() / 4)
+        .min(out.len() / 4);
+    let n = n.to_le_bytes();
+    let args = [Arg::read(a), Arg::read(b), Arg::write(out), Arg::bytes(&n)];
+    // SAFETY: `nuvec_add_f32` touches element `i` of each buffer only for `i < n` and
+    // `i < threads`, and `threads` is at most every buffer's length in floats.
+    unsafe { cmd.dispatch(pipeline, &args, threads) }
+}
+
+/// Runs `f` on another thread and fails the test if it takes longer than `limit` (a hang
+/// fails by timeout instead of blocking the suite).
+fn with_timeout<T: Send + 'static>(
+    limit: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
+    });
+    match rx.recv_timeout(limit) {
+        Ok(Ok(value)) => value,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => panic!("timed out after {limit:?}"),
+    }
 }
 
 #[test]
@@ -87,6 +120,27 @@ fn pipelines_are_cached() {
     assert!(first.same_as(&second));
     assert_eq!(first.name(), "nuvec_add_f32");
     assert!(first.execution_width() >= 1);
+}
+
+/// The loaded kernel library (precompiled or compiled from source) exports the kernels by
+/// name, as `newFunctionWithName` finds them.
+#[test]
+fn precompiled_library_contains_the_kernels() {
+    let Some(device) = device() else { return };
+    for name in [
+        "nuvec_binary_add_float32_c",
+        "nuvec_add_f32",
+        "nuvec_unary_exp_float32_c",
+    ] {
+        let pipeline = device
+            .pipeline(name)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(pipeline.name(), name);
+    }
+    assert!(matches!(
+        device.pipeline("nuvec_no_such_kernel"),
+        Err(GpuError::MissingKernel(_))
+    ));
 }
 
 #[test]
@@ -153,19 +207,18 @@ fn misuse_is_reported() {
     let pipeline = device.pipeline("nuvec_add_f32").unwrap();
     let small = device.new_buffer(16).unwrap();
     let mut cmd = device.command_buffer().unwrap();
-    let past_end = cmd.dispatch(&pipeline, &[Arg::Read(&small, 17)], 4);
+    // SAFETY: rejected before anything is encoded (as the dispatches below).
+    let past_end = unsafe { cmd.dispatch(&pipeline, &[Arg::Read(&small, 17)], 4) };
     assert!(matches!(past_end, Err(GpuError::InvalidArgument(_))));
     let bytes = [0u8; 4];
     let many: Vec<Arg<'_>> = (0..32).map(|_| Arg::bytes(&bytes)).collect();
-    assert!(matches!(
-        cmd.dispatch(&pipeline, &many, 4),
-        Err(GpuError::InvalidArgument(_))
-    ));
+    // SAFETY: rejected.
+    let too_many = unsafe { cmd.dispatch(&pipeline, &many, 4) };
+    assert!(matches!(too_many, Err(GpuError::InvalidArgument(_))));
     let big = vec![0u8; 5000];
-    assert!(matches!(
-        cmd.dispatch(&pipeline, &[Arg::bytes(&big)], 4),
-        Err(GpuError::InvalidArgument(_))
-    ));
+    // SAFETY: rejected.
+    let too_big = unsafe { cmd.dispatch(&pipeline, &[Arg::bytes(&big)], 4) };
+    assert!(matches!(too_big, Err(GpuError::InvalidArgument(_))));
     assert_eq!(cmd.barriers(), 0, "rejected dispatches encode nothing");
 }
 
@@ -210,7 +263,8 @@ fn empty_buffers_and_zero_threads() {
     assert!(empty.is_empty() && empty.contents().unwrap().is_empty());
     let pipeline = device.pipeline("nuvec_add_f32").unwrap();
     let mut cmd = device.command_buffer().unwrap();
-    cmd.dispatch(&pipeline, &[], 0).unwrap();
+    // SAFETY: no threads run.
+    unsafe { cmd.dispatch(&pipeline, &[], 0) }.unwrap();
     cmd.commit().wait().unwrap();
 }
 
@@ -233,7 +287,7 @@ fn timeline_orders_command_buffers_committed_without_waiting() {
         };
         add(&mut cmd, &device, src, &ones, dst, n as u32);
         let tx = tx.clone();
-        cmd.commit_then(move |r| tx.send(r).unwrap());
+        drop(cmd.commit_then(move |r| tx.send(r).unwrap()));
     }
     for _ in 0..200 {
         rx.recv().unwrap().unwrap();
@@ -272,7 +326,7 @@ fn completion_handlers_report_and_back_pressure_bounds_in_flight_work() {
         // CPU access is refused while the GPU uses the buffer.
         assert!(matches!(out.contents(), Err(GpuError::BufferInUse)));
         let tx = tx.clone();
-        cmd.commit_then(move |r| tx.send((r, read_f32(&out)[0])).unwrap());
+        drop(cmd.commit_then(move |r| tx.send((r, read_f32(&out)[0])).unwrap()));
     }
     for _ in 0..40 {
         let (result, first) = rx.recv().unwrap();
@@ -299,7 +353,7 @@ fn ordered_command_buffers_read_in_flight_results_across_threads() {
             (&y, &mut x)
         };
         add(&mut cmd, &device, src, &ones, dst, n as u32);
-        cmd.commit_then(|r| r.unwrap());
+        drop(cmd.commit_then(|r| r.unwrap()));
     }
     let (d, o) = (device.clone(), ones.clone());
     let reader = std::thread::spawn(move || {
@@ -345,7 +399,8 @@ fn function_constants_specialise_and_cache_pipelines() {
             .unwrap();
         let mut out = device.new_buffer(16).unwrap();
         let mut cmd = device.command_buffer().unwrap();
-        cmd.dispatch(&pipeline, &[Arg::write(&mut out)], 4).unwrap();
+        // SAFETY: the kernel writes `out[i]` for the 4 threads; `out` holds 4 floats.
+        unsafe { cmd.dispatch(&pipeline, &[Arg::write(&mut out)], 4) }.unwrap();
         cmd.commit().wait().unwrap();
         assert_eq!(read_f32(&out), [expected; 4]);
     }
@@ -465,13 +520,287 @@ fn mapped_files_are_read_without_a_copy_and_never_written() {
     // GPU writes are refused.
     let mut cmd = device.command_buffer().unwrap();
     let pipeline = device.pipeline("nuvec_add_f32").unwrap();
-    let err = cmd.dispatch(
-        &pipeline,
-        &[Arg::read(&ones), Arg::read(&ones), Arg::write(&mut mapped)],
-        n,
-    );
+    // SAFETY: rejected before anything is encoded.
+    let err = unsafe {
+        cmd.dispatch(
+            &pipeline,
+            &[Arg::read(&ones), Arg::read(&ones), Arg::write(&mut mapped)],
+            n,
+        )
+    };
     assert_eq!(err.unwrap_err(), GpuError::ReadOnly);
     drop(mapped);
     std::fs::remove_file(&path).unwrap();
     assert!(device.map_file(&path).is_err());
+}
+
+#[test]
+fn same_must_refer_to_a_written_argument() {
+    let Some(device) = device() else { return };
+    let pipeline = device.pipeline("nuvec_add_f32").unwrap();
+    let a = device.buffer_from(&f32s(&[1.0; 4])).unwrap();
+    let mut out = device.new_buffer(16).unwrap();
+    let mut cmd = device.command_buffer().unwrap();
+    let n = 4u32.to_le_bytes();
+    // `Same` of a read-only argument would let the kernel write a buffer nobody counts as
+    // written.
+    let args = [
+        Arg::read(&a),
+        Arg::Same(0, 0),
+        Arg::write(&mut out),
+        Arg::bytes(&n),
+    ];
+    // SAFETY: rejected before anything is encoded.
+    let result = unsafe { cmd.dispatch(&pipeline, &args, 4) };
+    assert!(
+        matches!(result, Err(GpuError::InvalidArgument(_))),
+        "{result:?}"
+    );
+    // `Same` of a written argument is the in-place pattern.
+    let args = [
+        Arg::read(&a),
+        Arg::Same(2, 0),
+        Arg::write(&mut out),
+        Arg::bytes(&n),
+    ];
+    // SAFETY: four floats in each bound buffer, four threads.
+    unsafe { cmd.dispatch(&pipeline, &args, 4) }.unwrap();
+    cmd.commit().wait().unwrap();
+}
+
+#[test]
+fn wait_returns_after_the_completion_has_run() {
+    let Some(device) = device() else { return };
+    let a = device.buffer_from(&f32s(&[1.0; 64])).unwrap();
+    let mut out = device.new_buffer(64 * 4).unwrap();
+    for _ in 0..10_000 {
+        let mut cmd = device.ordered_command_buffer().unwrap();
+        add(&mut cmd, &device, &a, &a, &mut out, 64);
+        cmd.commit_then(|r| r.unwrap()).wait();
+        assert_eq!(device.in_flight(), 0);
+        assert!(!out.in_use());
+        assert_eq!(out.contents().unwrap().len(), 64 * 4);
+    }
+}
+
+#[test]
+fn reading_reused_memory_waits_for_the_previous_owner() {
+    with_timeout(std::time::Duration::from_secs(30), || {
+        let Some(device) = device() else { return };
+        let n = 1 << 20;
+        let a = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
+        device.clear_cache();
+        let mut out = device.new_buffer(n * 4).unwrap();
+        let mut cmd = device.ordered_command_buffer().unwrap();
+        add(&mut cmd, &device, &a, &a, &mut out, n as u32);
+        let submitted = cmd.commit(); // not waited for
+        drop(out);
+        let before = device.memory().system_allocations;
+        let reused = device.new_gpu_buffer(n * 4).unwrap();
+        let was_reused = device.memory().system_allocations == before;
+        // Returns once the GPU has finished with the memory.
+        assert_eq!(reused.contents().unwrap().len(), n * 4);
+        assert!(was_reused, "the in-flight memory is reused");
+        submitted.wait().unwrap();
+    });
+}
+
+#[test]
+fn unordered_work_on_busy_memory_and_reads_of_unsubmitted_writes_are_refused() {
+    let Some(device) = device() else { return };
+    let pipeline = device.pipeline("nuvec_add_f32").unwrap();
+    // A writer encoded but not committed: its fence orders nothing yet.
+    let a = device.buffer_from(&f32s(&[1.0; 4])).unwrap();
+    let mut x = device.new_buffer(16).unwrap();
+    let mut y = device.new_buffer(16).unwrap();
+    let mut writer = device.ordered_command_buffer().unwrap();
+    add(&mut writer, &device, &a, &a, &mut x, 4);
+    let mut reader = device.ordered_command_buffer().unwrap();
+    assert_eq!(
+        try_add(&mut reader, &pipeline, &x, &a, &mut y, 4),
+        Err(GpuError::BufferInUse)
+    );
+    // The writer's own later dispatches may read it.
+    let mut z = device.new_buffer(16).unwrap();
+    add(&mut writer, &device, &x, &a, &mut z, 4);
+    writer.commit().wait().unwrap();
+    drop(reader);
+    assert_eq!(read_f32(&z), [3.0; 4]);
+
+    // Memory reused while its previous owner's ordered work runs: an unordered command
+    // buffer does not wait for that work's fence, so it is refused.
+    let n = 1 << 22;
+    let ones = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
+    let mut acc = device.buffer_from(&f32s(&vec![0.0; n])).unwrap();
+    let mut chain = device.new_buffer(n * 4).unwrap();
+    let mut cmd = device.ordered_command_buffer().unwrap();
+    for _ in 0..50 {
+        add(&mut cmd, &device, &acc, &ones, &mut chain, n as u32);
+        std::mem::swap(&mut acc, &mut chain);
+    }
+    let pending = cmd.commit_then(|r| r.unwrap());
+    device.clear_cache();
+    drop(chain);
+    let before = device.memory().system_allocations;
+    let mut reused = device.new_gpu_buffer(n * 4).unwrap();
+    let was_reused = device.memory().system_allocations == before;
+    let mut unordered = device.command_buffer().unwrap();
+    let result = try_add(
+        &mut unordered,
+        &pipeline,
+        &ones,
+        &ones,
+        &mut reused,
+        n as u32,
+    );
+    let still_running = device.in_flight() > 0;
+    pending.wait();
+    if was_reused && still_running {
+        assert_eq!(result, Err(GpuError::BufferInUse));
+    } else {
+        eprintln!("inconclusive: the chain finished before the dispatch");
+    }
+    drop(unordered);
+    assert!(read_f32(&acc).iter().all(|&v| v == 50.0));
+}
+
+/// Metal source for kernel `name` (`out[i] = 7`) with `count` distinct helper functions,
+/// slow to compile for large counts. `salt` keeps Metal's compiler cache from returning an
+/// earlier compilation.
+fn slow_source(name: &str, count: usize, salt: u128) -> String {
+    use std::fmt::Write;
+    let mut source = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+    for k in 0..count {
+        writeln!(
+            source,
+            "float f{k}_{salt}(float x) {{ return sin(x * {k}.5f) + cos(x - {k}.25f) \
+             * tanh(x * 0.{k}f); }}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        source,
+        "[[kernel]] void {name}(device float* out [[buffer(0)]], uint i \
+         [[thread_position_in_grid]]) {{ float x = float(i); float s = 0;"
+    )
+    .unwrap();
+    for k in 0..count {
+        writeln!(source, "s += f{k}_{salt}(x);").unwrap();
+    }
+    source.push_str("out[i] = 7.0f + 0.0f * s; }\n");
+    source
+}
+
+/// While one thread compiles a slow source kernel, another gets a cached pipeline at once
+/// (the cache's lock is not held while compiling).
+#[test]
+fn compiling_does_not_block_cached_pipelines() {
+    use std::time::{Duration, Instant};
+    let Some(device) = device() else { return };
+    // Loaded and cached before the slow compilation starts.
+    device.pipeline("nuvec_add_f32").unwrap();
+    // Compile times vary (Metal caches parts of compilations): grow the source until the
+    // compilation outlasts the lookup by a clear margin.
+    for count in [2000, 4000, 8000] {
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (started, compiling) = std::sync::mpsc::channel();
+        let d = device.clone();
+        let name = format!("nuvec_slow_test_{count}");
+        let slow = std::thread::spawn(move || {
+            let p = d.pipeline_from_source(&name, || {
+                started.send(()).unwrap();
+                slow_source(&name, count, salt)
+            });
+            (p, Instant::now())
+        });
+        compiling.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let t = Instant::now();
+        device.pipeline("nuvec_add_f32").unwrap();
+        let lookup = t.elapsed();
+        let (pipeline, done) = slow.join().unwrap();
+        pipeline.unwrap();
+        assert!(
+            lookup < Duration::from_millis(100),
+            "a cached lookup took {lookup:?} while another kernel compiled"
+        );
+        if done.duration_since(t) >= Duration::from_millis(500) {
+            return; // the lookup ran early in a long compilation
+        }
+    }
+    eprintln!("inconclusive: no source compiled slowly enough");
+}
+
+#[test]
+fn source_pipelines_have_their_own_namespace_and_language_version() {
+    let Some(device) = device() else { return };
+    let library = device.pipeline("nuvec_add_f32").unwrap();
+    // A source kernel named like a library kernel is its own pipeline.
+    let source = device
+        .pipeline_from_source("nuvec_add_f32", || {
+            "#include <metal_stdlib>\nusing namespace metal;\n[[kernel]] void nuvec_add_f32(\
+             device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) \
+             { out[i] = 7.0f; }\n"
+                .to_owned()
+        })
+        .unwrap();
+    assert!(!source.same_as(&library));
+    assert!(device.pipeline("nuvec_add_f32").unwrap().same_as(&library));
+    let mut out = device.new_buffer(16).unwrap();
+    let mut cmd = device.command_buffer().unwrap();
+    // SAFETY: the kernel writes `out[i]` for the 4 threads; `out` holds 4 floats.
+    unsafe { cmd.dispatch(&source, &[Arg::write(&mut out)], 4) }.unwrap();
+    cmd.commit().wait().unwrap();
+    assert_eq!(read_f32(&out), [7.0; 4]);
+    // Recent language features compile (`bfloat`, Metal 3.1+, as nuvec's kernels use).
+    device
+        .pipeline_from_source("nuvec_bfloat_test", || {
+            "#include <metal_stdlib>\nusing namespace metal;\n[[kernel]] void \
+             nuvec_bfloat_test(device bfloat* out [[buffer(0)]], uint i \
+             [[thread_position_in_grid]]) { out[i] = bfloat(1.0f); }\n"
+                .to_owned()
+        })
+        .unwrap();
+}
+
+/// Run under `MTL_DEBUG_LAYER=1` (as `just metal-check` does): two threads take turns
+/// extending one chain through ordered command buffers committed without waiting, so each
+/// reads the other's in-flight result through its fence.
+#[test]
+fn ordered_command_buffers_from_two_threads_stay_ordered() {
+    let Some(device) = device() else { return };
+    let n = 1024;
+    let steps = 10_000;
+    let ones = std::sync::Arc::new(device.buffer_from(&f32s(&vec![1.0; n])).unwrap());
+    let acc = std::sync::Arc::new(std::sync::Mutex::new(
+        device.buffer_from(&f32s(&vec![0.0; n])).unwrap(),
+    ));
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let (device, ones, acc) = (device.clone(), ones.clone(), acc.clone());
+            std::thread::spawn(move || {
+                for _ in 0..steps / 2 {
+                    device.wait_for_capacity(64);
+                    let mut acc = acc.lock().unwrap();
+                    let mut next = device.new_gpu_buffer(n * 4).unwrap();
+                    let mut cmd = device.ordered_command_buffer().unwrap();
+                    add(&mut cmd, &device, &acc, &ones, &mut next, n as u32);
+                    drop(cmd.commit_then(|r| r.unwrap()));
+                    *acc = next;
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    with_timeout(std::time::Duration::from_secs(30), {
+        let device = device.clone();
+        move || device.wait_for_capacity(1)
+    });
+    let acc = acc.lock().unwrap();
+    assert!(read_f32(&acc).iter().all(|&v| v == steps as f32));
 }

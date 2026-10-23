@@ -78,6 +78,14 @@ allow-build-scripts = [
     { crate = "crossbeam-deque" },
     { crate = "crossbeam-epoch" },
     { crate = "crossbeam-utils" },
+    # Via `trybuild` (dev-only: the compile-fail and inference tests of `nuvec`): compiler
+    # version/cfg probes and generated Rust source (serde's private module, the target
+    # triple), no native code.
+    { crate = "serde" },
+    { crate = "serde_core" },
+    { crate = "serde_json" },
+    { crate = "target-tuple" },
+    { crate = "zmij" },
     # Metal access (D-002): Apple-target cfg probe only, no native code.
     { crate = "objc2" },
 ]

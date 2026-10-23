@@ -1,67 +1,92 @@
 //! The Llama-family transformer, as mlx-lm's `llama`, `qwen2` and `qwen3` models, and its
 //! hybrid with Gated DeltaNet layers, as mlx-lm's `qwen3_5`, with parameter names matching
 //! Hugging Face checkpoints.
+//!
+//! The forward passes return arrays (a failed array carries the first error, see
+//! [`Array::check`]); construction and the paged cache's bookkeeping return `Result`.
 
 use std::sync::LazyLock;
 
 use nuvec::fast::{self, AttentionMask};
-use nuvec::{
-    Array, DType, Result, SliceArg, abs, add, argpartition, argsort, broadcast_to, concatenate,
-    exp, expand_dims, gather_mm, gather_qmm, log, matmul, maximum, multiply, negative, sigmoid,
-    slice, slice_update, softmax, split_at, squeeze, take, take_along_axis, transpose,
-};
+use nuvec::{Array, DType, OpErrorKind, Param, Result, ops};
 use nuvec_nn::{
-    Embedding, Linear, Module, Parameters, QuantizedEmbedding, QuantizedLinear, RmsNorm, silu,
+    Embedding, Linear, LoraLinear, Module, QuantizedEmbedding, QuantizedLinear, RmsNorm, silu,
 };
 
 use crate::config::{Config, LayerType, LinearAttention, MixtureOfExperts, RopeScaling};
 
-/// A zero-cost stand-in of `shape` (a broadcast scalar), replaced when weights load.
-fn placeholder(shape: &[usize], dtype: DType) -> Result<Array> {
-    broadcast_to(&Array::scalar(0u8).astype(dtype)?, shape)
+/// A stand-in of `shape` and `dtype` for a weight not loaded yet (no memory): a failed
+/// array, so a forward pass or `save_weights` before the weights load reports it.
+fn placeholder(shape: &[usize], dtype: DType) -> Array {
+    Array::failure(
+        "load_weights",
+        OpErrorKind::InvalidArgument("this weight has not been loaded".into()),
+    )
+    .astype(dtype)
+    .broadcast_to(shape)
+}
+
+/// A placeholder parameter.
+fn param(shape: &[usize], dtype: DType) -> Param {
+    Param::new(placeholder(shape, dtype))
+}
+
+/// A size of the configuration as an array dimension.
+fn int(what: &str, v: usize) -> Result<i32> {
+    i32::try_from(v).map_err(|_| nuvec::Error::InvalidArgument(format!("{what}: {v} is too large")))
+}
+
+/// A compiled function of two arrays (traced once per input signature, element-wise chains
+/// fused), as mlx-lm compiles its activations. On failed inputs it gives failed outputs.
+type Compiled2 = Box<dyn Fn(&(Array, Array)) -> Result<Array> + Send + Sync>;
+/// [`Compiled2`] of three arrays.
+type Compiled3 = Box<dyn Fn(&(Array, Array, Array)) -> Result<Array> + Send + Sync>;
+
+/// `silu(gate) · x`, uncompiled.
+#[track_caller]
+fn swiglu_graph(gate: &Array, x: &Array) -> Array {
+    silu(gate).multiply(x)
 }
 
 /// `silu(gate) · x` in one kernel, as mlx-lm's compiled `swiglu`.
-fn swiglu(gate: &Array, x: &Array) -> Result<Array> {
-    static SWIGLU: LazyLock<Compiled> = LazyLock::new(|| {
-        Box::new(nuvec::compile(|a: &[Array]| {
-            Ok(vec![multiply(silu(&a[0])?, &a[1])?])
-        }))
-    });
-    Ok(SWIGLU(&[gate.clone(), x.clone()])?.swap_remove(0))
+#[track_caller]
+fn swiglu(gate: &Array, x: &Array) -> Array {
+    static SWIGLU: LazyLock<Compiled2> =
+        LazyLock::new(|| Box::new(nuvec::compile(|(g, x): &(Array, Array)| swiglu_graph(g, x))));
+    // A failed replay (not expected for valid inputs) falls back to the graph, which
+    // carries the error.
+    SWIGLU(&(gate.clone(), x.clone())).unwrap_or_else(|_| swiglu_graph(gate, x))
 }
 
-/// A linear layer, full precision or quantized.
-#[derive(Debug, Clone)]
+/// A linear layer, full precision or quantized. Variants are transparent in parameter
+/// names (`q_proj.weight`).
+#[derive(Debug, Clone, Module)]
+#[non_exhaustive]
 pub enum Projection {
     /// Full precision.
     Dense(Linear),
     /// MLX's affine quantization.
     Quantized(QuantizedLinear),
+    /// A LoRA adapter over a full-precision or quantized base (mlx-lm's names:
+    /// `linear.weight`, `lora_a`, `lora_b`); see [`crate::lora`].
+    Lora(Box<LoraLinear>),
 }
 
 impl Projection {
     /// `x Wᵀ (+ b)`.
-    pub fn forward(&self, x: &Array) -> Result<Array> {
+    #[track_caller]
+    pub fn forward(&self, x: &Array) -> Array {
         match self {
             Self::Dense(l) => l.forward(x),
             Self::Quantized(q) => q.forward(x),
-        }
-    }
-}
-
-impl Module for Projection {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        match self {
-            Self::Dense(l) => l.visit(p),
-            Self::Quantized(q) => q.visit(p),
+            Self::Lora(l) => l.forward(x),
         }
     }
 }
 
 /// A token embedding, full precision or quantized.
-#[derive(Debug, Clone)]
-pub enum TokenEmbedding {
+#[derive(Debug, Clone, Module)]
+pub(crate) enum TokenEmbedding {
     /// Full precision.
     Dense(Embedding),
     /// MLX's affine quantization.
@@ -69,14 +94,16 @@ pub enum TokenEmbedding {
 }
 
 impl TokenEmbedding {
-    fn forward(&self, x: &Array) -> Result<Array> {
+    #[track_caller]
+    fn forward(&self, x: &Array) -> Array {
         match self {
             Self::Dense(e) => e.forward(x),
             Self::Quantized(q) => q.forward(x),
         }
     }
 
-    fn as_linear(&self, x: &Array) -> Result<Array> {
+    #[track_caller]
+    fn as_linear(&self, x: &Array) -> Array {
         match self {
             Self::Dense(e) => e.as_linear(x),
             Self::Quantized(q) => q.as_linear(x),
@@ -84,13 +111,12 @@ impl TokenEmbedding {
     }
 }
 
-impl Module for TokenEmbedding {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        match self {
-            Self::Dense(e) => e.visit(p),
-            Self::Quantized(q) => q.visit(p),
-        }
-    }
+/// The groups of `features` features in quantization groups of `group_size` (an error
+/// for an empty group).
+fn groups(path: &str, features: usize, group_size: usize) -> Result<usize> {
+    features
+        .checked_div(group_size)
+        .ok_or_else(|| nuvec::Error::InvalidArgument(format!("{path}: quantization group size 0")))
 }
 
 /// Builds layers with placeholder parameters; `quantized(path)` gives the group size and
@@ -107,20 +133,18 @@ impl Builder<'_> {
         output: usize,
         bias: bool,
     ) -> Result<Projection> {
-        let bias = bias
-            .then(|| placeholder(&[output], DType::F32))
-            .transpose()?;
+        let bias = bias.then(|| param(&[output], DType::F32));
         Ok(match (self.quantized)(path) {
             Some((group_size, bits)) => Projection::Quantized(QuantizedLinear {
-                weight: placeholder(&[output, input * bits as usize / 32], DType::U32)?,
-                scales: placeholder(&[output, input / group_size], DType::F32)?,
-                biases: placeholder(&[output, input / group_size], DType::F32)?,
+                weight: placeholder(&[output, input * bits as usize / 32], DType::U32),
+                scales: placeholder(&[output, groups(path, input, group_size)?], DType::F32),
+                biases: placeholder(&[output, groups(path, input, group_size)?], DType::F32),
                 bias,
-                group_size,
-                bits,
+                group_size: int(path, group_size)?,
+                bits: int(path, bits as usize)?,
             }),
             None => Projection::Dense(Linear {
-                weight: placeholder(&[output, input], DType::F32)?,
+                weight: param(&[output, input], DType::F32),
                 bias,
             }),
         })
@@ -134,15 +158,18 @@ impl Builder<'_> {
         experts: usize,
     ) -> Result<SwitchProjection> {
         Ok(match (self.quantized)(path) {
-            Some((group_size, bits)) => SwitchProjection::Quantized {
-                weight: placeholder(&[experts, output, input * bits as usize / 32], DType::U32)?,
-                scales: placeholder(&[experts, output, input / group_size], DType::F32)?,
-                biases: placeholder(&[experts, output, input / group_size], DType::F32)?,
-                group_size,
-                bits,
-            },
+            Some((group_size, bits)) => {
+                let groups = groups(path, input, group_size)?;
+                SwitchProjection::Quantized {
+                    weight: placeholder(&[experts, output, input * bits as usize / 32], DType::U32),
+                    scales: placeholder(&[experts, output, groups], DType::F32),
+                    biases: placeholder(&[experts, output, groups], DType::F32),
+                    group_size: int(path, group_size)?,
+                    bits: int(path, bits as usize)?,
+                }
+            }
             None => SwitchProjection::Dense {
-                weight: placeholder(&[experts, output, input], DType::F32)?,
+                weight: param(&[experts, output, input], DType::F32),
             },
         })
     }
@@ -150,34 +177,40 @@ impl Builder<'_> {
     fn embedding(&self, path: &str, count: usize, dims: usize) -> Result<TokenEmbedding> {
         Ok(match (self.quantized)(path) {
             Some((group_size, bits)) => TokenEmbedding::Quantized(QuantizedEmbedding {
-                weight: placeholder(&[count, dims * bits as usize / 32], DType::U32)?,
-                scales: placeholder(&[count, dims / group_size], DType::F32)?,
-                biases: placeholder(&[count, dims / group_size], DType::F32)?,
-                group_size,
-                bits,
+                weight: placeholder(&[count, dims * bits as usize / 32], DType::U32),
+                scales: placeholder(&[count, groups(path, dims, group_size)?], DType::F32),
+                biases: placeholder(&[count, groups(path, dims, group_size)?], DType::F32),
+                group_size: int(path, group_size)?,
+                bits: int(path, bits as usize)?,
             }),
             None => TokenEmbedding::Dense(Embedding {
-                weight: placeholder(&[count, dims], DType::F32)?,
+                weight: param(&[count, dims], DType::F32),
             }),
         })
     }
 
-    fn norm(dims: usize, eps: f32) -> Result<RmsNorm> {
-        Ok(RmsNorm {
-            weight: placeholder(&[dims], DType::F32)?,
+    fn norm(dims: usize, eps: f32) -> RmsNorm {
+        RmsNorm {
+            weight: param(&[dims], DType::F32),
             eps,
-        })
+        }
     }
 }
 
-/// The rotary embedding of every head's features.
-#[derive(Debug, Clone)]
+/// The rotary embedding of every head's features (no parameters).
+#[derive(Debug, Clone, Module)]
 struct Rope {
-    dims: usize,
+    #[tree(skip)]
+    dims: i32,
+    #[tree(skip)]
     traditional: bool,
+    #[tree(skip)]
     base: f32,
+    #[tree(skip)]
     scale: f32,
-    /// Per-pair frequencies (Llama 3 scaling) instead of `base`.
+    /// Per-pair frequencies (Llama 3 scaling) instead of `base`: computed from the
+    /// configuration, not in checkpoints (mlx-lm's `_freqs`).
+    #[tree(skip)]
     freqs: Option<Array>,
 }
 
@@ -185,7 +218,7 @@ impl Rope {
     fn new(dims: usize, config: &Config) -> Result<Self> {
         let base = config.rope_theta;
         let mut rope = Self {
-            dims,
+            dims: int("rope dims", dims)?,
             traditional: config.rope_traditional,
             base,
             scale: 1.0,
@@ -221,7 +254,7 @@ impl Rope {
                         }
                     })
                     .collect();
-                rope.freqs = Some(Array::from_slice(&freqs, &[freqs.len()])?);
+                rope.freqs = Some(Array::from(freqs));
             }
         }
         Ok(rope)
@@ -236,28 +269,44 @@ impl Rope {
             freqs: self.freqs.as_ref(),
         }
     }
-}
 
-/// Keys before they are cached: `[B, kv_heads, L, head_dim]`, to be normalised (optionally)
-/// and rotated at the cache's offset as they are written ([`fast::norm_rope`]: one kernel
-/// from the projection to the cache).
-struct Keys<'a> {
-    x: Array,
-    norm: Option<&'a RmsNorm>,
-    rope: &'a Rope,
-}
+    /// `x` (`[B, H, L, D]`) normalised by `norm` (if any) and rotated at positions
+    /// `offset..`, written into `cache` if given ([`fast::norm_rope`]: one kernel from the
+    /// projection to the cache).
+    #[track_caller]
+    fn norm_rope(
+        &self,
+        x: &Array,
+        norm: Option<&RmsNorm>,
+        at: i32,
+        cache: Option<&Array>,
+    ) -> Array {
+        let norm = norm.map(|n| (n.weight.value(), n.eps));
+        fast::norm_rope(x, norm, self.rotation(), at, cache)
+    }
 
-impl Keys<'_> {
-    /// The keys at positions `offset..`, written into `cache` if given.
-    fn rotate(&self, offset: usize, cache: Option<&Array>) -> Result<Array> {
-        let norm = self.norm.map(|n| (&n.weight, n.eps));
-        fast::norm_rope(&self.x, norm, self.rope.rotation(), offset, cache)
+    /// `x` (`[B, H, L, D]`) rotated at each sequence's position (`positions`, `[B]`).
+    #[track_caller]
+    fn rope_at(&self, x: &Array, positions: &Array) -> Array {
+        let r = self.rotation();
+        fast::rope(
+            x,
+            r.dims,
+            r.traditional,
+            r.base,
+            r.scale,
+            positions,
+            r.freqs,
+        )
     }
 }
 
+/// `[B, L, H, D]` as `[B, H, L, D]` and back (a transposition of axes 1 and 2).
+const HEADS_FIRST: [i32; 4] = [0, 2, 1, 3];
+
 /// One layer's cache. Attention layers keep keys and values, `[B, kv_heads, capacity,
 /// head_dim]`, as mlx-lm's `KVCache`: the capacity grows in steps of 256 positions and
-/// each step's keys and values are written into it (`slice_update`), so buffers keep their
+/// each step's keys and values are written into it (in place), so buffers keep their
 /// size between growths. Gated DeltaNet layers keep the convolution's last inputs and the
 /// recurrent state instead, as mlx-lm's `ArraysCache`.
 #[derive(Debug, Clone, Default)]
@@ -268,7 +317,8 @@ pub struct KvCache {
     conv: Option<Array>,
     /// The recurrent state, `[B, value_heads, value_head_dim, key_head_dim]` (float32).
     recurrent: Option<Array>,
-    offset: usize,
+    /// Positions cached.
+    offset: i32,
     /// Whether Gated DeltaNet layers keep every step's state ([`KvCache::keep_steps`]).
     keep_steps: bool,
     /// From the last forward with `keep_steps`: every step's recurrent state
@@ -277,60 +327,47 @@ pub struct KvCache {
 }
 
 /// Positions added to a cache's capacity at a time.
-const CACHE_STEP: usize = 256;
+const CACHE_STEP: i32 = 256;
 
 impl KvCache {
     /// Positions cached.
     pub fn offset(&self) -> usize {
-        self.offset
+        usize::try_from(self.offset).unwrap_or_default()
     }
 
-    /// Writes `keys` and `values` (`[B, kv_heads, L, head_dim]`) after the cached positions
-    /// and returns all cached positions.
-    fn update(&mut self, keys: Keys<'_>, values: Array) -> Result<(Array, Array)> {
-        let (prev, l) = (self.offset, values.shape()[2]);
-        let capacity = self.keys.as_ref().map_or(0, |k| k.shape()[2]);
-        if self.keys.is_none() || prev + l > capacity {
+    /// Writes `keys` and `values` (`[B, kv_heads, L, head_dim]`) after the cached positions,
+    /// the keys normalised by `norm` (if any) and rotated as they are written, and returns
+    /// all cached positions.
+    #[track_caller]
+    fn update(
+        &mut self,
+        rope: &Rope,
+        norm: Option<&RmsNorm>,
+        keys: &Array,
+        values: &Array,
+    ) -> (Array, Array) {
+        let prev = self.offset;
+        let end = prev + values.shape().get(2).copied().unwrap_or_default();
+        let fits = self.keys.as_ref().is_some_and(|k| end <= k.shape()[2]);
+        let (k, v) = if fits {
+            // Each write takes the cache's only handle, so it is done in place.
+            let k = rope.norm_rope(keys, norm, prev, self.keys.take().as_ref());
+            let all = self.values.take().expect("allocated with the keys");
+            (k, all.at((.., .., prev..end)).set(values))
+        } else {
             // Grown by whole steps (mlx-lm's rule), written in one concatenation: the cached
             // positions, the new ones, then zeros up to the step (no copy of the grown cache
             // to update it).
-            let pad = l.div_ceil(CACHE_STEP) * CACHE_STEP - l;
-            let grow = |old: &Option<Array>, new: &Array| -> Result<Array> {
-                let mut parts = Vec::with_capacity(3);
-                if let Some(old) = old {
-                    parts.push(positions(old, prev)?);
-                }
-                parts.push(new.clone());
-                if pad > 0 {
-                    let mut shape = new.shape().to_vec();
-                    shape[2] = pad;
-                    parts.push(nuvec::zeros(&shape, new.dtype())?);
-                }
-                concatenate(&parts, 2)
-            };
-            let keys = keys.rotate(prev, None)?;
-            let (k, v) = (grow(&self.keys, &keys)?, grow(&self.values, &values)?);
-            self.offset = prev + l;
-            let (pk, pv) = (positions(&k, self.offset)?, positions(&v, self.offset)?);
-            self.keys = Some(k);
-            self.values = Some(v);
-            return Ok((pk, pv));
-        }
-        self.offset = prev + l;
-        // Each write takes the cache's only handle, so it is done in place.
-        let all = self.keys.take().expect("allocated above");
-        let k = keys.rotate(prev, Some(&all))?;
+            let l = end - prev;
+            let pad = (l + CACHE_STEP - 1) / CACHE_STEP * CACHE_STEP - l;
+            let keys = rope.norm_rope(keys, norm, prev, None);
+            let k = grow(self.keys.take(), prev, &keys, pad);
+            (k, grow(self.values.take(), prev, values, pad))
+        };
+        self.offset = end;
         self.keys = Some(k.clone());
-        let all = self.values.take().expect("allocated above");
-        let region = [
-            SliceArg::full(),
-            SliceArg::full(),
-            SliceArg::new(Some(prev as isize), Some(self.offset as isize), 1),
-            SliceArg::full(),
-        ];
-        let v = slice_update(&all, &values, &region)?;
         self.values = Some(v.clone());
-        Ok((positions(&k, self.offset)?, positions(&v, self.offset)?))
+        (positions(&k, end), positions(&v, end))
     }
 
     /// Makes Gated DeltaNet layers keep the state after every position of the following
@@ -349,56 +386,53 @@ impl KvCache {
     /// which needs the last forward to have kept its steps ([`keep_steps`](Self::keep_steps))
     /// and `n` to be less than that forward's length.
     pub fn trim(&mut self, n: usize) -> Result<()> {
+        let invalid = |msg: String| nuvec::Error::InvalidArgument(msg);
         if self.conv.is_some() || self.recurrent.is_some() {
             if n == 0 {
                 return Ok(());
             }
             let Some((states, input)) = self.steps.take() else {
-                return Err(nuvec::Error::InvalidArgument(
+                return Err(invalid(
                     "a Gated DeltaNet layer rolls back only after a forward that kept its \
                      steps (KvCache::keep_steps)"
                         .into(),
                 ));
             };
-            let t = states.shape()[1];
-            if n >= t {
-                return Err(nuvec::Error::InvalidArgument(format!(
+            let [_, t, ..] = states.shape() else {
+                return Err(invalid("a Gated DeltaNet layer without steps".into()));
+            };
+            let t = *t;
+            let Some(kept) = i32::try_from(n).ok().filter(|&n| n < t).map(|n| t - n) else {
+                return Err(invalid(format!(
                     "cannot roll back {n} of the last forward's {t} positions"
                 )));
-            }
-            let along = |a: &Array, start: usize, len: usize| -> Result<Array> {
-                let mut args = vec![SliceArg::full(); a.ndim()];
-                args[1] = SliceArg::new(Some(start as isize), Some((start + len) as isize), 1);
-                slice(a, &args)
             };
-            let kept = t - n;
-            self.recurrent = Some(squeeze(&along(&states, kept - 1, 1)?, &[1])?);
+            self.recurrent = Some(states.i((.., kept - 1)));
             // The last `kernel − 1` inputs before the rejected positions (a copy: the view
             // would keep the whole input alive).
             let window = input.shape()[1] - t;
-            self.conv = Some(multiply(&along(&input, kept, window)?, 1.0)?);
-            self.offset -= n;
+            self.conv = Some(input.i((.., kept..kept + window)).multiply(1.0));
+            self.offset -= t - kept;
             return Ok(());
         }
-        if n > self.offset {
-            return Err(nuvec::Error::InvalidArgument(format!(
+        match i32::try_from(n).ok().filter(|&n| n <= self.offset) {
+            Some(n) => {
+                self.offset -= n;
+                Ok(())
+            }
+            None => Err(invalid(format!(
                 "cannot trim {n} of {} cached positions",
                 self.offset
-            )));
+            ))),
         }
-        self.offset -= n;
-        Ok(())
     }
 
     /// The cached keys and values of an attention layer, `[B, kv_heads, offset, head_dim]`
     /// (views), if any.
-    pub(crate) fn keys_values(&self) -> Result<Option<(Array, Array)>> {
+    pub(crate) fn keys_values(&self) -> Option<(Array, Array)> {
         match (&self.keys, &self.values) {
-            (Some(k), Some(v)) => Ok(Some((
-                positions(k, self.offset)?,
-                positions(v, self.offset)?,
-            ))),
-            _ => Ok(None),
+            (Some(k), Some(v)) => Some((positions(k, self.offset), positions(v, self.offset))),
+            _ => None,
         }
     }
 
@@ -406,6 +440,21 @@ impl KvCache {
     /// channels]` and `[B, Hv, Dv, Dk]`), if any.
     pub(crate) fn linear_state(&self) -> Option<(Array, Array)> {
         Some((self.conv.clone()?, self.recurrent.clone()?))
+    }
+
+    /// Sequence `i` of a batched cache (views of its row, the same positions), for
+    /// [`PagedCache::insert`](crate::PagedCache::insert). Kept steps are not carried.
+    pub(crate) fn row(&self, i: i32) -> KvCache {
+        let row = |a: &Option<Array>| a.as_ref().map(|a| a.i(i..i + 1));
+        KvCache {
+            keys: row(&self.keys),
+            values: row(&self.values),
+            conv: row(&self.conv),
+            recurrent: row(&self.recurrent),
+            offset: self.offset,
+            keep_steps: false,
+            steps: None,
+        }
     }
 
     /// The cached arrays (to evaluate them).
@@ -419,22 +468,34 @@ impl KvCache {
 }
 
 /// The first `n` positions (axis 2) of a cache array, as a view.
-fn positions(a: &Array, n: usize) -> Result<Array> {
-    if a.shape()[2] == n {
-        return Ok(a.clone());
+#[track_caller]
+fn positions(a: &Array, n: i32) -> Array {
+    if a.shape().get(2) == Some(&n) {
+        return a.clone();
     }
-    slice(
-        a,
-        &[
-            SliceArg::full(),
-            SliceArg::full(),
-            SliceArg::new(Some(0), Some(n as isize), 1),
-            SliceArg::full(),
-        ],
-    )
+    a.i((.., .., ..n))
 }
 
-#[derive(Debug, Clone)]
+/// `old`'s first `prev` positions (axis 2), then `new`, then `pad` positions of zeros, in
+/// one concatenation.
+#[track_caller]
+fn grow(old: Option<Array>, prev: i32, new: &Array, pad: i32) -> Array {
+    let mut parts = Vec::with_capacity(3);
+    if let Some(old) = old {
+        parts.push(positions(&old, prev));
+    }
+    parts.push(new.clone());
+    if pad > 0 {
+        let mut shape = new.shape().to_vec();
+        if let Some(d) = shape.get_mut(2) {
+            *d = pad;
+        }
+        parts.push(ops::zeros(shape, new.dtype()));
+    }
+    ops::concatenate(&parts, 2)
+}
+
+#[derive(Debug, Clone, Module)]
 struct Attention {
     q_proj: Projection,
     k_proj: Projection,
@@ -442,11 +503,15 @@ struct Attention {
     o_proj: Projection,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
-    heads: usize,
-    kv_heads: usize,
+    #[tree(skip)]
+    heads: i32,
+    #[tree(skip)]
+    kv_heads: i32,
+    #[tree(skip)]
     scale: f32,
     rope: Rope,
     /// The query projection also yields a gate of the output (`o · sigmoid(gate)`).
+    #[tree(skip)]
     gate: bool,
 }
 
@@ -455,70 +520,60 @@ impl Attention {
         let (d, hd) = (c.hidden_size, c.head_dim);
         let (q, kv) = (c.num_attention_heads * hd, c.num_key_value_heads * hd);
         let p = |name: &str| format!("{path}.{name}");
-        let norm = || {
-            c.qk_norm
-                .then(|| Builder::norm(hd, c.rms_norm_eps))
-                .transpose()
-        };
+        let norm = || c.qk_norm.then(|| Builder::norm(hd, c.rms_norm_eps));
         let gate = c.attn_output_gate;
         Ok(Self {
             q_proj: b.projection(&p("q_proj"), d, q * (1 + usize::from(gate)), c.qkv_bias)?,
             k_proj: b.projection(&p("k_proj"), d, kv, c.qkv_bias)?,
             v_proj: b.projection(&p("v_proj"), d, kv, c.qkv_bias)?,
             o_proj: b.projection(&p("o_proj"), q, d, c.o_bias)?,
-            q_norm: norm()?,
-            k_norm: norm()?,
-            heads: c.num_attention_heads,
-            kv_heads: c.num_key_value_heads,
+            q_norm: norm(),
+            k_norm: norm(),
+            heads: int(path, c.num_attention_heads)?,
+            kv_heads: int(path, c.num_key_value_heads)?,
             scale: (hd as f32).powf(-0.5),
             rope: Rope::new(c.rope_dims, c)?,
             gate,
         })
     }
 
-    fn forward(&self, x: &Array, mask: AttentionMask<'_>, cache: &mut KvCache) -> Result<Array> {
-        let (b, l) = (x.shape()[0] as isize, x.shape()[1] as isize);
-        // `[B, L, H·D]` as `[B, H, L, D]` (a view).
-        let heads = |h: Array, n: usize| -> Result<Array> {
-            transpose(&h.reshape(&[b, l, n as isize, -1])?, &[0, 2, 1, 3])
-        };
-        let offset = cache.offset();
-        // With an output gate, each head's projection is its query, then its gate.
-        let (q, gate) = match self.gate {
-            false => (self.q_proj.forward(x)?, None),
-            true => {
-                let qg = self
-                    .q_proj
-                    .forward(x)?
-                    .reshape(&[b, l, self.heads as isize, -1])?;
-                let half = qg.shape()[3] / 2;
-                let mut parts = split_at(&qg, &[half], -1)?;
-                let g = parts.pop().expect("two parts").reshape(&[b, l, -1])?;
-                (parts.pop().expect("two parts"), Some(g))
-            }
-        };
-        // The query (and, written into the cache, the key) normalised and rotated in one
-        // kernel each.
-        let q = fast::norm_rope(
-            &heads(q, self.heads)?,
-            self.q_norm.as_ref().map(|n| (&n.weight, n.eps)),
-            self.rope.rotation(),
-            offset,
-            None,
-        )?;
-        let keys = Keys {
-            x: heads(self.k_proj.forward(x)?, self.kv_heads)?,
-            norm: self.k_norm.as_ref(),
-            rope: &self.rope,
-        };
-        let v = heads(self.v_proj.forward(x)?, self.kv_heads)?;
-        let (k, v) = cache.update(keys, v)?;
-        let o = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None)?;
-        let o = transpose(&o, &[0, 2, 1, 3])?.reshape(&[b, l, -1])?;
+    /// The queries `[B, L, H, D]` and, with an output gate, the gate `[B, L, H·D]` (each
+    /// head's projection is its query, then its gate).
+    #[track_caller]
+    fn query(&self, x: &Array, [b, l]: [i32; 2]) -> (Array, Option<Array>) {
+        let q = self.q_proj.forward(x).reshape([b, l, self.heads, -1]);
+        if !self.gate {
+            return (q, None);
+        }
+        let [q, g] = q.split_n::<2>(-1);
+        (q, Some(g.reshape([b, l, -1])))
+    }
+
+    /// The attention output `o` (`[B, H, L, D]`) through the output projection, gated.
+    #[track_caller]
+    fn output(&self, o: &Array, gate: Option<Array>, [b, l]: [i32; 2]) -> Array {
+        let o = o.transpose(HEADS_FIRST).reshape([b, l, -1]);
         match gate {
-            Some(g) => self.o_proj.forward(&multiply(&o, sigmoid(&g)?)?),
+            Some(g) => self.o_proj.forward(&o.multiply(g.sigmoid())),
             None => self.o_proj.forward(&o),
         }
+    }
+
+    #[track_caller]
+    fn forward(&self, x: &Array, mask: AttentionMask<'_>, cache: &mut KvCache) -> Array {
+        let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
+        let (q, gate) = self.query(x, [b, l]);
+        // The query and key (written into the cache) normalised and rotated in one kernel.
+        let q = q.transpose(HEADS_FIRST);
+        let q = self
+            .rope
+            .norm_rope(&q, self.q_norm.as_ref(), cache.offset, None);
+        let heads = [b, l, self.kv_heads, -1];
+        let k = self.k_proj.forward(x).reshape(heads).transpose(HEADS_FIRST);
+        let v = self.v_proj.forward(x).reshape(heads).transpose(HEADS_FIRST);
+        let (k, v) = cache.update(&self.rope, self.k_norm.as_ref(), &k, &v);
+        let o = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, &mask.into());
+        self.output(&o, gate, [b, l])
     }
 }
 
@@ -532,6 +587,10 @@ pub(crate) struct PagedLayer {
     /// inputs `[slots, kernel − 1, channels]` and the recurrent states `[slots, Hv, Dv, Dk]`.
     pub(crate) conv: Option<Array>,
     pub(crate) recurrent: Option<Array>,
+    /// The pools' blocks and positions per block (attention layers), and state slots
+    /// (Gated DeltaNet layers): pools not allocated yet are created as zeros.
+    pub(crate) pool_size: (i32, i32),
+    pub(crate) state_slots: i32,
 }
 
 /// What one batched decoding step writes and reads, per sequence (`[B]`, int32): the slot
@@ -546,153 +605,154 @@ pub(crate) struct PagedStep {
     pub(crate) state_slots: Array,
 }
 
-impl Attention {
-    /// One new position per sequence (`x` is `[B, 1, D]`) over a paged cache: the query
-    /// and key normalised and rotated at each sequence's position, the key and value
-    /// written into their slots, then attention through the block tables.
-    fn forward_paged(&self, x: &Array, layer: &mut PagedLayer, step: &PagedStep) -> Result<Array> {
-        let b = x.shape()[0] as isize;
-        // `[B, 1, H·D]` normalised per head, then as `[B, H, 1, D]` rotated at each
-        // sequence's position (as `norm_rope`, unfused: the positions differ).
-        let prepared = |h: Array, n: usize, norm: Option<&RmsNorm>| -> Result<Array> {
-            let h = h.reshape(&[b, 1, n as isize, -1])?;
-            let h = match norm {
-                Some(norm) => norm.forward(&h)?,
-                None => h,
-            };
-            let r = self.rope.rotation();
-            fast::rope(
-                &transpose(&h, &[0, 2, 1, 3])?,
-                r.dims,
-                r.traditional,
-                r.base,
-                r.scale,
-                &step.positions,
-                r.freqs,
-            )
-        };
-        // With an output gate, each head's projection is its query, then its gate.
-        let (q, gate) = match self.gate {
-            false => (self.q_proj.forward(x)?, None),
-            true => {
-                let qg = self
-                    .q_proj
-                    .forward(x)?
-                    .reshape(&[b, 1, self.heads as isize, -1])?;
-                let half = qg.shape()[3] / 2;
-                let mut parts = split_at(&qg, &[half], -1)?;
-                let g = parts.pop().expect("two parts").reshape(&[b, 1, -1])?;
-                (parts.pop().expect("two parts"), Some(g))
-            }
-        };
-        let q = prepared(q, self.heads, self.q_norm.as_ref())?;
-        let k = prepared(self.k_proj.forward(x)?, self.kv_heads, self.k_norm.as_ref())?;
-        let rows = |a: &Array| a.reshape(&[b, self.kv_heads as isize, -1]);
-        let v = self.v_proj.forward(x)?;
-        // The pools are taken out of the cache first, so the writes are done in place.
-        let missing = || nuvec::Error::InvalidArgument("paged decoding: no cache".into());
-        let keys = fast::paged_write(
-            &layer.keys.take().ok_or_else(missing)?,
-            &rows(&k)?,
-            &step.slots,
-        )?;
-        let values = fast::paged_write(
-            &layer.values.take().ok_or_else(missing)?,
-            &rows(&v)?,
-            &step.slots,
-        )?;
-        layer.keys = Some(keys.clone());
-        layer.values = Some(values.clone());
-        let o = fast::paged_attention(&q, &keys, &values, &step.tables, &step.lengths, self.scale)?;
-        let o = transpose(&o, &[0, 2, 1, 3])?.reshape(&[b, 1, -1])?;
-        match gate {
-            Some(g) => self.o_proj.forward(&multiply(&o, sigmoid(&g)?)?),
-            None => self.o_proj.forward(&o),
-        }
+impl PagedLayer {
+    /// Keys and values (`[B, kv_heads, head_dim]`) written at `slots` of their pools, and
+    /// the pools.
+    #[track_caller]
+    fn write_kv(&mut self, k: &Array, v: &Array, slots: &Array) -> (Array, Array) {
+        let keys = write_pool(&mut self.keys, self.pool_size, k, slots);
+        (keys, write_pool(&mut self.values, self.pool_size, v, slots))
     }
 }
 
-impl Module for Attention {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        p.module("q_proj", &mut self.q_proj);
-        p.module("k_proj", &mut self.k_proj);
-        p.module("v_proj", &mut self.v_proj);
-        p.module("o_proj", &mut self.o_proj);
-        if let Some(n) = &mut self.q_norm {
-            p.module("q_norm", n);
+/// `rows` (`[B, kv_heads, head_dim]`) written at `slots` of the pool in `pool` (of `size`,
+/// blocks and positions per block), taken out first so that the write is done in place
+/// (zeros until a prefilled sequence brought the pool); put back and returned.
+#[track_caller]
+fn write_pool(pool: &mut Option<Array>, size: (i32, i32), rows: &Array, slots: &Array) -> Array {
+    let all = match pool.take() {
+        Some(p) => p,
+        None => {
+            let [_, heads, dims] = rows.shape_n::<3>().unwrap_or_default();
+            ops::zeros([size.0, heads, size.1, dims], rows.dtype())
         }
-        if let Some(n) = &mut self.k_norm {
-            p.module("k_norm", n);
-        }
+    };
+    let written = fast::paged_write(&all, rows, slots);
+    *pool = Some(written.clone());
+    written
+}
+
+impl Attention {
+    /// `h` (`[B, 1, H, D]`) normalised per head, then as `[B, H, 1, D]` rotated at each
+    /// sequence's position (as `norm_rope`, unfused: the positions differ).
+    #[track_caller]
+    fn rotate_at(&self, h: Array, norm: Option<&RmsNorm>, positions: &Array) -> Array {
+        let h = match norm {
+            Some(norm) => norm.forward(&h),
+            None => h,
+        };
+        self.rope.rope_at(&h.transpose(HEADS_FIRST), positions)
+    }
+
+    /// One new position per sequence (`x` is `[B, 1, D]`) over a paged cache: the query
+    /// and key normalised and rotated at each sequence's position, the key and value
+    /// written into their slots, then attention through the block tables.
+    #[track_caller]
+    fn forward_paged(&self, x: &Array, layer: &mut PagedLayer, step: &PagedStep) -> Array {
+        let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
+        let (q, gate) = self.query(x, [b, l]);
+        let q = self.rotate_at(q, self.q_norm.as_ref(), &step.positions);
+        let k = self.k_proj.forward(x).reshape([b, l, self.kv_heads, -1]);
+        let k = self.rotate_at(k, self.k_norm.as_ref(), &step.positions);
+        let v = self.v_proj.forward(x);
+        let rows = [b, self.kv_heads, -1];
+        let (keys, values) = layer.write_kv(&k.reshape(rows), &v.reshape(rows), &step.slots);
+        let o = fast::paged_attention(&q, &keys, &values, &step.tables, &step.lengths, self.scale);
+        self.output(&o, gate, [b, l])
     }
 }
 
 /// `log(1 + exp(x))`, stably (MLX's `nn.softplus`, `logaddexp(x, 0)`): in float32,
 /// rounded once to `x`'s dtype, as MLX's kernel.
-fn softplus(x: &Array) -> Result<Array> {
-    let xf = x.astype(DType::F32)?;
-    let y = add(
-        maximum(&xf, 0.0)?,
-        log(&add(exp(&negative(&abs(&xf)?)?)?, 1.0)?)?,
-    )?;
+#[track_caller]
+fn softplus(x: &Array) -> Array {
+    let xf = x.astype(DType::F32);
+    let y = xf
+        .maximum(0.0)
+        .add(xf.abs().negative().exp().add(1.0).log());
     y.astype(x.dtype())
 }
 
-/// A compiled function of arrays (traced once per input signature, element-wise chains
-/// fused), as mlx-lm compiles its activations.
-type Compiled = Box<dyn Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync>;
+/// `silu(z) · n` in float32, rounded to `n`'s dtype, uncompiled.
+#[track_caller]
+fn gated_norm_graph(n: &Array, z: &Array) -> Array {
+    let (nf, zf) = (n.astype(DType::F32), z.astype(DType::F32));
+    silu(&zf).multiply(&nf).astype(n.dtype())
+}
 
 /// The gated RMS normalisation of Gated DeltaNet's output (mlx-lm's
 /// `Qwen3NextRMSNormGated` with its compiled `precise_swiglu`): `silu(z) · rms_norm(x)`, in
 /// float32.
-fn gated_norm(x: &Array, z: &Array, norm: &RmsNorm) -> Result<Array> {
-    static GATE: LazyLock<Compiled> = LazyLock::new(|| {
-        Box::new(nuvec::compile(|a: &[Array]| {
-            let (n, z) = (a[0].astype(DType::F32)?, a[1].astype(DType::F32)?);
-            Ok(vec![multiply(silu(&z)?, &n)?.astype(a[0].dtype())?])
+#[track_caller]
+fn gated_norm(x: &Array, z: &Array, norm: &RmsNorm) -> Array {
+    static GATE: LazyLock<Compiled2> = LazyLock::new(|| {
+        Box::new(nuvec::compile(|(n, z): &(Array, Array)| {
+            gated_norm_graph(n, z)
         }))
     });
-    Ok(GATE(&[norm.forward(x)?, z.clone()])?.swap_remove(0))
+    let n = norm.forward(x);
+    GATE(&(n.clone(), z.clone())).unwrap_or_else(|_| gated_norm_graph(&n, z))
+}
+
+/// `exp(−exp(A_log) · softplus(a + dt_bias))` in float32, uncompiled.
+#[track_caller]
+fn decay_graph(a: &Array, dt_bias: &Array, a_log: &Array) -> Array {
+    let rate = a_log.astype(DType::F32).exp();
+    rate.negative().multiply(softplus(&a.add(dt_bias))).exp()
 }
 
 /// Gated DeltaNet's per-head decay, `exp(−exp(A_log) · softplus(a + dt_bias))` in float32
 /// (mlx-lm's compiled `compute_g`).
-fn decay(a: &Array, dt_bias: &Array, a_log: &Array) -> Result<Array> {
-    static DECAY: LazyLock<Compiled> = LazyLock::new(|| {
-        Box::new(nuvec::compile(|x: &[Array]| {
-            let rate = exp(&x[2].astype(DType::F32)?)?;
-            let g = exp(&multiply(negative(&rate)?, softplus(&add(&x[0], &x[1])?)?)?)?;
-            Ok(vec![g])
+#[track_caller]
+fn decay(a: &Array, dt_bias: &Array, a_log: &Array) -> Array {
+    static DECAY: LazyLock<Compiled3> = LazyLock::new(|| {
+        Box::new(nuvec::compile(|(a, dt, log): &(Array, Array, Array)| {
+            decay_graph(a, dt, log)
         }))
     });
-    Ok(DECAY(&[a.clone(), dt_bias.clone(), a_log.clone()])?.swap_remove(0))
+    DECAY(&(a.clone(), dt_bias.clone(), a_log.clone()))
+        .unwrap_or_else(|_| decay_graph(a, dt_bias, a_log))
 }
 
 /// The causal depthwise convolution of `input` (`[B, L + K − 1, C]`) with `weight`
 /// (`[C, K, 1]`), then `silu`, as mlx-lm: the convolution is one depthwise kernel (summed in
 /// float32 and rounded once, as MLX's).
-fn causal_conv_silu(input: &Array, weight: &Array) -> Result<Array> {
-    let channels = weight.shape()[0];
-    silu(&nuvec::conv1d(input, weight, 1, 0, 1, channels)?)
+#[track_caller]
+fn causal_conv_silu(input: &Array, weight: &Array) -> Array {
+    let channels = weight.shape().first().copied().unwrap_or_default();
+    silu(&input.conv1d(weight, 1, 0, 1, channels))
+}
+
+/// Gated DeltaNet's head counts and sizes and its convolution's kernel, as dimensions.
+#[derive(Debug, Clone, Copy, nuvec::Static)]
+struct DeltaSizes {
+    hk: i32,
+    hv: i32,
+    dk: i32,
+    dv: i32,
+    kernel: i32,
 }
 
 /// A Gated DeltaNet layer (mlx-lm's `qwen3_5.GatedDeltaNet`): a causal depthwise
 /// convolution over the query, key and value projections, then the gated delta rule
 /// ([`nuvec::fast::gated_delta`]) with per-head decays and write strengths, and a gated
 /// normalisation of the output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Module)]
 struct GatedDeltaNet {
     in_proj_qkv: Projection,
     in_proj_z: Projection,
     in_proj_b: Projection,
     in_proj_a: Projection,
     /// The depthwise convolution's weights, `[channels, kernel, 1]`.
-    conv1d: Array,
-    dt_bias: Array,
-    a_log: Array,
+    #[tree(rename = "conv1d.weight")]
+    conv1d: Param,
+    dt_bias: Param,
+    #[tree(rename = "A_log")]
+    a_log: Param,
     norm: RmsNorm,
     out_proj: Projection,
-    sizes: LinearAttention,
+    #[tree(skip)]
+    sizes: DeltaSizes,
 }
 
 impl GatedDeltaNet {
@@ -708,85 +768,87 @@ impl GatedDeltaNet {
             in_proj_z: b.projection(&p("in_proj_z"), d, value_dim, false)?,
             in_proj_b: b.projection(&p("in_proj_b"), d, hv, false)?,
             in_proj_a: b.projection(&p("in_proj_a"), d, hv, false)?,
-            conv1d: placeholder(&[conv_dim, sizes.conv_kernel, 1], DType::F32)?,
-            dt_bias: placeholder(&[hv], DType::F32)?,
-            a_log: placeholder(&[hv], DType::F32)?,
-            norm: Builder::norm(sizes.value_head_dim, c.rms_norm_eps)?,
+            conv1d: param(&[conv_dim, sizes.conv_kernel, 1], DType::F32),
+            dt_bias: param(&[hv], DType::F32),
+            a_log: param(&[hv], DType::F32),
+            norm: Builder::norm(sizes.value_head_dim, c.rms_norm_eps),
             out_proj: b.projection(&p("out_proj"), value_dim, d, false)?,
-            sizes,
+            sizes: DeltaSizes {
+                hk: int(path, sizes.key_heads)?,
+                hv: int(path, hv)?,
+                dk: int(path, sizes.key_head_dim)?,
+                dv: int(path, sizes.value_head_dim)?,
+                kernel: int(path, sizes.conv_kernel)?,
+            },
         })
     }
 
-    fn forward(&self, x: &Array, cache: &mut KvCache) -> Result<Array> {
-        let LinearAttention {
-            key_heads: hk,
-            value_heads: hv,
-            key_head_dim: dk,
-            value_head_dim: dv,
-            conv_kernel: kernel,
+    /// The convolution's output split into queries, keys and values (`[B, L, H, D]`),
+    /// normalised as mlx-lm's `normalize_qk`, unit queries and keys with the 1/sqrt(Dk)
+    /// scale in the query.
+    #[track_caller]
+    fn qkv(&self, conv: &Array, [b, l]: [i32; 2]) -> [Array; 3] {
+        let DeltaSizes { hk, hv, dk, dv, .. } = self.sizes;
+        let parts = conv.split_at(&[hk * dk, 2 * hk * dk], -1);
+        let [q, k, v]: [Array; 3] = parts.try_into().expect("three parts");
+        let inv = (dk as f32).powf(-0.5);
+        let eps = 1e-6 * inv * inv;
+        let q =
+            fast::rms_norm(&q.reshape([b, l, hk, dk]), None, eps).multiply(f64::from(inv * inv));
+        let k = fast::rms_norm(&k.reshape([b, l, hk, dk]), None, eps).multiply(f64::from(inv));
+        [q, k, v.reshape([b, l, hv, dv])]
+    }
+
+    /// The gated normalisation of the delta rule's output, through the output projection.
+    #[track_caller]
+    fn output(&self, out: &Array, z: &Array, [b, l]: [i32; 2]) -> Array {
+        let DeltaSizes { hv, dv, .. } = self.sizes;
+        let out = gated_norm(out, &z.reshape([b, l, hv, dv]), &self.norm);
+        self.out_proj.forward(&out.reshape([b, l, -1]))
+    }
+
+    #[track_caller]
+    fn forward(&self, x: &Array, cache: &mut KvCache) -> Array {
+        let DeltaSizes {
+            hv, dv, dk, kernel, ..
         } = self.sizes;
-        let (b, l) = (x.shape()[0], x.shape()[1]);
-        let qkv = self.in_proj_qkv.forward(x)?;
-        let channels = qkv.shape()[2];
-        let z = self.in_proj_z.forward(x)?;
-        let (beta, a) = (self.in_proj_b.forward(x)?, self.in_proj_a.forward(x)?);
+        let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
+        let qkv = self.in_proj_qkv.forward(x);
+        let z = self.in_proj_z.forward(x);
+        let (beta, a) = (self.in_proj_b.forward(x), self.in_proj_a.forward(x));
         // The causal convolution sees the previous step's last `kernel - 1` inputs.
         let state = match cache.conv.take() {
             Some(c) => c,
-            None => nuvec::zeros(&[b, kernel - 1, channels], qkv.dtype())?,
+            None => {
+                let channels = qkv.shape().get(2).copied().unwrap_or_default();
+                ops::zeros([b, kernel - 1, channels], qkv.dtype())
+            }
         };
-        let input = concatenate(&[state, qkv], 1)?;
-        let rows = |start: usize, len: usize| {
-            slice(
-                &input,
-                &[
-                    SliceArg::full(),
-                    SliceArg::new(Some(start as isize), Some((start + len) as isize), 1),
-                    SliceArg::full(),
-                ],
-            )
-        };
-        let kept = rows(l, kernel - 1)?;
+        let input = ops::concatenate(&[state, qkv], 1);
+        let kept = input.i((.., l..l + kernel - 1));
         // After a prompt, a copy: the view would keep the whole input alive.
-        cache.conv = Some(if l > 1 { multiply(&kept, 1.0)? } else { kept });
-        let conv = causal_conv_silu(&input, &self.conv1d)?;
-        let mut parts = split_at(&conv, &[hk * dk, 2 * hk * dk], -1)?;
-        let shaped = |a: Array, h: usize, d: usize| {
-            a.reshape(&[b as isize, l as isize, h as isize, d as isize])
-        };
-        let v = shaped(parts.pop().expect("three parts"), hv, dv)?;
-        let k = shaped(parts.pop().expect("three parts"), hk, dk)?;
-        let q = shaped(parts.pop().expect("three parts"), hk, dk)?;
-        // mlx-lm's `normalize_qk`: unit queries and keys, the 1/sqrt(Dk) scale in the query.
-        let inv = (dk as f32).powf(-0.5);
-        let eps = 1e-6 * inv * inv;
-        let q = multiply(&nuvec::fast::rms_norm(&q, None, eps)?, f64::from(inv * inv))?;
-        let k = multiply(&nuvec::fast::rms_norm(&k, None, eps)?, f64::from(inv))?;
+        cache.conv = Some(if l > 1 { kept.multiply(1.0) } else { kept });
+        let conv = causal_conv_silu(&input, &self.conv1d);
+        let [q, k, v] = self.qkv(&conv, [b, l]);
         // Per-head decay and write strength (mlx-lm's `compute_g`, in float32).
-        let g = decay(&a, &self.dt_bias, &self.a_log)?;
-        let beta = sigmoid(&beta)?;
+        let g = decay(&a, &self.dt_bias, &self.a_log);
+        let beta = beta.sigmoid();
         let state = match cache.recurrent.take() {
             Some(s) => s,
-            None => nuvec::zeros(&[b, hv, dv, dk], DType::F32)?,
+            None => ops::zeros([b, hv, dv, dk], DType::F32),
         };
         let out = if cache.keep_steps {
-            let (out, states) = nuvec::fast::gated_delta_steps(&q, &k, &v, &g, &beta, &state)?;
-            let mut last = vec![SliceArg::full(); states.ndim()];
-            last[1] = SliceArg::new(Some(l as isize - 1), Some(l as isize), 1);
-            let last = slice(&states, &last)?;
-            cache.recurrent = Some(squeeze(&last, &[1])?);
+            let (out, states) = fast::gated_delta_steps(&q, &k, &v, &g, &beta, &state);
+            cache.recurrent = Some(states.i((.., l - 1)));
             cache.steps = Some((states, input));
             out
         } else {
-            let (out, state) = nuvec::fast::gated_delta(&q, &k, &v, &g, &beta, &state)?;
+            let (out, state) = fast::gated_delta(&q, &k, &v, &g, &beta, &state);
             cache.recurrent = Some(state);
             out
         };
         cache.offset += l;
-        let z = z.reshape(&[b as isize, l as isize, hv as isize, dv as isize])?;
-        let out = gated_norm(&out, &z, &self.norm)?;
-        self.out_proj
-            .forward(&out.reshape(&[b as isize, l as isize, -1])?)
+        self.output(&out, &z, [b, l])
     }
 }
 
@@ -794,78 +856,57 @@ impl GatedDeltaNet {
     /// One new position per sequence (`x` is `[B, 1, D]`) with each sequence's states at
     /// its slot of the layer's pools: the convolution's inputs gathered and written back,
     /// the recurrent states updated in place ([`fast::gated_delta_slots`]).
-    fn forward_paged(&self, x: &Array, layer: &mut PagedLayer, step: &PagedStep) -> Result<Array> {
-        let LinearAttention {
-            key_heads: hk,
-            value_heads: hv,
-            key_head_dim: dk,
-            value_head_dim: dv,
-            conv_kernel: kernel,
+    #[track_caller]
+    fn forward_paged(&self, x: &Array, layer: &mut PagedLayer, step: &PagedStep) -> Array {
+        let DeltaSizes {
+            hv, dv, dk, kernel, ..
         } = self.sizes;
-        let b = x.shape()[0];
-        let missing = || nuvec::Error::InvalidArgument("paged decoding: no state pool".into());
-        let qkv = self.in_proj_qkv.forward(x)?;
-        let z = self.in_proj_z.forward(x)?;
-        let (beta, a) = (self.in_proj_b.forward(x)?, self.in_proj_a.forward(x)?);
-        // The convolution's last inputs of each sequence, then the new ones written back.
-        let conv_pool = layer.conv.take().ok_or_else(missing)?;
-        let state = take(&conv_pool, &step.state_slots, Some(0))?;
-        let input = concatenate(&[state, qkv], 1)?;
-        let kept = slice(
-            &input,
-            &[
-                SliceArg::full(),
-                SliceArg::new(Some(1), Some(kernel as isize), 1),
-                SliceArg::full(),
-            ],
-        )?;
-        let at = broadcast_to(&step.state_slots.reshape(&[-1, 1, 1])?, kept.shape())?;
-        layer.conv = Some(nuvec::put_along_axis(&conv_pool, &at, &kept, 0)?);
-        let conv = causal_conv_silu(&input, &self.conv1d)?;
-        let mut parts = split_at(&conv, &[hk * dk, 2 * hk * dk], -1)?;
-        let shaped =
-            |a: Array, h: usize, d: usize| a.reshape(&[b as isize, 1, h as isize, d as isize]);
-        let v = shaped(parts.pop().expect("three parts"), hv, dv)?;
-        let k = shaped(parts.pop().expect("three parts"), hk, dk)?;
-        let q = shaped(parts.pop().expect("three parts"), hk, dk)?;
-        let inv = (dk as f32).powf(-0.5);
-        let eps = 1e-6 * inv * inv;
-        let q = multiply(&nuvec::fast::rms_norm(&q, None, eps)?, f64::from(inv * inv))?;
-        let k = multiply(&nuvec::fast::rms_norm(&k, None, eps)?, f64::from(inv))?;
-        let g = decay(&a, &self.dt_bias, &self.a_log)?;
-        let beta = sigmoid(&beta)?;
-        let pool = layer.recurrent.take().ok_or_else(missing)?;
-        let (out, pool) =
-            nuvec::fast::gated_delta_slots(&q, &k, &v, &g, &beta, &pool, &step.state_slots)?;
+        let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
+        let qkv = self.in_proj_qkv.forward(x);
+        let z = self.in_proj_z.forward(x);
+        let (beta, a) = (self.in_proj_b.forward(x), self.in_proj_a.forward(x));
+        // The convolution's last inputs of each sequence, then the new ones written back
+        // (zeros until a prefilled sequence brought the pools).
+        let slots = layer.state_slots;
+        let conv_pool = match layer.conv.take() {
+            Some(p) => p,
+            None => {
+                let channels = qkv.shape().get(2).copied().unwrap_or_default();
+                ops::zeros([slots, kernel - 1, channels], qkv.dtype())
+            }
+        };
+        let state = conv_pool.take(&step.state_slots, 0);
+        let input = ops::concatenate(&[state, qkv], 1);
+        let kept = input.i((.., 1..kernel));
+        let at = step
+            .state_slots
+            .reshape([-1, 1, 1])
+            .broadcast_to(kept.shape());
+        layer.conv = Some(conv_pool.put_along_axis(&at, &kept, 0));
+        let conv = causal_conv_silu(&input, &self.conv1d);
+        let [q, k, v] = self.qkv(&conv, [b, l]);
+        let g = decay(&a, &self.dt_bias, &self.a_log);
+        let beta = beta.sigmoid();
+        let pool = match layer.recurrent.take() {
+            Some(p) => p,
+            None => ops::zeros([slots, hv, dv, dk], DType::F32),
+        };
+        let (out, pool) = fast::gated_delta_slots(&q, &k, &v, &g, &beta, &pool, &step.state_slots);
         layer.recurrent = Some(pool);
-        let z = z.reshape(&[b as isize, 1, hv as isize, dv as isize])?;
-        let out = gated_norm(&out, &z, &self.norm)?;
-        self.out_proj.forward(&out.reshape(&[b as isize, 1, -1])?)
+        self.output(&out, &z, [b, l])
     }
 }
 
-impl Module for GatedDeltaNet {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        p.module("in_proj_qkv", &mut self.in_proj_qkv);
-        p.module("in_proj_z", &mut self.in_proj_z);
-        p.module("in_proj_b", &mut self.in_proj_b);
-        p.module("in_proj_a", &mut self.in_proj_a);
-        p.param("conv1d.weight", &mut self.conv1d);
-        p.param("dt_bias", &mut self.dt_bias);
-        p.param("A_log", &mut self.a_log);
-        p.module("norm", &mut self.norm);
-        p.module("out_proj", &mut self.out_proj);
-    }
-}
-
-/// A layer's token mixer.
-#[derive(Debug, Clone)]
+/// A layer's token mixer, named as mlx-lm's (`self_attn`, `linear_attn`).
+#[derive(Debug, Clone, Module)]
 enum Mixer {
+    #[tree(rename = "self_attn")]
     Attention(Attention),
+    #[tree(rename = "linear_attn")]
     Linear(GatedDeltaNet),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Module)]
 struct Mlp {
     gate_proj: Projection,
     up_proj: Projection,
@@ -882,46 +923,42 @@ impl Mlp {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let gated = swiglu(&self.gate_proj.forward(x)?, &self.up_proj.forward(x)?)?;
+    #[track_caller]
+    fn forward(&self, x: &Array) -> Array {
+        let gated = swiglu(&self.gate_proj.forward(x), &self.up_proj.forward(x));
         self.down_proj.forward(&gated)
-    }
-}
-
-impl Module for Mlp {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        p.module("gate_proj", &mut self.gate_proj);
-        p.module("up_proj", &mut self.up_proj);
-        p.module("down_proj", &mut self.down_proj);
     }
 }
 
 /// One linear layer per expert, `[experts, out, in]`, applied to each row with its own
 /// expert (mlx-lm's `SwitchLinear` and `QuantizedSwitchLinear`).
-#[derive(Debug, Clone)]
-enum SwitchProjection {
-    /// Full precision: [`gather_mm`].
-    Dense { weight: Array },
-    /// MLX's affine quantization: [`gather_qmm`].
+#[derive(Debug, Clone, Module)]
+pub(crate) enum SwitchProjection {
+    /// Full precision: [`Array::gather_mm`].
+    Dense { weight: Param },
+    /// MLX's affine quantization: [`Array::gather_qmm`]; the packed weights are buffers.
     Quantized {
+        #[tree(buffer)]
         weight: Array,
+        #[tree(buffer)]
         scales: Array,
+        #[tree(buffer)]
         biases: Array,
-        group_size: usize,
-        bits: u32,
+        #[tree(skip)]
+        group_size: i32,
+        #[tree(skip)]
+        bits: i32,
     },
 }
 
 impl SwitchProjection {
     /// `x` (`[..., 1, in]`) through expert `indices` (broadcast with `x`'s batch); rows
     /// sorted by expert if `sorted`.
-    fn forward(&self, x: &Array, indices: &Array, sorted: bool) -> Result<Array> {
+    #[track_caller]
+    fn forward(&self, x: &Array, indices: &Array, sorted: bool) -> Array {
         match self {
             Self::Dense { weight } => {
-                let nd = weight.ndim();
-                let mut axes: Vec<usize> = (0..nd).collect();
-                axes.swap(nd - 1, nd - 2);
-                gather_mm(x, &transpose(weight, &axes)?, None, Some(indices), sorted)
+                x.gather_mm(&weight.transpose([0, 2, 1]), None, Some(indices), sorted)
             }
             Self::Quantized {
                 weight,
@@ -929,8 +966,7 @@ impl SwitchProjection {
                 biases,
                 group_size,
                 bits,
-            } => gather_qmm(
-                x,
+            } => x.gather_qmm(
                 weight,
                 scales,
                 biases,
@@ -945,26 +981,8 @@ impl SwitchProjection {
     }
 }
 
-impl Module for SwitchProjection {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        match self {
-            Self::Dense { weight } => p.param("weight", weight),
-            Self::Quantized {
-                weight,
-                scales,
-                biases,
-                ..
-            } => {
-                p.param("weight", weight);
-                p.param("scales", scales);
-                p.param("biases", biases);
-            }
-        }
-    }
-}
-
 /// The experts' SwiGLU MLPs (mlx-lm's `SwitchGLU`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Module)]
 struct SwitchGlu {
     gate_proj: SwitchProjection,
     up_proj: SwitchProjection,
@@ -972,58 +990,53 @@ struct SwitchGlu {
 }
 
 impl SwitchGlu {
+    /// Rows `x` through the experts `idx`.
+    #[track_caller]
+    fn through(&self, x: &Array, idx: &Array, sorted: bool) -> Array {
+        let up = self.up_proj.forward(x, idx, sorted);
+        let gate = self.gate_proj.forward(x, idx, sorted);
+        self.down_proj.forward(&swiglu(&gate, &up), idx, sorted)
+    }
+
     /// `x` (`[B, L, D]`) through each token's experts `indices` (`[B, L, k]`):
     /// `[B, L, k, D]`. With many rows, they are sorted by expert first, so that each
     /// expert's weights are read once (mlx-lm's `_gather_sort`).
-    fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
-        let (b, l, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
-        let k = indices.shape()[2];
-        let through = |x: &Array, idx: &Array, sorted: bool| -> Result<Array> {
-            let up = self.up_proj.forward(x, idx, sorted)?;
-            let gate = self.gate_proj.forward(x, idx, sorted)?;
-            self.down_proj.forward(&swiglu(&gate, &up)?, idx, sorted)
-        };
+    #[track_caller]
+    fn forward(&self, x: &Array, indices: &Array) -> Array {
+        let [b, l, d] = x.shape_n::<3>().unwrap_or_default();
+        let k = indices.shape().get(2).copied().unwrap_or_default();
         if indices.size() < 64 {
-            let x = expand_dims(&expand_dims(x, -2)?, -2)?; // [B, L, 1, 1, D]
-            return squeeze(&through(&x, indices, false)?, &[-2]);
+            let x = x.expand_dims([-3, -2]); // [B, L, 1, 1, D]
+            return self.through(&x, indices, false).squeeze(-2);
         }
-        let flat = indices.reshape(&[-1])?;
-        let order = argsort(&flat, Some(0))?;
-        let restore = argsort(&order, Some(0))?;
+        let flat = indices.reshape([-1]);
+        let order = flat.argsort(0);
+        let restore = order.argsort(0);
         // Each pair's token: pair `t·k + j` belongs to token `t`.
-        let tokens = broadcast_to(
-            &nuvec::arange(0.0, (b * l) as f64, 1.0, DType::U32)?.reshape(&[-1, 1])?,
-            &[b * l, k],
-        )?
-        .reshape(&[-1])?;
-        let rows = take(
-            &x.reshape(&[-1, 1, d as isize])?,
-            &take(&tokens, &order, Some(0))?,
-            Some(0),
-        )?;
-        let out = through(&rows, &take(&flat, &order, Some(0))?, true)?;
-        take(&out, &restore, Some(0))?.reshape(&[b as isize, l as isize, k as isize, d as isize])
-    }
-}
-
-impl Module for SwitchGlu {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        p.module("gate_proj", &mut self.gate_proj);
-        p.module("up_proj", &mut self.up_proj);
-        p.module("down_proj", &mut self.down_proj);
+        let tokens = ops::arange(0, b * l, 1).astype(DType::U32);
+        let tokens = tokens
+            .reshape([-1, 1])
+            .broadcast_to([b * l, k])
+            .reshape([-1]);
+        let rows = x.reshape([-1, 1, d]).take(&tokens.take(&order, 0), 0);
+        let out = self.through(&rows, &flat.take(&order, 0), true);
+        out.take(&restore, 0).reshape([b, l, k, d])
     }
 }
 
 /// A mixture-of-experts MLP (mlx-lm's `Qwen3NextSparseMoeBlock`): a softmax router picks
 /// each token's best experts, whose outputs are summed with the (renormalised) router
 /// weights, plus a shared expert gated by a sigmoid.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Module)]
 struct MoeMlp {
     gate: Projection,
     switch_mlp: SwitchGlu,
-    /// Qwen 3.5's gated shared expert.
-    shared: Option<(Mlp, Projection)>,
-    experts_per_token: usize,
+    /// Qwen 3.5's gated shared expert and its gate.
+    shared_expert: Option<Mlp>,
+    shared_expert_gate: Option<Projection>,
+    #[tree(skip)]
+    experts_per_token: i32,
+    #[tree(skip)]
     norm_topk_prob: bool,
 }
 
@@ -1038,84 +1051,66 @@ impl MoeMlp {
                 up_proj: b.switch(&p("switch_mlp.up_proj"), d, i, e)?,
                 down_proj: b.switch(&p("switch_mlp.down_proj"), i, d, e)?,
             },
-            shared: match moe.shared_intermediate_size {
-                Some(size) => Some((
-                    Mlp::new(b, &p("shared_expert"), d, size, false)?,
-                    b.projection(&p("shared_expert_gate"), d, 1, false)?,
-                )),
-                None => None,
-            },
-            experts_per_token: moe.experts_per_token,
+            shared_expert: moe
+                .shared_intermediate_size
+                .map(|size| Mlp::new(b, &p("shared_expert"), d, size, false))
+                .transpose()?,
+            shared_expert_gate: moe
+                .shared_intermediate_size
+                .map(|_| b.projection(&p("shared_expert_gate"), d, 1, false))
+                .transpose()?,
+            experts_per_token: int(path, moe.experts_per_token)?,
             norm_topk_prob: moe.norm_topk_prob,
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let k = self.experts_per_token as isize;
+    #[track_caller]
+    fn forward(&self, x: &Array) -> Array {
+        let k = self.experts_per_token;
         // The best `k` experts by router logit (as by probability: softmax is monotonic) and
         // their weights: the probabilities, or renormalised over the chosen experts, the
         // softmax of their logits (`p_i / Σ_top p_j` with `p = softmax(logits)`).
-        let logits = self.gate.forward(x)?;
-        let order = argpartition(&logits, -k, Some(-1))?;
-        let e = order.shape()[2] as isize;
-        let top = slice(
-            &order,
-            &[
-                SliceArg::full(),
-                SliceArg::full(),
-                SliceArg::new(Some(e - k), None, 1),
-            ],
-        )?;
+        let logits = self.gate.forward(x);
+        let top = logits.argpartition(-k, -1).i((.., .., -k..));
         // In float32, as mlx-lm's `softmax(…, precise=True)`.
-        let logits = logits.astype(DType::F32)?;
+        let logits = logits.astype(DType::F32);
         let scores = match self.norm_topk_prob {
-            true => softmax(&take_along_axis(&logits, &top, -1)?, &[-1])?,
-            false => take_along_axis(&softmax(&logits, &[-1])?, &top, -1)?,
+            true => logits.take_along_axis(&top, -1).softmax(-1),
+            false => logits.softmax(-1).take_along_axis(&top, -1),
         };
         // The weighted sum of the experts' outputs as one product (`[1, k] · [k, D]` per
         // token) in float32, rounded once to the activations' type, as mlx-lm.
-        let experts = self.switch_mlp.forward(x, &top)?;
-        let y = squeeze(&matmul(&expand_dims(&scores, -2)?, &experts)?, &[-2])?;
-        let y = y.astype(experts.dtype())?;
-        let Some((expert, gate)) = &self.shared else {
-            return Ok(y);
+        let experts = self.switch_mlp.forward(x, &top);
+        let y = scores.expand_dims(-2).matmul(&experts).squeeze(-2);
+        let y = y.astype(experts.dtype());
+        let (Some(expert), Some(gate)) = (&self.shared_expert, &self.shared_expert_gate) else {
+            return y;
         };
-        add(
-            &y,
-            multiply(sigmoid(&gate.forward(x)?)?, expert.forward(x)?)?,
-        )
-    }
-}
-
-impl Module for MoeMlp {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        p.module("gate", &mut self.gate);
-        p.module("switch_mlp", &mut self.switch_mlp);
-        if let Some((expert, gate)) = &mut self.shared {
-            p.module("shared_expert", expert);
-            p.module("shared_expert_gate", gate);
-        }
+        y.add(gate.forward(x).sigmoid().multiply(expert.forward(x)))
     }
 }
 
 /// A layer's MLP.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Module)]
 enum BlockMlp {
     Dense(Box<Mlp>),
     Moe(Box<MoeMlp>),
 }
 
-impl Module for BlockMlp {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
+impl BlockMlp {
+    #[track_caller]
+    fn forward(&self, x: &Array) -> Array {
         match self {
-            Self::Dense(m) => m.visit(p),
-            Self::Moe(m) => m.visit(p),
+            Self::Dense(m) => m.forward(x),
+            Self::Moe(m) => m.forward(x),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Module)]
 struct Block {
+    /// Transparent: the mixer names itself (`self_attn`, `linear_attn`).
+    #[tree(rename = "")]
     mixer: Mixer,
     mlp: BlockMlp,
     input_layernorm: RmsNorm,
@@ -1124,10 +1119,11 @@ struct Block {
 
 /// `x + r` and its normalisation, in one kernel ([`fast::add_rms_norm`]); `x` alone
 /// without `r`.
-fn add_norm(x: &Array, r: Option<&Array>, norm: &RmsNorm) -> Result<(Array, Array)> {
+#[track_caller]
+fn add_norm(x: &Array, r: Option<&Array>, norm: &RmsNorm) -> (Array, Array) {
     match r {
-        Some(r) => fast::add_rms_norm(x, r, Some(&norm.weight), norm.eps),
-        None => Ok((x.clone(), norm.forward(x)?)),
+        Some(r) => fast::add_rms_norm(x, r, norm.weight.value(), norm.eps),
+        None => (x.clone(), norm.forward(x)),
     }
 }
 
@@ -1136,84 +1132,59 @@ impl Block {
     /// gives the residual stream after attention and this block's MLP output. Each
     /// residual addition is fused with the normalisation that follows it, so a layer has
     /// no dependent dispatch for the additions.
+    #[track_caller]
     fn forward(
         &self,
         x: &Array,
         pending: Option<&Array>,
         mask: AttentionMask<'_>,
         cache: &mut KvCache,
-    ) -> Result<(Array, Array)> {
-        let (x, n) = add_norm(x, pending, &self.input_layernorm)?;
+    ) -> (Array, Array) {
+        let (x, n) = add_norm(x, pending, &self.input_layernorm);
         let mixed = match &self.mixer {
-            Mixer::Attention(a) => a.forward(&n, mask, cache)?,
-            Mixer::Linear(l) => l.forward(&n, cache)?,
+            Mixer::Attention(a) => a.forward(&n, mask, cache),
+            Mixer::Linear(l) => l.forward(&n, cache),
         };
-        let (h, n) = add_norm(&x, Some(&mixed), &self.post_attention_layernorm)?;
-        let mlp = match &self.mlp {
-            BlockMlp::Dense(m) => m.forward(&n)?,
-            BlockMlp::Moe(m) => m.forward(&n)?,
-        };
-        Ok((h, mlp))
+        let (h, n) = add_norm(&x, Some(&mixed), &self.post_attention_layernorm);
+        (h, self.mlp.forward(&n))
     }
-}
 
-impl Block {
     /// [`Block::forward`] for one new position per sequence over a paged cache.
+    #[track_caller]
     fn forward_paged(
         &self,
         x: &Array,
         pending: Option<&Array>,
         layer: &mut PagedLayer,
         step: &PagedStep,
-    ) -> Result<(Array, Array)> {
-        let (x, n) = add_norm(x, pending, &self.input_layernorm)?;
+    ) -> (Array, Array) {
+        let (x, n) = add_norm(x, pending, &self.input_layernorm);
         let mixed = match &self.mixer {
-            Mixer::Attention(a) => a.forward_paged(&n, layer, step)?,
-            Mixer::Linear(l) => l.forward_paged(&n, layer, step)?,
+            Mixer::Attention(a) => a.forward_paged(&n, layer, step),
+            Mixer::Linear(l) => l.forward_paged(&n, layer, step),
         };
-        let (h, n) = add_norm(&x, Some(&mixed), &self.post_attention_layernorm)?;
-        let mlp = match &self.mlp {
-            BlockMlp::Dense(m) => m.forward(&n)?,
-            BlockMlp::Moe(m) => m.forward(&n)?,
-        };
-        Ok((h, mlp))
+        let (h, n) = add_norm(&x, Some(&mixed), &self.post_attention_layernorm);
+        (h, self.mlp.forward(&n))
     }
 }
 
-impl Module for Block {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        match &mut self.mixer {
-            Mixer::Attention(a) => p.module("self_attn", a),
-            Mixer::Linear(l) => p.module("linear_attn", l),
-        }
-        p.module("mlp", &mut self.mlp);
-        p.module("input_layernorm", &mut self.input_layernorm);
-        p.module(
-            "post_attention_layernorm",
-            &mut self.post_attention_layernorm,
-        );
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Module)]
 struct Body {
     embed_tokens: TokenEmbedding,
     layers: Vec<Block>,
     norm: RmsNorm,
 }
 
-impl Module for Body {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        p.module("embed_tokens", &mut self.embed_tokens);
-        p.module("layers", &mut self.layers);
-        p.module("norm", &mut self.norm);
-    }
-}
-
-/// A causal language model of the Llama family.
-#[derive(Debug, Clone)]
+/// A causal language model of the Llama family. A [`Module`] with Hugging Face's
+/// parameter names (`model.layers.0.self_attn.q_proj.weight`).
+#[derive(Debug, Clone, Module)]
 pub struct Model {
-    /// The configuration it was built from.
+    /// Training or evaluation mode (MLX's `Module.training`): the mode new layers (LoRA
+    /// adapters) take; [`crate::load_model`] leaves models in evaluation mode.
+    #[tree(mode)]
+    training: bool,
+    /// The configuration it was built from (not hashed into the structure).
+    #[tree(skip, static_unchecked)]
     pub config: Config,
     model: Body,
     lm_head: Option<Projection>,
@@ -1221,7 +1192,7 @@ pub struct Model {
 
 impl Model {
     /// The model's structure with placeholder parameters (no memory), to be filled by
-    /// [`Module::load_weights`]. `quantized(path)` gives the group size and bits of each
+    /// [`Module::load_weights`] (until then, a forward pass gives a failed array). `quantized(path)` gives the group size and bits of each
     /// quantized layer (`None` for full precision).
     pub fn new(config: &Config, quantized: &dyn Fn(&str) -> Option<(usize, u32)>) -> Result<Self> {
         let b = Builder { quantized };
@@ -1252,17 +1223,18 @@ impl Model {
                             c.mlp_bias,
                         )?)),
                     },
-                    input_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps)?,
-                    post_attention_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps)?,
+                    input_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps),
+                    post_attention_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps),
                 })
             })
             .collect::<Result<_>>()?;
         Ok(Self {
+            training: true,
             config: config.clone(),
             model: Body {
                 embed_tokens: b.embedding("model.embed_tokens", c.vocab_size, c.hidden_size)?,
                 layers,
-                norm: Builder::norm(c.hidden_size, c.rms_norm_eps)?,
+                norm: Builder::norm(c.hidden_size, c.rms_norm_eps),
             },
             lm_head: (!c.tie_word_embeddings)
                 .then(|| b.projection("lm_head", c.hidden_size, c.vocab_size, false))
@@ -1273,10 +1245,12 @@ impl Model {
     /// Runs one token through the model (and discards the result), so that the first
     /// prompt does not pay for first use: on the GPU, memory-mapped weights are made
     /// resident when a command buffer first reads them, and kernels are compiled when
-    /// first dispatched. [`load_model`](crate::load_model) calls it.
+    /// first dispatched. [`load_model`](crate::load_model) does not call it (as mlx-lm's
+    /// `load`, it only loads the weights): a server can, before its first request. Its
+    /// KV cache and activations add to the peak memory.
     pub fn warm_up(&self) -> Result<()> {
-        let token = Array::from_slice(&[0u32], &[1, 1])?;
-        nuvec::eval(&[self.forward(&token, &mut self.new_cache())?])
+        let token = Array::from_slice(&[0u32], [1, 1]);
+        self.forward(&token, &mut self.new_cache()).eval()
     }
 
     /// An empty cache per layer.
@@ -1285,56 +1259,199 @@ impl Model {
     }
 
     /// The logits `[B, L, vocab]` for tokens `[B, L]` (integers) following the cached
-    /// positions, which are extended.
-    pub fn forward(&self, tokens: &Array, cache: &mut [KvCache]) -> Result<Array> {
-        let mut h = self.model.embed_tokens.forward(tokens)?;
+    /// positions, which are extended. `cache` has one entry per layer
+    /// ([`Model::new_cache`]); another length gives a failed array (and leaves the cache
+    /// alone).
+    ///
+    /// Nothing is evaluated: errors surface at [`Array::check`] or [`Array::eval`].
+    #[track_caller]
+    pub fn forward(&self, tokens: &Array, cache: &mut [KvCache]) -> Array {
+        if cache.len() != self.model.layers.len() {
+            return mismatched_layers(cache.len(), self.model.layers.len());
+        }
+        let mut h = self.model.embed_tokens.forward(tokens);
         // Causal (aligned to the last positions) for several tokens; one token sees all.
-        let mask = if tokens.shape()[1] > 1 {
-            AttentionMask::Causal
-        } else {
-            AttentionMask::None
+        let mask = match tokens.shape().get(1) {
+            Some(&l) if l > 1 => AttentionMask::Causal,
+            _ => AttentionMask::None,
         };
         let mut pending = None;
         for (layer, c) in self.model.layers.iter().zip(cache) {
-            let (next, mlp) = layer.forward(&h, pending.as_ref(), mask, c)?;
+            let (next, mlp) = layer.forward(&h, pending.as_ref(), mask, c);
             (h, pending) = (next, Some(mlp));
         }
-        let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm)?;
+        let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
+        self.head(&h)
+    }
+
+    /// The output head on the final hidden states.
+    #[track_caller]
+    fn head(&self, h: &Array) -> Array {
         match &self.lm_head {
-            Some(head) => head.forward(&h),
-            None => self.model.embed_tokens.as_linear(&h),
+            Some(head) => head.forward(h),
+            None => self.model.embed_tokens.as_linear(h),
         }
     }
 }
 
 impl Model {
     /// The logits `[B, 1, vocab]` for one new token per sequence (`tokens` `[B, 1]`) over
-    /// a paged cache (one [`PagedLayer`] per layer).
+    /// a paged cache (one [`PagedLayer`] per layer), checked (not evaluated).
+    ///
+    /// The layers' pools are taken out while the step is built (so that the writes are
+    /// done in place); when the step fails, they are put back as they were, so a failed
+    /// step leaves the cache unchanged.
     pub(crate) fn forward_paged(
         &self,
         tokens: &Array,
         layers: &mut [PagedLayer],
         step: &PagedStep,
     ) -> Result<Array> {
-        let mut h = self.model.embed_tokens.forward(tokens)?;
+        check_layers(layers.len(), self.model.layers.len())?;
+        // Handles to the pools (not copies): dropped before anything is evaluated, so
+        // the in-place writes still own their buffers.
+        let saved = layers.to_vec();
+        let mut logits = self.forward_paged_unguarded(tokens, layers, step).check();
+        #[cfg(test)]
+        if let Some(i) = tests::FAIL_PAGED_AT.with(std::cell::Cell::get)
+            && i < layers.len()
+        {
+            // An injected failure, after every layer replaced its pools.
+            logits = Err(nuvec::Error::InvalidArgument(format!(
+                "injected failure at layer {i}"
+            )));
+        }
+        if logits.is_ok() {
+            // A pool write that failed without failing the logits fails the step too.
+            for layer in layers.iter() {
+                for pool in [&layer.keys, &layer.values, &layer.conv, &layer.recurrent] {
+                    if let Some(e) = pool.as_ref().and_then(Array::error) {
+                        logits = Err(e.clone());
+                    }
+                }
+            }
+        }
+        if logits.is_err() {
+            layers.clone_from_slice(&saved);
+        }
+        logits
+    }
+
+    #[track_caller]
+    fn forward_paged_unguarded(
+        &self,
+        tokens: &Array,
+        layers: &mut [PagedLayer],
+        step: &PagedStep,
+    ) -> Array {
+        let mut h = self.model.embed_tokens.forward(tokens);
         let mut pending = None;
         for (layer, pages) in self.model.layers.iter().zip(layers) {
-            let (next, mlp) = layer.forward_paged(&h, pending.as_ref(), pages, step)?;
+            let (next, mlp) = layer.forward_paged(&h, pending.as_ref(), pages, step);
             (h, pending) = (next, Some(mlp));
         }
-        let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm)?;
-        match &self.lm_head {
-            Some(head) => head.forward(&h),
-            None => self.model.embed_tokens.as_linear(&h),
-        }
+        let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
+        self.head(&h)
     }
 }
 
-impl Module for Model {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        p.module("model", &mut self.model);
-        if let Some(head) = &mut self.lm_head {
-            p.module("lm_head", head);
+/// A cache of `got` layers for a model of `layers` (a shorter one would skip layers).
+fn check_layers(got: usize, layers: usize) -> Result<()> {
+    if got != layers {
+        return Err(nuvec::Error::InvalidArgument(format!(
+            "a cache of {got} layers for a model of {layers}"
+        )));
+    }
+    Ok(())
+}
+
+/// The failed array of a forward pass given a cache of `got` layers for a model of
+/// `layers`, located at the caller of `forward`.
+#[track_caller]
+fn mismatched_layers(got: usize, layers: usize) -> Array {
+    Array::failure(
+        "forward",
+        nuvec::OpErrorKind::InvalidArgument(format!(
+            "a cache of {got} layers for a model of {layers}"
+        )),
+    )
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    thread_local! {
+        /// A fault hook: `forward_paged` fails at this layer (on this thread).
+        pub(crate) static FAIL_PAGED_AT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Sets [`FAIL_PAGED_AT`] until the guard is dropped.
+    pub(crate) struct Fault;
+
+    impl Drop for Fault {
+        fn drop(&mut self) {
+            FAIL_PAGED_AT.with(|f| f.set(None));
         }
+    }
+
+    /// `forward_paged` fails at `layer` until the guard is dropped.
+    pub(crate) fn fail_paged_at(layer: usize) -> Fault {
+        FAIL_PAGED_AT.with(|f| f.set(Some(layer)));
+        Fault
+    }
+
+    /// A model of the `qwen3_f32` fixture, or `None` without a Metal device.
+    pub(crate) fn fixture_model(name: &str) -> Option<Model> {
+        nuvec::set_default_stream(nuvec::Stream::default_for(nuvec::Device::gpu(0)));
+        if (&Array::from(1.0f32) + 1.0).eval().is_err() {
+            eprintln!("skipped: no Metal device");
+            return None;
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        Some(crate::load_model(dir).unwrap())
+    }
+
+    /// `forward_paged` rejects a layer slice of another length, and a failed step leaves
+    /// the pools as they were.
+    #[test]
+    fn forward_paged_checks_layers_and_restores_pools() {
+        let Some(model) = fixture_model("qwen3_f32") else {
+            return;
+        };
+        let mut cache = crate::PagedCache::new(&model, 8, 4, 2).unwrap();
+        let mut kv = model.new_cache();
+        let prompt = Array::from_slice(&[1u32, 2, 3], [1, 3]);
+        let _ = model.forward(&prompt, &mut kv).check().unwrap();
+        let id = cache.insert(&kv).unwrap();
+        let reservation = cache.reserve(&[id]).unwrap();
+        let tokens = Array::from_slice(&[4u32], [1, 1]);
+        let layers = cache.layers.len();
+        assert!(
+            model
+                .forward_paged(&tokens, &mut cache.layers[..layers - 1], &reservation.step)
+                .is_err()
+        );
+        let before: Vec<Vec<f32>> = cache
+            .state()
+            .iter()
+            .map(|a| a.to_vec::<f32>().unwrap())
+            .collect();
+        FAIL_PAGED_AT.with(|f| f.set(Some(1)));
+        let failed = model.forward_paged(&tokens, &mut cache.layers, &reservation.step);
+        FAIL_PAGED_AT.with(|f| f.set(None));
+        assert!(failed.is_err());
+        let after: Vec<Vec<f32>> = cache
+            .state()
+            .iter()
+            .map(|a| a.to_vec::<f32>().unwrap())
+            .collect();
+        assert_eq!(before, after, "pools restored");
+        cache.rollback(reservation);
+        assert_eq!(cache.free_blocks(), 7);
     }
 }

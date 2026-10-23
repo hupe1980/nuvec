@@ -352,7 +352,7 @@ pub enum Primitive {
         transpose: bool,
     },
     /// A fused operation with a dedicated GPU kernel ([`crate::fast`]).
-    Fast(crate::fast::FastOp),
+    Fast(crate::fast::imp::FastOp),
     /// Element-wise operations fused into one generated kernel ([`crate::Fused`]), as
     /// `compile` builds them. The inputs share the output's shape.
     Compiled(crate::fused::Fused),
@@ -370,6 +370,17 @@ pub enum Primitive {
     Custom(CustomCall),
     /// A custom Metal kernel ([`crate::fast::MetalKernel`]).
     MetalKernel(crate::kernel::KernelCall),
+    /// A row-contiguous copy of the input into a new buffer. Never simplified away (as a
+    /// same-type conversion or identity view would be).
+    Copy,
+    /// `(x, deps...)`: `x` unchanged (sharing its data), evaluated only after the
+    /// `n_deps` other inputs. Gradients flow to `x` only. It orders work, as MLX's
+    /// `depends`: a recomputation that depends on cotangents cannot be merged with the
+    /// forward pass.
+    Depends {
+        /// The number of dependencies after `x`.
+        n_deps: usize,
+    },
     /// Test-only two-output primitive: `(a + b, a * b)`.
     #[cfg(test)]
     AddMultiply,
@@ -428,6 +439,8 @@ impl Primitive {
             Self::QuantizedMatmul { .. } => "quantized_matmul",
             Self::Custom(_) => "custom_function",
             Self::MetalKernel(_) => "metal_kernel",
+            Self::Copy => "copy",
+            Self::Depends { .. } => "depends",
             #[cfg(test)]
             Self::AddMultiply => "add_multiply",
         }
@@ -443,20 +456,38 @@ impl Primitive {
         let spec = match self {
             Self::Unary(op) => {
                 let [a] = self.arity::<1>(inputs)?;
+                // As the ops layer promotes and rejects (the kernels rely on it).
+                let supported = match op {
+                    UnaryOp::Negative => a.dtype() != DType::Bool,
+                    UnaryOp::Abs | UnaryOp::Conjugate => true,
+                    _ => a.dtype().category() == Category::Float,
+                };
+                if !supported {
+                    return Err(Error::unsupported_dtype(op.name(), a.dtype()));
+                }
                 let dtype = match (op, a.dtype()) {
                     (UnaryOp::Abs, DType::Complex64) => DType::F32,
                     (_, d) => d,
                 };
-                computed(dtype, a.shape())
+                computed(dtype, a.dims())
             }
             Self::Binary(op) => {
                 let [a, b] = self.arity::<2>(inputs)?;
                 self.same_shape_and_dtype(a, b)?;
-                if *op == BinaryOp::LogAddExp && a.dtype().category() != Category::Float {
-                    return Err(Error::UnsupportedDType {
-                        op: op.name(),
-                        dtype: a.dtype(),
-                    });
+                let category = a.dtype().category();
+                let unsupported = match op {
+                    BinaryOp::LogAddExp => category != Category::Float,
+                    BinaryOp::Divide => !matches!(category, Category::Float | Category::Complex),
+                    BinaryOp::Maximum
+                    | BinaryOp::Minimum
+                    | BinaryOp::Less
+                    | BinaryOp::LessEqual
+                    | BinaryOp::Greater
+                    | BinaryOp::GreaterEqual => category == Category::Complex,
+                    _ => false,
+                };
+                if unsupported {
+                    return Err(Error::unsupported_dtype(op.name(), a.dtype()));
                 }
                 computed(
                     if op.is_comparison() {
@@ -464,34 +495,40 @@ impl Primitive {
                     } else {
                         a.dtype()
                     },
-                    a.shape(),
+                    a.dims(),
                 )
             }
             Self::Select => {
                 let [c, a, b] = self.arity::<3>(inputs)?;
                 self.same_shape_and_dtype(a, b)?;
-                if c.dtype() != DType::Bool || c.shape() != a.shape() {
+                if c.dtype() != DType::Bool || c.dims() != a.dims() {
                     return Err(Error::InvalidArgument(
                         "where: condition must be a bool array of the same shape".into(),
                     ));
                 }
-                computed(a.dtype(), a.shape())
+                computed(a.dtype(), a.dims())
             }
             Self::AsType(dtype) => {
                 let [a] = self.arity::<1>(inputs)?;
-                computed(*dtype, a.shape())
+                computed(*dtype, a.dims())
             }
             Self::Reshape(shape) => {
                 let [a] = self.arity::<1>(inputs)?;
+                if crate::shape::checked_size(shape)? != a.size() {
+                    return Err(Error::InvalidArgument(format!(
+                        "reshape: cannot reshape {} elements into shape {shape:?}",
+                        a.size()
+                    )));
+                }
                 OutputSpec {
                     dtype: a.dtype(),
                     shape: shape.as_slice().into(),
-                    strides: view::nocopy_reshape(a.shape(), a.strides(), shape),
+                    strides: view::nocopy_reshape(a.dims(), a.strides(), shape),
                 }
             }
             Self::Transpose(axes) => {
                 let [a] = self.arity::<1>(inputs)?;
-                let (shape, strides) = view::permute(a.shape(), a.strides(), axes)?;
+                let (shape, strides) = view::permute(a.dims(), a.strides(), axes)?;
                 OutputSpec {
                     dtype: a.dtype(),
                     shape,
@@ -500,7 +537,14 @@ impl Primitive {
             }
             Self::Slice { len, .. } => {
                 let [a] = self.arity::<1>(inputs)?;
-                let (strides, _) = view::slice_geometry(a.strides(), &self.dim_slices(a.ndim())?);
+                let dims = self.dim_slices(a.ndim())?;
+                if !region_fits(&dims, a.dims()) {
+                    return Err(Error::InvalidArgument(format!(
+                        "slice: region {dims:?} does not fit shape {:?}",
+                        a.dims()
+                    )));
+                }
+                let (strides, _) = view::slice_geometry(a.strides(), &dims);
                 OutputSpec {
                     dtype: a.dtype(),
                     shape: len.as_slice().into(),
@@ -509,75 +553,115 @@ impl Primitive {
             }
             Self::Broadcast(shape) => {
                 let [a] = self.arity::<1>(inputs)?;
-                let strides = view::broadcast_strides(a.shape(), a.strides(), shape)?;
+                let strides = view::broadcast_strides(a.dims(), a.strides(), shape)?;
                 OutputSpec {
                     dtype: a.dtype(),
                     shape: shape.as_slice().into(),
                     strides: Some(strides),
                 }
             }
+            Self::Copy => {
+                let [a] = self.arity::<1>(inputs)?;
+                computed(a.dtype(), a.dims())
+            }
+            Self::Depends { n_deps } => {
+                if inputs.len() != n_deps + 1 {
+                    return Err(Error::InvalidArgument(format!(
+                        "depends: {} dependencies expected, got {}",
+                        n_deps,
+                        inputs.len().saturating_sub(1)
+                    )));
+                }
+                let a = &inputs[0];
+                OutputSpec {
+                    dtype: a.dtype(),
+                    shape: a.dims().into(),
+                    strides: Some(a.strides().into()),
+                }
+            }
             Self::StopGradient => {
                 let [a] = self.arity::<1>(inputs)?;
                 OutputSpec {
                     dtype: a.dtype(),
-                    shape: a.shape().into(),
+                    shape: a.dims().into(),
                     strides: Some(a.strides().into()),
                 }
             }
             Self::SliceUpdate { len, .. } => {
                 let [base, update] = self.arity::<2>(inputs)?;
                 let dims = self.dim_slices(base.ndim())?;
-                let in_bounds = dims.iter().zip(base.shape()).all(|(d, &n)| {
-                    let last = d.start as isize + (d.len as isize - 1) * d.step;
-                    d.len == 0 || (d.start < n && (0..n as isize).contains(&last))
-                });
-                if !in_bounds || update.shape() != len.as_slice() {
+                if !region_fits(&dims, base.dims()) || update.dims() != len.as_slice() {
                     return Err(Error::InvalidArgument(format!(
                         "slice_update: region {dims:?} does not fit shape {:?} with update {:?}",
-                        base.shape(),
-                        update.shape()
+                        base.dims(),
+                        update.dims()
                     )));
                 }
                 if base.dtype() != update.dtype() {
-                    return Err(Error::DTypeMismatch {
-                        op: "slice_update",
-                        lhs: base.dtype(),
-                        rhs: update.dtype(),
-                    });
+                    return Err(Error::dtype_mismatch(
+                        "slice_update",
+                        base.dtype(),
+                        update.dtype(),
+                    ));
                 }
-                computed(base.dtype(), base.shape())
+                computed(base.dtype(), base.dims())
             }
-            Self::Reduce { axes, .. } => {
+            Self::Reduce { op, axes } => {
                 let [a] = self.arity::<1>(inputs)?;
-                computed(a.dtype(), &self.reduced_shape(a.shape(), axes)?)
+                let shape = self.reduced_shape(a.dims(), axes)?;
+                if !axes.windows(2).all(|w| w[0] < w[1]) {
+                    return Err(Error::InvalidArgument(format!(
+                        "{}: axes {axes:?} must be sorted and unique",
+                        self.name()
+                    )));
+                }
+                let supported = match op {
+                    ReduceOp::And | ReduceOp::Or => a.dtype() == DType::Bool,
+                    ReduceOp::Max | ReduceOp::Min => a.dtype() != DType::Complex64,
+                    ReduceOp::Sum | ReduceOp::Prod => true,
+                };
+                if !supported {
+                    return Err(Error::unsupported_dtype(self.name(), a.dtype()));
+                }
+                let ordered = matches!(op, ReduceOp::Max | ReduceOp::Min);
+                if ordered && axes.iter().any(|&d| a.dims()[d] == 0) {
+                    return Err(Error::InvalidArgument(format!(
+                        "{}: cannot reduce a zero-length axis (no identity)",
+                        self.name()
+                    )));
+                }
+                computed(a.dtype(), &shape)
             }
             Self::ArgReduce { axis, .. } => {
                 let [a] = self.arity::<1>(inputs)?;
-                computed(DType::U32, &self.reduced_shape(a.shape(), &[*axis])?)
+                if a.dtype() == DType::Complex64 {
+                    return Err(Error::unsupported_dtype(self.name(), a.dtype()));
+                }
+                computed(DType::U32, &self.reduced_shape(a.dims(), &[*axis])?)
             }
             Self::GatherAxis { axis } => {
                 let [src, indices] = self.arity::<2>(inputs)?;
                 self.indexed(src, indices, *axis)?;
-                computed(src.dtype(), indices.shape())
+                computed(src.dtype(), indices.dims())
             }
             Self::ScatterAxis { axis, .. } => {
                 let [dst, indices, updates] = self.arity::<3>(inputs)?;
                 self.indexed(dst, indices, *axis)?;
-                if updates.shape() != indices.shape() {
-                    return Err(Error::ShapeMismatch {
-                        op: self.name(),
-                        lhs: indices.shape().to_vec(),
-                        rhs: updates.shape().to_vec(),
-                    });
+                if updates.dims() != indices.dims() {
+                    return Err(Error::shape_mismatch(
+                        self.name(),
+                        indices.dims(),
+                        updates.dims(),
+                    ));
                 }
                 if updates.dtype() != dst.dtype() {
-                    return Err(Error::DTypeMismatch {
-                        op: self.name(),
-                        lhs: dst.dtype(),
-                        rhs: updates.dtype(),
-                    });
+                    return Err(Error::dtype_mismatch(
+                        self.name(),
+                        dst.dtype(),
+                        updates.dtype(),
+                    ));
                 }
-                computed(dst.dtype(), dst.shape())
+                computed(dst.dtype(), dst.dims())
             }
             Self::Sort { axis } | Self::ArgSort { axis } | Self::Scan { axis, .. } => {
                 let [a] = self.arity::<1>(inputs)?;
@@ -608,16 +692,13 @@ impl Primitive {
                 if (ordered && category == crate::Category::Complex)
                     || (float_only && category != crate::Category::Float)
                 {
-                    return Err(Error::UnsupportedDType {
-                        op: self.name(),
-                        dtype: a.dtype(),
-                    });
+                    return Err(Error::unsupported_dtype(self.name(), a.dtype()));
                 }
                 let dtype = match self {
                     Self::ArgSort { .. } => DType::U32,
                     _ => a.dtype(),
                 };
-                computed(dtype, a.shape())
+                computed(dtype, a.dims())
             }
             Self::Concatenate { axis } => {
                 let first = inputs.first().ok_or_else(|| {
@@ -629,29 +710,27 @@ impl Primitive {
                         first.ndim()
                     )));
                 }
-                let mut shape: Shape = first.shape().into();
+                let mut shape: Shape = first.dims().into();
                 for a in &inputs[1..] {
                     let fits = a.ndim() == first.ndim()
-                        && a.shape()
+                        && a.dims()
                             .iter()
-                            .zip(first.shape())
+                            .zip(first.dims())
                             .enumerate()
                             .all(|(d, (x, y))| d == *axis || x == y);
                     if !fits {
-                        return Err(Error::ShapeMismatch {
-                            op: "concatenate",
-                            lhs: first.shape().to_vec(),
-                            rhs: a.shape().to_vec(),
-                        });
+                        return Err(Error::shape_mismatch("concatenate", first.dims(), a.dims()));
                     }
                     if a.dtype() != first.dtype() {
-                        return Err(Error::DTypeMismatch {
-                            op: "concatenate",
-                            lhs: first.dtype(),
-                            rhs: a.dtype(),
-                        });
+                        return Err(Error::dtype_mismatch(
+                            "concatenate",
+                            first.dtype(),
+                            a.dtype(),
+                        ));
                     }
-                    shape[*axis] += a.shape()[*axis];
+                    shape[*axis] = shape[*axis].checked_add(a.dims()[*axis]).ok_or_else(|| {
+                        Error::InvalidArgument("concatenate: the joined size overflows".into())
+                    })?;
                 }
                 computed(first.dtype(), &shape)
             }
@@ -666,34 +745,29 @@ impl Primitive {
                         (a, b)
                     }
                 };
-                let (sa, sb) = (a.shape(), b.shape());
+                let (sa, sb) = (a.dims(), b.dims());
                 let n = sa.len();
                 let valid =
                     n >= 2 && sb.len() == n && sa[..n - 2] == sb[..n - 2] && sa[n - 1] == sb[n - 2];
                 if !valid {
-                    return Err(Error::ShapeMismatch {
-                        op: self.name(),
-                        lhs: sa.to_vec(),
-                        rhs: sb.to_vec(),
-                    });
+                    return Err(Error::shape_mismatch(self.name(), sa, sb));
                 }
                 if a.dtype() != b.dtype() {
-                    return Err(Error::DTypeMismatch {
-                        op: self.name(),
-                        lhs: a.dtype(),
-                        rhs: b.dtype(),
-                    });
+                    return Err(Error::dtype_mismatch(self.name(), a.dtype(), b.dtype()));
+                }
+                if !matches!(a.dtype().category(), Category::Float | Category::Complex) {
+                    return Err(Error::unsupported_dtype(self.name(), a.dtype()));
                 }
                 let mut shape: Shape = sa.into();
                 shape[n - 1] = sb[n - 1];
                 if let Self::AddMM { .. } = self {
                     let c = &inputs[2];
-                    if c.shape() != shape.as_slice() || c.dtype() != a.dtype() {
+                    if c.dims() != shape.as_slice() || c.dtype() != a.dtype() {
                         return Err(Error::InvalidArgument(format!(
                             "addmm: c must be {} of shape {shape:?}, got {} {:?}",
                             a.dtype(),
                             c.dtype(),
-                            c.shape()
+                            c.dims()
                         )));
                     }
                 }
@@ -701,11 +775,11 @@ impl Primitive {
             }
             Self::RandomBits { shape, width } => {
                 let [keys] = self.arity::<1>(inputs)?;
-                if keys.dtype() != DType::U32 || keys.shape().last() != Some(&2) {
+                if keys.dtype() != DType::U32 || keys.dims().last() != Some(&2) {
                     return Err(Error::InvalidArgument(format!(
                         "random_bits: keys must be uint32 of shape [..., 2], got {} {:?}",
                         keys.dtype(),
-                        keys.shape()
+                        keys.dims()
                     )));
                 }
                 let dtype = match width {
@@ -718,7 +792,7 @@ impl Primitive {
                         )));
                     }
                 };
-                let out: Vec<usize> = keys.shape()[..keys.ndim() - 1]
+                let out: Vec<usize> = keys.dims()[..keys.ndim() - 1]
                     .iter()
                     .chain(shape)
                     .copied()
@@ -740,13 +814,9 @@ impl Primitive {
                         fused.inputs()
                     )));
                 }
-                let shape = inputs[0].shape();
-                if let Some(other) = inputs.iter().find(|a| a.shape() != shape) {
-                    return Err(Error::ShapeMismatch {
-                        op: "compiled",
-                        lhs: shape.to_vec(),
-                        rhs: other.shape().to_vec(),
-                    });
+                let shape = inputs[0].dims();
+                if let Some(other) = inputs.iter().find(|a| a.dims() != shape) {
+                    return Err(Error::shape_mismatch("compiled", shape, other.dims()));
                 }
                 return Ok(fused
                     .dtypes()
@@ -756,23 +826,21 @@ impl Primitive {
             }
             Self::Quantize { group_size, bits } => {
                 let [w] = self.arity::<1>(inputs)?;
+                crate::quantized::check_params(self.name(), *group_size, u32::from(*bits))?;
                 let n = w.ndim();
                 if !matches!(w.dtype(), DType::F16 | DType::BF16 | DType::F32) {
-                    return Err(Error::UnsupportedDType {
-                        op: "quantize",
-                        dtype: w.dtype(),
-                    });
+                    return Err(Error::unsupported_dtype("quantize", w.dtype()));
                 }
-                if n < 2 || w.shape()[n - 1] % group_size != 0 {
+                if n < 2 || w.dims()[n - 1] % group_size != 0 {
                     return Err(Error::InvalidArgument(format!(
                         "quantize: needs at least 2 dimensions with the last divisible by \
                          the group size {group_size}, got shape {:?}",
-                        w.shape()
+                        w.dims()
                     )));
                 }
-                let last = w.shape()[n - 1];
+                let last = w.dims()[n - 1];
                 let with_last = |d: usize| {
-                    let mut s: Shape = w.shape().into();
+                    let mut s: Shape = w.dims().into();
                     s[n - 1] = d;
                     s
                 };
@@ -782,7 +850,8 @@ impl Primitive {
             }
             Self::Dequantize { group_size, bits } => {
                 let [w, scales, _] = self.arity::<3>(inputs)?;
-                let mut shape: Shape = w.shape().into();
+                crate::quantized::check_params(self.name(), *group_size, u32::from(*bits))?;
+                let mut shape: Shape = w.dims().into();
                 let n = shape.len();
                 shape[n - 1] = self.quantized_columns(w, &inputs[1..], *group_size, *bits)?;
                 computed(scales.dtype(), &shape)
@@ -793,30 +862,31 @@ impl Primitive {
                 transpose,
             } => {
                 let [x, w, scales, _] = self.arity::<4>(inputs)?;
+                crate::quantized::check_params(self.name(), *group_size, u32::from(*bits))?;
                 let columns = self.quantized_columns(w, &inputs[2..], *group_size, *bits)?;
-                let rows = w.shape()[w.ndim() - 2];
+                let rows = w.dims()[w.ndim() - 2];
                 let (inner, outer) = if *transpose {
                     (columns, rows)
                 } else {
                     (rows, columns)
                 };
                 let (xn, wn) = (x.ndim(), w.ndim());
-                let batch_ok = wn == 2 || (xn == wn && x.shape()[..xn - 2] == w.shape()[..wn - 2]);
-                if xn == 0 || x.shape()[xn - 1] != inner || !batch_ok {
-                    return Err(Error::ShapeMismatch {
-                        op: "quantized_matmul",
-                        lhs: x.shape().to_vec(),
-                        rhs: w.shape().to_vec(),
-                    });
+                let batch_ok = wn == 2 || (xn == wn && x.dims()[..xn - 2] == w.dims()[..wn - 2]);
+                if xn == 0 || x.dims()[xn - 1] != inner || !batch_ok {
+                    return Err(Error::shape_mismatch(
+                        "quantized_matmul",
+                        x.dims(),
+                        w.dims(),
+                    ));
                 }
                 if x.dtype() != scales.dtype() {
-                    return Err(Error::DTypeMismatch {
-                        op: "quantized_matmul",
-                        lhs: x.dtype(),
-                        rhs: scales.dtype(),
-                    });
+                    return Err(Error::dtype_mismatch(
+                        "quantized_matmul",
+                        x.dtype(),
+                        scales.dtype(),
+                    ));
                 }
-                let mut shape: Shape = x.shape().into();
+                let mut shape: Shape = x.dims().into();
                 shape[xn - 1] = outer;
                 computed(x.dtype(), &shape)
             }
@@ -838,7 +908,7 @@ impl Primitive {
                     .iter()
                     .map(|a| OutputSpec {
                         dtype: a.dtype(),
-                        shape: a.shape().into(),
+                        shape: a.dims().into(),
                         strides: Some(a.strides().into()),
                     })
                     .collect());
@@ -847,7 +917,7 @@ impl Primitive {
             Self::AddMultiply => {
                 let [a, b] = self.arity::<2>(inputs)?;
                 self.same_shape_and_dtype(a, b)?;
-                let spec = computed(a.dtype(), a.shape());
+                let spec = computed(a.dtype(), a.dims());
                 return Ok(smallvec![spec.clone(), spec]);
             }
         };
@@ -894,28 +964,28 @@ impl Primitive {
         }
         if !matches!(scales.dtype(), DType::F16 | DType::BF16 | DType::F32)
             || biases.dtype() != scales.dtype()
-            || biases.shape() != scales.shape()
+            || biases.dims() != scales.dims()
         {
             return invalid(format!(
                 "scales and biases must share a float dtype and shape, got {} {:?} and {} {:?}",
                 scales.dtype(),
-                scales.shape(),
+                scales.dims(),
                 biases.dtype(),
-                biases.shape()
+                biases.dims()
             ));
         }
-        let packed = w.shape().last().copied().unwrap_or(0) * 32;
-        let groups = scales.shape().last().copied().unwrap_or(0) * group_size;
+        let packed = w.dims().last().copied().unwrap_or(0) * 32;
+        let groups = scales.dims().last().copied().unwrap_or(0) * group_size;
         if n < 2
             || scales.ndim() != n
-            || w.shape()[..n - 1] != scales.shape()[..n - 1]
+            || w.dims()[..n - 1] != scales.dims()[..n - 1]
             || packed != groups * usize::from(bits)
         {
             return invalid(format!(
                 "packed weights {:?} and scales {:?} do not match group size {group_size} \
                  and {bits} bits",
-                w.shape(),
-                scales.shape()
+                w.dims(),
+                scales.dims()
             ));
         }
         Ok(groups)
@@ -937,20 +1007,20 @@ impl Primitive {
         let fits = indices.ndim() == array.ndim()
             && axis < array.ndim()
             && indices
-                .shape()
+                .dims()
                 .iter()
-                .zip(array.shape())
+                .zip(array.dims())
                 .enumerate()
                 .all(|(d, (i, a))| d == axis || i == a);
         if !fits {
             return Err(Error::InvalidArgument(format!(
                 "{}: indices of shape {:?} do not fit an array of shape {:?} along axis {axis}",
                 self.name(),
-                indices.shape(),
-                array.shape()
+                indices.dims(),
+                array.dims()
             )));
         }
-        if array.shape()[axis] == 0 && indices.size() > 0 {
+        if array.dims()[axis] == 0 && indices.size() > 0 {
             return Err(Error::InvalidArgument(format!(
                 "{}: cannot index an empty axis",
                 self.name()
@@ -984,22 +1054,48 @@ impl Primitive {
     }
 
     fn same_shape_and_dtype(&self, a: &Array, b: &Array) -> Result<()> {
-        if a.shape() != b.shape() {
-            return Err(Error::ShapeMismatch {
-                op: self.name(),
-                lhs: a.shape().to_vec(),
-                rhs: b.shape().to_vec(),
-            });
+        if a.dims() != b.dims() {
+            return Err(Error::shape_mismatch(self.name(), a.dims(), b.dims()));
         }
         if a.dtype() != b.dtype() {
-            return Err(Error::DTypeMismatch {
-                op: self.name(),
-                lhs: a.dtype(),
-                rhs: b.dtype(),
-            });
+            return Err(Error::dtype_mismatch(self.name(), a.dtype(), b.dtype()));
         }
         Ok(())
     }
+}
+
+/// A row-contiguous copy of `x` ([`Primitive::Copy`]).
+pub(crate) fn copy(x: &Array) -> Result<Array> {
+    Ok(Array::from_op(Primitive::Copy, vec![x.clone()])?.swap_remove(0))
+}
+
+/// `x`, evaluated after `deps` ([`Primitive::Depends`]).
+pub(crate) fn depends(x: &Array, deps: &[Array]) -> Result<Array> {
+    let mut inputs = Vec::with_capacity(deps.len() + 1);
+    inputs.push(x.clone());
+    inputs.extend_from_slice(deps);
+    let primitive = Primitive::Depends { n_deps: deps.len() };
+    Ok(Array::from_op(primitive, inputs)?.swap_remove(0))
+}
+
+/// Whether each dimension's slice selects indices within `shape` with a non-zero step (a
+/// zero-length slice starts at most at the end), so that no offset computed from it
+/// overflows. The step of a slice of at most one index is never applied (any value).
+pub(crate) fn region_fits(dims: &[DimSlice], shape: &[usize]) -> bool {
+    dims.len() == shape.len()
+        && dims.iter().zip(shape).all(|(d, &n)| {
+            if d.step == 0 {
+                return false;
+            }
+            if d.len == 0 {
+                return d.start <= n;
+            }
+            let last = isize::try_from(d.len - 1)
+                .ok()
+                .and_then(|steps| steps.checked_mul(d.step))
+                .and_then(|span| isize::try_from(d.start).ok()?.checked_add(span));
+            d.start < n && last.is_some_and(|last| (0..n as isize).contains(&last))
+        })
 }
 
 #[cfg(test)]

@@ -2,24 +2,38 @@
 
 use std::sync::Arc;
 
-use crate::array::{Data, Node, NodeMap, NodeSet, State};
+use crate::array::{Completion, Data, Node, NodeMap, NodeSet, State};
 use crate::gpu::GpuEval;
 use crate::kernels::{self, Operand};
 use crate::primitive::Primitive;
+use crate::tree::{Leaves, collect_leaves};
 use crate::{Array, DeviceKind, Error, Result, view};
 
-/// Evaluates `arrays` and everything they depend on, and waits for them. Each node runs at
-/// most once, even across threads.
+/// Evaluates the leaves of `tree` and everything they depend on, and waits for them. Each
+/// node runs at most once, even across threads.
+///
+/// `tree` is any [`Leaves`] value: a slice or array of arrays (`eval(&[a, b])`), a `Vec`, a
+/// model, or a borrowed view such as `&(&loss, &grads)`, which evaluates both without
+/// cloning either.
 ///
 /// Nodes on the GPU stream run as Metal kernels where one exists, and on the CPU (over the
 /// same unified memory) otherwise. Returns the first error among `arrays`. Errors are
 /// sticky: a failed array, and anything computed from it, fails with the same error on
 /// every later evaluation or readback.
-pub fn eval(arrays: &[Array]) -> Result<()> {
-    schedule(arrays).eval()
+///
+/// A failed GPU command buffer fails the evaluation that encoded it (its outputs and those
+/// of its later command buffers) and every evaluation that read its results while they
+/// were in flight; independent evaluations, earlier or later, are unaffected.
+///
+/// Several threads may evaluate arrays that share work: each node runs once, and a thread
+/// that needs a node another thread is running waits for it (after submitting its own GPU
+/// work), receiving its error if it fails.
+pub fn eval<T: Leaves + ?Sized>(tree: &T) -> Result<()> {
+    schedule(&collect_leaves(tree)).eval()
 }
 
-/// Starts evaluating `arrays` and returns without waiting for GPU work: reading the arrays
+/// Starts evaluating the leaves of `tree` (any [`Leaves`] value, as [`eval`]) and returns
+/// without waiting for GPU work: reading the arrays
 /// (or evaluating them) later waits for exactly the work they need. As in MLX, use it to
 /// overlap building the next computation with the GPU running this one.
 ///
@@ -28,19 +42,19 @@ pub fn eval(arrays: &[Array]) -> Result<()> {
 /// an affected array. Submission blocks while too many command buffers are in flight.
 ///
 /// ```
-/// use nuvec_core::{Array, Result, async_eval};
+/// use nuvec_core::{Result, array, async_eval};
 ///
 /// # fn main() -> Result<()> {
-/// let x = Array::from_slice(&[1.0f32, 2.0], &[2])?;
+/// let x = array![1.0, 2.0];
 /// let y = &x * 3.0;
-/// async_eval(std::slice::from_ref(&y))?;
+/// async_eval(&y)?;
 /// // ... build the next computation here ...
 /// assert_eq!(y.to_vec::<f32>()?, [3.0, 6.0]); // waits for `y` only
 /// # Ok(())
 /// # }
 /// ```
-pub fn async_eval(arrays: &[Array]) -> Result<()> {
-    schedule(arrays).async_eval()
+pub fn async_eval<T: Leaves + ?Sized>(tree: &T) -> Result<()> {
+    schedule(&collect_leaves(tree)).async_eval()
 }
 
 /// `arrays` with the work they need put in order, to be started later by
@@ -52,10 +66,10 @@ pub fn async_eval(arrays: &[Array]) -> Result<()> {
 /// started; nodes evaluated in between (by another evaluation) are skipped.
 ///
 /// ```
-/// use nuvec_core::{Array, Result, schedule};
+/// use nuvec_core::{Result, array, schedule};
 ///
 /// # fn main() -> Result<()> {
-/// let x = Array::from_slice(&[1.0f32, 2.0], &[2])?;
+/// let x = array![1.0, 2.0];
 /// let y = &(&x * 3.0) + 1.0;
 /// let scheduled = schedule(std::slice::from_ref(&y));
 /// // ... wait for something else here ...
@@ -96,7 +110,7 @@ impl Scheduled {
     pub fn async_eval(self) -> Result<()> {
         let arrays = self.arrays.clone();
         self.submit().commit();
-        match arrays.iter().find_map(Array::error) {
+        match arrays.iter().find_map(Array::slot_error) {
             Some(err) => Err(err),
             None => Ok(()),
         }
@@ -156,7 +170,8 @@ fn topological_order(arrays: &[Array]) -> Vec<Arc<Node>> {
         }
         let pending: Vec<Arc<Node>> = match &*node.lock() {
             State::Pending { inputs, .. } => inputs.iter().map(|a| a.node.clone()).collect(),
-            State::Retained { .. } | State::Done => {
+            // Running on another thread: its consumers wait for it (`input_data`).
+            State::Running { .. } | State::Retained { .. } | State::Done | State::Failed { .. } => {
                 done.insert(key);
                 continue;
             }
@@ -215,41 +230,123 @@ fn topological_order(arrays: &[Array]) -> Vec<Arc<Node>> {
 
 /// Runs one node whose inputs are all evaluated, stores (or, for GPU work, defers) its
 /// outputs, and detaches it (unless a running transform needs its graph).
+///
+/// The node's lock is held only to move it from `Pending` to `Running` and from `Running`
+/// to its final state: computing (which may wait for inputs another thread is producing)
+/// happens without it, so two evaluations sharing nodes never wait on each other's locks.
+/// A node another thread is running is skipped here; its consumers wait for it in
+/// [`input_data`].
 fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
-    let mut state = node.lock();
-    let (primitive, inputs) = match std::mem::replace(&mut *state, State::Done) {
-        State::Pending { primitive, inputs } => (primitive, inputs),
-        evaluated => {
-            *state = evaluated; // evaluated meanwhile by another thread
-            return;
+    let done = Arc::new(Completion::default());
+    let (primitive, mut inputs) = {
+        let mut state = node.lock();
+        if !matches!(*state, State::Pending { .. }) {
+            return; // evaluated, or running, on another thread
         }
+        let running = State::Running {
+            owner: std::thread::current().id(),
+            done: done.clone(),
+        };
+        match std::mem::replace(&mut *state, running) {
+            State::Pending { primitive, inputs } => (primitive, inputs),
+            _ => unreachable!("checked above"),
+        }
+    };
+    let running = Running {
+        node,
+        done,
+        finished: false,
     };
     #[cfg(test)]
     counter::inc();
-    let mut inputs = inputs;
     let result = match donation(node, &primitive, &mut inputs, &mut *gpu) {
         Some(base) => in_place(node, &primitive, &inputs, base, gpu),
         None => compute(node, &primitive, &inputs, gpu),
     };
-    match result {
-        Ok((outputs, true)) => gpu.defer(node.clone(), outputs),
+    let failure = match result {
+        Ok((outputs, true)) => {
+            gpu.defer(node.clone(), outputs);
+            None
+        }
         Ok((outputs, false)) => {
             for (output, data) in node.outputs.iter().zip(outputs) {
                 let _ = output.slot.set(Ok(data));
             }
+            None
         }
         Err(err) => {
             for output in &node.outputs {
                 let _ = output.slot.set(Err(err.clone()));
             }
+            Some(err)
         }
-    }
-    if node.tracer && crate::transforms::tracing() {
-        *state = State::Retained { primitive, inputs };
+    };
+    // A tracer keeps its graph while its transform runs, which releases it on exit.
+    if crate::transforms::retain(node) {
+        running.finish(State::Retained { primitive, inputs });
         return;
     }
-    drop(state);
+    running.finish(match failure {
+        Some(error) => State::Failed { error },
+        None => State::Done,
+    });
     drop(inputs); // detach: release the inputs outside the lock
+}
+
+/// A node this thread is running. Finishing it publishes its final state and wakes the
+/// threads waiting for it; dropping it unfinished (a panic while computing) fails it, so
+/// waiters never hang.
+struct Running<'a> {
+    node: &'a Arc<Node>,
+    done: Arc<Completion>,
+    finished: bool,
+}
+
+impl Running<'_> {
+    fn finish(mut self, state: State) {
+        *self.node.lock() = state;
+        self.done.finish();
+        // Dropping `self` now releases `done` without failing the node.
+        self.finished = true;
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let error = Error::Backend("the evaluation of this array panicked".into());
+        for output in &self.node.outputs {
+            let _ = output.slot.set(Err(error.clone()));
+        }
+        *self.node.lock() = State::Failed { error };
+        self.done.finish();
+    }
+}
+
+/// Waits until `node`, if another thread is running it, has finished. The owner may wait
+/// for GPU work of ours in turn, so our open command buffer is committed first. Returns
+/// the owner's error if the node failed.
+fn wait_running(node: &Node, gpu: &mut GpuEval) -> Result<()> {
+    let done = match &*node.lock() {
+        State::Running { owner, done } => {
+            if *owner == std::thread::current().id() {
+                return Err(Error::InvalidArgument(
+                    "eval: an array was evaluated from within its own evaluation".into(),
+                ));
+            }
+            done.clone()
+        }
+        State::Failed { error } => return Err(error.clone()),
+        _ => return Ok(()),
+    };
+    gpu.commit();
+    done.wait();
+    match &*node.lock() {
+        State::Failed { error } => Err(error.clone()),
+        _ => Ok(()),
+    }
 }
 
 /// An input to be written in place (MLX's donation), and its buffer: an update's base
@@ -263,17 +360,20 @@ fn donation(
     gpu: &mut GpuEval,
 ) -> Option<(usize, Data)> {
     let device = node.stream.device;
-    if node.tracer || device.kind == DeviceKind::Cpu || !gpu.available(device) {
+    if node.is_tracer() || device.kind == DeviceKind::Cpu || !gpu.available(device) {
         return None;
     }
     let base = match primitive {
         Primitive::SliceUpdate { .. }
-        | Primitive::Fast(crate::fast::FastOp::NormRope { cache: true, .. })
-        | Primitive::Fast(crate::fast::FastOp::PagedWrite) => Some(0),
-        Primitive::Fast(crate::fast::FastOp::GatedDeltaSlots) => Some(5),
+        | Primitive::Fast(crate::fast::imp::FastOp::NormRope { cache: true, .. })
+        | Primitive::Fast(crate::fast::imp::FastOp::PagedWrite) => Some(0),
+        Primitive::Fast(crate::fast::imp::FastOp::GatedDeltaSlots) => Some(5),
         _ => None,
     };
     if let Some(at) = base {
+        if !donatable_size(inputs[at].size()) {
+            return None;
+        }
         return owned(&mut inputs[at], gpu).map(|data| (at, data));
     }
     let [out] = node.outputs.as_slice() else {
@@ -285,6 +385,12 @@ fn donation(
         }
     }
     None
+}
+
+/// Whether a buffer of `size` elements may be written in place: the in-place kernels index
+/// with 32 bits (as the GPU's `supports` requires of every operand).
+fn donatable_size(size: usize) -> bool {
+    size > 0 && size < u32::MAX as usize
 }
 
 /// The inputs of an element-wise operation or softmax whose buffer the output may take:
@@ -299,17 +405,17 @@ fn in_place_inputs(
         Primitive::Unary(op) if *op != UnaryOp::Conjugate => &[0],
         Primitive::Binary(_) => &[0, 1],
         Primitive::Select => &[1, 2],
-        Primitive::Fast(crate::fast::FastOp::Softmax) => &[0],
+        Primitive::Fast(crate::fast::imp::FastOp::Softmax) => &[0],
         _ => &[],
     };
     let float = matches!(out.dtype, DType::F16 | DType::BF16 | DType::F32);
-    if !float || out.size == 0 || out.size >= u32::MAX as usize {
+    if !float || !donatable_size(out.size) {
         return Vec::new();
     }
     candidates
         .iter()
         .copied()
-        .filter(|&i| inputs[i].dtype() == out.dtype && inputs[i].shape() == out.shape.as_slice())
+        .filter(|&i| inputs[i].dtype() == out.dtype && inputs[i].dims() == out.shape.as_slice())
         .collect()
 }
 
@@ -324,6 +430,13 @@ fn in_place_inputs(
 /// taking it over under the lock that publishing takes means it is never published), or
 /// computed earlier in this evaluation. The buffer's fences and the encoder's barriers
 /// order the write after the work that produces and reads it.
+///
+/// Invariant (concurrency): the `Arc::strong_count` checks are race-free only because a
+/// node no other handle refers to is out of every graph: another thread can reach a node
+/// only through an `Arc` (an array, a consumer's inputs, or its own evaluation order),
+/// and each of those counts. Weak references from committed GPU work upgrade only to
+/// publish, under the in-flight lock that donation takes too. Arrays put in order by [`schedule`] hold their nodes strongly until started,
+/// so scheduled-but-unstarted work disables donation of what it reads.
 fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
     // Output `at` of the node (another output, if any, has no holder either: the node's
     // only strong handle is this input).
@@ -403,17 +516,17 @@ fn in_place(
             .filter_map(|(a, d)| d.as_ref().map(|d| (a.out(), d)))
             .collect()
     };
-    if let Primitive::Fast(crate::fast::FastOp::GatedDeltaSlots) = primitive {
+    if let Primitive::Fast(crate::fast::imp::FastOp::GatedDeltaSlots) = primitive {
         let pool = inputs[at].out();
         let all = operands(0);
         let datas = gpu.gated_delta_slots_in_place(&all, pool, base, &node.outputs)?;
         return Ok((datas, true));
     }
     let data = match primitive {
-        Primitive::Fast(crate::fast::FastOp::PagedWrite) => {
+        Primitive::Fast(crate::fast::imp::FastOp::PagedWrite) => {
             gpu.paged_write_in_place(base, &operands(1), out)?
         }
-        Primitive::Fast(crate::fast::FastOp::Softmax) => gpu.softmax_in_place(base, out)?,
+        Primitive::Fast(crate::fast::imp::FastOp::Softmax) => gpu.softmax_in_place(base, out)?,
         Primitive::Fast(op) => gpu.norm_rope_in_place(base, op, &operands(1), out)?,
         Primitive::SliceUpdate { .. } => {
             let slices = primitive.dim_slices(out.shape.len())?;
@@ -446,11 +559,25 @@ fn input_data<'a>(
         // runs after it, so it may read the data at once.
         *pending = true;
         foreign.push(input);
+        gpu.read_in_flight(input);
         Ok(d)
     } else {
         // Produced by another evaluation (another thread, or an earlier `async_eval`):
-        // submit our own GPU work first, so two evaluations never wait on each other.
+        // submit our own GPU work first, so two evaluations never wait on each other, then
+        // wait for the other thread to finish running the node.
         gpu.commit();
+        wait_running(&input.node, gpu)?;
+        if let Some(result) = input.out().slot.get() {
+            return result.clone();
+        }
+        if let Some(d) = input.out().inflight.get() {
+            *pending = true;
+            foreign.push(input);
+            gpu.read_in_flight(input);
+            return Ok(d);
+        }
+        // Deferred in the producer's open GPU work, which it commits before it waits for
+        // anything and at the end of its evaluation.
         input.out().slot.wait().clone()
     }
 }
@@ -483,6 +610,12 @@ fn compute(
         }
         Ok(())
     };
+    if matches!(primitive, Primitive::Depends { .. }) {
+        // An ordering point (blocked attention, checkpoints): the work before it is
+        // encoded, so the intermediates it no longer needs return to the allocator now,
+        // whatever their size, before the work after it allocates.
+        gpu.release_unreferenced();
+    }
     if let Some(views) = view_outputs(primitive, &operands)? {
         // Views do no work: they are published with this evaluation's GPU work (which runs
         // after any foreign producer) or, without GPU work, once the producers complete.
@@ -516,9 +649,10 @@ fn view_outputs(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Optio
         }])
     };
     Ok(match primitive {
-        Primitive::Transpose(_) | Primitive::Broadcast(_) | Primitive::StopGradient => {
-            share(operands[0].1.offset)
-        }
+        Primitive::Transpose(_)
+        | Primitive::Broadcast(_)
+        | Primitive::StopGradient
+        | Primitive::Depends { .. } => share(operands[0].1.offset),
         Primitive::Slice { .. } => {
             let (meta, data) = operands[0];
             let (_, delta) =
@@ -633,11 +767,14 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
             &primitive.dim_slices(operands[0].0.shape.len())?,
         )?),
         // A reshape that `view_outputs` could not express as a view copies.
-        Primitive::Reshape(_) => new(kernels::contiguous(operands[0].0, operands[0].1)?),
+        Primitive::Reshape(_) | Primitive::Copy => {
+            new(kernels::contiguous(operands[0].0, operands[0].1)?)
+        }
         Primitive::Transpose(_)
         | Primitive::Broadcast(_)
         | Primitive::Slice { .. }
         | Primitive::StopGradient
+        | Primitive::Depends { .. }
         | Primitive::Custom(_) => {
             unreachable!("views are handled by view_outputs")
         }
@@ -685,7 +822,7 @@ mod tests {
 
     #[test]
     fn shared_node_runs_once() {
-        let x = Array::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
+        let x = Array::from_slice(&[1.0f32, 2.0], [2]);
         let shared = &x + &x;
         let left = &shared * &x;
         let right = &shared + &x;
@@ -699,13 +836,34 @@ mod tests {
     }
 
     #[test]
+    fn running_releases_its_completion() {
+        // Both ends of a running node release the shared `Completion`: finishing it and
+        // dropping it unfinished (a panic while computing).
+        let x = Array::from_slice(&[1.0f32], [1]);
+        for finish in [true, false] {
+            let done = Arc::new(Completion::default());
+            let running = Running {
+                node: &x.node,
+                done: done.clone(),
+                finished: false,
+            };
+            if finish {
+                running.finish(State::Done);
+            } else {
+                drop(running);
+            }
+            assert_eq!(Arc::strong_count(&done), 1, "finish = {finish}");
+        }
+    }
+
+    #[test]
     fn intermediates_freed() {
         // The live count is per thread; GPU buffers are released on Metal's completion
         // thread, so this checks the CPU path.
         crate::set_default_stream(crate::Stream::default_for(crate::Device::cpu()));
         let before = live::count();
-        let mut x = Array::scalar(0i64);
-        let one = Array::scalar(1i64);
+        let mut x = Array::from(0i64);
+        let one = Array::from(1i64);
         let steps = if cfg!(miri) { 100 } else { 10_000 };
         for _ in 0..steps {
             x = &x + &one;
@@ -722,8 +880,8 @@ mod tests {
 
     #[test]
     fn multi_output_once() {
-        let a = Array::from_slice(&[2i32, 3], &[2]).unwrap();
-        let b = Array::from_slice(&[5i32, 7], &[2]).unwrap();
+        let a = Array::from_slice(&[2i32, 3], [2]);
+        let b = Array::from_slice(&[5i32, 7], [2]);
         let mut outs = Array::from_op(Primitive::AddMultiply, vec![a, b]).unwrap();
         let product = outs.pop().unwrap();
         let sum = outs.pop().unwrap();
@@ -737,13 +895,12 @@ mod tests {
     #[test]
     fn slice_update_writes_a_strided_region() {
         // Base: a transposed view; region: rows 0..3 step 2, columns reversed.
-        let base = crate::arange(0.0, 12.0, 1.0, crate::DType::I32)
+        let base = crate::ops::imp::arange(0.0, 12.0, 1.0, crate::DType::I32)
             .unwrap()
-            .reshape(&[4, 3])
+            .try_reshape(&[4, 3])
             .unwrap()
-            .t()
-            .unwrap(); // [[0,3,6,9],[1,4,7,10],[2,5,8,11]]
-        let update = Array::from_slice(&[-1i32, -2, -3, -4, -5, -6, -7, -8], &[2, 4]).unwrap();
+            .t(); // [[0,3,6,9],[1,4,7,10],[2,5,8,11]]
+        let update = Array::from_slice(&[-1i32, -2, -3, -4, -5, -6, -7, -8], [2, 4]);
         let primitive = Primitive::SliceUpdate {
             start: vec![0, 3],
             step: vec![2, -1],
@@ -756,13 +913,13 @@ mod tests {
             out.to_vec::<i32>().unwrap(),
             [-4, -3, -2, -1, 1, 4, 7, 10, -8, -7, -6, -5]
         );
-        let wrong = Array::from_slice(&[0i32; 3], &[3]).unwrap();
+        let wrong = Array::from_slice(&[0i32; 3], [3]);
         assert!(Array::from_op(primitive, vec![base, wrong]).is_err());
     }
 
     #[test]
     fn tracer_nodes_keep_their_graph_only_while_tracing() {
-        let x = Array::scalar(2.0f32);
+        let x = Array::from(2.0f32);
         let kept = std::cell::Cell::new(false);
         let g = crate::grad(|x: &Array| {
             let y = x * x;
@@ -772,14 +929,10 @@ mod tests {
         });
         assert_eq!(g(&x).unwrap().item::<f32>().unwrap(), 4.0);
         assert!(kept.get(), "retained inside a transform");
-        let traced = crate::vjp(
-            |xs| Ok(vec![&xs[0] * &xs[0]]),
-            &[x],
-            &[Array::scalar(1.0f32)],
-        )
-        .unwrap()
-        .0
-        .remove(0);
+        let traced = crate::vjp_flat(|xs| Ok(vec![&xs[0] * &xs[0]]), &[x], &[Array::from(1.0f32)])
+            .unwrap()
+            .0
+            .remove(0);
         traced.eval().unwrap();
         assert!(
             matches!(&*traced.node.lock(), State::Done),
@@ -788,12 +941,38 @@ mod tests {
     }
 
     #[test]
+    fn huge_buffers_are_never_donated() {
+        // The rule both donation paths (element-wise inputs and update bases) apply.
+        assert!(donatable_size(1));
+        assert!(donatable_size(u32::MAX as usize - 1));
+        assert!(!donatable_size(u32::MAX as usize));
+        assert!(!donatable_size(1 << 33));
+        assert!(!donatable_size(0));
+        // A lazy update of a base of 2^32 elements (metadata only) is never written in
+        // place. (A single dimension cannot exceed `i32::MAX`, so the base is 2-D.)
+        let base =
+            crate::ops::imp::broadcast_to(&Array::from(0.0f32), &[1 << 16, 1 << 16]).unwrap();
+        let update = Array::from_slice(&[1.0f32], [1, 1]);
+        let primitive = Primitive::SliceUpdate {
+            start: vec![0, 0],
+            step: vec![1, 1],
+            len: vec![1, 1],
+        };
+        let out = Array::from_op(primitive.clone(), vec![base.clone(), update.clone()])
+            .unwrap()
+            .remove(0);
+        let mut inputs = vec![base, update];
+        let mut gpu = GpuEval::new();
+        assert!(donation(&out.node, &primitive, &mut inputs, &mut gpu).is_none());
+    }
+
+    #[test]
     fn evaluation_detaches_inputs() {
-        let a = Array::scalar(1u8);
+        let a = Array::from(1u8);
         let c = &a + &a;
-        assert!(c.primitive().is_some());
+        assert!(c.primitive_t().is_some());
         c.eval().unwrap();
-        assert_eq!(c.primitive(), None);
+        assert_eq!(c.primitive_t(), None);
         assert_eq!(Arc::strong_count(&a.node), 1, "c no longer references a");
     }
 
@@ -820,7 +999,7 @@ mod tests {
 
     #[test]
     fn independent_work_is_ordered_side_by_side() {
-        let x = Array::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
+        let x = Array::from_slice(&[1.0f32, 2.0], [2]);
         let (a1, b1) = (&x + 1.0, &x + 3.0);
         let (a2, b2) = (&a1 * 2.0, &b1 * 4.0);
         let top = &a2 + &b2;
@@ -835,13 +1014,13 @@ mod tests {
 
     #[test]
     fn wide_and_shared_graphs_are_ordered() {
-        let x = Array::from_slice(&[1i32], &[1]).unwrap();
-        let one = Array::from_slice(&[1i32], &[1]).unwrap();
+        let x = Array::from_slice(&[1i32], [1]);
+        let one = Array::from_slice(&[1i32], [1]);
         let shared = &x + &x;
         // 100 chains of different depths (wider than the breadth-first limit), joined.
         let mut joined = shared.clone();
         for i in 0..100 {
-            let mut c = &shared + &Array::from_slice(&[i], &[1]).unwrap();
+            let mut c = &shared + &Array::from_slice(&[i], [1]);
             for _ in 0..i % 7 {
                 c = &c * &one;
             }
@@ -860,7 +1039,7 @@ mod tests {
 
     #[test]
     fn scheduled_evaluation_skips_work_done_meanwhile() {
-        let x = Array::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
+        let x = Array::from_slice(&[1.0f32, 2.0], [2]);
         let shared = &x * &x;
         let top = &shared + &x;
         let scheduled = schedule(std::slice::from_ref(&top));

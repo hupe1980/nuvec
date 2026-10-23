@@ -340,6 +340,7 @@ pub(crate) fn addmm(
     let product_meta = Output {
         dtype: meta.dtype,
         shape: meta.shape.clone(),
+        ishape: Default::default(),
         flags: shape::flags_for(&meta.shape, &strides),
         strides,
         size: n,
@@ -701,6 +702,7 @@ pub(crate) fn matmul(a: Operand<'_>, b: Operand<'_>) -> Result<Buffer> {
             let row = |m: &Output| Output {
                 dtype: DType::F32,
                 shape: m.shape.clone(),
+                ishape: Default::default(),
                 strides: shape::row_contiguous_strides(&m.shape),
                 flags: m.flags,
                 size: m.size,
@@ -843,6 +845,7 @@ pub(crate) fn strided(dtype: DType, shape: &[usize], strides: &[isize]) -> Outpu
     Output {
         dtype,
         shape: shape.into(),
+        ishape: Default::default(),
         strides: strides.into(),
         flags: shape::flags_for(shape, strides),
         size: shape.iter().product(),
@@ -918,7 +921,8 @@ fn matmul_typed<T: Pod, G: Gemm + Pod>(a: Operand<'_>, b: Operand<'_>) -> Result
             row_stride: b.0.strides[nd - 2],
             col_stride: b.0.strides[nd - 1],
         };
-        nuvec_cpu::matmul(m, n, k, va, vb, &mut chunk[..m * n]);
+        nuvec_cpu::matmul(m, n, k, va, vb, &mut chunk[..m * n])
+            .map_err(|e| crate::Error::InvalidArgument(e.to_string()))?;
         for d in (0..nd - 2).rev() {
             index[d] += 1;
             if index[d] < sa[d] {

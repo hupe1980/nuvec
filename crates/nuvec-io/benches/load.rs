@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use nuvec_core::{Device, Stream, eval, set_default_stream, sum};
+use nuvec_core::{Device, Stream, eval, set_default_stream};
 use nuvec_io::load_safetensors;
 
 fn main() -> nuvec_core::Result<()> {
@@ -25,11 +25,7 @@ fn main() -> nuvec_core::Result<()> {
     for _ in 0..5 {
         let t = Instant::now();
         let st = load_safetensors(&path)?;
-        let sums = st
-            .tensors
-            .values()
-            .map(|a| sum(a, &[], false))
-            .collect::<nuvec_core::Result<Vec<_>>>()?;
+        let sums = st.tensors.values().map(|a| a.sum(..)).collect::<Vec<_>>();
         eval(&sums)?;
         best = best.min(t.elapsed().as_secs_f64());
     }

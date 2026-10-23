@@ -3,7 +3,7 @@
 //! A Rust number combined with an array adapts to the array: `&f16_array * 2.0` stays
 //! float16, `&int8_array + 1` stays int8 (and `+ 300` is an overflow error), `&bool_array + 1`
 //! is int32, `&int_array * 0.5` is float32. Every Rust scalar is weak, including typed
-//! literals such as `2.0f32`; use [`Array::scalar`] for a strongly typed scalar.
+//! literals such as `2.0f32`; use [`Array::from`] for a strongly typed scalar.
 
 use crate::cast::Canon;
 use crate::{Array, Category, Complex64, DType, Error, Result, bf16, f16};
@@ -140,7 +140,7 @@ impl Scalar {
         })
     }
 
-    fn canon(self) -> Canon {
+    pub(crate) fn canon(self) -> Canon {
         match self {
             Self::Bool(b) => Canon::Int(i128::from(b)),
             Self::Int(v) => Canon::Int(v),
@@ -155,7 +155,7 @@ impl Scalar {
             Some(like) => self.dtype_like(like)?,
             None => self.default_dtype(),
         };
-        crate::ops::filled(&[], dtype, |_| self.canon())
+        crate::ops::imp::filled(&[], dtype, |_| self.canon())
     }
 }
 
@@ -182,7 +182,7 @@ impl ScalarOrArray {
 pub(crate) fn resolve(a: ScalarOrArray, b: ScalarOrArray) -> Result<(Array, Array)> {
     for x in [&a, &b] {
         if let ScalarOrArray::Array(x) = x
-            && let Some(err) = x.error()
+            && let Some(err) = x.slot_error()
         {
             return Err(err);
         }

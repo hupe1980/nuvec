@@ -182,8 +182,8 @@ fn int_values(t: &Tensor) -> Option<Vec<i128>> {
 
 /// Builds an array holding the tensor's elements.
 pub fn to_array(t: &Tensor) -> Array {
-    let s = &t.shape;
-    let a = match t.dtype {
+    let s = &t.shape[..];
+    match t.dtype {
         DType::Bool => Array::from_slice(&t.data.iter().map(|&b| b != 0).collect::<Vec<_>>(), s),
         DType::U8 => Array::from_slice(&t.data, s),
         DType::U16 => Array::from_slice(&decode!(t.data, u16), s),
@@ -221,8 +221,7 @@ pub fn to_array(t: &Tensor) -> Array {
                 s,
             )
         }
-    };
-    a.unwrap()
+    }
 }
 
 /// Reads an array back into a recorded-style tensor.
@@ -266,14 +265,14 @@ pub fn from_array(a: &Array) -> Result<Tensor> {
     };
     Ok(Tensor {
         dtype: a.dtype(),
-        shape: a.shape().to_vec(),
+        shape: a.shape().iter().map(|&d| d as usize).collect(),
         data,
     })
 }
 
 // ── Operation dispatch (mirrors `apply` in the recorder) ────────────────────
 
-fn ints(s: &str) -> Vec<isize> {
+fn ints(s: &str) -> Vec<i32> {
     if s.is_empty() {
         Vec::new()
     } else {
@@ -285,7 +284,16 @@ fn usizes(s: &str) -> Vec<usize> {
     ints(s).into_iter().map(|x| x as usize).collect()
 }
 
-fn slice_args(spec: &str) -> Vec<SliceArg> {
+/// Reduction axes: the recorder writes no axes for "every axis".
+fn reduce_axes(s: &str, x: &Array) -> Vec<i32> {
+    if s.is_empty() {
+        (0..x.ndim() as i32).collect()
+    } else {
+        ints(s)
+    }
+}
+
+fn slice_args(spec: &str) -> Vec<graph::SliceArg> {
     spec.split(';')
         .map(|part| {
             let f: Vec<&str> = part.split(':').collect();
@@ -296,7 +304,7 @@ fn slice_args(spec: &str) -> Vec<SliceArg> {
                     Some(s.parse().unwrap())
                 }
             };
-            SliceArg::new(opt(f[0]), opt(f[1]), f[2].parse().unwrap())
+            graph::SliceArg::new(opt(f[0]), opt(f[1]), f[2].parse().unwrap())
         })
         .collect()
 }
@@ -316,8 +324,14 @@ fn parse_scalar(spec: &str) -> Option<Scalar> {
     })
 }
 
+/// A recorded number: an integer when it parses as one, otherwise a float.
+fn number(s: &str) -> Scalar {
+    s.parse::<i128>()
+        .map_or_else(|_| Scalar::Float(s.parse().unwrap()), Scalar::Int)
+}
+
 /// MLX's random functions, from `key(seed)` or the seeded per-thread sequence.
-fn random_case(case: &Case) -> Result<Array> {
+fn random_case(case: &Case) -> Array {
     let p = |k: &str| case.params.get(k).map(String::as_str).unwrap_or("");
     let f = |k: &str| p(k).parse::<f64>().unwrap();
     let dtype = DTYPES[p("dtype").parse::<usize>().unwrap_or(11)];
@@ -326,38 +340,45 @@ fn random_case(case: &Case) -> Result<Array> {
     let key = if p("seq") == "1" {
         random::seed(seed);
         for _ in 0..p("skip").parse::<usize>().unwrap_or(0) {
-            random::uniform(0.0, 1.0, &shape, DType::F32, None)?;
+            let _ = random::uniform(0.0, 1.0, &shape[..], DType::F32, None);
         }
         None
     } else {
         Some(random::key(seed))
     };
     let opt = |k: &str| (!p(k).is_empty()).then(|| f(k));
+    let shape = &shape[..];
     match p("fn") {
-        "bits" => random::bits(&shape, p("width").parse().unwrap(), key.as_ref()),
+        "bits" => random::bits(shape, p("width").parse().unwrap(), key.as_ref()),
         "split" => random::split(key.as_ref().unwrap(), p("num").parse().unwrap()),
-        "uniform" => random::uniform(f("low"), f("high"), &shape, dtype, key.as_ref()),
-        "normal" => random::normal(&shape, dtype, opt("loc"), opt("scale"), key.as_ref()),
-        "gumbel" => random::gumbel(&shape, dtype, key.as_ref()),
+        "uniform" => random::uniform(f("low"), f("high"), shape, dtype, key.as_ref()),
+        "normal" => random::normal(
+            shape,
+            dtype,
+            opt("loc").unwrap_or(0.0),
+            opt("scale").unwrap_or(1.0),
+            key.as_ref(),
+        ),
+        "gumbel" => random::gumbel(shape, dtype, key.as_ref()),
         "categorical" => random::categorical(
             &to_array(&case.inputs[0]),
-            p("axis").parse().unwrap(),
+            p("axis").parse::<i32>().unwrap(),
             key.as_ref(),
         ),
         "randint" => random::randint(
             p("low").parse().unwrap(),
             p("high").parse().unwrap(),
-            &shape,
+            shape,
             dtype,
             key.as_ref(),
         ),
-        "bernoulli" => random::bernoulli(f("p"), &shape, key.as_ref()),
+        "bernoulli" => random::bernoulli(f("p"), shape, key.as_ref()),
         other => panic!("unknown random function {other}"),
     }
 }
 
-/// A reduction operation: `(array, axes, keepdims)`.
-type Reduction = fn(&Array, &[isize], bool) -> Result<Array>;
+/// A reduction operation over the given axes.
+type Reduction = fn(&Array, Vec<i32>) -> Array;
 
 /// Runs the case in nuvec: one array per recorded output.
 pub fn run(case: &Case) -> Result<Vec<Array>> {
@@ -374,36 +395,32 @@ pub fn run(case: &Case) -> Result<Vec<Array>> {
         "vjp" => {
             let n = xs.len() - 1 - consts;
             let cs = &xs[n..n + consts];
-            Ok(vjp(|ps: &[Array]| f(ps, cs), &xs[..n], &xs[n + consts..])?.1)
+            Ok(vjp_flat(|ps: &[Array]| f(ps, cs), &xs[..n], &xs[n + consts..])?.1)
         }
         "jvp" => {
             let n = (xs.len() - consts) / 2;
             let cs = &xs[n..n + consts];
-            Ok(jvp(|ps: &[Array]| f(ps, cs), &xs[..n], &xs[n + consts..])?.1)
+            Ok(jvp_flat(|ps: &[Array]| f(ps, cs), &xs[..n], &xs[n + consts..])?.1)
         }
         "quantize" => {
-            let (wq, s, b) = quantize(
-                &xs[0],
-                p("group_size").parse().unwrap(),
-                p("bits").parse().unwrap(),
-            )?;
+            let (wq, s, b) =
+                xs[0].quantize(p("group_size").parse().unwrap(), p("bits").parse().unwrap());
             Ok(vec![wq, s, b])
         }
         "vmap" => {
-            let in_axes: Vec<Option<isize>> = p("in_axes")
+            let in_axes: Vec<Option<i32>> = p("in_axes")
                 .split(',')
                 .map(|a| (a != "n").then(|| a.parse().unwrap()))
                 .collect();
-            let out_axes = [p("out_axes").parse().unwrap()];
-            vmap(|ps: &[Array]| f(ps, &[]), &in_axes, &out_axes)(&xs)
+            let out_axes: [i32; 1] = [p("out_axes").parse().unwrap()];
+            vmap_flat(|ps: &[Array]| f(ps, &[]), &in_axes, &out_axes)(&xs)
         }
         "split" => {
-            let axis = p("axis").parse().unwrap();
+            let axis = p("axis").parse::<i32>().unwrap();
             if p("at").is_empty() {
-                split(&xs[0], p("parts").parse().unwrap(), axis)
+                Ok(xs[0].split(p("parts").parse().unwrap(), axis))
             } else {
-                let at: Vec<usize> = p("at").split(',').map(|v| v.parse().unwrap()).collect();
-                split_at(&xs[0], &at, axis)
+                Ok(xs[0].split_at(&ints(p("at")), axis))
             }
         }
         op => Ok(vec![apply(case, op, xs)?]),
@@ -415,12 +432,8 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
     let p = |k: &str| case.params.get(k).map(String::as_str).unwrap_or("");
     if let Some(x) = xs.first_mut() {
         *x = match p("pre") {
-            "t" => x.t()?,
-            "r" => {
-                let mut args = vec![SliceArg::full(); x.ndim()];
-                *args.last_mut().unwrap() = SliceArg::new(None, None, -1);
-                slice(x, &args)?
-            }
+            "t" => x.t(),
+            "r" => x.i((Ellipsis, (..).step(-1))),
             _ => x.clone(),
         };
     }
@@ -429,68 +442,78 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
     let gs = || p("group_size").parse().unwrap();
     let bits = || p("bits").parse().unwrap();
     let t = || p("transpose") == "1";
+    // An optional single axis: none means the flattened array.
+    let axis = || (!p("axis").is_empty()).then(|| p("axis").parse::<i32>().unwrap());
     if op == "matmul" {
-        return matmul(&xs[0], &xs[1]);
+        return Ok(xs[0].matmul(&xs[1]));
     }
     type S = ScalarOrArray;
-    let binary: Option<fn(S, S) -> Result<Array>> = match op {
-        "add" => Some(add),
-        "subtract" => Some(subtract),
-        "multiply" => Some(multiply),
-        "divide" => Some(divide),
-        "maximum" => Some(maximum),
-        "minimum" => Some(minimum),
-        "logaddexp" => Some(logaddexp),
-        "equal" => Some(equal),
-        "not_equal" => Some(not_equal),
-        "less" => Some(less),
-        "less_equal" => Some(less_equal),
-        "greater" => Some(greater),
-        "greater_equal" => Some(greater_equal),
+    let binary: Option<fn(S, S) -> Array> = match op {
+        "add" => Some(ops::add),
+        "subtract" => Some(ops::subtract),
+        "multiply" => Some(ops::multiply),
+        "divide" => Some(ops::divide),
+        "maximum" => Some(ops::maximum),
+        "minimum" => Some(ops::minimum),
+        "logaddexp" => Some(ops::logaddexp),
+        "equal" => Some(ops::equal),
+        "not_equal" => Some(ops::not_equal),
+        "less" => Some(ops::less),
+        "less_equal" => Some(ops::less_equal),
+        "greater" => Some(ops::greater),
+        "greater_equal" => Some(ops::greater_equal),
         _ => None,
     };
     if let Some(f) = binary {
         let array = S::from(&xs[0]);
-        return match (parse_scalar(p("scalar")), p("side")) {
+        return Ok(match (parse_scalar(p("scalar")), p("side")) {
             (None, _) => f(array, S::from(&xs[1])),
             (Some(s), "left") => f(s.into(), array),
             (Some(s), _) => f(array, s.into()),
-        };
+        });
     }
-    let unary: Option<fn(&Array) -> Result<Array>> = match op {
-        "negative" => Some(negative),
-        "abs" => Some(abs),
-        "exp" => Some(exp),
-        "log" => Some(log),
-        "sqrt" => Some(sqrt),
-        "sin" => Some(sin),
-        "cos" => Some(cos),
-        "tanh" => Some(tanh),
-        "sigmoid" => Some(sigmoid),
-        "conjugate" => Some(conjugate),
-        "erfinv" => Some(erfinv),
+    let unary: Option<fn(&Array) -> Array> = match op {
+        "negative" => Some(ops::negative),
+        "abs" => Some(ops::abs),
+        "exp" => Some(ops::exp),
+        "log" => Some(ops::log),
+        "sqrt" => Some(ops::sqrt),
+        "sin" => Some(ops::sin),
+        "cos" => Some(ops::cos),
+        "tanh" => Some(ops::tanh),
+        "sigmoid" => Some(ops::sigmoid),
+        "conjugate" => Some(ops::conjugate),
+        "erfinv" => Some(ops::erfinv),
         _ => None,
     };
     if let Some(f) = unary {
-        return f(&xs[0]);
+        return Ok(f(&xs[0]));
     }
-    let reduction: Option<Reduction> = match op {
-        "sum" => Some(sum),
-        "prod" => Some(prod),
-        "max" => Some(max),
-        "min" => Some(min),
-        "mean" => Some(mean),
-        "all" => Some(all),
-        "any" => Some(any),
+    let reduction: Option<Reduction> = match (op, keep) {
+        ("sum", false) => Some(|x, a| x.sum(a)),
+        ("sum", true) => Some(|x, a| x.sum_keepdims(a)),
+        ("prod", false) => Some(|x, a| x.prod(a)),
+        ("prod", true) => Some(|x, a| x.prod_keepdims(a)),
+        ("max", false) => Some(|x, a| x.max(a)),
+        ("max", true) => Some(|x, a| x.max_keepdims(a)),
+        ("min", false) => Some(|x, a| x.min(a)),
+        ("min", true) => Some(|x, a| x.min_keepdims(a)),
+        ("mean", false) => Some(|x, a| x.mean(a)),
+        ("mean", true) => Some(|x, a| x.mean_keepdims(a)),
+        ("all", false) => Some(|x, a| x.all(a)),
+        ("all", true) => Some(|x, a| x.all_keepdims(a)),
+        ("any", false) => Some(|x, a| x.any(a)),
+        ("any", true) => Some(|x, a| x.any_keepdims(a)),
+        ("logsumexp", false) => Some(|x, a| x.logsumexp(a)),
+        ("logsumexp", true) => Some(|x, a| x.logsumexp_keepdims(a)),
         _ => None,
     };
     if let Some(f) = reduction {
-        return f(&xs[0], &ints(p("axes")), keep);
+        return Ok(f(&xs[0], reduce_axes(p("axes"), &xs[0])));
     }
-    match op {
-        "where" => where_(&xs[0], &xs[1], &xs[2]),
-        "addmm" => addmm(
-            &xs[2],
+    Ok(match op {
+        "where" => ops::where_(&xs[0], &xs[1], &xs[2]),
+        "addmm" => xs[2].addmm(
             &xs[0],
             &xs[1],
             p("alpha").parse().unwrap(),
@@ -516,34 +539,39 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
                 _ => fast::AttentionMask::None,
             };
             let sinks = rest.next();
+            let mut options = fast::AttentionOptions::from(mask).sinks(sinks);
+            if let Ok(w) = p("window").parse() {
+                options = options.window(w);
+            }
+            if let Ok(cap) = p("cap").parse() {
+                options = options.max_score_bytes(cap);
+            }
             fast::scaled_dot_product_attention(
                 &xs[0],
                 &xs[1],
                 &xs[2],
                 p("scale").parse().unwrap(),
-                mask,
-                sinks,
+                &options,
             )
         }
-        "dequantize" => dequantize(&xs[0], &xs[1], &xs[2], gs(), bits()),
-        "quantized_matmul" => quantized_matmul(&xs[0], &xs[1], &xs[2], &xs[3], t(), gs(), bits()),
-        "quantized_matmul_xsb" => {
-            quantized_matmul(&xs[0], &xs[3], &xs[1], &xs[2], t(), gs(), bits())
+        "dequantize" => xs[0].dequantize(&xs[1], &xs[2], gs(), bits()),
+        "quantized_matmul" => xs[0].quantized_matmul(&xs[1], &xs[2], &xs[3], t(), gs(), bits()),
+        "quantized_matmul_xsb" => xs[0].quantized_matmul(&xs[3], &xs[1], &xs[2], t(), gs(), bits()),
+        "softmax" => {
+            let axes = reduce_axes(p("axes"), &xs[0]);
+            xs[0].softmax(axes)
         }
-        "logsumexp" => logsumexp(&xs[0], &ints(p("axes")), keep),
-        "softmax" => softmax(&xs[0], &ints(p("axes"))),
         "random" => random_case(case),
         "astype" => xs[0].astype(dtype()),
-        "reshape" => xs[0].reshape(&ints(p("shape"))),
+        "reshape" => xs[0].reshape(ints(p("shape"))),
         "transpose" if p("axes").is_empty() => xs[0].t(),
-        "transpose" => transpose(&xs[0], &usizes(p("axes"))),
-        "slice" => slice(&xs[0], &slice_args(p("args"))),
-        "broadcast_to" => broadcast_to(&xs[0], &usizes(p("shape"))),
-        "expand_dims" => expand_dims(&xs[0], p("axis").parse().unwrap()),
+        "transpose" => xs[0].transpose(usizes(p("axes"))),
+        "slice" => graph::slice(&xs[0], &slice_args(p("args")))?,
+        "broadcast_to" => xs[0].broadcast_to(usizes(p("shape"))),
+        "expand_dims" => xs[0].expand_dims(p("axis").parse::<i32>().unwrap()),
         "conv1d" => {
-            let n = |k: &str| p(k).parse::<usize>().unwrap();
-            conv1d(
-                &xs[0],
+            let n = |k: &str| p(k).parse::<i32>().unwrap();
+            xs[0].conv1d(
                 &xs[1],
                 n("stride"),
                 n("padding"),
@@ -557,72 +585,81 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
             let lhs = p("idx").contains('l').then(|| rest.next().unwrap());
             let rhs = p("idx").contains('r').then(|| rest.next().unwrap());
             let b = match p("tb") {
-                "1" => transpose(&xs[1], &[0, 2, 1])?,
+                "1" => xs[1].transpose([0, 2, 1]),
                 _ => xs[1].clone(),
             };
-            gather_mm(&xs[0], &b, lhs, rhs, p("sorted") == "1")
+            xs[0].gather_mm(&b, lhs, rhs, p("sorted") == "1")
         }
         "repeat" => {
-            let axis = (!p("axis").is_empty()).then(|| p("axis").parse().unwrap());
-            repeat(&xs[0], p("repeats").parse().unwrap(), axis)
-        }
-        "contiguous" if p("pre") == "t" => contiguous(&xs[0].t()?),
-        "contiguous" => contiguous(&xs[0]),
-        "squeeze" => squeeze(&xs[0], &ints(p("axes"))),
-        "sort" => sort(&xs[0], Some(p("axis").parse().unwrap())),
-        "argsort" => argsort(&xs[0], Some(p("axis").parse().unwrap())),
-        "topk" => {
-            let axis = p("axis").parse().unwrap();
-            sort(
-                &topk(&xs[0], p("k").parse().unwrap(), Some(axis))?,
-                Some(axis),
-            )
-        }
-        "cumsum" | "cumprod" | "cummax" | "cummin" | "logcumsumexp" => {
-            let axis = (!p("axis").is_empty()).then(|| p("axis").parse().unwrap());
-            let (reverse, inclusive) = (p("reverse") == "1", p("inclusive") != "0");
-            let f = match op {
-                "cumsum" => cumsum,
-                "cumprod" => cumprod,
-                "cummax" => cummax,
-                "cummin" => cummin,
-                _ => logcumsumexp,
-            };
-            f(&xs[0], axis, reverse, inclusive)
-        }
-        "take" => {
-            let axis = (!p("axis").is_empty()).then(|| p("axis").parse().unwrap());
-            take(&xs[0], &xs[1], axis)
-        }
-        "take_along_axis" => take_along_axis(&xs[0], &xs[1], p("axis").parse().unwrap()),
-        "put_along_axis" => {
-            let (i, v) = if p("order") == "avi" { (2, 1) } else { (1, 2) };
-            put_along_axis(&xs[0], &xs[i], &xs[v], p("axis").parse().unwrap())
-        }
-        "concatenate" => concatenate(&xs, p("axis").parse().unwrap()),
-        "stack" => stack(&xs, p("axis").parse().unwrap()),
-        "argmax" | "argmin" => {
-            let axis = if p("axis").is_empty() {
-                None
-            } else {
-                Some(p("axis").parse().unwrap())
-            };
-            if op == "argmax" {
-                argmax(&xs[0], axis, keep)
-            } else {
-                argmin(&xs[0], axis, keep)
+            let repeats = p("repeats").parse().unwrap();
+            match axis() {
+                Some(a) => xs[0].repeat(repeats, a),
+                None => xs[0].repeat(repeats, ..),
             }
         }
-        "arange" => arange(
-            p("start").parse().unwrap(),
-            p("stop").parse().unwrap(),
-            p("step").parse().unwrap(),
-            dtype(),
-        ),
-        "zeros" => zeros(&usizes(p("shape")), dtype()),
-        "ones" => ones(&usizes(p("shape")), dtype()),
+        "contiguous" if p("pre") == "t" => xs[0].t().contiguous(),
+        "contiguous" => xs[0].contiguous(),
+        "squeeze" if p("axes").is_empty() => xs[0].squeeze(..),
+        "squeeze" => xs[0].squeeze(ints(p("axes"))),
+        "sort" => xs[0].sort(p("axis").parse::<i32>().unwrap()),
+        "argsort" => xs[0].argsort(p("axis").parse::<i32>().unwrap()),
+        "topk" => {
+            let axis = p("axis").parse::<i32>().unwrap();
+            xs[0].topk(p("k").parse().unwrap(), axis).sort(axis)
+        }
+        "cumsum" | "cumprod" | "cummax" | "cummin" | "logcumsumexp" => {
+            let options = ScanOptions {
+                reverse: p("reverse") == "1",
+                exclusive: p("inclusive") == "0",
+            };
+            let x = &xs[0];
+            macro_rules! scan {
+                ($ax:expr) => {
+                    match op {
+                        "cumsum" => x.cumsum_with($ax, options),
+                        "cumprod" => x.cumprod_with($ax, options),
+                        "cummax" => x.cummax_with($ax, options),
+                        "cummin" => x.cummin_with($ax, options),
+                        _ => x.logcumsumexp_with($ax, options),
+                    }
+                };
+            }
+            match axis() {
+                Some(a) => scan!(a),
+                None => scan!(..),
+            }
+        }
+        "take" => match axis() {
+            Some(a) => xs[0].take(&xs[1], a),
+            None => xs[0].take(&xs[1], ..),
+        },
+        "take_along_axis" => xs[0].take_along_axis(&xs[1], p("axis").parse::<i32>().unwrap()),
+        "put_along_axis" => {
+            let (i, v) = if p("order") == "avi" { (2, 1) } else { (1, 2) };
+            xs[0].put_along_axis(&xs[i], &xs[v], p("axis").parse::<i32>().unwrap())
+        }
+        "concatenate" => ops::concatenate(&xs, p("axis").parse::<i32>().unwrap()),
+        "stack" => ops::stack(&xs, p("axis").parse::<i32>().unwrap()),
+        "argmax" | "argmin" => {
+            let x = &xs[0];
+            match (op, axis(), keep) {
+                ("argmax", Some(a), false) => x.argmax(a),
+                ("argmax", Some(a), true) => x.argmax_keepdims(a),
+                ("argmax", None, false) => x.argmax(..),
+                ("argmax", None, true) => x.argmax_keepdims(..),
+                (_, Some(a), false) => x.argmin(a),
+                (_, Some(a), true) => x.argmin_keepdims(a),
+                (_, None, false) => x.argmin(..),
+                (_, None, true) => x.argmin_keepdims(..),
+            }
+        }
+        "arange" => {
+            ops::arange(number(p("start")), number(p("stop")), number(p("step"))).astype(dtype())
+        }
+        "zeros" => ops::zeros(usizes(p("shape")), dtype()),
+        "ones" => ops::ones(usizes(p("shape")), dtype()),
         other => panic!("unknown fixture op {other}"),
-    }
+    })
 }
 
 // ── Comparison ──────────────────────────────────────────────────────────────
@@ -749,9 +786,9 @@ fn close(got: f64, expected: f64, tol: f64) -> bool {
 
 /// Runs `case` and compares every output with MLX's; `Some` describes the first failure.
 pub fn check(case: &Case) -> Option<String> {
-    let got = match run(case)
-        .and_then(|arrays| arrays.iter().map(from_array).collect::<Result<Vec<_>>>())
-    {
+    let ran =
+        run(case).and_then(|arrays| arrays.iter().map(from_array).collect::<Result<Vec<_>>>());
+    let got = match ran {
         Ok(got) => got,
         Err(e) => return Some(format!("{} ({}): nuvec error: {e}", case.name, case.op)),
     };
@@ -789,9 +826,16 @@ pub fn compare(case: &Case, got: &Tensor, expected: &Tensor) -> std::result::Res
             None => Ok(()),
         };
     }
+    // Products' tolerances bound the inputs, not the element: computed once.
+    let op = match case.op.as_str() {
+        "vmap" => case.params["fn"].as_str(),
+        op => op,
+    };
+    let fixed = matches!(op, "quantized_matmul" | "matmul" | "addmm" | "gather_mm")
+        .then(|| tolerance(case, expected, 0.0));
+    let tol = |e: f64| fixed.unwrap_or_else(|| tolerance(case, expected, e));
     for (i, (g, e)) in values(got).iter().zip(values(expected)).enumerate() {
-        let ok = close(g.0, e.0, tolerance(case, expected, e.0))
-            && close(g.1, e.1, tolerance(case, expected, e.1));
+        let ok = close(g.0, e.0, tol(e.0)) && close(g.1, e.1, tol(e.1));
         if !ok {
             return Err(format!("{ctx}: element {i}: {g:?} vs MLX {e:?}"));
         }

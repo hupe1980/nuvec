@@ -1,0 +1,659 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hupe1980.github.io/nuvec/benchmarks/parity-record-v1.schema.json",
+  "title": "nuvec parity record, version 1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "created",
+    "environment",
+    "settings",
+    "sections",
+    "models",
+    "summary"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "nuvec-parity-record"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "created": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "environment": {
+      "type": "object",
+      "required": [
+        "machine",
+        "chip",
+        "memory_bytes",
+        "macos",
+        "power",
+        "swap_used_bytes_at_start",
+        "nuvec",
+        "rust",
+        "mlx",
+        "mlx_lm"
+      ],
+      "properties": {
+        "machine": {
+          "type": "string"
+        },
+        "chip": {
+          "type": "string"
+        },
+        "cpu_cores": {
+          "type": "object",
+          "properties": {
+            "performance": {
+              "type": "integer"
+            },
+            "efficiency": {
+              "type": "integer"
+            }
+          }
+        },
+        "gpu_cores": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "memory_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "macos": {
+          "type": "object",
+          "required": [
+            "version",
+            "build"
+          ],
+          "properties": {
+            "version": {
+              "type": "string"
+            },
+            "build": {
+              "type": "string"
+            }
+          }
+        },
+        "power": {
+          "type": "object",
+          "required": [
+            "source",
+            "low_power_mode"
+          ],
+          "properties": {
+            "source": {
+              "enum": [
+                "ac",
+                "battery",
+                "unknown"
+              ]
+            },
+            "low_power_mode": {
+              "type": "boolean"
+            }
+          }
+        },
+        "swap_used_bytes_at_start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "nuvec": {
+          "type": "object",
+          "required": [
+            "version",
+            "commit",
+            "dirty"
+          ],
+          "properties": {
+            "version": {
+              "type": "string"
+            },
+            "commit": {
+              "type": "string"
+            },
+            "dirty": {
+              "type": "boolean"
+            }
+          }
+        },
+        "rust": {
+          "type": "string"
+        },
+        "mlx": {
+          "type": "string"
+        },
+        "mlx_lm": {
+          "type": "string"
+        },
+        "python": {
+          "type": "string"
+        }
+      }
+    },
+    "settings": {
+      "type": "object",
+      "required": [
+        "passes",
+        "runs_per_pass",
+        "max_tokens",
+        "prompt_tokens"
+      ],
+      "properties": {
+        "passes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "runs_per_pass": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "prompt_tokens": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "legacy_repeats": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "concurrency": {
+          "type": "object"
+        },
+        "load": {
+          "type": "object"
+        },
+        "memory": {
+          "type": "object",
+          "required": [
+            "method"
+          ],
+          "properties": {
+            "method": {
+              "const": "peak_with_mapped-vs-get_peak_memory+ru_maxrss"
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "gates": {
+          "type": "object",
+          "required": [
+            "gate",
+            "goal"
+          ],
+          "properties": {
+            "gate": {
+              "type": "number"
+            },
+            "goal": {
+              "type": "number"
+            }
+          }
+        },
+        "baseline": {
+          "type": "object",
+          "required": [
+            "ref",
+            "commit"
+          ],
+          "properties": {
+            "ref": {
+              "type": "string"
+            },
+            "commit": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "decode",
+          "ttft",
+          "memory",
+          "load",
+          "concurrency"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/model"
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "below_gate",
+        "below_goal",
+        "correctness_flags"
+      ],
+      "properties": {
+        "below_gate": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "model",
+                "ratio"
+              ],
+              "properties": {
+                "model": {
+                  "type": "string"
+                },
+                "ratio": {
+                  "type": "number"
+                }
+              }
+            }
+          }
+        },
+        "below_goal": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "model",
+                "ratio"
+              ],
+              "properties": {
+                "model": {
+                  "type": "string"
+                },
+                "ratio": {
+                  "type": "number"
+                }
+              }
+            }
+          }
+        },
+        "correctness_flags": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "model",
+              "check"
+            ],
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "level": {
+                "type": "integer"
+              },
+              "check": {
+                "const": "matches_solo"
+              }
+            }
+          }
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/geomean"
+      }
+    }
+  },
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "required": [
+        "median",
+        "samples",
+        "unit"
+      ],
+      "properties": {
+        "median": {
+          "type": "number"
+        },
+        "samples": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 1
+        },
+        "unit": {
+          "enum": [
+            "tok/s",
+            "s",
+            "bytes"
+          ]
+        }
+      }
+    },
+    "pair": {
+      "type": "object",
+      "required": [
+        "nuvec",
+        "mlx_lm",
+        "ratio"
+      ],
+      "properties": {
+        "nuvec": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/metric"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mlx_lm": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/metric"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ratio": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "gate_pass": {
+          "type": "boolean"
+        },
+        "goal_pass": {
+          "type": "boolean"
+        }
+      },
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "nuvec": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "mlx_lm": {
+                "type": "null"
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "ratio": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    "geomean": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "value",
+            "n"
+          ],
+          "properties": {
+            "value": {
+              "type": "number"
+            },
+            "n": {
+              "type": "integer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/geomean"
+          }
+        }
+      ]
+    },
+    "model": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "dense",
+            "hybrid",
+            "moe",
+            "hybrid-moe"
+          ]
+        },
+        "snapshot": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "partial",
+            "skipped",
+            "failed"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "decode": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "repeats",
+              "prompt_tokens",
+              "tok_s"
+            ],
+            "properties": {
+              "repeats": {
+                "type": "integer"
+              },
+              "prompt_tokens": {
+                "type": "object",
+                "properties": {
+                  "nuvec": {
+                    "type": "integer"
+                  },
+                  "mlx_lm": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "tok_s": {
+                "$ref": "#/$defs/pair"
+              }
+            }
+          }
+        },
+        "ttft": {
+          "type": "object",
+          "properties": {
+            "lengths": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "prompt_tokens",
+                  "ttft_s",
+                  "prefill_tok_s"
+                ],
+                "properties": {
+                  "prompt_tokens": {
+                    "type": "integer"
+                  },
+                  "ttft_s": {
+                    "$ref": "#/$defs/pair"
+                  },
+                  "prefill_tok_s": {
+                    "$ref": "#/$defs/pair"
+                  }
+                }
+              }
+            },
+            "legacy": {
+              "type": "array"
+            }
+          }
+        },
+        "memory": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "peak_bytes",
+              "os_peak_rss_bytes"
+            ],
+            "properties": {
+              "peak_bytes": {
+                "$ref": "#/$defs/pair",
+                "description": "The one definition: nuvec MemoryStats::peak_with_mapped vs mlx-lm get_peak_memory()"
+              },
+              "os_peak_rss_bytes": {
+                "$ref": "#/$defs/pair"
+              },
+              "nuvec_raw": {
+                "type": "object",
+                "required": [
+                  "peak_bytes",
+                  "active_bytes",
+                  "mapped_bytes"
+                ],
+                "properties": {
+                  "peak_bytes": {
+                    "type": "integer"
+                  },
+                  "active_bytes": {
+                    "type": "integer"
+                  },
+                  "mapped_bytes": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "load": {
+          "type": "object",
+          "properties": {
+            "warm": {
+              "$ref": "#/$defs/load_phase"
+            },
+            "cold": {
+              "$ref": "#/$defs/load_phase"
+            }
+          }
+        },
+        "concurrency": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "level",
+              "total_tokens",
+              "wall_s",
+              "aggregate_tok_s"
+            ],
+            "properties": {
+              "level": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "total_tokens": {
+                "type": "integer"
+              },
+              "wall_s": {
+                "$ref": "#/$defs/pair"
+              },
+              "aggregate_tok_s": {
+                "$ref": "#/$defs/pair"
+              },
+              "decode_aggregate_tok_s": {
+                "$ref": "#/$defs/pair"
+              },
+              "nuvec_matches_solo": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "not": {
+              "const": "ok"
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "reason"
+        ]
+      }
+    },
+    "load_phase": {
+      "type": "object",
+      "required": [
+        "model_ready_s",
+        "first_token_s"
+      ],
+      "properties": {
+        "model_ready_s": {
+          "$ref": "#/$defs/pair"
+        },
+        "first_token_s": {
+          "$ref": "#/$defs/pair"
+        }
+      }
+    }
+  }
+}

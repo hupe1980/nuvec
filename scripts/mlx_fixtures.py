@@ -139,9 +139,16 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
     if op == "cross_entropy":
         return mx.fast.cross_entropy(xs[0], xs[1])
     if op == "sdpa":
+        # `cap` (nuvec's max_score_bytes) changes how nuvec runs, not the result: MLX
+        # computes the uncapped attention. A `window` is mlx-lm's sliding causal mask.
         mode = p.get("mask", "none")
         rest = xs[3:]
         mask = "causal" if mode == "causal" else (rest.pop(0) if mode == "array" else None)
+        if "window" in p:
+            lq, lk, w = xs[0].shape[2], xs[1].shape[2], int(p["window"])
+            pos = mx.arange(lk - lq, lk)[:, None]
+            keys = mx.arange(lk)[None]
+            mask = (pos >= keys) & (pos < keys + w)
         sinks = rest[0] if rest else None
         return mx.fast.scaled_dot_product_attention(xs[0], xs[1], xs[2], scale=float(p["scale"]),
                                                     mask=mask, sinks=sinks)
@@ -639,6 +646,18 @@ case("gather_mm-default", "gather_mm", [make("float32", (3, 2, 4)), make("float3
      idx="", sorted=0)
 case("gather_mm-tb", "gather_mm", [make("float32", (4, 2, 6)), make("float32", (3, 5, 6)),
      ints("uint32", (4,), 0, 3)], idx="r", sorted=0, tb=1)
+# One row per output batch (nuvec's `gather_mv`): unsorted, sorted, transposed b, and a
+# lhs gather over batched rows.
+case("gather_mv-r", "gather_mm", [make("float32", (16, 1, 64)), make("float32", (8, 64, 40)),
+     ints("uint32", (16,), 0, 8)], idx="r", sorted=0)
+case("gather_mv-sorted", "gather_mm", [make("float32", (12, 1, 48)), make("float32", (5, 48, 33)),
+     mx.array([0, 0, 1, 1, 1, 2, 3, 3, 4, 4, 4, 4], dtype=mx.uint32)], idx="r", sorted=1)
+case("gather_mv-tb", "gather_mm", [make("float32", (9, 1, 40)), make("float32", (6, 2100, 40)),
+     ints("uint32", (9,), 0, 6)], idx="r", sorted=0, tb=1)
+case("gather_mv-lr", "gather_mm", [make("float32", (3, 4, 1, 32)), make("float32", (5, 32, 7)),
+     ints("uint32", (6,), 0, 12), ints("uint32", (6,), 0, 5)], idx="lr", sorted=0)
+derivative("vjp", "vjp-gather_mv", "gather_mm", [make("float32", (6, 1, 8)), make("float32", (3, 8, 5))],
+           [mx.array([2, 0, 1, 2, 2, 0], dtype=mx.uint32)], idx="r", sorted=0)
 case("repeat-axis", "repeat", [make("float32", (2, 3))], repeats=3, axis=1)
 case("repeat-flat", "repeat", [make("int32", (2, 2))], repeats=2, axis="")
 case("contiguous-transposed", "contiguous", [make("float32", (3, 4))], pre="t")
@@ -703,6 +722,16 @@ for name, xs, ws, t, gs, bits, dt in [
 ]:
     case(name, "quantized_matmul", [make(dt, xs)] + quantized(dt, ws, gs, bits),
          transpose=t, group_size=gs, bits=bits)
+# Few-row products (2–16 rows, nuvec's multi-row kernels) for every bit width.
+for i, bits in enumerate([1, 2, 3, 5, 6, 8]):
+    for rows in [2, 7, 16]:
+        dt, gs = [("float16", 32), ("bfloat16", 64), ("float16", 128)][(i + rows) % 3]
+        case(f"qmm-rows{rows}-b{bits}-{dt}", "quantized_matmul",
+             [make(dt, (rows, 512))] + quantized(dt, (72, 512), gs, bits),
+             transpose=1, group_size=gs, bits=bits)
+        case(f"qmm-n-rows{rows}-b{bits}-{dt}", "quantized_matmul",
+             [make(dt, (rows, 256))] + quantized(dt, (256, 128), gs, bits),
+             transpose=0, group_size=gs, bits=bits)
 wq, s, b = quantized("float32", (6, 64), 32, 4)
 derivative("vjp", "vjp-qmm", "quantized_matmul_xsb", [make("float32", (3, 64)), s, b], [wq],
            transpose=1, group_size=32, bits=4)
@@ -736,25 +765,47 @@ derivative("vjp", "vjp-rope", "rope", [make("float32", (2, 3, 4, 8))],
            [mx.array(2, dtype=mx.int32)], dims=8, traditional=0, base=10000.0, scale=1.0)
 derivative("vjp", "vjp-cross_entropy", "cross_entropy", [make("float32", (5, 7))],
            [ints("int32", (5,), 0, 7)])
-# Scaled dot-product attention: (q, k, v[, mask][, sinks]).
+# Scaled dot-product attention: (q, k, v[, mask][, sinks]). Inputs are N(0, 16): the
+# scales keep the scores about N(0, 1), away from float32's rounding amplification.
 for dt in ["float32", "float16"]:
     case(f"sdpa-{dt}", "sdpa", [make(dt, (2, 4, 6, 16)), make(dt, (2, 4, 9, 16)),
-                                make(dt, (2, 4, 9, 16))], scale=0.25)
+                                make(dt, (2, 4, 9, 16))], scale=0.0625)
     case(f"sdpa-causal-gqa-{dt}", "sdpa", [make(dt, (1, 8, 5, 8)), make(dt, (1, 2, 7, 8)),
-                                           make(dt, (1, 2, 7, 12))], scale=0.35, mask="causal")
+                                           make(dt, (1, 2, 7, 12))], scale=0.088, mask="causal")
     case(f"sdpa-bool-{dt}", "sdpa", [make(dt, (1, 2, 3, 8)), make(dt, (1, 2, 4, 8)),
-                                     make(dt, (1, 2, 4, 8)), make("bool", (3, 4))], scale=0.5,
+                                     make(dt, (1, 2, 4, 8)), make("bool", (3, 4))], scale=0.088,
          mask="array")
     case(f"sdpa-additive-sinks-{dt}", "sdpa",
          [make(dt, (1, 4, 2, 8)), make(dt, (1, 2, 5, 8)), make(dt, (1, 2, 5, 8)),
-          make(dt, (1, 4, 1, 5)), make(dt, (4,))], scale=0.5, mask="array")
+          make(dt, (1, 4, 1, 5)), make(dt, (4,))], scale=0.088, mask="array")
+# Capped attention (the composition in query blocks, or the tiled kernel) and sliding
+# windows, replayed against MLX's uncapped attention; sliced key caches and transposed
+# queries are built from these in tests/mlx.rs.
+for dt in ["float32", "float16", "bfloat16"]:
+    for (b, hq, hkv, lq, lk, d) in [(1, 4, 2, 33, 45, 64), (2, 2, 2, 20, 20, 80), (1, 8, 1, 18, 60, 256)]:
+        row = b * hq * lk * (4 if dt == "float32" else 2)
+        # Inputs are N(0, 16): scale the scores to about N(0, 1).
+        sc = round(1 / (16 * d ** 0.5), 6)
+        shapes = [make(dt, (b, hq, lq, d)), make(dt, (b, hkv, lk, d)), make(dt, (b, hkv, lk, d))]
+        for blocks in [1, 2, 3, -(-lq // 9)]:
+            cap = row * -(-lq // blocks)
+            case(f"sdpa-cap{blocks}-{dt}-{lq}x{lk}x{d}", "sdpa", shapes, scale=sc, mask="causal",
+                 cap=cap)
+        case(f"sdpa-cap-sinks-{dt}-{lq}x{lk}x{d}", "sdpa", shapes + [make(dt, (hq,))], scale=sc,
+             mask="causal", cap=b * hq * lk * 4 * 4)
+        case(f"sdpa-cap-bool-{dt}-{lq}x{lk}x{d}", "sdpa", shapes + [make("bool", (lq, lk))],
+             scale=sc, mask="array", cap=row * 5)
+        case(f"sdpa-window-{dt}-{lq}x{lk}x{d}", "sdpa", shapes, scale=sc, mask="causal",
+             window=7)
+        case(f"sdpa-window-cap-{dt}-{lq}x{lk}x{d}", "sdpa", shapes + [make(dt, (hq,))],
+             scale=sc, mask="causal", window=7, cap=b * hq * 12 * 4 * 3)
 # Shapes the GPU kernels take (vector for one query, tiled for 40), replayed on both devices.
 case("sdpa-vector-kernel", "sdpa", [make("float32", (1, 4, 1, 64)), make("float32", (1, 2, 40, 64)),
                                     make("float32", (1, 2, 40, 64))], scale=0.125)
 case("sdpa-full-kernel", "sdpa", [make("float16", (1, 2, 40, 64)), make("float16", (1, 2, 40, 64)),
                                   make("float16", (1, 2, 40, 64))], scale=0.125, mask="causal")
 derivative("vjp", "vjp-sdpa", "sdpa", [make("float32", (1, 2, 4, 8)), make("float32", (1, 2, 5, 8)),
-                                       make("float32", (1, 2, 5, 8))], scale=0.3, mask="causal")
+                                       make("float32", (1, 2, 5, 8))], scale=0.0625, mask="causal")
 derivative("jvp", "jvp-rms_norm", "rms_norm", [make("float32", (2, 8)), make("float32", (8,))],
            eps=1e-5)
 
@@ -839,6 +890,128 @@ derivative("jvp", "jvp-logcumsumexp", "logcumsumexp", [make("float32", (2, 5))],
 batched("vmap-sort", "sort", [make("float32", (3, 2, 5))], "1", axis=1)
 batched("vmap-cumsum", "cumsum", [make("float32", (2, 4, 3))], "2", axis=0, reverse=1)
 
+
+# ── Array API cases: indexing, updates, var/std, empty axes, scans ──
+# Written to a second file, `mlx_api.bin`, replayed by `tests/indexing.rs`, `tests/axes.rs`
+# and `tests/reduce.rs`. Each case evaluates a Python expression over `x` (the first input,
+# after `pre`), `a1`, `a2`, … (index arrays) and `v` (the last input for updates); the Rust
+# tests hold the same expressions, keyed by the `expr` parameter.
+
+OUT_API = OUT.with_name("mlx_api.bin")
+api_cases: list[tuple[str, str, list[mx.array], list[mx.array]]] = []
+api_rng = np.random.default_rng(SEED + 62)
+
+
+def api_make(dtype: str, shape: tuple[int, ...]) -> mx.array:
+    n = int(np.prod(shape)) if shape else 1
+    if dtype == "bool":
+        return mx.array(api_rng.integers(0, 2, n).astype(np.bool_).reshape(shape))
+    if dtype.startswith(("uint", "int")):
+        return mx.array(api_rng.integers(-50, 50, n).reshape(shape)).astype(MX[dtype])
+    return mx.array((api_rng.normal(size=n) * 4).astype(np.float32).reshape(shape)).astype(MX[dtype])
+
+
+def api_ints(shape: tuple[int, ...], lo: int, hi: int) -> mx.array:
+    n = int(np.prod(shape)) if shape else 1
+    return mx.array(api_rng.integers(lo, hi, n).reshape(shape)).astype(mx.int32)
+
+
+def api_eval(kind: str, expr: str, xs: list[mx.array], pre: str | None) -> mx.array:
+    env = {"mx": mx, "x": pre_view(xs[0], pre)}
+    for k, a in enumerate(xs[1:], start=1):
+        env[f"a{k}"] = a
+    env["v"] = xs[-1]
+    if kind == "set":
+        target, value = expr.split("=", 1)
+        y = mx.array(env["x"])
+        exec(f"y{target[1:]} = {value}", env | {"y": y})
+        return y
+    return eval(expr, env)
+
+
+def api_case(kind: str, expr: str, inputs: list[mx.array], pre: str | None = None) -> None:
+    dt = NAME_OF[inputs[0].dtype]
+    name = f"{kind}/{expr}/{dt}/{pre or 'c'}"
+    out = api_eval(kind, expr, inputs, pre)
+    mx.eval(out)
+    spelled = f"{kind}|expr={expr}" + (f"|pre={pre}" if pre else "")
+    api_cases.append((name, spelled, list(inputs), [out]))
+
+
+API_DTYPES = ["float32", "float16", "bfloat16", "int32", "bool"]
+BASIC = [
+    "x[0]", "x[-1]", "x[1:3]", "x[:, 1:3]", "x[..., -1]", "x[:, None, :]", "x[::-1]",
+    "x[1:, :3, 0:6:2]", "x[None]", "x[..., None]", "x[2, ..., 1:4]", "x[-3:-1, ::2]",
+    "x[:, ::-2, 4]", "x[1:100]", "x[3:1]", "x[..., ::-1, None, 0]", "x[:3]", "x[1, 2, 3]",
+    "x[...]", "x[:, -2:]", "x[::2, 1::2, ::-3]",
+    # nuvec's stepped ranges select the range, then walk it (backwards for a negative step):
+    # `(1..4).step(-1)` is `x[3:0:-1]`, `(..2).step(-1)` is `x[1::-1]`, `(1..).step(-1)` is
+    # `x[:0:-1]`, `(0..4).step(-2)` is `x[3::-2]`.
+    "x[3:0:-1]", "x[1::-1]", "x[:0:-1]", "x[3::-2]",
+]
+for dt in API_DTYPES:
+    for expr in BASIC:
+        for pre in (None, "t", "r"):
+            api_case("index", expr, [api_make(dt, (4, 5, 6) if pre != "t" else (6, 5, 4))], pre)
+
+# Advanced (integer arrays): MLX's placement rules, broadcasting of index arrays.
+ADVANCED = [
+    ("x[a1]", [(3,)]), ("x[a1]", [(2, 3)]), ("x[a1, a2]", [(3,), (3,)]),
+    ("x[a1, :, a2]", [(3,), (3,)]), ("x[:, a1, a2]", [(3,), (3,)]),
+    ("x[a1, a2]", [(2, 1), (3,)]), ("x[a1, 2]", [(3,)]), ("x[1, :, a1]", [(2,)]),
+    ("x[a1, 1:4]", [(3,)]), ("x[..., a1]", [(2,)]), ("x[None, a1]", [(2,)]),
+    ("x[a1, None]", [(2,)]), ("x[::-1, a1]", [(4,)]), ("x[a1, a2, a1]", [(2, 2), (2,)]),
+]
+for dt in ["float32", "int32", "float16"]:
+    for expr, idx_shapes in ADVANCED:
+        for pre in (None, "t"):
+            x = api_make(dt, (4, 5, 6) if pre != "t" else (6, 5, 4))
+            idx = [api_ints(s, -4, 4) for s in idx_shapes]
+            api_case("index", expr, [x] + idx, pre)
+
+# Functional updates: `x.at[...]` (add) and copies with `y[...] = v` (set).
+UPDATES = [
+    ("set", "x[:, 1:3]=v", [], (4, 2, 6)), ("set", "x[0]=v", [], (5, 6)),
+    ("set", "x[..., -1]=v", [], (5,)), ("set", "x[::2, :, 1:4]=v", [], (1, 3)),
+    ("set", "x[:, None, 2]=v", [], (4, 1, 6)), ("set", "x[a1]=v", [(3,)], (3, 5, 6)),
+    ("set", "x[a1, :, a2]=v", [(2,), (2,)], (2, 5)),
+    ("add", "x.at[1:3].add(v)", [], (5, 6)), ("add", "x.at[..., 0].add(v)", [], (4, 5)),
+    ("add", "x.at[a1].add(v)", [(7,)], (7, 5, 6)), ("add", "x.at[a1, a2].add(v)", [(6,), (6,)], (6, 6)),
+    ("add", "x.at[:, a1].add(v)", [(4,)], (4, 4, 6)),
+]
+for dt in ["float32", "int32"]:
+    for kind, expr, idx_shapes, vshape in UPDATES:
+        x = api_make(dt, (4, 5, 6))
+        lo, hi = (-4, 4)
+        idx = [api_ints(s, lo, hi) for s in idx_shapes]
+        if kind == "set" and idx:  # unique indices: MLX leaves repeated `set` unspecified
+            idx = [mx.array(api_rng.permutation(4)[: s[0]] - 4 * api_rng.integers(0, 2)).astype(mx.int32)
+                   for s in idx_shapes]
+        api_case(kind, expr, [x] + idx + [api_make(dt, vshape)])
+
+# var/std (ddof, keepdims), empty-axes reductions (MLX C++: no axis reduced), scans.
+for dt in ["float32", "float16", "int32"]:
+    x = api_make(dt, (3, 4, 5))
+    for expr in ["mx.var(x)", "mx.var(x, axis=-1)", "mx.var(x, axis=[0, 2], keepdims=True)",
+                 "mx.var(x, axis=1, ddof=1)", "mx.std(x)", "mx.std(x, axis=0, ddof=1, keepdims=True)",
+                 "mx.std(x, axis=[1, 2])", "mx.var(x, axis=-1, ddof=5)"]:
+        api_case("reduce", expr, [x])
+        api_case("reduce", expr, [api_make(dt, (5, 4, 3))], "t")
+for dt in ["float32", "int8", "int32", "bool", "float16"]:
+    x = api_make(dt, (2, 3, 4))
+    for fn in ["sum", "prod", "max", "min", "mean", "all", "any", "logsumexp", "var", "std"]:
+        if dt == "bool" and fn in ("logsumexp", "var", "std", "mean"):
+            continue
+        api_case("reduce", f"mx.{fn}(x, axis=[])", [x])
+        api_case("reduce", f"mx.{fn}(x, axis=[], keepdims=True)", [x])
+for dt in ["float32", "int32"]:
+    x = api_make(dt, (3, 6))
+    for fn in ["cumsum", "cumprod", "cummax", "cummin"] + (["logcumsumexp"] if dt == "float32" else []):
+        for rev in (False, True):
+            for inc in (True, False):
+                api_case("reduce", f"mx.{fn}(x, axis=-1, reverse={rev}, inclusive={inc})", [x])
+        api_case("reduce", f"mx.{fn}(x, reverse=True)", [x], "t")
+
 # ── Writer ──────────────────────────────────────────────────────────────────
 
 def string(s: str) -> bytes:
@@ -858,7 +1031,7 @@ def tensor(a: mx.array) -> bytes:
     return head + struct.pack("<Q", len(data)) + data
 
 
-def main() -> None:
+def write(out: Path, cases: list[tuple[str, str, list[mx.array], list[mx.array]]]) -> None:
     blob = bytearray(b"BSMXFIX1")
     blob += string(f"mlx={mx.__version__} device=cpu seed={SEED}")
     blob += struct.pack("<I", len(cases))
@@ -866,9 +1039,14 @@ def main() -> None:
         blob += string(name) + string(op)
         blob += struct.pack("<B", len(inputs)) + b"".join(tensor(x) for x in inputs)
         blob += struct.pack("<B", len(outputs)) + b"".join(tensor(y) for y in outputs)
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_bytes(bytes(blob))
-    print(f"wrote {len(cases)} cases, {len(blob)} bytes -> {OUT.name}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(bytes(blob))
+    print(f"wrote {len(cases)} cases, {len(blob)} bytes -> {out.name}")
+
+
+def main() -> None:
+    write(OUT, cases)
+    write(OUT_API, api_cases)
 
 
 if __name__ == "__main__":

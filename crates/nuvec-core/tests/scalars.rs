@@ -1,9 +1,10 @@
 //! Weak scalar operands: MLX's Python typing rules, operators on both sides, functions.
 
+use nuvec_core::ops;
 use nuvec_core::*;
 
 fn arr<T: Element>(data: &[T]) -> Array {
-    Array::from_slice(data, &[data.len()]).unwrap()
+    Array::from(data)
 }
 
 #[test]
@@ -46,21 +47,37 @@ fn integer_scalar_keeps_integer_dtype() {
 #[test]
 fn integer_scalar_out_of_range_is_an_error() {
     let c = arr(&[1i8]);
-    assert!(matches!(add(&c, 300), Err(Error::InvalidArgument(_))));
     assert!(matches!(
-        subtract(arr(&[1u32]), -1),
-        Err(Error::InvalidArgument(_))
+        ops::add(&c, 300).check(),
+        Err(Error::Op {
+            kind: OpErrorKind::InvalidArgument(_),
+            ..
+        })
+    ));
+    assert!(matches!(
+        ops::subtract(arr(&[1u32]), -1).check(),
+        Err(Error::Op {
+            kind: OpErrorKind::InvalidArgument(_),
+            ..
+        })
     ));
     // Operators defer the error to evaluation.
     let y = &c + 300;
-    assert!(matches!(y.eval(), Err(Error::InvalidArgument(_))));
+    assert!(matches!(
+        y.eval(),
+        Err(Error::Op {
+            op: "add",
+            kind: OpErrorKind::InvalidArgument(_),
+            ..
+        })
+    ));
     // Boundaries are exact.
     assert_eq!(
-        add(arr(&[0u64]), u64::MAX).unwrap().item::<u64>().unwrap(),
+        ops::add(arr(&[0u64]), u64::MAX).item::<u64>().unwrap(),
         u64::MAX
     );
     assert_eq!(
-        add(arr(&[0i64]), i64::MIN).unwrap().item::<i64>().unwrap(),
+        ops::add(arr(&[0i64]), i64::MIN).item::<i64>().unwrap(),
         i64::MIN
     );
 }
@@ -102,7 +119,10 @@ fn scalar_on_the_left() {
     assert_eq!((3 * &arr(&[2i16])).dtype(), DType::I16);
     assert!(matches!(
         (300 + &arr(&[1i8])).eval(),
-        Err(Error::InvalidArgument(_))
+        Err(Error::Op {
+            kind: OpErrorKind::InvalidArgument(_),
+            ..
+        })
     ));
 }
 
@@ -110,50 +130,50 @@ fn scalar_on_the_left() {
 #[cfg_attr(miri, ignore = "Miri cannot execute half's hardware f16 conversion")]
 fn functions_accept_scalars() {
     let x = arr(&[f16::from_f32(-1.0), f16::from_f32(2.0)]);
-    let relu = maximum(&x, 0.0).unwrap();
+    let relu = x.maximum(0.0);
     assert_eq!(relu.dtype(), DType::F16);
     assert_eq!(
         relu.to_vec::<f16>().unwrap(),
         [f16::ZERO, f16::from_f32(2.0)]
     );
-    assert_eq!(minimum(1.0, &x).unwrap().dtype(), DType::F16);
+    assert_eq!(ops::minimum(1.0, &x).dtype(), DType::F16);
 
     let ints = arr(&[-1i32, 3]);
-    assert_eq!(
-        greater(&ints, 0).unwrap().to_vec::<bool>().unwrap(),
-        [false, true]
-    );
+    assert_eq!(ints.greater(0).to_vec::<bool>().unwrap(), [false, true]);
 
     let m = arr(&[true, false]);
     let y = arr(&[5.0f32, 6.0]);
-    let w = where_(&m, &y, 0.0).unwrap();
+    let w = m.select(&y, 0.0);
     assert_eq!(w.dtype(), DType::F32);
     assert_eq!(w.to_vec::<f32>().unwrap(), [5.0, 0.0]);
     assert_eq!(
-        where_(true, 1, &y).unwrap().to_vec::<f32>().unwrap(),
+        ops::where_(true, 1, &y).to_vec::<f32>().unwrap(),
         [1.0, 1.0]
     );
 }
 
 #[test]
 fn scalars_alone_use_default_dtypes() {
-    assert_eq!(add(1, 2).unwrap().dtype(), DType::I32);
-    assert_eq!(add(1, 2.0).unwrap().dtype(), DType::F32);
-    assert_eq!(add(true, false).unwrap().dtype(), DType::Bool);
-    assert_eq!(add(1i64 << 40, 1).unwrap().dtype(), DType::I64);
+    assert_eq!(ops::add(1, 2).dtype(), DType::I32);
+    assert_eq!(ops::add(1, 2.0).dtype(), DType::F32);
+    assert_eq!(ops::add(true, false).dtype(), DType::Bool);
+    assert_eq!(ops::add(1i64 << 40, 1).dtype(), DType::I64);
     assert_eq!(
-        multiply(2, Complex64::new(1.0, 0.0)).unwrap().dtype(),
+        ops::multiply(2, Complex64::new(1.0, 0.0)).dtype(),
         DType::Complex64
     );
-    assert_eq!(divide(1, 2).unwrap().item::<f32>().unwrap(), 0.5);
+    assert_eq!(ops::divide(1, 2).item::<f32>().unwrap(), 0.5);
 }
 
 #[test]
 fn earlier_failure_wins_over_overflow() {
     let failed = &arr(&[1i8, 2]) + &arr(&[1i8, 2, 3]);
     assert!(matches!(
-        add(&failed, 300),
-        Err(Error::ShapeMismatch { .. })
+        ops::add(&failed, 300).check(),
+        Err(Error::Op {
+            kind: OpErrorKind::ShapeMismatch { .. },
+            ..
+        })
     ));
 }
 
@@ -163,11 +183,10 @@ fn scalars_on_gpu() {
     if cfg!(miri) {
         return;
     }
-    let previous = default_stream();
-    set_default_stream(Stream::default_for(Device::gpu(0)));
-    let x = arr(&[f16::from_f32(1.0), f16::from_f32(3.0)]);
-    let y = (2.0 * &x - 1).to_vec::<f16>();
-    set_default_stream(previous);
+    let y = with_stream(Device::gpu(0), || {
+        let x = arr(&[f16::from_f32(1.0), f16::from_f32(3.0)]);
+        (2.0 * &x - 1).to_vec::<f16>()
+    });
     match y {
         Ok(v) => assert_eq!(v, [f16::from_f32(1.0), f16::from_f32(5.0)]),
         Err(e) => eprintln!("skipped: no Metal device ({e})"),

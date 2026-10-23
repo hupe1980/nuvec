@@ -6,13 +6,10 @@
 
 use std::time::Instant;
 
-use nuvec_core::{
-    Array, DType, Device, Result, Stream, async_eval, gather_qmm, quantize, quantized_matmul,
-    random, set_default_stream,
-};
+use nuvec_core::{Array, DType, Device, Result, Stream, async_eval, random, set_default_stream};
 
 /// (name, M, K, N, transpose, bits, group size): `x [M, K]` times weights of `N` outputs.
-const SHAPES: &[(&str, usize, usize, usize, bool, u32, usize)] = &[
+const SHAPES: &[(&str, usize, usize, usize, bool, i32, i32)] = &[
     ("qmv4096", 1, 4096, 4096, true, 4, 64),
     ("qmvup", 1, 4096, 11008, true, 4, 64),
     ("qmvdown", 1, 11008, 4096, true, 4, 64),
@@ -54,17 +51,17 @@ fn main() -> Result<()> {
                 (false, true) => vec![n, k],
                 (false, false) => vec![k, n],
             };
-            let w = random::uniform(-1.0, 1.0, &w_shape, DType::F32, None)?.astype(dtype)?;
-            let (wq, s, b) = quantize(&w, gs, bits)?;
+            let w = random::uniform(-1.0, 1.0, &w_shape[..], DType::F32, None).astype(dtype);
+            let (wq, s, b) = w.quantize(gs, bits);
             let x_shape = if gathered { vec![m, 1, k] } else { vec![m, k] };
-            let x = random::uniform(-1.0, 1.0, &x_shape, DType::F32, None)?.astype(dtype)?;
+            let x = random::uniform(-1.0, 1.0, &x_shape[..], DType::F32, None).astype(dtype);
             let ids: Vec<u32> = (0..m).map(|i| (i * EXPERTS / m) as u32).collect();
-            let experts = Array::from_slice(&ids, &[m])?;
+            let experts = Array::from_slice(&ids, [m]);
             nuvec_core::eval(&[wq.clone(), s.clone(), b.clone(), x.clone()])?;
-            let product = || -> Result<Array> {
+            let product = || -> Array {
                 match gathered {
-                    true => gather_qmm(&x, &wq, &s, &b, None, Some(&experts), true, gs, bits, true),
-                    false => quantized_matmul(&x, &wq, &s, &b, transpose, gs, bits),
+                    true => x.gather_qmm(&wq, &s, &b, None, Some(&experts), true, gs, bits, true),
+                    false => x.quantized_matmul(&wq, &s, &b, transpose, gs, bits),
                 }
             };
             // About 0.1 s of work per measurement (at least 20 products).
@@ -74,14 +71,14 @@ fn main() -> Result<()> {
                 let t = Instant::now();
                 let mut pending: Vec<Array> = Vec::new();
                 for _ in 0..count {
-                    pending.push(product()?);
+                    pending.push(product());
                     if pending.len() == per_eval {
                         async_eval(&pending)?;
                         pending.clear();
                     }
                 }
                 nuvec_core::eval(&pending)?;
-                nuvec_core::eval(&[product()?])?;
+                nuvec_core::eval(&[product()])?;
                 Ok(t.elapsed().as_secs_f64() / count as f64)
             };
             let best = |per_eval: usize| -> Result<f64> {

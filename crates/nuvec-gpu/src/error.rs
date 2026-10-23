@@ -6,7 +6,8 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GpuError {
-    /// The kernel library is unavailable in this build (non-macOS target).
+    /// This build embeds no kernel library. Builds for macOS (15 or later, nuvec's floor)
+    /// always embed one, precompiled or as runtime sources, so they never report this.
     NoKernels,
     /// The kernel library could not be loaded or compiled.
     LibraryLoad(String),

@@ -1,7 +1,7 @@
 [package]
 name = "nuvec-lm"
-description = "LLM runtime for nuvec: Llama/Qwen models, MLX checkpoints, sampling, speculative decoding"
-exclude = ["tests/fixtures"]
+description = "LLM runtime for nuvec: Llama, Mistral and Qwen models from MLX checkpoints, sampling, speculative decoding, batched serving and LoRA"
+exclude.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,6 +18,13 @@ nuvec.workspace = true
 nuvec-nn.workspace = true
 unicode-general-category.workspace = true
 unicode-normalization.workspace = true
+
+[dev-dependencies]
+# The soak example samples the process footprint (`proc_pid_rusage`).
+libc.workspace = true
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
 
 [lints]
 workspace = true

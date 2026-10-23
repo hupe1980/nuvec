@@ -6,8 +6,12 @@
 //! Sequences are prefilled as usual (into [`KvCache`]s) and then moved into the paged
 //! cache with [`PagedCache::insert`]. Gated DeltaNet layers keep each sequence's states at
 //! its slot of a state pool ([`nuvec::fast::gated_delta_slots`]).
+//!
+//! A step is atomic: its new positions are reserved, the forward pass runs, and only then
+//! are the lengths and blocks committed; a failed step frees what it reserved and leaves
+//! the pools as they were.
 
-use nuvec::{Array, DType, Result, SliceArg, fast, slice, slice_update, squeeze, transpose, zeros};
+use nuvec::{Array, Result, fast, ops};
 
 use crate::model::{KvCache, Model, PagedLayer, PagedStep};
 
@@ -26,7 +30,7 @@ struct Sequence {
 /// sequence (up to `sequences`).
 #[derive(Debug, Clone)]
 pub struct PagedCache {
-    layers: Vec<PagedLayer>,
+    pub(crate) layers: Vec<PagedLayer>,
     blocks: usize,
     block_size: usize,
     max_sequences: usize,
@@ -34,6 +38,17 @@ pub struct PagedCache {
     head_dim: usize,
     free: Vec<u32>,
     sequences: Vec<Option<Sequence>>,
+}
+
+/// One new position reserved for each of a step's sequences: the blocks it allocated
+/// (lengths unchanged), and the step's description. [`PagedCache::commit`] makes it part
+/// of the sequences after a successful forward pass, [`PagedCache::rollback`] frees it.
+#[derive(Debug)]
+pub(crate) struct Reservation {
+    ids: Vec<SeqId>,
+    /// The block each sequence's new position needed, if any.
+    blocks: Vec<Option<u32>>,
+    pub(crate) step: PagedStep,
 }
 
 fn invalid(msg: impl std::fmt::Display) -> nuvec::Error {
@@ -51,8 +66,16 @@ impl PagedCache {
             ));
         }
         let c = &model.config;
+        let int = |v: usize| i32::try_from(v).map_err(|_| invalid(format!("{v} is too large")));
         Ok(Self {
-            layers: vec![PagedLayer::default(); c.num_hidden_layers],
+            layers: vec![
+                PagedLayer {
+                    pool_size: (int(blocks)?, int(block_size)?),
+                    state_slots: int(sequences)?,
+                    ..Default::default()
+                };
+                c.num_hidden_layers
+            ],
             blocks,
             block_size,
             max_sequences: sequences,
@@ -66,6 +89,16 @@ impl PagedCache {
     /// Blocks not used by any sequence.
     pub fn free_blocks(&self) -> usize {
         self.free.len()
+    }
+
+    /// Blocks in all (used or free).
+    pub(crate) fn total_blocks(&self) -> usize {
+        self.blocks
+    }
+
+    /// Positions per block.
+    pub(crate) fn block_size(&self) -> usize {
+        self.block_size
     }
 
     /// The positions sequence `id` holds.
@@ -100,18 +133,15 @@ impl PagedCache {
         Ok(self.free.split_off(self.free.len() - n))
     }
 
-    /// Slots (`block · block_size + position`) of positions `start..end` of `sequence`.
-    fn slots(&self, sequence: &Sequence, start: usize, end: usize) -> Vec<i32> {
-        (start..end)
-            .map(|p| {
-                (sequence.blocks[p / self.block_size] as usize * self.block_size
-                    + p % self.block_size) as i32
-            })
-            .collect()
+    /// The slot (`block · block_size + position`) of position `p` in `blocks`.
+    fn slot(&self, blocks: &[u32], p: usize) -> i32 {
+        (blocks[p / self.block_size] as usize * self.block_size + p % self.block_size) as i32
     }
 
     /// Moves a prefilled sequence (`cache`, one [`KvCache`] per layer, batch 1) into the
-    /// paged cache and returns its id.
+    /// paged cache and returns its id. An empty cache (nothing prefilled, as for a
+    /// one-token prompt) is a sequence of length 0: no blocks, zeroed states. When a write
+    /// fails, the blocks are returned and the pools left as they were.
     pub fn insert(&mut self, cache: &[KvCache]) -> Result<SeqId> {
         if cache.len() != self.layers.len() {
             return Err(invalid(format!(
@@ -123,12 +153,13 @@ impl PagedCache {
         let len = cache.first().map_or(0, KvCache::offset);
         // Checked before anything is allocated.
         for c in cache {
-            let batch = match (c.linear_state(), c.keys_values()?) {
-                (Some((conv, _)), _) => conv.shape()[0],
-                (None, Some((k, _))) => k.shape()[0],
+            let batch = match (c.linear_state(), c.keys_values()) {
+                (Some((conv, _)), _) => conv.shape().first().copied(),
+                (None, Some((k, _))) => k.shape().first().copied(),
+                (None, None) if len == 0 => Some(1),
                 (None, None) => return Err(invalid("a layer without keys, values or states")),
             };
-            if batch != 1 || c.offset() != len {
+            if batch != Some(1) || c.offset() != len {
                 return Err(invalid(
                     "prefilled caches of one sequence, all of its length",
                 ));
@@ -140,12 +171,29 @@ impl PagedCache {
             None => return Err(invalid(format!("{} sequences already", self.max_sequences))),
         };
         let blocks = self.allocate(self.blocks_needed(0, len))?;
-        let sequence = Sequence { blocks, len };
-        let slots = self.slots(&sequence, 0, len);
-        let slots = Array::from_slice(&slots, &[len])?;
-        let (kv, d) = (self.kv_heads, self.head_dim);
-        let max_sequences = self.max_sequences;
+        let saved = self.layers.clone();
+        if let Err(e) = self.write(cache, id, &blocks, len) {
+            self.layers = saved;
+            self.free.extend(blocks);
+            return Err(e);
+        }
+        drop(saved);
+        if id == self.sequences.len() {
+            self.sequences.push(None);
+        }
+        self.sequences[id] = Some(Sequence { blocks, len });
+        Ok(id)
+    }
+
+    /// Writes a prefilled sequence's keys and values (positions `0..len`) into `blocks`
+    /// and its states into slot `id` (zeros for an empty sequence).
+    fn write(&mut self, cache: &[KvCache], id: SeqId, blocks: &[u32], len: usize) -> Result<()> {
+        let slots: Vec<i32> = (0..len).map(|p| self.slot(blocks, p)).collect();
+        let slots = (len > 0).then(|| Array::from(slots));
+        let (kv, d, block_size, pool_blocks) =
+            (self.kv_heads, self.head_dim, self.block_size, self.blocks);
         for (layer, c) in self.layers.iter_mut().zip(cache) {
+            let state_slots = layer.state_slots;
             if let Some((conv, recurrent)) = c.linear_state() {
                 // A Gated DeltaNet layer: its states into slot `id` of the pools.
                 for (pool_slot, state) in
@@ -155,33 +203,36 @@ impl PagedCache {
                         Some(p) => p,
                         None => {
                             let mut shape = state.shape().to_vec();
-                            shape[0] = max_sequences;
-                            zeros(&shape, state.dtype())?
+                            shape[0] = state_slots;
+                            ops::zeros(shape, state.dtype())
                         }
                     };
-                    let mut region = vec![SliceArg::full(); state.ndim()];
-                    region[0] = SliceArg::new(Some(id as isize), Some(id as isize + 1), 1);
-                    *pool_slot = Some(slice_update(&pool_array, &state, &region)?);
+                    *pool_slot = Some(pool_array.at(id..id + 1).set(&state).check()?);
                 }
                 continue;
             }
-            let (k, v) = c.keys_values()?.expect("checked above");
-            let pool = |dtype: DType| zeros(&[self.blocks, kv, self.block_size, d], dtype);
+            let Some(slots) = &slots else {
+                // An empty sequence: a previous sequence's states at its slot are zeroed
+                // (pools not allocated yet start as zeros).
+                for pool_slot in [&mut layer.conv, &mut layer.recurrent] {
+                    if let Some(pool_array) = pool_slot.take() {
+                        *pool_slot = Some(pool_array.at(id..id + 1).set(0.0).check()?);
+                    }
+                }
+                continue;
+            };
+            let (k, v) = c.keys_values().expect("checked by insert");
             for (pool_slot, new) in [(&mut layer.keys, k), (&mut layer.values, v)] {
                 let pool_array = match pool_slot.take() {
                     Some(p) => p,
-                    None => pool(new.dtype())?,
+                    None => ops::zeros([pool_blocks, kv, block_size, d], new.dtype()),
                 };
                 // `[1, Hkv, len, D]` as rows `[len, Hkv, D]`.
-                let rows = transpose(&squeeze(&new, &[0])?, &[1, 0, 2])?;
-                *pool_slot = Some(fast::paged_write(&pool_array, &rows, &slots)?);
+                let rows = new.squeeze(0).transpose([1, 0, 2]);
+                *pool_slot = Some(fast::paged_write(&pool_array, &rows, slots).check()?);
             }
         }
-        if id == self.sequences.len() {
-            self.sequences.push(None);
-        }
-        self.sequences[id] = Some(sequence);
-        Ok(id)
+        Ok(())
     }
 
     /// Frees sequence `id`'s blocks.
@@ -192,62 +243,75 @@ impl PagedCache {
         Ok(())
     }
 
-    /// Reserves one new position for each of `ids` and describes the step.
-    fn step(&mut self, ids: &[SeqId]) -> Result<PagedStep> {
+    /// Reserves one new position for each of `ids` (all or nothing: the blocks they need
+    /// are allocated, their lengths unchanged) and describes the step.
+    pub(crate) fn reserve(&mut self, ids: &[SeqId]) -> Result<Reservation> {
         for (i, &id) in ids.iter().enumerate() {
             self.sequence(id)?;
             if ids[..i].contains(&id) {
                 return Err(invalid(format!("sequence {id} twice in one step")));
             }
         }
-        // All or nothing: enough free blocks for every sequence's new position.
-        let needed: usize = ids
+        let lens: Vec<usize> = ids
             .iter()
-            .map(|&id| self.blocks_needed(self.sequences[id].as_ref().expect("checked").len, 1))
-            .sum();
-        if needed > self.free.len() {
-            return Err(invalid(format!(
-                "{needed} more blocks needed, {} free",
-                self.free.len()
-            )));
-        }
+            .map(|&id| self.sequences[id].as_ref().expect("checked").len)
+            .collect();
+        let needed: usize = lens.iter().map(|&len| self.blocks_needed(len, 1)).sum();
+        let mut new = self.allocate(needed)?.into_iter();
+        let mut reserved = Vec::with_capacity(ids.len());
+        let mut tables_of = Vec::with_capacity(ids.len());
         let mut slots = Vec::with_capacity(ids.len());
         let mut positions = Vec::with_capacity(ids.len());
-        for &id in ids {
-            let len = self.sequence(id)?.len;
-            let more = self.blocks_needed(len, 1);
-            let new = self.allocate(more)?;
-            let sequence = self.sequences[id].as_mut().expect("checked");
-            sequence.blocks.extend(new);
-            sequence.len += 1;
-            let sequence = self.sequences[id].as_ref().expect("checked");
-            slots.push(self.slots(sequence, len, len + 1)[0]);
+        for (&id, &len) in ids.iter().zip(&lens) {
+            let block = (self.blocks_needed(len, 1) == 1).then(|| new.next().expect("allocated"));
+            let mut table = self.sequences[id].as_ref().expect("checked").blocks.clone();
+            table.extend(block);
+            slots.push(self.slot(&table, len));
             positions.push(len as i32);
+            reserved.push(block);
+            tables_of.push(table);
         }
-        let width = ids
-            .iter()
-            .map(|&id| self.sequences[id].as_ref().expect("checked").blocks.len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
+        let width = tables_of.iter().map(Vec::len).max().unwrap_or(1).max(1);
         let mut tables = vec![0i32; ids.len() * width];
-        let mut lengths = Vec::with_capacity(ids.len());
-        for (i, &id) in ids.iter().enumerate() {
-            let s = self.sequences[id].as_ref().expect("checked");
-            for (j, &block) in s.blocks.iter().enumerate() {
+        for (i, table) in tables_of.iter().enumerate() {
+            for (j, &block) in table.iter().enumerate() {
                 tables[i * width + j] = block as i32;
             }
-            lengths.push(s.len as i32);
         }
+        let lengths: Vec<i32> = lens.iter().map(|&len| len as i32 + 1).collect();
         let b = ids.len();
         let state_slots: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
-        Ok(PagedStep {
-            slots: Array::from_slice(&slots, &[b])?,
-            positions: Array::from_slice(&positions, &[b])?,
-            lengths: Array::from_slice(&lengths, &[b])?,
-            tables: Array::from_slice(&tables, &[b, width])?,
-            state_slots: Array::from_slice(&state_slots, &[b])?,
+        let step = PagedStep {
+            slots: Array::from(slots),
+            positions: Array::from(positions),
+            lengths: Array::from(lengths),
+            tables: Array::from_slice(&tables, [b, width]),
+            state_slots: Array::from(state_slots),
+        };
+        Ok(Reservation {
+            ids: ids.to_vec(),
+            blocks: reserved,
+            step,
         })
+    }
+
+    /// Extends each sequence of a reservation by its new position (after the forward
+    /// pass succeeded). A sequence removed meanwhile gets its block freed.
+    pub(crate) fn commit(&mut self, reservation: Reservation) {
+        for (id, block) in reservation.ids.into_iter().zip(reservation.blocks) {
+            match self.sequences.get_mut(id).and_then(Option::as_mut) {
+                Some(sequence) => {
+                    sequence.blocks.extend(block);
+                    sequence.len += 1;
+                }
+                None => self.free.extend(block),
+            }
+        }
+    }
+
+    /// Frees a reservation's blocks (after the forward pass failed).
+    pub(crate) fn rollback(&mut self, reservation: Reservation) {
+        self.free.extend(reservation.blocks.into_iter().flatten());
     }
 
     /// The cached arrays (to evaluate them).
@@ -263,32 +327,43 @@ impl PagedCache {
 
 /// The logits `[B, vocab]` of the next token of each sequence in `ids` after `tokens` (one
 /// per sequence, the token at each one's next position), extending each sequence by it.
+/// On an error the cache is left as it was.
 pub fn decode_batch(
     model: &Model,
     tokens: &[u32],
     ids: &[SeqId],
     cache: &mut PagedCache,
 ) -> Result<Array> {
-    if tokens.len() != ids.len() || ids.is_empty() {
+    let reservation = cache.reserve(ids)?;
+    match forward_reserved(model, &Array::from(tokens.to_vec()), &reservation, cache) {
+        Ok(logits) => {
+            cache.commit(reservation);
+            Ok(logits)
+        }
+        Err(e) => {
+            cache.rollback(reservation);
+            Err(e)
+        }
+    }
+}
+
+/// The logits `[B, vocab]` of a reserved step (not committed), after `tokens` (`[B]`
+/// token ids, maybe not computed yet: a pipelined step feeds the previous step's tokens).
+pub(crate) fn forward_reserved(
+    model: &Model,
+    tokens: &Array,
+    reservation: &Reservation,
+    cache: &mut PagedCache,
+) -> Result<Array> {
+    let b = tokens.shape().first().copied().unwrap_or(0);
+    if tokens.ndim() != 1 || b as usize != reservation.ids.len() || b == 0 {
         return Err(invalid(format!(
-            "{} tokens for {} sequences",
-            tokens.len(),
-            ids.len()
+            "{:?} tokens for {} sequences",
+            tokens.shape(),
+            reservation.ids.len()
         )));
     }
-    let step = cache.step(ids)?;
-    let b = ids.len();
-    let input = Array::from_slice(tokens, &[b, 1])?;
-    let logits = model.forward_paged(&input, &mut cache.layers, &step)?;
-    squeeze(
-        &slice(
-            &logits,
-            &[
-                SliceArg::full(),
-                SliceArg::new(Some(0), Some(1), 1),
-                SliceArg::full(),
-            ],
-        )?,
-        &[1],
-    )
+    let input = tokens.reshape([b, 1]);
+    let logits = model.forward_paged(&input, &mut cache.layers, &reservation.step)?;
+    logits.i((.., 0)).check()
 }

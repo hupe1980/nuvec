@@ -6,7 +6,7 @@
 //! primitive has a rule (a missing one fails to compile), so `vmap` needs no loop fallback.
 
 use crate::array::Array;
-use crate::ops::{broadcast_to, expand_dims, matmul, reshape, transpose};
+use crate::ops::imp::{broadcast_to, expand_dims, matmul, reshape, transpose};
 use crate::primitive::Primitive;
 use crate::quantized::{dequantize, quantize, quantized_matmul};
 use crate::{Result, view};
@@ -36,7 +36,7 @@ fn front(a: &Array, axis: Option<usize>) -> Result<Array> {
 /// [`front`], with unbatched inputs broadcast to the full batch size `b`.
 fn front_full(a: &Array, axis: Option<usize>, b: usize) -> Result<Array> {
     let x = front(a, axis)?;
-    let mut shape = x.shape().to_vec();
+    let mut shape = x.dims().to_vec();
     shape[0] = b;
     broadcast_to(&x, &shape)
 }
@@ -57,12 +57,22 @@ impl Primitive {
         let b = inputs
             .iter()
             .zip(axes)
-            .find_map(|(a, ax)| ax.map(|ax| a.shape()[ax]))
+            .find_map(|(a, ax)| ax.map(|ax| a.dims()[ax]))
             .expect("at least one batched input");
         let x = &inputs[0];
         let at_front = |p: Primitive| Ok((record(p, vec![front(x, axes[0])?])?, 0));
         match self {
-            Self::Unary(_) | Self::AsType(_) | Self::StopGradient => {
+            Self::Depends { .. } => {
+                // Batched `x` keeps its axis; the dependencies only order the work.
+                let (x, axis) = match axes[0] {
+                    Some(axis) => (x.clone(), axis),
+                    None => (front_full(x, None, b)?, 0),
+                };
+                let mut all = vec![x];
+                all.extend_from_slice(&inputs[1..]);
+                Ok((record(self.clone(), all)?, axis))
+            }
+            Self::Unary(_) | Self::AsType(_) | Self::StopGradient | Self::Copy => {
                 Ok((record(self.clone(), vec![x.clone()])?, axes[0].unwrap_or(0)))
             }
             Self::Binary(_) | Self::Select => self.elementwise(inputs, axes),
@@ -94,7 +104,7 @@ impl Primitive {
                 let missing = shape.len() - (x.ndim() - 1);
                 let aligned: Vec<isize> = std::iter::once(b)
                     .chain(std::iter::repeat_n(1, missing))
-                    .chain(x.shape()[1..].iter().copied())
+                    .chain(x.dims()[1..].iter().copied())
                     .map(|n| n as isize)
                     .collect();
                 let out = broadcast_to(&reshape(&x, &aligned)?, &prepend(b, shape))?;
@@ -164,7 +174,7 @@ impl Primitive {
                 let a = front(x, axes[0])?;
                 let b = front(&inputs[1], axes[1])?;
                 let c = front(&inputs[2], axes[2])?;
-                Ok((vec![crate::ops::addmm(&c, &a, &b, alpha, beta)?], 0))
+                Ok((vec![crate::ops::imp::addmm(&c, &a, &b, alpha, beta)?], 0))
             }
             Self::Fast(op) => op.vmap(inputs, axes),
             Self::MetalKernel(_) => Err(crate::Error::InvalidArgument("metal_kernel: no derivative or batching rule (wrap the kernel in `custom_function`)".into())),
@@ -231,7 +241,7 @@ impl Primitive {
     fn elementwise(&self, inputs: &[Array], axes: &[Option<usize>]) -> Result<(Vec<Array>, usize)> {
         if let Some(axis) = axes[0]
             && axes.iter().all(|&a| a == Some(axis))
-            && inputs.iter().all(|a| a.shape() == inputs[0].shape())
+            && inputs.iter().all(|a| a.dims() == inputs[0].dims())
         {
             return Ok((record(self.clone(), inputs.to_vec())?, axis));
         }
@@ -240,9 +250,9 @@ impl Primitive {
             .zip(axes)
             .map(|(a, &ax)| front(a, ax))
             .collect::<Result<Vec<_>>>()?;
-        let mut shape = fronted[0].shape().to_vec();
+        let mut shape = fronted[0].dims().to_vec();
         for a in &fronted[1..] {
-            shape = view::broadcast_shapes(self.name(), &shape, a.shape())?.to_vec();
+            shape = view::broadcast_shapes(self.name(), &shape, a.dims())?.to_vec();
         }
         let operands = fronted
             .iter()

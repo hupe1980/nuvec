@@ -10,9 +10,11 @@ Decoding is limited by memory bandwidth: every token reads all the model's weigh
 
 ## Using it
 
-```rust
+```rust,no_run
 use nuvec_lm::{GenerateOptions, PromptLookup, load, speculative_generate};
 
+# fn main() -> nuvec::Result<()> {
+# let code_and_instructions = String::from("fn main() {}\nRename main to run.");
 let (model, tokenizer) = load("mlx-community/Qwen3-8B-4bit")?;
 let prompt = tokenizer.encode(&code_and_instructions);
 let mut generation = speculative_generate(
@@ -20,6 +22,8 @@ let mut generation = speculative_generate(
 )?;
 let ids: Vec<u32> = generation.by_ref().collect::<nuvec::Result<_>>()?;
 let stats = generation.stats(); // steps, drafted, accepted
+# Ok(())
+# }
 ```
 
 The output is the model's own greedy output: drafts only decide how many tokens a step produces, never which tokens.
@@ -45,7 +49,7 @@ pub trait Drafter {
 
 ## Results
 
-Apple M4 Pro, 4-bit models, 256 tokens, drafts of up to 4 tokens. Repetitive text is a paragraph repeated eight times; natural text is a short-story request.
+Apple M4 Pro, nuvec 0.2 (2026-10-20), 4-bit models, 256 tokens, drafts of up to 4 tokens. Repetitive text is a paragraph repeated eight times; natural text is a short-story request.
 
 | Model | Prompt | Plain decoding | Speculative | Drafts accepted |
 |---|---|---:|---:|---|

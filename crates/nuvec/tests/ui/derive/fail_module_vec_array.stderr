@@ -1,0 +1,5 @@
+error: a module field of type `Array` needs a role: use `Param` for a parameter, `#[tree(buffer)]` for a buffer, or `#[tree(skip)]` for a computed constant
+ --> tests/ui/derive/fail_module_vec_array.rs:5:14
+  |
+5 |     weights: Vec<nuvec::Array>,
+  |              ^^^

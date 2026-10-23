@@ -1,0 +1,5 @@
+error: `rename` needs a value: `#[tree(rename = "name")]`
+ --> tests/ui/derive/fail_rename_without_value.rs:5:12
+  |
+5 |     #[tree(rename)]
+  |            ^^^^^^

@@ -1,0 +1,5 @@
+error: use one attribute namespace per field: `#[tree(..)]` or its alias `#[module(..)]`, not both
+ --> tests/ui/derive/fail_module_mixed_namespaces.rs:7:5
+  |
+7 |     #[module(skip)]
+  |     ^

@@ -592,5 +592,525 @@ template <
       simd_lid);
 }
 
+
+///////////////////////////////////////////////////////////////////////////////
+/// Multi-row matrix vector multiplication (nuvec)
+///////////////////////////////////////////////////////////////////////////////
+
+// `gemv` and `gemv_t` for up to R input vectors (rows of a matrix X) at once: each matrix
+// element is loaded once and used for every row, and each row's arithmetic (block shape,
+// per-thread accumulation order, SIMD-group and threadgroup reductions) is exactly the
+// one-row kernel's, so row r of the result has the bits of the one-row product of row r
+// (nuvec's row-independence contract; MLX's `gemv_wide` reads the matrix once in the same
+// way). Rows past `n_rows` are skipped.
+
+template <
+    typename T,
+    const int BM,
+    const int BN,
+    const int SM,
+    const int SN,
+    const int TM,
+    const int TN,
+    const int R, /* Rows (input vectors) at most */
+    const bool kDoAxpby,
+    typename AccT = typename DefaultAccT<T>::type>
+struct GEMVRowsKernel {
+  using one = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby, AccT>;
+  MLX_MTL_CONST int blockM = one::blockM;
+  MLX_MTL_CONST int blockN = one::blockN;
+  MLX_MTL_CONST short tgp_mem_size = BN > 1 ? R * BN * (blockM + TM) : 0;
+  MLX_MTL_CONST bool needs_tgp_reduction = BN > 1;
+
+  static METAL_FUNC void run(
+      const device T* mat,
+      const device T* in_vec,
+      const device T* bias,
+      device T* out_vec,
+      const constant int& in_vec_size,
+      const constant int& out_vec_size,
+      const constant int& matrix_ld,
+      const constant float& alpha,
+      const constant float& beta,
+      const constant int& bias_stride,
+      const int n_rows,
+      const int64_t vec_row_stride,
+      const int bias_row_stride,
+      threadgroup AccT* tgp_memory,
+      uint3 tid,
+      uint simd_gid,
+      uint simd_lid) {
+    thread AccT result[R][TM];
+    thread T inter[TN];
+    thread AccT v_coeff[R][TN];
+    MLX_MTL_PRAGMA_UNROLL
+    for (int r = 0; r < R; r++) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tm = 0; tm < TM; tm++) {
+        result[r][tm] = 0;
+      }
+    }
+
+    const int thrM = SN != 32 ? simd_lid / SN : 0;
+    const int thrN = SN != 32 ? simd_lid % SN : int(simd_lid);
+    const int sgN = BN != 1 ? (simd_gid % BN) : 0;
+    const int simdM = BN != 1 ? SM * (simd_gid / BN) : int(SM * simd_gid);
+    const int simdN = BN != 1 ? SN * (simd_gid % BN) : 0;
+
+    int bm = (simdM + thrM) * TM;
+    int bn = (simdN + thrN) * TN;
+    int out_row = tid.x * blockM + bm;
+    constexpr const uniform<int> loop_stride = make_uniform(blockN);
+    const uniform<int> in_size = make_uniform(in_vec_size);
+    const uniform<int> n_iter = in_size / loop_stride;
+    const uniform<int> last_iter = loop_stride * n_iter;
+    const uniform<int> leftover = in_size - last_iter;
+
+    if (out_row >= out_vec_size)
+      return;
+    out_row = out_row + TM <= out_vec_size ? out_row : out_vec_size - TM;
+    mat += size_t(out_row) * matrix_ld;
+
+    for (int i = 0; i < n_iter; ++i) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int r = 0; r < R; r++) {
+        if (r < n_rows) {
+          one::template load_unsafe<AccT>(in_vec + r * vec_row_stride, v_coeff[r], bn);
+        }
+      }
+      int mat_offset = 0;
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tm = 0; tm < TM; tm++) {
+        one::load_unsafe(mat, inter, mat_offset + bn);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int r = 0; r < R; r++) {
+          if (r < n_rows) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+              result[r][tm] += inter[tn] * v_coeff[r][tn];
+            }
+          }
+        }
+        mat_offset += matrix_ld;
+      }
+      bn += blockN;
+    }
+
+    if (leftover > 0) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int r = 0; r < R; r++) {
+        if (r < n_rows) {
+          one::template load_safe<AccT>(
+              in_vec + r * vec_row_stride, v_coeff[r], bn, in_size);
+        }
+      }
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tm = 0; tm < TM; tm++) {
+        one::load_safe(&mat[tm * matrix_ld], inter, bn, in_size);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int r = 0; r < R; r++) {
+          if (r < n_rows) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+              result[r][tm] += inter[tn] * v_coeff[r][tn];
+            }
+          }
+        }
+      }
+    }
+
+    MLX_MTL_PRAGMA_UNROLL
+    for (int r = 0; r < R; r++) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tm = 0; tm < TM; tm++) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+          result[r][tm] += simd_shuffle_down(result[r][tm], sn);
+        }
+      }
+    }
+
+    if (needs_tgp_reduction) {
+      if (thrN == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int r = 0; r < R; r++) {
+          threadgroup AccT* tgp_results =
+              tgp_memory + r * BN * (blockM + TM) + sgN * (blockM + TM) + bm;
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tm = 0; tm < TM; tm++) {
+            tgp_results[tm] = result[r][tm];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+        if (sgN == 0) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int r = 0; r < R; r++) {
+            threadgroup AccT* tgp_results = tgp_memory + r * BN * (blockM + TM) + bm;
+            MLX_MTL_PRAGMA_UNROLL
+            for (int sgn = 1; sgn < BN; sgn++) {
+              MLX_MTL_PRAGMA_UNROLL
+              for (int tm = 0; tm < TM; tm++) {
+                result[r][tm] += tgp_results[sgn * (blockM + TM) + tm];
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (simdN == 0 && thrN == 0) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int r = 0; r < R; r++) {
+        if (r < n_rows) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tm = 0; tm < TM; tm++) {
+            if (kDoAxpby) {
+              out_vec[r * out_vec_size + out_row + tm] =
+                  static_cast<T>(alpha) * static_cast<T>(result[r][tm]) +
+                  static_cast<T>(beta) *
+                      bias[r * bias_row_stride + (out_row + tm) * bias_stride];
+            } else {
+              out_vec[r * out_vec_size + out_row + tm] = static_cast<T>(result[r][tm]);
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
+template <
+    typename T,
+    const int BM,
+    const int BN,
+    const int SM,
+    const int SN,
+    const int TM,
+    const int TN,
+    const int R,
+    const bool kDoAxpby,
+    typename AccT = typename DefaultAccT<T>::type>
+struct GEMVTRowsKernel {
+  MLX_MTL_CONST int threadsM = BM * SM;
+  MLX_MTL_CONST int threadsN = BN * SN;
+  MLX_MTL_CONST int blockM = threadsM * TM;
+  MLX_MTL_CONST int blockN = threadsN * TN;
+  MLX_MTL_CONST short tgp_mem_size = BM > 1 ? R * BM * (blockN + TN) : 0;
+  MLX_MTL_CONST bool needs_tgp_reduction = BM > 1;
+
+  static METAL_FUNC void run(
+      const device T* mat,
+      const device T* in_vec,
+      const device T* bias,
+      device T* out_vec,
+      const constant int& in_vec_size,
+      const constant int& out_vec_size,
+      const constant int& marix_ld,
+      const constant float& alpha,
+      const constant float& beta,
+      const constant int& bias_stride,
+      const int n_rows,
+      const int64_t vec_row_stride,
+      const int bias_row_stride,
+      threadgroup AccT* tgp_memory,
+      uint3 tid,
+      uint simd_gid,
+      uint simd_lid) {
+    AccT result[R][TN];
+    T inter[TN];
+    AccT v_coeff[R][TM];
+    MLX_MTL_PRAGMA_UNROLL
+    for (int r = 0; r < R; r++) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tn = 0; tn < TN; tn++) {
+        result[r][tn] = 0;
+      }
+    }
+    const int thrM = SN != 32 ? simd_lid / SN : 0;
+    const int thrN = SN != 32 ? simd_lid % SN : int(simd_lid);
+    const int sgM = BN != 1 ? (simd_gid / BN) : int(simd_gid);
+    const int sgN = BN != 1 ? (simd_gid % BN) : 0;
+    const int simdM = SM * sgM;
+    const int simdN = SN * sgN;
+    int cm = (simdM + thrM);
+    int cn = (simdN + thrN);
+    int bm = cm * TM;
+    int bn = cn * TN;
+    int out_col = tid.x * blockN + bn;
+
+    constexpr const uniform<int> loop_stride = make_uniform(blockM);
+    const uniform<int> in_size = make_uniform(in_vec_size);
+    const uniform<int> n_iter = in_size / loop_stride;
+    const uniform<int> last_iter = loop_stride * n_iter;
+    const uniform<int> leftover = in_size - last_iter;
+
+    if (out_col < out_vec_size) {
+      out_col = out_col + TN < out_vec_size ? out_col : out_vec_size - TN;
+      for (int i = 0; i < n_iter; ++i) {
+        threadgroup_barrier(mem_flags::mem_none);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int r = 0; r < R; r++) {
+          if (r < n_rows) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+              v_coeff[r][tm] = static_cast<AccT>(in_vec[r * vec_row_stride + bm + tm]);
+            }
+          }
+        }
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+          for (int tn = 0; tn < TN; tn++) {
+            inter[tn] = mat[size_t(bm + tm) * marix_ld + out_col + tn];
+          }
+          MLX_MTL_PRAGMA_UNROLL
+          for (int r = 0; r < R; r++) {
+            if (r < n_rows) {
+              auto vc = static_cast<AccT>(v_coeff[r][tm]);
+              for (int tn = 0; tn < TN; tn++) {
+                result[r][tn] += vc * inter[tn];
+              }
+            }
+          }
+        }
+        bm += blockM;
+      }
+      if (leftover > 0) {
+        for (int tm = 0; tm < TM && bm + tm < in_vec_size; tm++) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tn = 0; tn < TN; tn++) {
+            inter[tn] = mat[size_t(bm + tm) * marix_ld + out_col + tn];
+          }
+          MLX_MTL_PRAGMA_UNROLL
+          for (int r = 0; r < R; r++) {
+            if (r < n_rows) {
+              v_coeff[r][tm] = static_cast<AccT>(in_vec[r * vec_row_stride + bm + tm]);
+              MLX_MTL_PRAGMA_UNROLL
+              for (int tn = 0; tn < TN; tn++) {
+                result[r][tn] += v_coeff[r][tm] * inter[tn];
+              }
+            }
+          }
+        }
+      }
+    }
+
+    MLX_MTL_PRAGMA_UNROLL
+    for (int r = 0; r < R; r++) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tn = 0; tn < TN; tn++) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (ushort sm = (SM / 2); sm >= 1; sm >>= 1) {
+          result[r][tn] += simd_shuffle_down(result[r][tn], SN * sm);
+        }
+      }
+    }
+
+    if (needs_tgp_reduction) {
+      if (thrM == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int r = 0; r < R; r++) {
+          threadgroup AccT* tgp_results =
+              tgp_memory + r * BM * (blockN + TN) + sgM * (blockN + TN) + bn;
+          MLX_MTL_PRAGMA_UNROLL
+          for (int tn = 0; tn < TN; tn++) {
+            tgp_results[tn] = result[r][tn];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+        if (sgM == 0) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int r = 0; r < R; r++) {
+            threadgroup AccT* tgp_results = tgp_memory + r * BM * (blockN + TN) + bn;
+            MLX_MTL_PRAGMA_UNROLL
+            for (int sgm = 1; sgm < BM; sgm++) {
+              MLX_MTL_PRAGMA_UNROLL
+              for (int tn = 0; tn < TN; tn++) {
+                result[r][tn] += tgp_results[sgm * (blockN + TN) + tn];
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (cm == 0 && out_col < out_vec_size) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int r = 0; r < R; r++) {
+        if (r < n_rows) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int j = 0; j < TN; j++) {
+            if (kDoAxpby) {
+              out_vec[r * out_vec_size + out_col + j] =
+                  static_cast<T>(alpha) * static_cast<T>(result[r][j]) +
+                  static_cast<T>(beta) *
+                      bias[r * bias_row_stride + (out_col + j) * bias_stride];
+            } else {
+              out_vec[r * out_vec_size + out_col + j] = static_cast<T>(result[r][j]);
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
+#define NUVEC_GEMV_ROWS_KERNEL(fname, Kernel)                                          \
+  template <                                                                          \
+      typename T,                                                                     \
+      const int BM,                                                                   \
+      const int BN,                                                                   \
+      const int SM,                                                                   \
+      const int SN,                                                                   \
+      const int TM,                                                                   \
+      const int TN,                                                                   \
+      const int R,                                                                    \
+      const bool kDoNCBatch,                                                          \
+      const bool kDoAxpby>                                                            \
+  [[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]] void fname(             \
+      const device T* mat [[buffer(0)]],                                              \
+      const device T* in_vec [[buffer(1)]],                                           \
+      const device T* bias [[buffer(2)]],                                             \
+      device T* out_vec [[buffer(3)]],                                                \
+      const constant int& in_vec_size [[buffer(4)]],                                  \
+      const constant int& out_vec_size [[buffer(5)]],                                 \
+      const constant int& marix_ld [[buffer(6)]],                                     \
+      const constant float& alpha [[buffer(7)]],                                      \
+      const constant float& beta [[buffer(8)]],                                       \
+      const constant int& batch_ndim [[buffer(9)]],                                   \
+      const constant int* batch_shape [[buffer(10)]],                                 \
+      const constant int64_t* vector_batch_stride [[buffer(11)]],                     \
+      const constant int64_t* matrix_batch_stride [[buffer(12)]],                     \
+      const constant int64_t* bias_batch_stride [[buffer(13)]],                       \
+      const constant int& bias_stride [[buffer(14)]],                                 \
+      const constant int& n_rows [[buffer(15)]],                                      \
+      const constant int64_t& vec_row_stride [[buffer(16)]],                          \
+      const constant int& bias_row_stride [[buffer(17)]],                             \
+      const constant int& row_groups [[buffer(18)]],                                  \
+      uint3 group_id [[threadgroup_position_in_grid]],                                \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                               \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                                  \
+    using rows_k = Kernel<T, BM, BN, SM, SN, TM, TN, R, kDoAxpby>;                      \
+    /* Groups of R rows of one output tile are neighbours in the grid, so they read */  \
+    /* the same matrix block at about the same time (from the cache after the first). */ \
+    const int row_group = group_id.x % row_groups;                                    \
+    const uint3 tid = uint3(group_id.x / row_groups, group_id.y, group_id.z);         \
+    const int rows_here = min(R, n_rows - row_group * R);                             \
+    threadgroup float tgp_memory[rows_k::tgp_mem_size == 0 ? 1 : rows_k::tgp_mem_size]; \
+    if (kDoNCBatch) {                                                                 \
+      in_vec += elem_to_loc(tid.z, batch_shape, vector_batch_stride, batch_ndim);     \
+      mat += elem_to_loc(tid.z, batch_shape, matrix_batch_stride, batch_ndim);        \
+      if (kDoAxpby) {                                                                 \
+        bias += elem_to_loc(tid.z, batch_shape, bias_batch_stride, batch_ndim);       \
+      }                                                                               \
+    } else {                                                                          \
+      in_vec += tid.z * vector_batch_stride[0];                                       \
+      mat += tid.z * matrix_batch_stride[0];                                          \
+      if (kDoAxpby) {                                                                 \
+        bias += tid.z * bias_batch_stride[0];                                         \
+      }                                                                               \
+    }                                                                                 \
+    out_vec += tid.z * n_rows * out_vec_size + row_group * R * out_vec_size;           \
+    in_vec += row_group * R * vec_row_stride;                                         \
+    if (kDoAxpby) {                                                                   \
+      bias += row_group * R * bias_row_stride;                                        \
+    }                                                                                 \
+    rows_k::run(                                                                      \
+        mat,                                                                          \
+        in_vec,                                                                       \
+        bias,                                                                         \
+        out_vec,                                                                      \
+        in_vec_size,                                                                  \
+        out_vec_size,                                                                 \
+        marix_ld,                                                                     \
+        alpha,                                                                        \
+        beta,                                                                         \
+        bias_stride,                                                                  \
+        rows_here,                                                                    \
+        vec_row_stride,                                                               \
+        bias_row_stride,                                                              \
+        rows_k::tgp_mem_size == 0 ? nullptr : tgp_memory,                             \
+        tid,                                                                          \
+        simd_gid,                                                                     \
+        simd_lid);                                                                    \
+  }
+
+NUVEC_GEMV_ROWS_KERNEL(gemv_rows, GEMVRowsKernel)
+NUVEC_GEMV_ROWS_KERNEL(gemv_t_rows, GEMVTRowsKernel)
+
+
+///////////////////////////////////////////////////////////////////////////////
+/// Gathered matrix vector multiplication (MLX's `gemv_gather`)
+///////////////////////////////////////////////////////////////////////////////
+
+// Output batch `i` is the vector `in_vec[lhs_indices[i]]` times the matrix
+// `mat[rhs_indices[i]]`, each batch computed by the one-row kernel, so every row of a
+// gathered (mixture-of-experts) product has the bits of the same row computed alone.
+template <
+    typename T,
+    const int BM,
+    const int BN,
+    const int SM,
+    const int SN,
+    const int TM,
+    const int TN,
+    const bool kTransposed>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]] void gemv_gather(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    device T* out_vec [[buffer(2)]],
+    const constant int& in_vec_size [[buffer(3)]],
+    const constant int& out_vec_size [[buffer(4)]],
+    const constant int& marix_ld [[buffer(5)]],
+    const constant int& batch_ndim [[buffer(6)]],
+    const constant int* batch_shape [[buffer(7)]],
+    const constant int64_t* lhs_strides [[buffer(8)]],
+    const constant int64_t* rhs_strides [[buffer(9)]],
+    const constant int& vec_ndim [[buffer(10)]],
+    const constant int* vec_shape [[buffer(11)]],
+    const constant int64_t* vec_strides [[buffer(12)]],
+    const constant int& mat_ndim [[buffer(13)]],
+    const constant int* mat_shape [[buffer(14)]],
+    const constant int64_t* mat_strides [[buffer(15)]],
+    const device uint32_t* lhs_indices [[buffer(16)]],
+    const device uint32_t* rhs_indices [[buffer(17)]],
+    const constant float& alpha [[buffer(18)]],
+    const constant float& beta [[buffer(19)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using gemv_kernel = metal::conditional_t<
+      kTransposed,
+      GEMVTKernel<T, BM, BN, SM, SN, TM, TN, false>,
+      GEMVKernel<T, BM, BN, SM, SN, TM, TN, false>>;
+  threadgroup typename gemv_kernel::acc_type tgp_memory
+      [gemv_kernel::tgp_mem_size == 0 ? 1 : gemv_kernel::tgp_mem_size];
+
+  uint32_t indx_vec =
+      lhs_indices[elem_to_loc(tid.z, batch_shape, lhs_strides, batch_ndim)];
+  uint32_t indx_mat =
+      rhs_indices[elem_to_loc(tid.z, batch_shape, rhs_strides, batch_ndim)];
+  in_vec += elem_to_loc(indx_vec, vec_shape, vec_strides, vec_ndim);
+  mat += elem_to_loc(indx_mat, mat_shape, mat_strides, mat_ndim);
+  out_vec += tid.z * out_vec_size;
+
+  gemv_kernel::run(
+      mat,
+      in_vec,
+      in_vec,
+      out_vec,
+      in_vec_size,
+      out_vec_size,
+      marix_ld,
+      alpha,
+      beta,
+      marix_ld,
+      gemv_kernel::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
+}
+
 } // namespace matvec
 } // namespace mlx

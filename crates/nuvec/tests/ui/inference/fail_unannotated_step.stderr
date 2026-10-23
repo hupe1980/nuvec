@@ -1,0 +1,13 @@
+error[E0282]: type annotations needed for `&mut (_, _)`
+ --> tests/ui/inference/fail_unannotated_step.rs:7:29
+  |
+7 |     let step = compile_mut(|(model, opt), (x, y): &(Array, Array)| {
+  |                             ^^^^^^^^^^^^
+8 |         let _ = (x, y);
+9 |         opt.update(model, model)?;
+  |         --- type must be known at this point
+  |
+help: consider giving this closure parameter an explicit type, where the placeholders `_` are specified
+  |
+7 |     let step = compile_mut(|(model, opt): &mut (_, _), (x, y): &(Array, Array)| {
+  |                                         +++++++++++++

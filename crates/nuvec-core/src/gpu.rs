@@ -23,6 +23,57 @@ pub(crate) fn available() -> bool {
     false
 }
 
+/// The shared GPU's class letter for routing decisions (`'g'` when unknown).
+pub(crate) fn class() -> char {
+    #[cfg(all(target_os = "macos", not(miri)))]
+    if let Some(device) = nuvec_gpu::Device::shared() {
+        return device.info().class.unwrap_or('g');
+    }
+    'g'
+}
+
+/// The function constants that specialise the vector attention kernels' pipelines.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VectorFlags {
+    pub(crate) has_mask: bool,
+    /// Causal masking over several query rows.
+    pub(crate) causal: bool,
+    pub(crate) bool_mask: bool,
+    pub(crate) float_mask: bool,
+    pub(crate) sinks: bool,
+}
+
+/// Threads per threadgroup the first pass of two-pass vector attention (four keys per
+/// step) allows for these types and constants on the shared GPU, a fixed property of the
+/// compiled pipeline (1024 without a GPU).
+pub(crate) fn vector_threads(
+    dtype: crate::DType,
+    d: usize,
+    dv: usize,
+    flags: VectorFlags,
+    blocks: usize,
+) -> usize {
+    #[cfg(all(target_os = "macos", not(miri)))]
+    if let Some(device) = nuvec_gpu::Device::shared() {
+        use nuvec_gpu::Constant;
+        let name = format!("nuvec_sdpa_vector_2pass_1_{}_{d}_{dv}", dtype.name());
+        let constants = [
+            (30, Constant::Bool(flags.has_mask)),
+            (31, Constant::Bool(false)),
+            (32, Constant::Bool(flags.causal)),
+            (33, Constant::Bool(flags.bool_mask)),
+            (34, Constant::Bool(flags.float_mask)),
+            (35, Constant::Bool(flags.sinks)),
+            (36, Constant::Int(blocks as i32)),
+        ];
+        if let Ok(p) = device.pipeline_with_constants(&name, &constants) {
+            return p.max_threads_per_threadgroup();
+        }
+    }
+    let _ = (dtype, d, dv, flags, blocks);
+    1024
+}
+
 #[cfg(all(target_os = "macos", not(miri)))]
 pub(crate) use metal::GpuEval;
 #[cfg(not(all(target_os = "macos", not(miri))))]
@@ -56,6 +107,7 @@ mod stub {
         pub(crate) fn available(&self, _: Device) -> bool {
             false
         }
+        pub(crate) fn release_unreferenced(&mut self) {}
         pub(crate) fn supports(&self, _: &Primitive, _: &[Operand<'_>], _: &[Output]) -> bool {
             false
         }
@@ -84,7 +136,7 @@ mod stub {
         pub(crate) fn norm_rope_in_place(
             &mut self,
             _: Data,
-            _: &crate::fast::FastOp,
+            _: &crate::fast::imp::FastOp,
             _: &[Operand<'_>],
             _: &Output,
         ) -> Result<Data> {
@@ -122,6 +174,7 @@ mod stub {
         }
         pub(crate) fn commit(&mut self) {}
         pub(crate) fn depend_on(&mut self, _: &[&crate::Array]) {}
+        pub(crate) fn read_in_flight(&mut self, _: &crate::Array) {}
         pub(crate) fn lookup(&self, _: &Arc<Node>, _: u32) -> Option<Data> {
             None
         }
@@ -141,7 +194,7 @@ mod stub {
 
 #[cfg(all(target_os = "macos", not(miri)))]
 mod metal {
-    use crate::array::NodeMap;
+    use crate::array::{ChunkStatus, NodeMap};
 
     use std::sync::{Mutex, PoisonError, Weak};
 
@@ -155,6 +208,20 @@ mod metal {
     mod reduce;
 
     use crate::fused::Load;
+
+    /// What the attention plan decided for one fused attention dispatch.
+    #[derive(Debug, Clone, Copy)]
+    struct AttentionFlags {
+        scale: f32,
+        causal: bool,
+        has_mask: bool,
+        has_sinks: bool,
+        /// 1 or 2 for the vector kernels, 0 for the tiled kernel.
+        passes: u8,
+        blocks: usize,
+        gqa_kernel: bool,
+        tk1: bool,
+    }
 
     /// The most dispatches per command buffer.
     const MAX_DISPATCHES: usize = 256;
@@ -213,34 +280,37 @@ mod metal {
         exposed: Vec<bool>,
         /// Chunks published so far (in commit order).
         next: usize,
+        /// Per committed chunk: its failure cell, set when it (or an earlier chunk of the
+        /// evaluation) fails, for other evaluations that read its in-flight outputs.
+        statuses: Vec<ChunkStatus>,
         /// The first failure; it fails every later chunk too.
         error: Option<Error>,
     }
 
     /// Lets later evaluations' GPU work read these outputs while they are in flight.
-    fn expose(chunk: &Chunk) {
+    fn expose(chunk: &Chunk, status: &ChunkStatus) {
         for (node, outputs) in chunk {
             for (output, data) in node.outputs.iter().zip(outputs) {
-                output.inflight.set(data.clone());
+                output.inflight.set_from(data.clone(), status);
             }
         }
     }
 
-    /// The first GPU command failure on this device. GPU work may read other evaluations'
-    /// in-flight results, so once a command fails every later GPU result is reported as
-    /// failed too, as in MLX, where a command-buffer error ends the stream.
-    static DEVICE_FAILURE: Mutex<Option<Error>> = Mutex::new(None);
-
-    fn device_result(result: Result<()>) -> Result<()> {
-        let mut failure = DEVICE_FAILURE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let (Err(e), None) = (&result, &*failure) {
-            *failure = Some(Error::Backend(format!("a GPU command failed earlier: {e}")));
-        }
-        match &*failure {
-            Some(e) if result.is_ok() => Err(e.clone()),
-            _ => result,
+    /// A chunk's result: its command buffer's, failed as well if a chunk of another
+    /// evaluation whose in-flight outputs it read has failed. A failure is scoped to the
+    /// evaluation that encoded the failed chunk and to readers of its results; independent
+    /// evaluations are unaffected.
+    ///
+    /// The readers' command buffers run after the chunks they read (one queue), whose
+    /// completion handlers Metal calls in order, so a producer's failure is recorded by the
+    /// time a reader's handler checks it.
+    fn chunk_result(result: Result<()>, reads: &[ChunkStatus]) -> Result<()> {
+        result?;
+        match reads.iter().find_map(|s| s.get()) {
+            Some(e) => Err(Error::Backend(format!(
+                "GPU work this result reads from failed: {e}"
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -271,6 +341,9 @@ mod metal {
                 }
                 let result = p.error.clone().map_or(Ok(()), Err);
                 let next = p.next;
+                if let (Err(e), Some(status)) = (&result, p.statuses.get(next)) {
+                    let _ = status.set(e.clone());
+                }
                 for node in p.chunks[next].take().unwrap_or_default() {
                     if let Some(node) = node.upgrade() {
                         publish_committed(&node, &result);
@@ -300,6 +373,9 @@ mod metal {
         submitted: Vec<Pending>,
         /// Other evaluations' in-flight outputs that deferred views of the open chunk read.
         foreign: Vec<crate::Array>,
+        /// Failure cells of other evaluations' chunks whose in-flight outputs the open
+        /// chunk reads.
+        reads: Vec<ChunkStatus>,
     }
 
     fn backend(e: nuvec_gpu::GpuError) -> Error {
@@ -448,6 +524,62 @@ mod metal {
                 GemmBuffer::View(b) => Arg::Read(b, self.offset),
                 GemmBuffer::Copy(b) => Arg::Read(b.metal().expect("device storage"), 0),
             }
+        }
+    }
+
+    /// A matrix-vector kernel's block shape (MLX's choice in `gemv_axbpy`/`gemv`).
+    struct GemvConfig {
+        kind: &'static str,
+        bm: usize,
+        bn: usize,
+        sm: usize,
+        sn: usize,
+        tm: usize,
+        tn: usize,
+        /// Outputs per threadgroup.
+        per_group: usize,
+    }
+
+    /// The block shape of a product of a vector of `in_len` with a matrix giving
+    /// `out_len` outputs, read along its rows (`gemv`) or columns (`gemv_t`,
+    /// `transpose_mat`). Independent of how many vectors a call multiplies, so one-row and
+    /// multi-row products share it.
+    fn gemv_config(transpose_mat: bool, in_len: usize, out_len: usize) -> GemvConfig {
+        let (mut bm, mut bn, mut sm, mut sn, mut tm, mut tn) = (1, 1, 1, 32, 4, 4);
+        let (kind, per_group) = if transpose_mat {
+            (sm, sn) = if in_len >= 8192 && out_len >= 2048 {
+                (4, 8)
+            } else {
+                (8, 4)
+            };
+            bn = if out_len >= 2048 {
+                16
+            } else if out_len >= 512 {
+                4
+            } else {
+                2
+            };
+            tn = if out_len < tn { 1 } else { tn };
+            ("gemv_t", bn * sn * tn)
+        } else {
+            bm = if out_len >= 4096 { 8 } else { 4 };
+            if in_len <= 64 {
+                (bm, sm, sn) = (1, 8, 4);
+            } else if in_len >= 16 * out_len {
+                (bm, bn) = (1, 8);
+            }
+            tm = if out_len < tm { 1 } else { tm };
+            ("gemv", bm * sm * tm)
+        };
+        GemvConfig {
+            kind,
+            bm,
+            bn,
+            sm,
+            sn,
+            tm,
+            tn,
+            per_group,
         }
     }
 
@@ -902,31 +1034,6 @@ mod metal {
             })
     }
 
-    /// Whether MLX's vector attention takes two passes over `lk` keys on a GPU of `class`.
-    fn vector_two_pass(class: char, lk: usize, grouped: bool) -> bool {
-        (matches!(class, 'd' | 's') && lk >= 1024) || (grouped && lk >= 4096)
-    }
-
-    /// MLX's key partitions (blocks) for the first of two passes, by GPU class, keys and
-    /// SIMD-groups per threadgroup (`n_simds`, query heads per key head times queries).
-    fn vector_blocks(class: char, lk: usize, n_simds: usize) -> usize {
-        match class {
-            's' if lk > 1024 && n_simds > 4 => match lk {
-                ..=8192 => 128,
-                8193..=32768 => 256,
-                32769..=65536 => 512,
-                _ => 1024,
-            },
-            's' => 64,
-            'd' if n_simds <= 2 && lk > 8192 => 256,
-            'd' if n_simds >= 6 && lk >= 65536 => 1024,
-            'd' if n_simds >= 6 && lk >= 16384 => 512,
-            'd' => 128,
-            _ if n_simds >= 4 => 64,
-            _ => 32,
-        }
-    }
-
     /// Values per packing unit of `bits`-bit codes (MLX's `get_pack_factor`, in `word` bits).
     fn pack_factor(bits: usize, word: usize) -> usize {
         match bits {
@@ -983,6 +1090,7 @@ mod metal {
                 shared: Arc::default(),
                 submitted: Vec::new(),
                 foreign: Vec::new(),
+                reads: Vec::new(),
             }
         }
 
@@ -1038,7 +1146,7 @@ mod metal {
                 }
                 (Primitive::Select, _) => true,
                 (Primitive::AsType(to), Some(d)) => not64(d) && not64(*to),
-                (Primitive::Reshape(_), _) => true,
+                (Primitive::Reshape(_) | Primitive::Copy, _) => true,
                 (Primitive::Reduce { op, .. }, Some(d)) => match op {
                     ReduceOp::And | ReduceOp::Or => d == DType::Bool,
                     ReduceOp::Max | ReduceOp::Min => not64(d) && d != DType::Complex64,
@@ -1112,7 +1220,7 @@ mod metal {
                     let name = format!("nuvec_cast_{}_{}", operands[0].0.dtype.name(), to.name());
                     self.elementwise(&name, operands, out, &mut buffer)?;
                 }
-                Primitive::Reshape(_) => self.copy(operands[0], &mut buffer)?,
+                Primitive::Reshape(_) | Primitive::Copy => self.copy(operands[0], &mut buffer)?,
                 Primitive::GatherAxis { axis } => {
                     self.gather(operands[0], operands[1], *axis, &mut buffer)?
                 }
@@ -1301,9 +1409,7 @@ mod metal {
             }
             let pipeline = self.pipeline(name)?;
             let group = block_dims(grid);
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, args, grid, group)
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, args, grid, group)?;
             self.counted()
         }
 
@@ -1366,9 +1472,7 @@ mod metal {
                     .map(|b| Arg::write(b.metal_mut().expect("device storage"))),
             );
             args.extend(consts.iter().map(|c| Arg::bytes(c)));
-            self.command_buffer()?
-                .dispatch(&pipeline, &args, out.size.div_ceil(per_thread))
-                .map_err(backend)?;
+            self.encode_dispatch(&pipeline, &args, out.size.div_ceil(per_thread))?;
             self.counted()?;
             Ok(buffers.into_iter().map(Data::new).collect())
         }
@@ -2028,6 +2132,11 @@ mod metal {
             if m.min(n) == 1 {
                 return self.gemv(a, b, c, (m, n, k), out, buffer);
             }
+            // A few rows: the multi-row matrix-vector kernels, each row with the bits of
+            // its one-row product (the row-independence contract).
+            if m <= crate::ROW_INDEPENDENT_ROWS {
+                return self.gemv_rows(a, b, c, (m, n, k), out, buffer);
+            }
             let ga = self.gemmand(a, m, k)?;
             let gb = self.gemmand(b, k, n)?;
             let class = self
@@ -2134,14 +2243,12 @@ mod metal {
                 Arg::bytes(&shape),
                 Arg::bytes(strides),
             ];
-            self.command_buffer()?
-                .dispatch_groups(
-                    &pipeline,
-                    &args,
-                    [n.div_ceil(bn), m.div_ceil(bm), batch],
-                    [32, wn, wm],
-                )
-                .map_err(backend)?;
+            self.encode_groups(
+                &pipeline,
+                &args,
+                [n.div_ceil(bn), m.div_ceil(bm), batch],
+                [32, wn, wm],
+            )?;
             self.counted()
         }
 
@@ -2199,14 +2306,12 @@ mod metal {
                 Arg::write(partial.metal_mut().expect("device storage")),
                 Arg::bytes(params),
             ];
-            self.command_buffer()?
-                .dispatch_groups(
-                    &pipeline,
-                    &args,
-                    [n.div_ceil(bn), m.div_ceil(bm), partitions],
-                    [32, wn, wm],
-                )
-                .map_err(backend)?;
+            self.encode_groups(
+                &pipeline,
+                &args,
+                [n.div_ceil(bn), m.div_ceil(bm), partitions],
+                [32, wn, wm],
+            )?;
             self.counted()?;
             let axpby = c.filter(|&(_, alpha, beta)| alpha != 1.0 || beta != 0.0);
             let name = match axpby {
@@ -2240,9 +2345,7 @@ mod metal {
                 ));
                 args.extend(scalars.iter().map(|b| Arg::bytes(b)));
             }
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, &args, [n, m, 1], [n.min(32), m.min(32), 1])
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, &args, [n, m, 1], [n.min(32), m.min(32), 1])?;
             self.counted()
         }
 
@@ -2289,32 +2392,16 @@ mod metal {
                 mat.transposed
             };
             let (in_len, out_len) = (k, if is_b_matrix { n } else { m });
-            let (mut bm, mut bn, mut sm, mut sn, mut tm, mut tn) = (1, 1, 1, 32, 4, 4);
-            let (kind, per_group) = if transpose_mat {
-                (sm, sn) = if in_len >= 8192 && out_len >= 2048 {
-                    (4, 8)
-                } else {
-                    (8, 4)
-                };
-                bn = if out_len >= 2048 {
-                    16
-                } else if out_len >= 512 {
-                    4
-                } else {
-                    2
-                };
-                tn = if out_len < tn { 1 } else { tn };
-                ("gemv_t", bn * sn * tn)
-            } else {
-                bm = if out_len >= 4096 { 8 } else { 4 };
-                if k <= 64 {
-                    (bm, sm, sn) = (1, 8, 4);
-                } else if k >= 16 * out_len {
-                    (bm, bn) = (1, 8);
-                }
-                tm = if out_len < tm { 1 } else { tm };
-                ("gemv", bm * sm * tm)
-            };
+            let GemvConfig {
+                kind,
+                bm,
+                bn,
+                sm,
+                sn,
+                tm,
+                tn,
+                per_group,
+            } = gemv_config(transpose_mat, in_len, out_len);
             let axpby = c.filter(|&(_, alpha, beta)| alpha != 1.0 || beta != 0.0);
             let batch_shape: Vec<usize> = match &out.shape[..nd - 2] {
                 [] => vec![1],
@@ -2385,14 +2472,140 @@ mod metal {
                 Arg::bytes(&bias_strides),
                 Arg::bytes(&scalars[6]),
             ];
-            self.command_buffer()?
-                .dispatch_groups(
-                    &pipeline,
-                    &args,
-                    [out_len.div_ceil(per_group), 1, batch],
-                    [32, bn, bm],
-                )
-                .map_err(backend)?;
+            self.encode_groups(
+                &pipeline,
+                &args,
+                [out_len.div_ceil(per_group), 1, batch],
+                [32, bn, bm],
+            )?;
+            self.counted()
+        }
+
+        /// `a · b` for `2 ≤ m ≤ ROW_INDEPENDENT_ROWS` rows of `a`: the matrix-vector
+        /// kernels' multi-row variants, which read `b` once and give each row the bits of
+        /// [`Self::gemv`] on that row alone (same block shape, same accumulation order).
+        fn gemv_rows(
+            &mut self,
+            a: Operand<'_>,
+            b: Operand<'_>,
+            c: Option<(Operand<'_>, f32, f32)>,
+            (m, n, k): (usize, usize, usize),
+            out: &Output,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let nd = out.shape.len();
+            let mat = self.gemmand(b, k, n)?;
+            // The rows are read contiguously along K, each `ld` apart.
+            let vec = match Gemmand::view(a, m, k) {
+                Some(g) if !g.transposed => g,
+                _ => self.gemmand_copy(a)?,
+            };
+            let transpose_mat = !mat.transposed;
+            let GemvConfig {
+                kind,
+                bm,
+                bn,
+                sm,
+                sn,
+                tm,
+                tn,
+                per_group,
+            } = gemv_config(transpose_mat, k, n);
+            // Groups of rows of one tile are neighbours in the grid, so the matrix block
+            // comes from the cache for all but the first group: four rows per group in
+            // half precision (more registers per thread are slower), eight in float32
+            // (whose larger matrices fall out of the cache between groups). Measured on
+            // an M4 Pro (`just bench-rows`).
+            let rows = match m {
+                ..=2 => 2,
+                _ if m <= 4 || out.dtype != DType::F32 => 4,
+                _ => 8,
+            };
+            let groups = m.div_ceil(rows);
+            let axpby = c.filter(|&(_, alpha, beta)| alpha != 1.0 || beta != 0.0);
+            let batch_shape: Vec<usize> = match &out.shape[..nd - 2] {
+                [] => vec![1],
+                s => s.to_vec(),
+            };
+            let batch: usize = batch_shape.iter().product();
+            let nc = batch_shape.len() > 1;
+            let name = format!(
+                "nuvec_{kind}_rows{rows}_{}_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc{}_axpby{}",
+                out.dtype.name(),
+                u8::from(nc),
+                u8::from(axpby.is_some())
+            );
+            let strides = |v: &[isize]| -> Vec<u8> {
+                let v: Vec<i64> = if v.is_empty() {
+                    vec![0]
+                } else {
+                    v.iter().map(|&s| s as i64).collect()
+                };
+                bytemuck::cast_slice(&v).to_vec()
+            };
+            let (vec_strides, mat_strides) =
+                (strides(&vec.batch_strides), strides(&mat.batch_strides));
+            let (bias_strides, bias_stride, bias_row_stride, alpha, beta) = match axpby {
+                Some(((cm, _), alpha, beta)) => (
+                    strides(&cm.strides[..nd - 2]),
+                    cm.strides[nd - 1] as i32,
+                    cm.strides[nd - 2] as i32,
+                    alpha,
+                    beta,
+                ),
+                None => (strides(&[]), 0, 0, 1.0, 0.0),
+            };
+            let ints = |v: usize| (v as i32).to_le_bytes();
+            let scalars = [
+                ints(k),
+                ints(n),
+                mat.ld.to_le_bytes(),
+                alpha.to_le_bytes(),
+                beta.to_le_bytes(),
+                ints(nd.saturating_sub(2).max(1)),
+                bias_stride.to_le_bytes(),
+                ints(m),
+                bias_row_stride.to_le_bytes(),
+                ints(groups),
+            ];
+            let row_stride = i64::from(vec.ld).to_le_bytes();
+            let shape = shape_bytes(&batch_shape);
+            let unused = [0u8; 4];
+            let pipeline = self.pipeline_with(&name, &[])?;
+            let bias_arg = match axpby {
+                Some(((cm, cd), _, _)) => Arg::Read(
+                    cd.buffer.metal().expect("checked"),
+                    cd.offset as usize * cm.dtype.size(),
+                ),
+                None => Arg::bytes(&unused),
+            };
+            let args = [
+                mat.arg(),
+                vec.arg(),
+                bias_arg,
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&scalars[0]),
+                Arg::bytes(&scalars[1]),
+                Arg::bytes(&scalars[2]),
+                Arg::bytes(&scalars[3]),
+                Arg::bytes(&scalars[4]),
+                Arg::bytes(&scalars[5]),
+                Arg::bytes(&shape),
+                Arg::bytes(&vec_strides),
+                Arg::bytes(&mat_strides),
+                Arg::bytes(&bias_strides),
+                Arg::bytes(&scalars[6]),
+                Arg::bytes(&scalars[7]),
+                Arg::bytes(&row_stride),
+                Arg::bytes(&scalars[8]),
+                Arg::bytes(&scalars[9]),
+            ];
+            self.encode_groups(
+                &pipeline,
+                &args,
+                [n.div_ceil(per_group) * groups, 1, batch],
+                [32, bn, bm],
+            )?;
             self.counted()
         }
 
@@ -2434,9 +2647,7 @@ mod metal {
         fn dispatch_linear(&mut self, name: &str, args: &[Arg<'_>], threads: usize) -> Result<()> {
             let pipeline = self.pipeline(name)?;
             let group = pipeline.max_threads_per_threadgroup().min(threads);
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, args, [threads, 1, 1], [group, 1, 1])
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, args, [threads, 1, 1], [group, 1, 1])?;
             self.counted()
         }
 
@@ -2448,9 +2659,7 @@ mod metal {
             rows: usize,
             group: usize,
         ) -> Result<()> {
-            self.command_buffer()?
-                .dispatch_threads(pipeline, args, [rows * group, 1, 1], [group, 1, 1])
-                .map_err(backend)?;
+            self.encode_threads(pipeline, args, [rows * group, 1, 1], [group, 1, 1])?;
             self.counted()
         }
 
@@ -2470,21 +2679,34 @@ mod metal {
         /// The fused operations (MLX's `fast` kernels and its softmax and log-sum-exp).
         fn fast(
             &mut self,
-            op: &crate::fast::FastOp,
+            op: &crate::fast::imp::FastOp,
             operands: &[Operand<'_>],
             outputs: &[Output],
         ) -> Result<Vec<Data>> {
-            use crate::fast::FastOp;
+            use crate::fast::imp::FastOp;
             let alloc = |o: &Output| Buffer::try_alloc_gpu(o.size * o.dtype.size());
             if let FastOp::Attention {
                 scale,
                 causal,
                 mask,
                 sinks,
-            } = op
+                passes,
+                blocks,
+                gqa_kernel,
+                tk1,
+            } = *op
             {
                 let mut out = alloc(&outputs[0])?;
-                let flags = (f32::from_bits(*scale), *causal, *mask, *sinks);
+                let flags = AttentionFlags {
+                    scale: f32::from_bits(scale),
+                    causal,
+                    has_mask: mask,
+                    has_sinks: sinks,
+                    passes,
+                    blocks: blocks as usize,
+                    gqa_kernel,
+                    tk1,
+                };
                 self.attention(operands, &outputs[0], flags, &mut out)?;
                 return Ok(vec![Data::new(out)]);
             }
@@ -2536,9 +2758,7 @@ mod metal {
                 let grid = [c, l_out, n];
                 let name = format!("nuvec_depthwise_conv1d_{}", operands[0].0.dtype.name());
                 let pipeline = self.pipeline(&name)?;
-                self.command_buffer()?
-                    .dispatch_threads(&pipeline, &args, grid, block_dims(grid))
-                    .map_err(backend)?;
+                self.encode_threads(&pipeline, &args, grid, block_dims(grid))?;
                 self.counted()?;
                 return Ok(vec![Data::new(out)]);
             }
@@ -2763,9 +2983,7 @@ mod metal {
                         Some(f) => args.extend([f.arg(), Arg::bytes(&freq_stride)]),
                         None => args.push(Arg::bytes(&log_base)),
                     }
-                    self.command_buffer()?
-                        .dispatch_threads(&pipeline, &args, grid, group)
-                        .map_err(backend)?;
+                    self.encode_threads(&pipeline, &args, grid, group)?;
                     self.counted()?;
                 }
                 FastOp::Attention { .. }
@@ -2868,9 +3086,7 @@ mod metal {
                     _ => Arg::bytes(c),
                 });
             }
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, &args, call.grid, call.threadgroup)
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, &args, call.grid, call.threadgroup)?;
             drop(args);
             self.counted()?;
             Ok(outs.into_iter().map(Data::new).collect())
@@ -2990,12 +3206,16 @@ mod metal {
                 .collect::<Result<Vec<_>>>()?;
             let (q, cache, tables) = (operands[0].0, operands[1].0, operands[3].0);
             let (b, hq, lq, d) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
-            let (hkv, block_size) = (cache.shape[1], cache.shape[2]);
+            let (num_blocks, hkv, block_size) = (cache.shape[0], cache.shape[1], cache.shape[2]);
             let max_blocks = tables.shape[1];
             let as_i32 = |v: usize| {
                 i32::try_from(v)
                     .map_err(|_| Error::InvalidArgument("paged_attention: too large".into()))
             };
+            // The kernels clamp positions to the capacity in `int`s, with headroom for the
+            // key loops' strides.
+            let capacity = max_blocks * block_size;
+            as_i32(capacity.saturating_mul(2).saturating_add(1 << 16))?;
             let shift = block_size.trailing_zeros() as usize;
             let sc = scale.to_le_bytes();
             let dtn = q.dtype.name();
@@ -3006,9 +3226,10 @@ mod metal {
                 .and_then(|dev| dev.info().class)
                 .unwrap_or('g');
             let gqa = hq / hkv;
-            let capacity = max_blocks * block_size;
-            if vector_two_pass(class, capacity, hkv < hq) && 32 * gqa * lq <= 1024 {
-                let blocks = vector_blocks(class, capacity, gqa * lq);
+            if crate::fast::plan::vector_two_pass(class, capacity, hkv < hq)
+                && 32 * gqa * lq <= 1024
+            {
+                let blocks = crate::fast::plan::vector_blocks(class, capacity, gqa * lq);
                 let rows = b * hq * lq;
                 let mut partial = Buffer::try_alloc_gpu(rows * blocks * d * q.dtype.size())?;
                 let mut sums = Buffer::try_alloc_gpu(rows * blocks * 4)?;
@@ -3019,6 +3240,7 @@ mod metal {
                     as_i32(shift)?,
                     as_i32(max_blocks)?,
                     as_i32(blocks)?,
+                    as_i32(num_blocks)?,
                 ];
                 {
                     let mut args: Vec<Arg<'_>> = ins.iter().take(3).map(Packed::arg).collect();
@@ -3033,9 +3255,7 @@ mod metal {
                     ]);
                     let name = format!("nuvec_paged_attention_2pass_1_{dtn}_{d}");
                     let pipeline = self.pipeline(&name)?;
-                    self.command_buffer()?
-                        .dispatch_groups(&pipeline, &args, [hkv, b, blocks], [32, gqa, lq])
-                        .map_err(backend)?;
+                    self.encode_groups(&pipeline, &args, [hkv, b, blocks], [32, gqa, lq])?;
                     self.counted()?;
                 }
                 let bl = as_i32(blocks)?.to_le_bytes();
@@ -3055,6 +3275,7 @@ mod metal {
                 as_i32(lq)?,
                 as_i32(shift)?,
                 as_i32(max_blocks)?,
+                as_i32(num_blocks)?,
             ];
             let mut args: Vec<Arg<'_>> = ins.iter().take(3).map(Packed::arg).collect();
             args.push(Arg::write(buffer.metal_mut().expect("device storage")));
@@ -3062,9 +3283,7 @@ mod metal {
             args.extend([Arg::bytes(bytemuck::bytes_of(&params)), Arg::bytes(&sc)]);
             let name = format!("nuvec_paged_attention_{dtn}_{d}");
             let pipeline = self.pipeline(&name)?;
-            self.command_buffer()?
-                .dispatch_groups(&pipeline, &args, [b * hq, lq, 1], [1024, 1, 1])
-                .map_err(backend)?;
+            self.encode_groups(&pipeline, &args, [b * hq, lq, 1], [1024, 1, 1])?;
             self.counted()
         }
 
@@ -3084,7 +3303,17 @@ mod metal {
             if t == 0 {
                 return Ok(());
             }
-            let params = [hkv as i32, cache_shape[2] as i32, d as i32];
+            // Slots past `num_blocks · block_size` are skipped by the kernel.
+            let as_i32 = |v: usize| {
+                i32::try_from(v)
+                    .map_err(|_| Error::InvalidArgument("paged_write: too large".into()))
+            };
+            let params = [
+                as_i32(hkv)?,
+                as_i32(cache_shape[2])?,
+                as_i32(d)?,
+                as_i32(cache_shape[0])?,
+            ];
             let args = [
                 new.arg(),
                 slots.arg(),
@@ -3094,9 +3323,7 @@ mod metal {
             let name = format!("nuvec_paged_write_{}", operands[0].0.dtype.name());
             let pipeline = self.pipeline(&name)?;
             let grid = [d, hkv, t];
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, &args, grid, block_dims(grid))
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, &args, grid, block_dims(grid))?;
             self.counted()
         }
 
@@ -3118,7 +3345,7 @@ mod metal {
         pub(crate) fn norm_rope_in_place(
             &mut self,
             mut base: Data,
-            op: &crate::fast::FastOp,
+            op: &crate::fast::imp::FastOp,
             operands: &[Operand<'_>],
             out: &Output,
         ) -> Result<Data> {
@@ -3132,12 +3359,12 @@ mod metal {
         /// cache) or 0: one threadgroup per row, reading `x` through its strides.
         fn norm_rope_into(
             &mut self,
-            op: &crate::fast::FastOp,
+            op: &crate::fast::imp::FastOp,
             operands: &[Operand<'_>],
             out_shape: &[usize],
             buffer: &mut Buffer,
         ) -> Result<()> {
-            let crate::fast::FastOp::NormRope {
+            let crate::fast::imp::FastOp::NormRope {
                 eps,
                 dims,
                 traditional,
@@ -3388,9 +3615,7 @@ mod metal {
             } else {
                 ([32, dv, b * hv], [32, 4, 1])
             };
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, &args, grid, group)
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, &args, grid, group)?;
             self.counted()
         }
 
@@ -3414,14 +3639,25 @@ mod metal {
         }
 
         /// MLX's `ScaledDotProductAttention::eval_gpu` (without NAX): the vector kernels
-        /// (one or two passes) for up to 8 queries, the tiled steel kernel otherwise.
+        /// (one or two passes) or the tiled steel kernel, as the attention plan decided
+        /// (`crate::fast::plan`; the encoder makes no routing decisions).
         fn attention(
             &mut self,
             operands: &[Operand<'_>],
             out: &Output,
-            (scale, causal, has_mask, has_sinks): (f32, bool, bool, bool),
+            flags: AttentionFlags,
             buffer: &mut Buffer,
         ) -> Result<()> {
+            let AttentionFlags {
+                scale,
+                causal,
+                has_mask,
+                has_sinks,
+                passes,
+                blocks,
+                gqa_kernel,
+                tk1,
+            } = flags;
             use nuvec_gpu::Constant;
             let (qm, km) = (operands[0].0, operands[1].0);
             let (b, hq, lq, d) = (qm.shape[0], qm.shape[1], qm.shape[2], qm.shape[3]);
@@ -3443,7 +3679,7 @@ mod metal {
             let i32b = |v: usize| (v as i32).to_le_bytes();
             let u64b = |v: isize| (v as u64).to_le_bytes();
             let unused = [0u8; 4];
-            if lq <= 8 {
+            if passes > 0 {
                 let q = self.packed(operands[0], true)?;
                 let kv_ok = |m: &Output| {
                     unit(m)
@@ -3513,8 +3749,7 @@ mod metal {
                     }
                 }
                 let push_mask = |args: &mut Vec<Arg<'_>>, at: usize| pad(args, at, &[0u8; 4]);
-                let two_pass = vector_two_pass(class, lk, hkv < hq);
-                if !two_pass {
+                if passes == 1 {
                     let name = format!("nuvec_sdpa_vector_{dtn}_{d}_{dv}");
                     let device = self
                         .device()
@@ -3546,19 +3781,9 @@ mod metal {
                         push_mask(&mut args, 16);
                         args.extend([s.arg(), Arg::bytes(&nh)]);
                     }
-                    self.command_buffer()?
-                        .dispatch_groups(&pipeline, &args, [b * hq, lq, 1], [1024, 1, 1])
-                        .map_err(backend)?;
+                    self.encode_groups(&pipeline, &args, [b * hq, lq, 1], [1024, 1, 1])?;
                     return self.counted();
                 }
-                let blocks = vector_blocks(class, lk, gqa * lq);
-                let gqa_kernel = !has_mask
-                    && !has_sinks
-                    && lq == 1
-                    && d == dv
-                    && lk >= 8192
-                    && ((gqa == 8 && (d == 64 || d == 128))
-                        || ((gqa == 12 || gqa == 16) && d == 128));
                 let mut name = format!(
                     "nuvec_sdpa_vector_2pass_1_{}{dtn}_{d}_{dv}",
                     if gqa_kernel {
@@ -3570,18 +3795,13 @@ mod metal {
                 let device = self
                     .device()
                     .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+                if tk1 {
+                    name.push_str("_tk1");
+                }
                 let consts = constants(Some(blocks as i32));
-                let mut pipeline = device
+                let pipeline = device
                     .pipeline_with_constants(&name, &consts)
                     .map_err(backend)?;
-                let tk1 = (qm.dtype == DType::BF16 && d == 256 && dv == 256)
-                    || (qm.dtype == DType::F32 && d == dv && (d == 192 || d == 256));
-                if tk1 && 32 * gqa * lq > pipeline.max_threads_per_threadgroup() {
-                    name.push_str("_tk1");
-                    pipeline = device
-                        .pipeline_with_constants(&name, &consts)
-                        .map_err(backend)?;
-                }
                 let rows = b * hq * lq;
                 let mut partial = Buffer::try_alloc_gpu(rows * blocks * dv * qm.dtype.size())?;
                 let mut sums = Buffer::try_alloc_gpu(rows * blocks * 4)?;
@@ -3612,9 +3832,7 @@ mod metal {
                         push_mask(&mut args, 18);
                         args.push(s.arg());
                     }
-                    self.command_buffer()?
-                        .dispatch_groups(&pipeline, &args, [hkv, b, blocks], [32, gqa, lq])
-                        .map_err(backend)?;
+                    self.encode_groups(&pipeline, &args, [hkv, b, blocks], [32, gqa, lq])?;
                     self.counted()?;
                 }
                 let name = format!("nuvec_sdpa_vector_2pass_2_{dtn}_{dv}");
@@ -3706,9 +3924,7 @@ mod metal {
                 args.push(s.arg());
             }
             let _ = out;
-            self.command_buffer()?
-                .dispatch_groups(&pipeline, &args, [nq, hq, b], [32, wm, wn])
-                .map_err(backend)?;
+            self.encode_groups(&pipeline, &args, [nq, hq, b], [32, wm, wn])?;
             self.counted()
         }
 
@@ -3795,18 +4011,26 @@ mod metal {
                 .map(|d| d.info())
                 .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
             let (generation, class) = (info.generation.unwrap_or(0), info.class.unwrap_or('g'));
+            // Up to `ROW_INDEPENDENT_ROWS` rows run as matrix-vector products, whose rows
+            // are independent (the row-independence contract), even where MLX's tuned
+            // limit would switch to the tiled product earlier.
+            let rows = crate::ROW_INDEPENDENT_ROWS + 1;
             let limit = if transpose {
-                qmv_batch_limit(k, n, generation, class)
+                qmv_batch_limit(k, n, generation, class).max(rows)
             } else {
-                4
+                rows
             };
             let dtype = out.dtype.name();
             let base = format!("{dtype}_gs{group_size}_b{bits}");
             let batched = batch > 1;
             if m >= limit && transpose && !batched {
+                // The K partitions are chosen from one item's rows (`x`'s second-to-last
+                // dimension), not from all of them: each item of `[B, L, K]` then gets the
+                // bits of its product alone (`B = 1`, as MLX chooses).
+                let item = if nd >= 3 { x.shape[nd - 2] } else { m };
                 return self.qmm_splitk(
                     [&w, &s, &b, &x],
-                    (m, n, k),
+                    (m, n, k, item),
                     &base,
                     out,
                     buffer,
@@ -3851,8 +4075,8 @@ mod metal {
             }
             args.extend([Arg::bytes(&kb), Arg::bytes(&nb)]);
             let fast = k % (pack_factor(bits, 32) * if bits == 2 { 1 } else { 2 } * 32) == 0;
-            if transpose && fast && !batched && bits == 4 && m >= 4 {
-                // nuvec's few-row kernel: weights unpacked once for two rows.
+            if transpose && fast && !batched && m >= 4 {
+                // nuvec's few-row kernel: weights loaded once for two rows.
                 args.push(Arg::bytes(&mb));
                 let name = format!(
                     "nuvec_affine_qmv_rows_{base}_pr{}_r2",
@@ -3933,9 +4157,7 @@ mod metal {
                 let pipeline = self.pipeline_with(&name, &constants)?;
                 // Every expert adds at most one partial row tile.
                 let tiles = batch.div_ceil(16) + groups;
-                self.command_buffer()?
-                    .dispatch_groups(&pipeline, &args, [n.div_ceil(32), tiles, 1], [32, 2, 1])
-                    .map_err(backend)?;
+                self.encode_groups(&pipeline, &args, [n.div_ceil(32), tiles, 1], [32, 2, 1])?;
                 return self.counted();
             }
             let info = self
@@ -4023,6 +4245,11 @@ mod metal {
             };
             let first = |strides: &[isize]| strides.first().map_or(0, |&s| s as i64);
             let ints = |v: usize| (v as i32).to_le_bytes();
+            if m == 1 && batch <= crate::quantized::ROW_TOKENS {
+                // Few gathered rows: one matrix-vector product each (MLX's `gather_mv`),
+                // whose rows are independent.
+                return self.gather_mv(operands, &ga, &gb, (n, k, batch), out, buffer);
+            }
             if let Some(&offsets) = operands.get(4) {
                 // `a` is `[rows, 1, K]`, sorted by weight batch: one stride walks the batches.
                 if gb.batch_strides.len() != 1 {
@@ -4064,9 +4291,7 @@ mod metal {
                 ];
                 // Every batch of `b` adds at most one partial row tile.
                 let tiles = batch.div_ceil(16) + groups;
-                self.command_buffer()?
-                    .dispatch_groups(&pipeline, &args, [n.div_ceil(64), tiles, 1], [32, 2, 1])
-                    .map_err(backend)?;
+                self.encode_groups(&pipeline, &args, [n.div_ceil(64), tiles, 1], [32, 2, 1])?;
                 return self.counted();
             }
             let lhs = self.view_if(operands[2], true)?;
@@ -4118,24 +4343,95 @@ mod metal {
                 Arg::bytes(bytemuck::bytes_of(&params)),
             ];
             args.extend(layout.iter().map(|v| Arg::bytes(v)));
-            self.command_buffer()?
-                .dispatch_groups(
-                    &pipeline,
-                    &args,
-                    [n.div_ceil(64), m.div_ceil(64), batch],
-                    [32, 2, 2],
-                )
-                .map_err(backend)?;
+            self.encode_groups(
+                &pipeline,
+                &args,
+                [n.div_ceil(64), m.div_ceil(64), batch],
+                [32, 2, 2],
+            )?;
+            self.counted()
+        }
+
+        /// `gather_mm` for one row per output batch: MLX's `gather_mv` (the matrix-vector
+        /// kernels with gathered operands), each batch the one-row product.
+        fn gather_mv(
+            &mut self,
+            operands: &[Operand<'_>],
+            ga: &Gemmand<'_>,
+            gb: &Gemmand<'_>,
+            (n, k, batch): (usize, usize, usize),
+            out: &Output,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let lhs = self.view_if(operands[2], true)?;
+            let rhs = self.view_if(operands[3], true)?;
+            let transpose_mat = !gb.transposed;
+            let GemvConfig {
+                kind,
+                bm,
+                bn,
+                sm,
+                sn,
+                tm,
+                tn,
+                per_group,
+            } = gemv_config(transpose_mat, k, n);
+            let name = format!(
+                "nuvec_{kind}_gather_{}_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}",
+                out.dtype.name()
+            );
+            let ints = |v: usize| (v as i32).to_le_bytes();
+            let (a_shape, b_shape) = (&operands[0].0.shape, &operands[1].0.shape);
+            let batch_shape: Vec<usize> = match &out.shape[..out.shape.len() - 2] {
+                [] => vec![1],
+                s => s.to_vec(),
+            };
+            let nonempty = |s: &[usize]| if s.is_empty() { vec![1] } else { s.to_vec() };
+            let nonempty_strides = |s: &[isize]| if s.is_empty() { vec![0] } else { s.to_vec() };
+            let (va, vb) = (&a_shape[..a_shape.len() - 2], &b_shape[..b_shape.len() - 2]);
+            let scalars = [ints(k), ints(n), gb.ld.to_le_bytes()];
+            let layout = [
+                ints(batch_shape.len()).to_vec(),
+                shape_bytes(&batch_shape),
+                strides_bytes(&nonempty_strides(&lhs.strides)),
+                strides_bytes(&nonempty_strides(&rhs.strides)),
+                ints(va.len().max(1)).to_vec(),
+                shape_bytes(&nonempty(va)),
+                strides_bytes(&nonempty_strides(&ga.batch_strides)),
+                ints(vb.len().max(1)).to_vec(),
+                shape_bytes(&nonempty(vb)),
+                strides_bytes(&nonempty_strides(&gb.batch_strides)),
+            ];
+            let (alpha, beta) = (1.0f32.to_le_bytes(), 0.0f32.to_le_bytes());
+            let mut args = vec![
+                gb.arg(),
+                ga.arg(),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&scalars[0]),
+                Arg::bytes(&scalars[1]),
+                Arg::bytes(&scalars[2]),
+            ];
+            args.extend(layout.iter().map(|v| Arg::bytes(v)));
+            args.extend([lhs.arg(), rhs.arg(), Arg::bytes(&alpha), Arg::bytes(&beta)]);
+            let pipeline = self.pipeline_with(&name, &[])?;
+            self.encode_groups(
+                &pipeline,
+                &args,
+                [n.div_ceil(per_group), 1, batch],
+                [32, bn, bm],
+            )?;
             self.counted()
         }
 
         /// MLX's `qmm_splitk`: K split into partitions of whole groups, partial products in
         /// float32, summed by the GEMM's split-K accumulation. One partition runs `qmm_t`.
+        /// The partitions are counted for `item` rows (MLX's rule for `m = item`), so the
+        /// bits of a row do not depend on how many items share the product.
         #[allow(clippy::too_many_arguments)]
         fn qmm_splitk(
             &mut self,
             [w, s, b, x]: [&Packed<'_>; 4],
-            (m, n, k): (usize, usize, usize),
+            (m, n, k, item): (usize, usize, usize, usize),
             base: &str,
             out: &Output,
             buffer: &mut Buffer,
@@ -4143,7 +4439,8 @@ mod metal {
         ) -> Result<()> {
             let (n_tiles, m_tiles) = (n.div_ceil(32), m.div_ceil(32));
             let k_align = group_size.max(32);
-            let mut split = (512 / (n_tiles * m_tiles)).max(1).min(k / k_align);
+            let item_tiles = item.div_ceil(32).max(1);
+            let mut split = (512 / (n_tiles * item_tiles)).max(1).min(k / k_align);
             while split > 1 && k % (split * k_align) != 0 {
                 split -= 1;
             }
@@ -4190,9 +4487,7 @@ mod metal {
             ];
             let name = format!("nuvec_gemm_splitk_accum_{}", out.dtype.name());
             let pipeline = self.pipeline(&name)?;
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, &args, [n, m, 1], [n.min(32), m.min(32), 1])
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, &args, [n, m, 1], [n.min(32), m.min(32), 1])?;
             self.counted()
         }
 
@@ -4258,6 +4553,61 @@ mod metal {
             Ok(self.cmd.as_mut().expect("just created"))
         }
 
+        // Every dispatch of core's kernels goes through the three helpers below: the only
+        // `unsafe` dispatch calls in core.
+
+        /// Encodes `pipeline` over `threads` threads (a 1-D grid).
+        #[allow(unsafe_code)]
+        fn encode_dispatch(
+            &mut self,
+            pipeline: &nuvec_gpu::Pipeline,
+            args: &[Arg<'_>],
+            threads: usize,
+        ) -> Result<()> {
+            let cmd = self.command_buffer()?;
+            // SAFETY: core's 1-D kernels (elementwise, copies, gathers and scatters, fused
+            // elementwise source) guard every access with the element count bound next to
+            // the buffers (`if (i >= n) return`, or a grid of exactly that many threads),
+            // and the buffers are allocated for, or are validated views of, the shapes
+            // those counts and strides come from.
+            unsafe { cmd.dispatch(pipeline, args, threads) }.map_err(backend)
+        }
+
+        /// Encodes `pipeline` over `groups` threadgroups of `threads` threads.
+        #[allow(unsafe_code)]
+        fn encode_groups(
+            &mut self,
+            pipeline: &nuvec_gpu::Pipeline,
+            args: &[Arg<'_>],
+            groups: [usize; 3],
+            threads: [usize; 3],
+        ) -> Result<()> {
+            let cmd = self.command_buffer()?;
+            // SAFETY: core's threadgroup kernels (reductions, matrix products, attention,
+            // quantized products) index rows and tiles by threadgroup position within the
+            // grid sized from the operands' shapes, and guard partial tiles and rows with
+            // the sizes bound next to the buffers; the buffers hold those shapes.
+            unsafe { cmd.dispatch_groups(pipeline, args, groups, threads) }.map_err(backend)
+        }
+
+        /// Encodes `pipeline` over exactly `grid` threads in threadgroups of `group`.
+        #[allow(unsafe_code)]
+        fn encode_threads(
+            &mut self,
+            pipeline: &nuvec_gpu::Pipeline,
+            args: &[Arg<'_>],
+            grid: [usize; 3],
+            group: [usize; 3],
+        ) -> Result<()> {
+            let cmd = self.command_buffer()?;
+            // SAFETY: core's grid kernels (random bits, strided copies, reductions,
+            // attention, user `MetalKernel`s, whose source is trusted code by contract)
+            // launch exactly `grid` threads, sized from the operands' shapes, and index
+            // the buffers by grid position within those shapes (checking partial rows
+            // against the sizes bound next to the buffers).
+            unsafe { cmd.dispatch_threads(pipeline, args, grid, group) }.map_err(backend)
+        }
+
         fn pipeline(&mut self, name: &str) -> Result<nuvec_gpu::Pipeline> {
             let device = self
                 .device()
@@ -4289,17 +4639,13 @@ mod metal {
             ];
             let grid = [words / 2 + words % 2, num_keys, 1];
             let pipeline = self.pipeline("nuvec_random_bits")?;
-            self.command_buffer()?
-                .dispatch_threads(&pipeline, &args, grid, block_dims(grid))
-                .map_err(backend)?;
+            self.encode_threads(&pipeline, &args, grid, block_dims(grid))?;
             self.counted()
         }
 
         fn dispatch(&mut self, name: &str, args: &[Arg<'_>], threads: usize) -> Result<()> {
             let pipeline = self.pipeline(name)?;
-            self.command_buffer()?
-                .dispatch(&pipeline, args, threads)
-                .map_err(backend)?;
+            self.encode_dispatch(&pipeline, args, threads)?;
             self.counted()
         }
 
@@ -4311,9 +4657,7 @@ mod metal {
             threads: [usize; 3],
         ) -> Result<()> {
             let pipeline = self.pipeline(name)?;
-            self.command_buffer()?
-                .dispatch_groups(&pipeline, args, groups, threads)
-                .map_err(backend)?;
+            self.encode_groups(&pipeline, args, groups, threads)?;
             self.counted()
         }
 
@@ -4370,27 +4714,38 @@ mod metal {
                     return;
                 }
                 // No GPU work orders these views after their producers: wait for them.
+                let reads = std::mem::take(&mut self.reads);
                 let result = std::mem::take(&mut self.foreign)
                     .iter()
                     .try_for_each(|a| a.out().slot.wait().clone().map(|_| ()));
                 let committed = std::mem::take(&mut self.chunk);
-                let k = self.reserve(&committed);
-                expose(&committed);
+                let (k, status) = self.reserve(&committed);
+                expose(&committed, &status);
                 self.shared.exposed(k);
-                self.shared.complete(k, result);
+                self.shared.complete(k, chunk_result(result, &reads));
                 return;
             };
             // This command buffer runs after every foreign producer (device timeline).
             self.foreign.clear();
+            let reads = std::mem::take(&mut self.reads);
             if let Some(device) = self.device {
                 device.wait_for_capacity(MAX_IN_FLIGHT);
             }
             // Held until exposed: a completion handler that runs first publishes from it.
             let committed = std::mem::take(&mut self.chunk);
-            let k = self.reserve(&committed);
+            let (k, status) = self.reserve(&committed);
             let shared = self.shared.clone();
+            #[cfg(test)]
+            let injected = fault::take();
             let pending = cmd.commit_then(move |result| {
-                shared.complete(k, device_result(result.map_err(backend)));
+                #[cfg(test)]
+                let result = match injected {
+                    true => Err(nuvec_gpu::GpuError::CommandBuffer(
+                        "injected failure".into(),
+                    )),
+                    false => result,
+                };
+                shared.complete(k, chunk_result(result.map_err(backend), &reads));
             });
             // Profiling times each command buffer alone: nothing may overlap it.
             if nuvec_gpu::profile::enabled() {
@@ -4398,26 +4753,38 @@ mod metal {
             }
             self.submitted.push(pending);
             // Only now, after the commit, may other evaluations encode work that reads it.
-            expose(&committed);
+            expose(&committed, &status);
             self.shared.exposed(k);
         }
 
-        /// Registers `chunk` (the open chunk) as committed chunk `k`.
-        fn reserve(&mut self, chunk: &Chunk) -> usize {
+        /// Registers `chunk` (the open chunk) as committed chunk `k`, with its failure cell.
+        fn reserve(&mut self, chunk: &Chunk) -> (usize, ChunkStatus) {
             let mut p = self
                 .shared
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let status = ChunkStatus::default();
             p.chunks.push(Some(weak(chunk)));
             p.results.push(None);
             p.exposed.push(false);
-            p.chunks.len() - 1
+            p.statuses.push(status.clone());
+            (p.chunks.len() - 1, status)
         }
 
         /// Records that the open chunk reads other evaluations' in-flight `outputs`.
         pub(crate) fn depend_on(&mut self, outputs: &[&crate::Array]) {
             self.foreign.extend(outputs.iter().map(|&a| a.clone()));
+        }
+
+        /// Records that the open chunk reads `input`'s in-flight data, produced by another
+        /// evaluation: it fails if that work fails.
+        pub(crate) fn read_in_flight(&mut self, input: &crate::Array) {
+            if let Some(status) = input.out().inflight.chunk()
+                && !self.reads.iter().any(|s| Arc::ptr_eq(s, &status))
+            {
+                self.reads.push(status);
+            }
         }
 
         /// Holds `outputs` of `node` until the GPU work producing them has completed (or
@@ -4435,7 +4802,7 @@ mod metal {
         /// consumers are all encoded): nobody can read them, and their memory returns to the
         /// allocator at once, for later GPU work to reuse (ordered after its uses, as MLX
         /// reuses memory).
-        fn release_unreferenced(&mut self) {
+        pub(crate) fn release_unreferenced(&mut self) {
             self.chunk.retain(|(node, _)| Arc::strong_count(node) > 1);
             {
                 let mut p = self
@@ -4572,14 +4939,78 @@ mod metal {
         }
     }
 
+    /// Test-only fault injection: the next command buffer this thread commits completes
+    /// with an error.
+    #[cfg(test)]
+    pub(crate) mod fault {
+        use std::cell::Cell;
+
+        thread_local!(static FAIL_NEXT: Cell<bool> = const { Cell::new(false) });
+
+        /// Fails the next command buffer committed on this thread.
+        pub(crate) fn fail_next_commit() {
+            FAIL_NEXT.set(true);
+        }
+
+        pub(super) fn take() -> bool {
+            FAIL_NEXT.replace(false)
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use crate::Array;
 
+        /// A GPU failure fails the evaluation that encoded into the failed command buffer,
+        /// and nothing independent of it.
+        #[test]
+        fn a_failed_chunk_fails_only_its_evaluation() {
+            if MetalDevice::shared().is_none() {
+                return;
+            }
+            crate::set_default_stream(crate::Stream::default_for(crate::Device::gpu(0)));
+            let x = Array::from_slice(&[1.0f32, 2.0, 3.0], [3]);
+            let failing = crate::ops::imp::exp(&x).unwrap();
+            fault::fail_next_commit();
+            let err = failing.eval().unwrap_err();
+            assert!(err.to_string().contains("injected"), "{err}");
+            assert!(failing.to_vec::<f32>().is_err(), "sticky for that array");
+            // An independent evaluation afterwards succeeds.
+            let y = crate::ops::imp::exp(&(&x * 2.0f32)).unwrap();
+            let expected: Vec<f32> = [2.0f32, 4.0, 6.0].iter().map(|v| v.exp()).collect();
+            let got = y.to_vec::<f32>().unwrap();
+            for (g, e) in got.iter().zip(&expected) {
+                assert!((g - e).abs() <= 1e-5 * e, "{got:?}");
+            }
+            // As does reading the inputs of the failed evaluation.
+            assert_eq!(x.to_vec::<f32>().unwrap(), [1.0, 2.0, 3.0]);
+        }
+
+        /// A consumer reading a failed evaluation's in-flight result in another evaluation
+        /// fails too.
+        #[test]
+        fn readers_of_a_failed_chunk_fail() {
+            if MetalDevice::shared().is_none() {
+                return;
+            }
+            crate::set_default_stream(crate::Stream::default_for(crate::Device::gpu(0)));
+            let x = Array::from_slice(&[1.0f32; 1024], [1024]);
+            let mut producer = x.clone();
+            for _ in 0..64 {
+                producer = crate::ops::imp::exp(&(&producer * 0.5f32)).unwrap();
+            }
+            fault::fail_next_commit();
+            crate::async_eval(std::slice::from_ref(&producer)).unwrap();
+            // Encoded while the producer is (usually) still in flight.
+            let consumer = &producer + 1.0f32;
+            assert!(consumer.eval().is_err());
+            assert!(producer.eval().is_err());
+        }
+
         fn pending() -> (Arc<Node>, Vec<Data>) {
-            let x = Array::scalar(1.0f32);
-            let y = crate::negative(&x).unwrap();
+            let x = Array::from(1.0f32);
+            let y = crate::ops::imp::negative(&x).unwrap();
             let data = x.out().slot.get().unwrap().clone().unwrap();
             (y.node.clone(), vec![data])
         }

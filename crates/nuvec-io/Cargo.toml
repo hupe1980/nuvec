@@ -1,7 +1,7 @@
 [package]
 name = "nuvec-io"
-description = "Zero-copy safetensors and npy loading for nuvec"
-exclude = ["tests/fixtures"]
+description = "safetensors and npy I/O for nuvec: fast checkpoint loading and saving of any tree of arrays"
+exclude.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,6 +18,9 @@ nuvec-core.workspace = true
 
 [dev-dependencies]
 nuvec-gpu.workspace = true
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
 
 [lints]
 workspace = true

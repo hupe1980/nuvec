@@ -1,0 +1,61 @@
+{
+ "Linear": [
+  "weight",
+  "bias"
+ ],
+ "Linear_no_bias": [
+  "weight"
+ ],
+ "QuantizedLinear": [
+  "weight",
+  "scales",
+  "biases",
+  "bias"
+ ],
+ "QuantizedLinear_trainable_after_unfreeze": [
+  "weight",
+  "scales",
+  "biases",
+  "bias"
+ ],
+ "Embedding": [
+  "weight"
+ ],
+ "QuantizedEmbedding": [
+  "weight",
+  "scales",
+  "biases"
+ ],
+ "RMSNorm": [
+  "weight"
+ ],
+ "LayerNorm": [
+  "weight",
+  "bias"
+ ],
+ "LayerNorm_no_bias": [
+  "weight"
+ ],
+ "LayerNorm_no_affine": [],
+ "RoPE": [],
+ "LoRALinear": [
+  "linear.weight",
+  "linear.bias",
+  "lora_a",
+  "lora_b"
+ ],
+ "LoRALinear_trainable": [
+  "lora_a",
+  "lora_b"
+ ],
+ "MLP": [
+  "layers.0.weight",
+  "layers.0.bias",
+  "layers.1.weight",
+  "layers.1.bias",
+  "layers.2.weight",
+  "layers.2.bias"
+ ],
+ "MLP_total": 26506,
+ "MLP_trainable": 26506
+}

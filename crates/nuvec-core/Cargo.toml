@@ -1,7 +1,7 @@
 [package]
 name = "nuvec-core"
-description = "Lazy array graph, primitives, dtypes and evaluation for nuvec"
-exclude = ["tests/fixtures"]
+description = "Lazy arrays, operations, transforms and evaluation for nuvec"
+exclude.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,6 +19,10 @@ nuvec-gpu.workspace = true
 bytemuck.workspace = true
 half.workspace = true
 smallvec.workspace = true
+
+[dev-dependencies]
+# `#[derive(Tree)]` in the tree module's doc examples (`#[tree(crate = "nuvec_core")]`).
+nuvec-macros.workspace = true
 
 # Document the Metal API, which only exists on Apple targets.
 [package.metadata.docs.rs]
@@ -41,4 +45,12 @@ harness = false
 
 [[bench]]
 name = "fast"
+harness = false
+
+[[bench]]
+name = "attention_route"
+harness = false
+
+[[bench]]
+name = "rows"
 harness = false

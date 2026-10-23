@@ -31,4 +31,4 @@ Tolerances are derived per operation from the dtype's machine epsilon and the op
 - Results are bit-identical from run to run, also with memory reused under pending GPU work, and kernels compiled from embedded sources give the precompiled library's results.
 - The core runs under **Miri** to catch undefined behaviour, and Metal's API validation layer runs over the GPU runtime tests.
 
-`just ci` runs everything CI runs: formatting, clippy, tests on the minimum and latest Rust, docs, Miri, cargo-deny and the Metal library checks.
+`just ci` runs CI's gates locally: formatting, clippy, tests, docs, Miri, cargo-deny, the Metal library and hygiene checks. CI also tests the latest stable Rust and builds the portable crates on Linux.

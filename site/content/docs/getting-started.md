@@ -25,19 +25,22 @@ cargo add nuvec-lm     # optional: the LLM runtime
 ## Your first computation
 
 ```rust
-use nuvec::{Array, Result, grad, multiply, sum};
+use nuvec::prelude::*;
+use nuvec::grad;
 
 fn main() -> Result<()> {
-    let x = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3])?;
+    let x = array![1.0, 2.0, 3.0];          // float32, shape [3]
     let y = (&x * 2.0 + 1.0) * &x;          // records a graph; nothing runs yet
     assert_eq!(y.to_vec::<f32>()?, [3.0, 10.0, 21.0]); // evaluated here, on the GPU
 
     // Gradients are functions that return lazy arrays too.
-    let f = |x: &Array| sum(&multiply(x, x)?, &[], false); // sum(x²)
+    let f = |x: &Array| x.multiply(x).sum(..); // sum(x²) over all axes
     assert_eq!(grad(f)(&x)?.to_vec::<f32>()?, [2.0, 4.0, 6.0]);
     Ok(())
 }
 ```
+
+Operations are methods that chain (`x.multiply(x).sum(..)`); MLX's free functions are in `nuvec::ops` (`use nuvec::ops as mx;`). They return arrays, not `Result`: a mistake gives a failed array whose error, with your file and line, surfaces at `to_vec()?`, `item()?`, `eval()?` or `check()?` (see [Arrays](@/docs/arrays.md#errors)).
 
 Three things happened:
 
@@ -48,18 +51,22 @@ Three things happened:
 ## Choosing a device
 
 ```rust
+use nuvec::prelude::*;
 use nuvec::{Device, Stream, set_default_stream};
 
+let x = array![1.0, 2.0, 3.0];
+let y = with_stream(Device::cpu(), || x.exp().sum(..)); // built for the CPU
 set_default_stream(Stream::default_for(Device::cpu())); // this thread now uses the CPU
+# assert!((y.item::<f32>().unwrap() - 30.192_875).abs() < 1e-4);
 ```
 
-The default stream is per thread. Operations without a GPU kernel (for example on `float64`) run on the CPU over the same memory, so they work everywhere.
+`with_stream` runs a closure on another device and restores the previous default afterwards. The default stream is per thread. Operations without a GPU kernel (for example on `float64`) run on the CPU over the same memory, so they work everywhere.
 
 ## Generate text
 
 With a model in your local Hugging Face cache (for example `hf download mlx-community/Qwen3-8B-4bit`):
 
-```rust
+```rust,no_run
 use nuvec_lm::{GenerateOptions, StreamDecoder, generate, load};
 
 fn main() -> nuvec::Result<()> {
@@ -86,4 +93,5 @@ cargo run --release -p nuvec-lm --example generate -- \
 
 - [Arrays](@/docs/arrays.md): dtypes, promotion, broadcasting, views and indexing.
 - [Transforms](@/docs/transforms.md): `grad`, `vjp`, `jvp`, `vmap` and custom rules.
+- [Neural networks](@/docs/neural-networks.md): modules, layers and optimizers.
 - [LLM runtime](@/docs/llm.md): models, sampling and speculative decoding.

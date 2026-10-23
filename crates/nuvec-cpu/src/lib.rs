@@ -4,11 +4,14 @@
 //! dispatches to them. Inputs may have any layout (contiguous, transposed, sliced with
 //! negative steps, broadcast with zero strides); outputs are always row-contiguous.
 //!
+//! **Stability:** no promise when this crate is depended on directly; depend on `nuvec`,
+//! whose re-exports are semver-tracked.
+//!
 //! **Status:** pre-alpha. Element-wise, reduction and matrix-multiplication kernels.
 
 mod matmul;
 
-pub use matmul::{Gemm, MatView, matmul};
+pub use matmul::{Gemm, MatView, MatmulError, matmul};
 
 /// The version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

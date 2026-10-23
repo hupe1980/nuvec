@@ -44,6 +44,11 @@ CASES = [
     ("sdpa-prefill64", (1, 16, 16, 2048, 2048, 64)),
     ("sdpa-chunk2048", (1, 16, 8, 2048, 2048, 128)),
     ("sdpa-chunk1793", (1, 16, 8, 1793, 3841, 128)),
+    ("sdpa-verify2-1k", (1, 32, 8, 2, 1025, 128)),
+    ("sdpa-verify4-4k", (1, 32, 8, 4, 4096, 128)),
+    ("sdpa-verify8-4k", (1, 32, 8, 8, 4096, 128)),
+    ("sdpa-verify4-q36", (1, 16, 2, 4, 8194, 256)),
+    ("sdpa-verify8-q36", (1, 16, 2, 8, 32768, 256)),
 ]
 DTYPES = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 FILTER = sys.argv[1] if len(sys.argv) > 1 else ""

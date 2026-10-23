@@ -13,10 +13,22 @@
 
 #include "fast.h"
 
+// Out-of-range inputs never reach outside the caches (`indexing.metal`'s clamp rule): a
+// sequence's length is clamped to the table's capacity, `max_blocks * block_size` (so the
+// last key a query attends is at most `capacity - 1`), and block ids to `0..num_blocks`.
+// The host keeps `2 * capacity` within an `int`.
+inline int paged_last(int n, int lq, int l, int max_blocks, int shift) {
+  return clamp(n, 0, max_blocks << shift) - lq + l;
+}
+
+inline uint paged_block(const device int* table, int i, int shift, int num_blocks) {
+  return uint(clamp(table[i >> shift], 0, num_blocks - 1));
+}
+
 // Queries `[B, Hq, L, D]` (row-contiguous), output likewise. `params`: Hq, Hkv, L,
-// log2(block_size), max_blocks. Query `l` of a sequence of length `N` attends keys
-// `0..=N - L + l` (causal at the end, as `sdpa_vector`). One threadgroup of 32 SIMD-groups
-// per (sequence, query head, query).
+// log2(block_size), max_blocks, num_blocks. Query `l` of a sequence of length `N` attends
+// keys `0..=N - L + l` (causal at the end, as `sdpa_vector`). One threadgroup of 32
+// SIMD-groups per (sequence, query head, query).
 template <typename T, int D>
 [[kernel]] void paged_attention(
     const device T* queries [[buffer(0)]],
@@ -35,7 +47,7 @@ template <typename T, int D>
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = D / BD;
   const int hq = params[0], hkv = params[1], lq = params[2], shift = params[3],
-            max_blocks = params[4];
+            max_blocks = params[4], num_blocks = params[5];
   const int block_size = 1 << shift, within = block_size - 1;
   // 32-bit offsets (the host keeps caches under 2^32 elements): Apple GPUs emulate 64-bit
   // integer products, which would cost more than the keys' arithmetic.
@@ -53,8 +65,7 @@ template <typename T, int D>
 
   const int b = tid.x / hq, head = tid.x % hq, l = tid.y;
   const int kv_head = head / (hq / hkv);
-  const int n = lengths[b];
-  const int last = n - lq + l;
+  const int last = paged_last(lengths[b], lq, l, max_blocks, shift);
   const device int* table = block_tables + size_t(b) * max_blocks;
   const uint head_offset = uint(kv_head) * uint(block_size * D);
   const size_t row = (size_t(b) * hq + head) * lq + l;
@@ -72,7 +83,7 @@ template <typename T, int D>
   U sum_exp_score = 0;
 
   for (int i = simd_gid; i <= last; i += BN) {
-    const uint at = uint(table[i >> shift]) * page_stride + head_offset +
+    const uint at = paged_block(table, i, shift, num_blocks) * page_stride + head_offset +
         (uint(i & within) * uint(D)) + simd_lid * qk_per_thread;
     const device T* keys = k_cache + at;
     const device T* values = v_cache + at;
@@ -127,7 +138,7 @@ template <typename T, int D>
 // the group and query (`[32, G, L]` threads); key `i` of a sequence is visited by block
 // `i % blocks`, read through the block table. Writes MLX's partials layout (outputs, sums
 // and maxima per block), reduced by `sdpa_vector_2pass_2`. `params`: Hkv, L,
-// log2(block_size), max_blocks, blocks.
+// log2(block_size), max_blocks, blocks, num_blocks.
 template <typename T, int D, int TK = 4>
 [[kernel]] void paged_attention_2pass_1(
     const device T* queries [[buffer(0)]],
@@ -148,7 +159,7 @@ template <typename T, int D, int TK = 4>
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = D / BD;
   const int hkv = params[0], lq = params[1], shift = params[2], max_blocks = params[3],
-            blocks = params[4];
+            blocks = params[4], num_blocks = params[5];
   const int block_size = 1 << shift, within = block_size - 1;
   const uint page_stride = uint(hkv) << (shift + __builtin_ctz(uint(D)));
 
@@ -161,8 +172,7 @@ template <typename T, int D, int TK = 4>
   const int gqa = tptg.y, l = tidtg.z;
   const int head = gqa * kv_head + tidtg.y;
   const int hq = hkv * gqa;
-  const int n = lengths[b];
-  const int last = n - lq + l;
+  const int last = paged_last(lengths[b], lq, l, max_blocks, shift);
   const device int* table = block_tables + size_t(b) * max_blocks;
   const size_t row = (size_t(b) * hq + head) * lq + l;
 
@@ -181,7 +191,8 @@ template <typename T, int D, int TK = 4>
   // The offset of key `i` (this head) in the caches.
   const uint head_offset = uint(kv_head) * uint(block_size * D) + simd_lid * qk_per_thread;
   auto at = [&](int i) {
-    return uint(table[i >> shift]) * page_stride + head_offset + uint(i & within) * uint(D);
+    return paged_block(table, i, shift, num_blocks) * page_stride + head_offset +
+        uint(i & within) * uint(D);
   };
 
   int i = block_idx;
@@ -247,7 +258,8 @@ template <typename T, int D, int TK = 4>
 }
 
 // `cache[slot / block_size, h, slot % block_size, :] = new[t, h, :]` for each new position
-// `t` with its `slots[t]`; one thread per element. `params`: kv_heads, block_size, D.
+// `t` with its `slots[t]`; one thread per element. `params`: kv_heads, block_size, D,
+// num_blocks. Slots outside `0..num_blocks * block_size` are skipped.
 template <typename T>
 [[kernel]] void paged_write(
     const device T* src [[buffer(0)]],
@@ -255,9 +267,12 @@ template <typename T>
     device T* cache [[buffer(2)]],
     const constant int* params [[buffer(3)]],
     uint3 pos [[thread_position_in_grid]]) {
-  const int hkv = params[0], block_size = params[1], d = params[2];
+  const int hkv = params[0], block_size = params[1], d = params[2], num_blocks = params[3];
   const int t = pos.z, h = pos.y, e = pos.x;
   const int slot = slots[t];
+  if (slot < 0 || ulong(slot) >= ulong(num_blocks) * ulong(block_size)) {
+    return;
+  }
   const size_t at =
       ((size_t(slot / block_size) * hkv + h) * block_size + slot % block_size) * d + e;
   cache[at] = src[(size_t(t) * hkv + h) * d + e];

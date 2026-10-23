@@ -1,0 +1,6003 @@
+{
+  "schema": "nuvec-parity-record",
+  "schema_version": 1,
+  "created": "2026-10-23T16:02:33+00:00",
+  "environment": {
+    "machine": "Mac16,7",
+    "chip": "Apple M4 Pro",
+    "cpu_cores": {
+      "performance": 10,
+      "efficiency": 4
+    },
+    "gpu_cores": 20,
+    "memory_bytes": 51539607552,
+    "macos": {
+      "version": "26.6.2",
+      "build": "25G83"
+    },
+    "power": {
+      "source": "ac",
+      "low_power_mode": false
+    },
+    "swap_used_bytes_at_start": 14417657856,
+    "nuvec": {
+      "version": "0.4.0",
+      "commit": "76ad586e4a669c9cdedc15075d74e7574c1dc592",
+      "dirty": true
+    },
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "mlx": "0.32.4",
+    "mlx_lm": "0.32.2",
+    "python": "3.13.12"
+  },
+  "settings": {
+    "passes": 2,
+    "runs_per_pass": 2,
+    "max_tokens": 128,
+    "prompt_tokens": [
+      2048
+    ],
+    "legacy_repeats": [
+      1,
+      40,
+      160
+    ],
+    "extra_prompt_tokens": {
+      "mlx-community/Qwen3.6-35B-A3B-4bit": [
+        32768,
+        65536,
+        261952
+      ]
+    },
+    "concurrency": {
+      "levels": [
+        1,
+        4,
+        8
+      ],
+      "prompt_tokens": 512,
+      "max_tokens": 128,
+      "eos": "ignored"
+    },
+    "load": {
+      "samples": 3,
+      "first_token_prompt_tokens": 16,
+      "cold_method": "sudo -n purge"
+    },
+    "memory": {
+      "method": "peak_with_mapped-vs-get_peak_memory+ru_maxrss",
+      "note": "nuvec counts mapped files whole; both engines copy unaligned (mlx-community) checkpoints once"
+    },
+    "gates": {
+      "gate": 0.98,
+      "goal": 1.0
+    }
+  },
+  "sections": [
+    "decode",
+    "ttft",
+    "memory",
+    "load",
+    "concurrency"
+  ],
+  "models": [
+    {
+      "id": "mlx-community/Qwen3-0.6B-4bit",
+      "kind": "dense",
+      "snapshot": "73e3e38d981303bc594367cd910ea6eb48349da8",
+      "decode": [
+        {
+          "repeats": 1,
+          "prompt_tokens": {
+            "nuvec": 25,
+            "mlx_lm": 25
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 432.40999999999997,
+              "samples": [
+                435.9,
+                432.16,
+                432.44,
+                432.38
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 393.73973161844293,
+              "samples": [
+                395.84081391574585,
+                393.61883005703635,
+                392.8740285970342,
+                393.8606331798495
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0982,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 40,
+          "prompt_tokens": {
+            "nuvec": 961,
+            "mlx_lm": 961
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 347.69,
+              "samples": [
+                347.73,
+                348.72,
+                347.06,
+                347.65
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 319.53882561864305,
+              "samples": [
+                321.16817493695424,
+                319.55969565141413,
+                319.517955585872,
+                318.62204745378654
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0881,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 160,
+          "prompt_tokens": {
+            "nuvec": 3841,
+            "mlx_lm": 3841
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 231.385,
+              "samples": [
+                231.96,
+                231.45,
+                231.32,
+                230.69
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 218.44879155343745,
+              "samples": [
+                218.23236936078195,
+                218.66521374609297,
+                219.35960812422755,
+                216.959190123641
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0592,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        }
+      ],
+      "ttft": {
+        "legacy": [
+          {
+            "repeats": 1,
+            "prompt_tokens": {
+              "nuvec": 25,
+              "mlx_lm": 25
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 2006.495,
+                "samples": [
+                  1976.95,
+                  1973.57,
+                  2036.04,
+                  2081.61
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 1675.5273863268358,
+                "samples": [
+                  1674.009094122676,
+                  1705.4998750858256,
+                  1677.0456785309955,
+                  1659.4893752687508
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.1975,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 40,
+            "prompt_tokens": {
+              "nuvec": 961,
+              "mlx_lm": 961
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 6192.54,
+                "samples": [
+                  6163.21,
+                  6188.23,
+                  6196.85,
+                  6224.58
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 5958.558895812921,
+                "samples": [
+                  5928.86595965054,
+                  6013.751516019364,
+                  5960.507759730196,
+                  5956.610031895646
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0393,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 160,
+            "prompt_tokens": {
+              "nuvec": 3841,
+              "mlx_lm": 3841
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 4870.5,
+                "samples": [
+                  4874.91,
+                  4873.98,
+                  4862.63,
+                  4867.02
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 4765.180970132832,
+                "samples": [
+                  4771.419680558148,
+                  4772.349451116936,
+                  4758.942259707516,
+                  4746.523820366896
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0221,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ],
+        "lengths": [
+          {
+            "prompt_tokens": 2048,
+            "ttft_s": {
+              "nuvec": {
+                "median": 0.35814999999999997,
+                "samples": [
+                  0.3585,
+                  0.3578,
+                  0.3597,
+                  0.3572
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 0.3703455419999955,
+                "samples": [
+                  0.3710947090003174,
+                  0.36917658299353207,
+                  0.3714220409965492,
+                  0.36959637499967357
+                ],
+                "unit": "s"
+              },
+              "ratio": 1.0341,
+              "gate_pass": true,
+              "goal_pass": true
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 5718.344999999999,
+                "samples": [
+                  5712.23,
+                  5724.46,
+                  5693.88,
+                  5733.47
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 5529.9933395534745,
+                "samples": [
+                  5518.806790635887,
+                  5547.480783839101,
+                  5513.94309962081,
+                  5541.1798884710615
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0341,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ]
+      },
+      "memory": {
+        "load": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 335462400.0,
+              "samples": [
+                335462400,
+                335462400
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 335380488.0,
+              "samples": [
+                335380488,
+                335380488
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 0.9998
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 97935360.0,
+              "samples": [
+                98910208,
+                96960512
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 696647680.0,
+              "samples": [
+                696582144,
+                696713216
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 7.1133
+          },
+          "nuvec_raw": {
+            "peak_bytes": 0,
+            "active_bytes": 0,
+            "mapped_bytes": 335462400
+          }
+        },
+        "decode": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 376283392.0,
+              "samples": [
+                376389888,
+                376176896
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 455278860.0,
+              "samples": [
+                455639312,
+                454918408
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.2099
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 220405760.0,
+              "samples": [
+                220643328,
+                220168192
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 699506688.0,
+              "samples": [
+                702627840,
+                696385536
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 3.1737
+          },
+          "nuvec_raw": {
+            "peak_bytes": 40714496,
+            "active_bytes": 0,
+            "mapped_bytes": 335462400
+          }
+        },
+        "prefill_2048": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 2034169856.0,
+              "samples": [
+                2034169856,
+                2034169856
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 1459462292.0,
+              "samples": [
+                1459462292,
+                1459462292
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 0.7175
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 191954944.0,
+              "samples": [
+                192053248,
+                191856640
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 696573952.0,
+              "samples": [
+                695844864,
+                697303040
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 3.6288
+          },
+          "nuvec_raw": {
+            "peak_bytes": 1698707456,
+            "active_bytes": 0,
+            "mapped_bytes": 335462400
+          }
+        },
+        "prefill_32768": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 4200532992.0,
+              "samples": [
+                4227794944,
+                4173271040
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4739530808.0,
+              "samples": [
+                4739530808,
+                4739530808
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.1283
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 189751296.0,
+              "samples": [
+                189595648,
+                189906944
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 699269120.0,
+              "samples": [
+                699465728,
+                699072512
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 3.6852
+          },
+          "nuvec_raw": {
+            "peak_bytes": 3837808640,
+            "active_bytes": 0,
+            "mapped_bytes": 335462400
+          }
+        }
+      },
+      "load": {
+        "warm": {
+          "model_ready_s": {
+            "nuvec": {
+              "median": 0.0624,
+              "samples": [
+                0.0624,
+                0.0618,
+                0.0633
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.297630165994633,
+              "samples": [
+                0.29584445799991954,
+                0.29799062500387663,
+                0.297630165994633
+              ],
+              "unit": "s"
+            },
+            "ratio": 4.7697,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "first_token_s": {
+            "nuvec": {
+              "median": 0.1247,
+              "samples": [
+                0.1247,
+                0.1223,
+                0.1291
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.34507424899493344,
+              "samples": [
+                0.3389129990027868,
+                0.3486197500023991,
+                0.34507424899493344
+              ],
+              "unit": "s"
+            },
+            "ratio": 2.7672,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        "cold": {
+          "model_ready_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          },
+          "first_token_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          }
+        }
+      },
+      "concurrency": [
+        {
+          "level": 1,
+          "total_tokens": 128,
+          "wall_s": {
+            "nuvec": {
+              "median": 0.3562,
+              "samples": [
+                0.3562
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.37415025000518654,
+              "samples": [
+                0.37415025000518654
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0504,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 359.3486805165637,
+              "samples": [
+                359.3486805165637
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 342.1085513058608,
+              "samples": [
+                342.1085513058608
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0504,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 409.28134063809216,
+              "samples": [
+                409.28134063809216
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 398.9748645592289,
+              "samples": [
+                398.9748645592289
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0258,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 4,
+          "total_tokens": 512,
+          "wall_s": {
+            "nuvec": {
+              "median": 0.6593,
+              "samples": [
+                0.6593
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.6477648329964723,
+              "samples": [
+                0.6477648329964723
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9825,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 776.5812225087213,
+              "samples": [
+                776.5812225087213
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 790.4103062087478,
+              "samples": [
+                790.4103062087478
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9825,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 995.1028403525955,
+              "samples": [
+                995.1028403525955
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 1008.3261339531379,
+              "samples": [
+                1008.3261339531379
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9869,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 8,
+          "total_tokens": 1024,
+          "wall_s": {
+            "nuvec": {
+              "median": 1.1218,
+              "samples": [
+                1.1218
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 1.0881882090034196,
+              "samples": [
+                1.0881882090034196
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.97,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 912.8186842574435,
+              "samples": [
+                912.8186842574435
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 941.0136881907549,
+              "samples": [
+                941.0136881907549
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.97,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 1203.6488567705248,
+              "samples": [
+                1203.6488567705248
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 1220.549501045099,
+              "samples": [
+                1220.549501045099
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9862,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        }
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+      "kind": "dense",
+      "snapshot": "7f0dc925e0d0afb0322d96f9255cfddf2ba5636e",
+      "decode": [
+        {
+          "repeats": 1,
+          "prompt_tokens": {
+            "nuvec": 26,
+            "mlx_lm": 26
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 117.33500000000001,
+              "samples": [
+                117.58,
+                117.14,
+                117.42,
+                117.25
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 117.5756441631427,
+              "samples": [
+                117.7401993379465,
+                117.59420319824461,
+                117.08666253351069,
+                117.55708512804078
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.998,
+            "gate_pass": true,
+            "goal_pass": false
+          }
+        },
+        {
+          "repeats": 40,
+          "prompt_tokens": {
+            "nuvec": 962,
+            "mlx_lm": 962
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 109.095,
+              "samples": [
+                108.51,
+                109.21,
+                109.23,
+                108.98
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 109.1669289973538,
+              "samples": [
+                109.32370911698129,
+                109.30614514396916,
+                108.91390645131538,
+                109.02771285073844
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9993,
+            "gate_pass": true,
+            "goal_pass": false
+          }
+        },
+        {
+          "repeats": 160,
+          "prompt_tokens": {
+            "nuvec": 3842,
+            "mlx_lm": 3842
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 94.38999999999999,
+              "samples": [
+                94.94,
+                94.46,
+                94.32,
+                94.19
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 94.11793004855409,
+              "samples": [
+                94.31784784400041,
+                94.04610991617957,
+                94.18975018092858,
+                89.72014643830073
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0029,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        }
+      ],
+      "ttft": {
+        "legacy": [
+          {
+            "repeats": 1,
+            "prompt_tokens": {
+              "nuvec": 26,
+              "mlx_lm": 26
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 573.9749999999999,
+                "samples": [
+                  578.4,
+                  569.55,
+                  605.57,
+                  563.97
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 514.4643086099519,
+                "samples": [
+                  489.2145502226563,
+                  505.4514199232932,
+                  553.8435281322454,
+                  523.4771972966106
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.1157,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 40,
+            "prompt_tokens": {
+              "nuvec": 962,
+              "mlx_lm": 962
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 1120.16,
+                "samples": [
+                  1116.81,
+                  1123.15,
+                  1118.91,
+                  1121.41
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 1112.4765202528208,
+                "samples": [
+                  1112.8673991598362,
+                  1112.9334889263212,
+                  1111.1105220565134,
+                  1112.0856413458055
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0069,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 160,
+            "prompt_tokens": {
+              "nuvec": 3842,
+              "mlx_lm": 3842
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 1068.195,
+                "samples": [
+                  1067.87,
+                  1068.83,
+                  1066.43,
+                  1068.52
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 1066.5392485843659,
+                "samples": [
+                  1066.5206516058524,
+                  1067.3937835350098,
+                  1066.5578455628795,
+                  1065.496586274952
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0016,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ],
+        "lengths": [
+          {
+            "prompt_tokens": 2048,
+            "ttft_s": {
+              "nuvec": {
+                "median": 1.81385,
+                "samples": [
+                  1.8152,
+                  1.8125,
+                  1.8157,
+                  1.81
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 1.8197005209985946,
+                "samples": [
+                  1.8207475840026746,
+                  1.8179372920058086,
+                  1.8253357499997946,
+                  1.8186534579945146
+                ],
+                "unit": "s"
+              },
+              "ratio": 1.0032,
+              "gate_pass": true,
+              "goal_pass": true
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 1129.105,
+                "samples": [
+                  1128.26,
+                  1129.95,
+                  1127.95,
+                  1131.49
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 1125.4602910968229,
+                "samples": [
+                  1124.8126967153464,
+                  1126.5515092329467,
+                  1121.9853662539783,
+                  1126.1078854782993
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0032,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ]
+      },
+      "memory": {
+        "load": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 1807440896.0,
+              "samples": [
+                1807440896,
+                1807440896
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 1807441224.0,
+              "samples": [
+                1807441224,
+                1807441224
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 1925029888.0,
+              "samples": [
+                1925005312,
+                1925054464
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 2256142336.0,
+              "samples": [
+                2252734464,
+                2259550208
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.172
+          },
+          "nuvec_raw": {
+            "peak_bytes": 1807440896,
+            "active_bytes": 1807440896,
+            "mapped_bytes": 0
+          }
+        },
+        "decode": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 1856538880.0,
+              "samples": [
+                1856269312,
+                1856808448
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 1987573088.0,
+              "samples": [
+                1994995052,
+                1980151124
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0706
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 2062737408.0,
+              "samples": [
+                2062532608,
+                2062942208
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 2252832768.0,
+              "samples": [
+                2254422016,
+                2251243520
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0922
+          },
+          "nuvec_raw": {
+            "peak_bytes": 1856808448,
+            "active_bytes": 1807440896,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_2048": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 2264599808.0,
+              "samples": [
+                2264599808,
+                2264599808
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 2809730112.0,
+              "samples": [
+                2809730112,
+                2809730112
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.2407
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 2034589696.0,
+              "samples": [
+                2034237440,
+                2034941952
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 2253447168.0,
+              "samples": [
+                2253324288,
+                2253570048
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.1076
+          },
+          "nuvec_raw": {
+            "peak_bytes": 2264599808,
+            "active_bytes": 1807440896,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_32768": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 5710253312.0,
+              "samples": [
+                5724933376,
+                5695573248
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 6186365996.0,
+              "samples": [
+                6186365996,
+                6186365996
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0834
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 2035752960.0,
+              "samples": [
+                2035531776,
+                2035974144
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 2253881344.0,
+              "samples": [
+                2252849152,
+                2254913536
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.1071
+          },
+          "nuvec_raw": {
+            "peak_bytes": 5695573248,
+            "active_bytes": 1807440896,
+            "mapped_bytes": 0
+          }
+        }
+      },
+      "load": {
+        "warm": {
+          "model_ready_s": {
+            "nuvec": {
+              "median": 0.1926,
+              "samples": [
+                0.1928,
+                0.1926,
+                0.1901
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.5744096670023282,
+              "samples": [
+                0.5744096670023282,
+                0.5696259169999394,
+                0.5754193339962512
+              ],
+              "unit": "s"
+            },
+            "ratio": 2.9824,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "first_token_s": {
+            "nuvec": {
+              "median": 0.2811,
+              "samples": [
+                0.2811,
+                0.2828,
+                0.2778
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.6537041670017061,
+              "samples": [
+                0.659169833001215,
+                0.6523002089961665,
+                0.6537041670017061
+              ],
+              "unit": "s"
+            },
+            "ratio": 2.3255,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        "cold": {
+          "model_ready_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          },
+          "first_token_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          }
+        }
+      },
+      "concurrency": [
+        {
+          "level": 1,
+          "total_tokens": 128,
+          "wall_s": {
+            "nuvec": {
+              "median": 1.2957,
+              "samples": [
+                1.2957
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 1.3057021659988095,
+              "samples": [
+                1.3057021659988095
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0077,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 98.78829976074708,
+              "samples": [
+                98.78829976074708
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 98.03154450776695,
+              "samples": [
+                98.03154450776695
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0077,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 117.12625657105967,
+              "samples": [
+                117.12625657105967
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 117.34642315800683,
+              "samples": [
+                117.34642315800683
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9981,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 4,
+          "total_tokens": 512,
+          "wall_s": {
+            "nuvec": {
+              "median": 2.3276,
+              "samples": [
+                2.3276
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 2.3161529159988277,
+              "samples": [
+                2.3161529159988277
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9951,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 219.96906684997424,
+              "samples": [
+                219.96906684997424
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 221.0562163073775,
+              "samples": [
+                221.0562163073775
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9951,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 312.5384520733358,
+              "samples": [
+                312.5384520733358
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 316.83335450388336,
+              "samples": [
+                316.83335450388336
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9864,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 8,
+          "total_tokens": 1024,
+          "wall_s": {
+            "nuvec": {
+              "median": 4.4228,
+              "samples": [
+                4.4228
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 4.290194957997301,
+              "samples": [
+                4.290194957997301
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.97,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 231.52753911549246,
+              "samples": [
+                231.52753911549246
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 238.6837917682911,
+              "samples": [
+                238.6837917682911
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.97,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 332.4389765067731,
+              "samples": [
+                332.4389765067731
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 347.87898040085867,
+              "samples": [
+                347.87898040085867
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9556,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        }
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+      "kind": "dense",
+      "snapshot": "241a666dad6cb93c8ff213d39a7f34a36bf26db4",
+      "decode": [
+        {
+          "repeats": 1,
+          "prompt_tokens": {
+            "nuvec": 25,
+            "mlx_lm": 25
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 55.035,
+              "samples": [
+                55.0,
+                54.96,
+                55.09,
+                55.07
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 54.7526764723973,
+              "samples": [
+                54.788247467945396,
+                54.785495992136966,
+                54.71985695265762,
+                54.68029705821966
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0052,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 40,
+          "prompt_tokens": {
+            "nuvec": 961,
+            "mlx_lm": 961
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 52.78,
+              "samples": [
+                52.74,
+                52.7,
+                53.1,
+                52.82
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 52.39361882381827,
+              "samples": [
+                52.29355983470854,
+                52.55082353276512,
+                52.33947582498613,
+                52.44776182265042
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0074,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 160,
+          "prompt_tokens": {
+            "nuvec": 3841,
+            "mlx_lm": 3841
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 48.78,
+              "samples": [
+                48.74,
+                48.83,
+                48.82,
+                48.61
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 48.68261193022986,
+              "samples": [
+                48.78973757832847,
+                48.715786037055636,
+                48.64778470160561,
+                48.649437823404085
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.002,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        }
+      ],
+      "ttft": {
+        "legacy": [
+          {
+            "repeats": 1,
+            "prompt_tokens": {
+              "nuvec": 25,
+              "mlx_lm": 25
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 271.17499999999995,
+                "samples": [
+                  273.85,
+                  265.53,
+                  269.51,
+                  272.84
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 231.57376344474017,
+                "samples": [
+                  212.16279757064802,
+                  239.71770918962238,
+                  223.42981769985798,
+                  240.51701537628188
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.171,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 40,
+            "prompt_tokens": {
+              "nuvec": 961,
+              "mlx_lm": 961
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 479.35,
+                "samples": [
+                  478.95,
+                  480.01,
+                  479.56,
+                  479.14
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 476.2120707490658,
+                "samples": [
+                  476.5167961016376,
+                  476.72303258186747,
+                  475.7356954008454,
+                  475.90734539649395
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0066,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 160,
+            "prompt_tokens": {
+              "nuvec": 3841,
+              "mlx_lm": 3841
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 458.5,
+                "samples": [
+                  458.41,
+                  458.79,
+                  458.35,
+                  458.59
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 457.4531262760285,
+                "samples": [
+                  457.8911758285652,
+                  457.2034321441055,
+                  457.2056113211805,
+                  457.7006412308765
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0023,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ],
+        "lengths": [
+          {
+            "prompt_tokens": 2048,
+            "ttft_s": {
+              "nuvec": {
+                "median": 4.33945,
+                "samples": [
+                  4.3395,
+                  4.3394,
+                  4.3425,
+                  4.3376
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 4.355367187996308,
+                "samples": [
+                  4.3559870419994695,
+                  4.355356708998443,
+                  4.354977499999222,
+                  4.355377666994173
+                ],
+                "unit": "s"
+              },
+              "ratio": 1.0037,
+              "gate_pass": true,
+              "goal_pass": true
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 471.945,
+                "samples": [
+                  471.94,
+                  471.95,
+                  471.62,
+                  472.15
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 470.2244177382529,
+                "samples": [
+                  470.1575051196512,
+                  470.2255490965189,
+                  470.26649391423166,
+                  470.2232863799869
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0037,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ]
+      },
+      "memory": {
+        "load": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 4517421056.0,
+              "samples": [
+                4517421056,
+                4517421056
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4517406216.0,
+              "samples": [
+                4517406216,
+                4517406216
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 4605370368.0,
+              "samples": [
+                4605198336,
+                4605542400
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4923138048.0,
+              "samples": [
+                4914479104,
+                4931796992
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.069
+          },
+          "nuvec_raw": {
+            "peak_bytes": 4517421056,
+            "active_bytes": 4517421056,
+            "mapped_bytes": 0
+          }
+        },
+        "decode": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 4583453696.0,
+              "samples": [
+                4583453696,
+                4583453696
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4662444376.0,
+              "samples": [
+                4662444376,
+                4662444376
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0172
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 4745224192.0,
+              "samples": [
+                4745297920,
+                4745150464
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4934639616.0,
+              "samples": [
+                4930027520,
+                4939251712
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0399
+          },
+          "nuvec_raw": {
+            "peak_bytes": 4583453696,
+            "active_bytes": 4517421056,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_2048": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 5108797696.0,
+              "samples": [
+                5108797696,
+                5108797696
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 5536538676.0,
+              "samples": [
+                5536538676,
+                5536538676
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0837
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 4712751104.0,
+              "samples": [
+                4712693760,
+                4712808448
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4936048640.0,
+              "samples": [
+                4936548352,
+                4935548928
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0474
+          },
+          "nuvec_raw": {
+            "peak_bytes": 5108797696,
+            "active_bytes": 4517421056,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_32768": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 9030504704.0,
+              "samples": [
+                9030504704,
+                9030504704
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 9533866024.0,
+              "samples": [
+                9533866024,
+                9533866024
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0557
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 4713504768.0,
+              "samples": [
+                4713267200,
+                4713742336
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4937449472.0,
+              "samples": [
+                4936548352,
+                4938350592
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0475
+          },
+          "nuvec_raw": {
+            "peak_bytes": 9030504704,
+            "active_bytes": 4517421056,
+            "mapped_bytes": 0
+          }
+        }
+      },
+      "load": {
+        "warm": {
+          "model_ready_s": {
+            "nuvec": {
+              "median": 0.3372,
+              "samples": [
+                0.3848,
+                0.3372,
+                0.3336
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.6497755829987,
+              "samples": [
+                0.651819875005458,
+                0.6497755829987,
+                0.6345107500019367
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.927,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "first_token_s": {
+            "nuvec": {
+              "median": 0.4808,
+              "samples": [
+                0.5257,
+                0.4808,
+                0.4759
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.8290236250104499,
+              "samples": [
+                0.8290236250104499,
+                0.8431806660009897,
+                0.8062151670019375
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.7243,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        "cold": {
+          "model_ready_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          },
+          "first_token_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          }
+        }
+      },
+      "concurrency": [
+        {
+          "level": 1,
+          "total_tokens": 128,
+          "wall_s": {
+            "nuvec": {
+              "median": 2.8148,
+              "samples": [
+                2.8148
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 3.080393791999086,
+              "samples": [
+                3.080393791999086
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0944,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 45.473923546966034,
+              "samples": [
+                45.473923546966034
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 41.553128802058694,
+              "samples": [
+                41.553128802058694
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0944,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 54.651863327308725,
+              "samples": [
+                54.651863327308725
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 50.24333152052835,
+              "samples": [
+                50.24333152052835
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0877,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 4,
+          "total_tokens": 512,
+          "wall_s": {
+            "nuvec": {
+              "median": 5.1828,
+              "samples": [
+                5.1828
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 5.204361874995811,
+              "samples": [
+                5.204361874995811
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0042,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 98.78829976074708,
+              "samples": [
+                98.78829976074708
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 98.37901596733452,
+              "samples": [
+                98.37901596733452
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0042,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 145.11383437598195,
+              "samples": [
+                145.11383437598195
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 145.6371930928024,
+              "samples": [
+                145.6371930928024
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9964,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 8,
+          "total_tokens": 1024,
+          "wall_s": {
+            "nuvec": {
+              "median": 9.9785,
+              "samples": [
+                9.9785
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 9.965706584000145,
+              "samples": [
+                9.965706584000145
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9987,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 102.62063436388235,
+              "samples": [
+                102.62063436388235
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 102.75237298718217,
+              "samples": [
+                102.75237298718217
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9987,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 152.3558168131242,
+              "samples": [
+                152.3558168131242
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 153.41991450411447,
+              "samples": [
+                153.41991450411447
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9931,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        }
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "mlx-community/Qwen3-8B-4bit",
+      "kind": "dense",
+      "snapshot": "545dc4251c05440727734bcd94334791f6ab0192",
+      "decode": [
+        {
+          "repeats": 1,
+          "prompt_tokens": {
+            "nuvec": 25,
+            "mlx_lm": 25
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 53.835,
+              "samples": [
+                54.25,
+                53.83,
+                53.84,
+                53.81
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 53.6359844572558,
+              "samples": [
+                53.69183317924228,
+                53.736314303872234,
+                53.36012916007855,
+                53.58013573526933
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0037,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 40,
+          "prompt_tokens": {
+            "nuvec": 961,
+            "mlx_lm": 961
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 51.519999999999996,
+              "samples": [
+                51.76,
+                51.5,
+                51.33,
+                51.54
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 50.90937985571227,
+              "samples": [
+                51.15879710752953,
+                50.943081285151784,
+                50.875017757418604,
+                50.87567842627275
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.012,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 160,
+          "prompt_tokens": {
+            "nuvec": 3841,
+            "mlx_lm": 3841
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 47.315,
+              "samples": [
+                47.32,
+                47.31,
+                47.26,
+                47.44
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 46.721118007951915,
+              "samples": [
+                46.68497684301541,
+                46.71911776651532,
+                46.723118249388506,
+                46.754508477568365
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0127,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        }
+      ],
+      "ttft": {
+        "legacy": [
+          {
+            "repeats": 1,
+            "prompt_tokens": {
+              "nuvec": 25,
+              "mlx_lm": 25
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 262.89,
+                "samples": [
+                  268.41,
+                  257.92,
+                  258.89,
+                  266.89
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 232.6310209176164,
+                "samples": [
+                  230.95870644421476,
+                  224.53400839570915,
+                  236.92275251719894,
+                  234.30333539101804
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.1301,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 40,
+            "prompt_tokens": {
+              "nuvec": 961,
+              "mlx_lm": 961
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 477.42,
+                "samples": [
+                  477.48,
+                  477.8,
+                  476.6,
+                  477.36
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 473.5957359954693,
+                "samples": [
+                  474.04172475212175,
+                  472.9975784716326,
+                  473.1958473253921,
+                  473.9956246655465
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0081,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 160,
+            "prompt_tokens": {
+              "nuvec": 3841,
+              "mlx_lm": 3841
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 453.995,
+                "samples": [
+                  453.66,
+                  454.35,
+                  453.76,
+                  454.23
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 452.4528784216285,
+                "samples": [
+                  452.5880041965358,
+                  446.53171874843036,
+                  452.40737393435313,
+                  452.49838290890386
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0034,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ],
+        "lengths": [
+          {
+            "prompt_tokens": 2048,
+            "ttft_s": {
+              "nuvec": {
+                "median": 4.36715,
+                "samples": [
+                  4.374,
+                  4.3642,
+                  4.3694,
+                  4.3649
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 4.382627458500792,
+                "samples": [
+                  4.392362749997119,
+                  4.378417874999286,
+                  4.3830097500031115,
+                  4.382245166998473
+                ],
+                "unit": "s"
+              },
+              "ratio": 1.0035,
+              "gate_pass": true,
+              "goal_pass": true
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 468.955,
+                "samples": [
+                  468.22,
+                  469.28,
+                  468.71,
+                  469.2
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 467.29959025163083,
+                "samples": [
+                  466.2638576473091,
+                  467.7488669352589,
+                  467.2588282511911,
+                  467.34035225207055
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0035,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ]
+      },
+      "memory": {
+        "load": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 4607737856.0,
+              "samples": [
+                4607737856,
+                4607737856
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4607731720.0,
+              "samples": [
+                4607731720,
+                4607731720
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 4692172800.0,
+              "samples": [
+                4692099072,
+                4692246528
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4974198784.0,
+              "samples": [
+                4973035520,
+                4975362048
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0601
+          },
+          "nuvec_raw": {
+            "peak_bytes": 4607737856,
+            "active_bytes": 4607737856,
+            "mapped_bytes": 0
+          }
+        },
+        "decode": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 4675690752.0,
+              "samples": [
+                4675715328,
+                4675666176
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4773439832.0,
+              "samples": [
+                4773439832,
+                4773439832
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0209
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 4846698496.0,
+              "samples": [
+                4846092288,
+                4847304704
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4972822528.0,
+              "samples": [
+                4974788608,
+                4970856448
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.026
+          },
+          "nuvec_raw": {
+            "peak_bytes": 4675666176,
+            "active_bytes": 4607737856,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_2048": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 5215891456.0,
+              "samples": [
+                5215891456,
+                5215891456
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 5610080308.0,
+              "samples": [
+                5610080308,
+                5610080308
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0756
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 4809154560.0,
+              "samples": [
+                4809359360,
+                4808949760
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4974206976.0,
+              "samples": [
+                4975165440,
+                4973248512
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0343
+          },
+          "nuvec_raw": {
+            "peak_bytes": 5215891456,
+            "active_bytes": 4607737856,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_32768": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 9632526336.0,
+              "samples": [
+                9632526336,
+                9632526336
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 10127501352.0,
+              "samples": [
+                10127501352,
+                10127501352
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0514
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 4806443008.0,
+              "samples": [
+                4806606848,
+                4806279168
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 4973494272.0,
+              "samples": [
+                4972544000,
+                4974444544
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0348
+          },
+          "nuvec_raw": {
+            "peak_bytes": 9632526336,
+            "active_bytes": 4607737856,
+            "mapped_bytes": 0
+          }
+        }
+      },
+      "load": {
+        "warm": {
+          "model_ready_s": {
+            "nuvec": {
+              "median": 0.304,
+              "samples": [
+                0.3097,
+                0.304,
+                0.3026
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.42849145799846156,
+              "samples": [
+                0.42849145799846156,
+                0.42238370799896074,
+                0.446266499995545
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.4095,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "first_token_s": {
+            "nuvec": {
+              "median": 0.4486,
+              "samples": [
+                0.4517,
+                0.4486,
+                0.4451
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.5960553749973769,
+              "samples": [
+                0.5960553749973769,
+                0.5883206660000724,
+                0.6089078749937471
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.3287,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        "cold": {
+          "model_ready_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          },
+          "first_token_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          }
+        }
+      },
+      "concurrency": [
+        {
+          "level": 1,
+          "total_tokens": 128,
+          "wall_s": {
+            "nuvec": {
+              "median": 2.95,
+              "samples": [
+                2.95
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 2.893604208002216,
+              "samples": [
+                2.893604208002216
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9809,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 43.389830508474574,
+              "samples": [
+                43.389830508474574
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 44.235489997567065,
+              "samples": [
+                44.235489997567065
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9809,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 51.81347150259068,
+              "samples": [
+                51.81347150259068
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 53.82151473486468,
+              "samples": [
+                53.82151473486468
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9627,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 4,
+          "total_tokens": 512,
+          "wall_s": {
+            "nuvec": {
+              "median": 5.401,
+              "samples": [
+                5.401
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 5.363828082998225,
+              "samples": [
+                5.363828082998225
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9931,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 94.79725976670987,
+              "samples": [
+                94.79725976670987
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 95.45421517570466,
+              "samples": [
+                95.45421517570466
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9931,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 139.32695208579028,
+              "samples": [
+                139.32695208579028
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 139.93993208999035,
+              "samples": [
+                139.93993208999035
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9956,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 8,
+          "total_tokens": 1024,
+          "wall_s": {
+            "nuvec": {
+              "median": 10.1692,
+              "samples": [
+                10.1692
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 10.180138000003353,
+              "samples": [
+                10.180138000003353
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0011,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 100.69621995830548,
+              "samples": [
+                100.69621995830548
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 100.58802739212992,
+              "samples": [
+                100.58802739212992
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0011,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 148.50327408793265,
+              "samples": [
+                148.50327408793265
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 147.93665854394038,
+              "samples": [
+                147.93665854394038
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0038,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "nuvec_matches_solo": true
+        }
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "mlx-community/Qwen3.5-9B-4bit",
+      "kind": "hybrid",
+      "snapshot": "8b2b98c00a6b4d291155e4890773ca8f769aee53",
+      "decode": [
+        {
+          "repeats": 1,
+          "prompt_tokens": {
+            "nuvec": 25,
+            "mlx_lm": 25
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 49.05,
+              "samples": [
+                48.92,
+                48.65,
+                49.28,
+                49.18
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 49.73595786276313,
+              "samples": [
+                49.72871581765351,
+                49.897912289724914,
+                49.668313283099856,
+                49.74319990787274
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9862,
+            "gate_pass": true,
+            "goal_pass": false
+          }
+        },
+        {
+          "repeats": 40,
+          "prompt_tokens": {
+            "nuvec": 961,
+            "mlx_lm": 961
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 48.47,
+              "samples": [
+                48.42,
+                48.43,
+                48.74,
+                48.51
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 49.19120276341693,
+              "samples": [
+                49.29619492581261,
+                49.39431677543748,
+                49.08621060102126,
+                48.43260153462984
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9853,
+            "gate_pass": true,
+            "goal_pass": false
+          }
+        },
+        {
+          "repeats": 160,
+          "prompt_tokens": {
+            "nuvec": 3841,
+            "mlx_lm": 3841
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 47.57,
+              "samples": [
+                47.53,
+                47.55,
+                47.6,
+                47.59
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 48.260386672729034,
+              "samples": [
+                47.74270442784095,
+                48.114542161021205,
+                48.463833234684856,
+                48.40623118443686
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9857,
+            "gate_pass": true,
+            "goal_pass": false
+          }
+        }
+      ],
+      "ttft": {
+        "legacy": [
+          {
+            "repeats": 1,
+            "prompt_tokens": {
+              "nuvec": 25,
+              "mlx_lm": 25
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 246.375,
+                "samples": [
+                  247.49,
+                  245.1,
+                  245.26,
+                  248.3
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 212.79286537801465,
+                "samples": [
+                  209.31099007288628,
+                  213.54364888221747,
+                  212.04208187381184,
+                  227.81932173939097
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.1578,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 40,
+            "prompt_tokens": {
+              "nuvec": 961,
+              "mlx_lm": 961
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 470.64,
+                "samples": [
+                  470.26,
+                  470.95,
+                  470.33,
+                  471.16
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 471.25192038920363,
+                "samples": [
+                  471.31471460674703,
+                  471.1891261716603,
+                  471.37402216671046,
+                  469.09613595903295
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9987,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          },
+          {
+            "repeats": 160,
+            "prompt_tokens": {
+              "nuvec": 3841,
+              "mlx_lm": 3841
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 469.94,
+                "samples": [
+                  469.74,
+                  470.14,
+                  469.6,
+                  470.69
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 471.55388218320434,
+                "samples": [
+                  471.91517522552783,
+                  471.06270307865,
+                  471.72121288579467,
+                  471.386551480614
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9966,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          }
+        ],
+        "lengths": [
+          {
+            "prompt_tokens": 2048,
+            "ttft_s": {
+              "nuvec": {
+                "median": 4.3324,
+                "samples": [
+                  4.3369,
+                  4.3251,
+                  4.3394,
+                  4.3279
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 4.346874271002889,
+                "samples": [
+                  4.354380167002091,
+                  4.34408604100463,
+                  4.346893417001411,
+                  4.346855125004367
+                ],
+                "unit": "s"
+              },
+              "ratio": 1.0033,
+              "gate_pass": true,
+              "goal_pass": true
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 472.72,
+                "samples": [
+                  472.23,
+                  473.51,
+                  471.96,
+                  473.21
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 471.14314156761355,
+                "samples": [
+                  470.33100497745687,
+                  471.44554243828276,
+                  471.1410663969669,
+                  471.1452167382602
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0033,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ]
+      },
+      "memory": {
+        "load": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 5038063616.0,
+              "samples": [
+                5038063616,
+                5038063616
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 5038041608.0,
+              "samples": [
+                5038041608,
+                5038041608
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 5170503680.0,
+              "samples": [
+                5169070080,
+                5171937280
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 5666373632.0,
+              "samples": [
+                5666455552,
+                5666291712
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0959
+          },
+          "nuvec_raw": {
+            "peak_bytes": 5038063616,
+            "active_bytes": 5038063616,
+            "mapped_bytes": 0
+          }
+        },
+        "decode": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 5131303680.0,
+              "samples": [
+                5131303680,
+                5131303680
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 5226481789.0,
+              "samples": [
+                5226481789,
+                5226481789
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0185
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 5340545024.0,
+              "samples": [
+                5338316800,
+                5342773248
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 5668052992.0,
+              "samples": [
+                5670535168,
+                5665570816
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0613
+          },
+          "nuvec_raw": {
+            "peak_bytes": 5131303680,
+            "active_bytes": 5038065152,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_2048": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 6557158912.0,
+              "samples": [
+                6557158912,
+                6557158912
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 6769838664.0,
+              "samples": [
+                6769838664,
+                6769838664
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0324
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 5333762048.0,
+              "samples": [
+                5333532672,
+                5333991424
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 5666357248.0,
+              "samples": [
+                5666684928,
+                5666029568
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0624
+          },
+          "nuvec_raw": {
+            "peak_bytes": 6557158912,
+            "active_bytes": 5038065152,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_32768": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 9559596288.0,
+              "samples": [
+                9559596288,
+                9559596288
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 9791113782.0,
+              "samples": [
+                9791187510,
+                9791040054
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0242
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 5335670784.0,
+              "samples": [
+                5335171072,
+                5336170496
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 5666119680.0,
+              "samples": [
+                5665947648,
+                5666291712
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0619
+          },
+          "nuvec_raw": {
+            "peak_bytes": 9559596288,
+            "active_bytes": 5038065664,
+            "mapped_bytes": 0
+          }
+        }
+      },
+      "load": {
+        "warm": {
+          "model_ready_s": {
+            "nuvec": {
+              "median": 0.3752,
+              "samples": [
+                0.3752,
+                0.3803,
+                0.3737
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.7830497920003836,
+              "samples": [
+                0.7830497920003836,
+                0.7772160000022268,
+                0.7876438339953893
+              ],
+              "unit": "s"
+            },
+            "ratio": 2.087,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "first_token_s": {
+            "nuvec": {
+              "median": 0.5101,
+              "samples": [
+                0.5101,
+                0.5145,
+                0.5086
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.9486682919960003,
+              "samples": [
+                0.9486682919960003,
+                0.9468430420020013,
+                0.9564257089950843
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.8598,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        "cold": {
+          "model_ready_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          },
+          "first_token_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          }
+        }
+      },
+      "concurrency": [
+        {
+          "level": 1,
+          "total_tokens": 128,
+          "wall_s": {
+            "nuvec": {
+              "median": 3.0738,
+              "samples": [
+                3.0738
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 3.0516885410033865,
+              "samples": [
+                3.0516885410033865
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9928,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 41.64226690090442,
+              "samples": [
+                41.64226690090442
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 41.943992081811196,
+              "samples": [
+                41.943992081811196
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9928,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 49.39135845681173,
+              "samples": [
+                49.39135845681173
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 50.34509930345648,
+              "samples": [
+                50.34509930345648
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9811,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 4,
+          "total_tokens": 512,
+          "wall_s": {
+            "nuvec": {
+              "median": 5.6589,
+              "samples": [
+                5.6589
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 5.668664415999956,
+              "samples": [
+                5.668664415999956
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0017,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 90.47694781671349,
+              "samples": [
+                90.47694781671349
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 90.32109901494017,
+              "samples": [
+                90.32109901494017
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0017,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 129.25221993232068,
+              "samples": [
+                129.25221993232068
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 129.89145968407735,
+              "samples": [
+                129.89145968407735
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9951,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 8,
+          "total_tokens": 1024,
+          "wall_s": {
+            "nuvec": {
+              "median": 10.7908,
+              "samples": [
+                10.7908
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 10.776120290996914,
+              "samples": [
+                10.776120290996914
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9986,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 94.89565185157726,
+              "samples": [
+                94.89565185157726
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 95.02492291734322,
+              "samples": [
+                95.02492291734322
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9986,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 136.6767111493758,
+              "samples": [
+                136.6767111493758
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 138.0362959098991,
+              "samples": [
+                138.0362959098991
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9902,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        }
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "mlx-community/Qwen3.8-27B-4bit",
+      "kind": "hybrid",
+      "snapshot": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+      "decode": [
+        {
+          "repeats": 1,
+          "prompt_tokens": {
+            "nuvec": 25,
+            "mlx_lm": 25
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 15.344999999999999,
+              "samples": [
+                15.32,
+                15.34,
+                15.35,
+                15.36
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 15.092138288655743,
+              "samples": [
+                15.38387305637318,
+                15.085630030184932,
+                15.098646547126554,
+                15.078557130097677
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0168,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 40,
+          "prompt_tokens": {
+            "nuvec": 961,
+            "mlx_lm": 961
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 15.235,
+              "samples": [
+                15.22,
+                15.25,
+                15.25,
+                15.2
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 15.08956162605762,
+              "samples": [
+                15.21821664591102,
+                15.232467620921259,
+                14.960906606204219,
+                14.943355271560733
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0096,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 160,
+          "prompt_tokens": {
+            "nuvec": 3841,
+            "mlx_lm": 3841
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 15.004999999999999,
+              "samples": [
+                14.92,
+                15.05,
+                15.02,
+                14.99
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 14.748414344489474,
+              "samples": [
+                14.486015427411113,
+                15.003451680511027,
+                14.748011497653433,
+                14.748817191325514
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0174,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        }
+      ],
+      "ttft": {
+        "legacy": [
+          {
+            "repeats": 1,
+            "prompt_tokens": {
+              "nuvec": 25,
+              "mlx_lm": 25
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 76.355,
+                "samples": [
+                  75.96,
+                  76.55,
+                  76.28,
+                  76.43
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 65.01848900835765,
+                "samples": [
+                  65.61178230060652,
+                  65.50733239689089,
+                  64.5296456198244,
+                  64.51945906925565
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.1744,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 40,
+            "prompt_tokens": {
+              "nuvec": 961,
+              "mlx_lm": 961
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 132.85500000000002,
+                "samples": [
+                  132.82,
+                  132.88,
+                  132.83,
+                  132.89
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 131.08543996083725,
+                "samples": [
+                  131.99120527907832,
+                  131.9997331159949,
+                  130.11568923059755,
+                  130.17967464259618
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0135,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 160,
+            "prompt_tokens": {
+              "nuvec": 3841,
+              "mlx_lm": 3841
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 132.35000000000002,
+                "samples": [
+                  132.37,
+                  132.44,
+                  132.33,
+                  132.25
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 131.21195700757806,
+                "samples": [
+                  132.00397513919603,
+                  132.1232560691024,
+                  130.41993887596007,
+                  130.32030278494017
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0087,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ],
+        "lengths": [
+          {
+            "prompt_tokens": 2048,
+            "ttft_s": {
+              "nuvec": {
+                "median": 15.591149999999999,
+                "samples": [
+                  15.5951,
+                  15.5872,
+                  15.5973,
+                  15.5806
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 15.753858208499878,
+                "samples": [
+                  15.75038754200068,
+                  15.752678042001207,
+                  15.755038374998549,
+                  15.756141959005618
+                ],
+                "unit": "s"
+              },
+              "ratio": 1.0104,
+              "gate_pass": true,
+              "goal_pass": true
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 131.355,
+                "samples": [
+                  131.32,
+                  131.39,
+                  131.3,
+                  131.45
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 129.99990125518974,
+                "samples": [
+                  130.02854656996297,
+                  130.0096399189673,
+                  129.9901625914122,
+                  129.98105788387113
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0104,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          }
+        ]
+      },
+      "memory": {
+        "load": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 15132819456.0,
+              "samples": [
+                15132819456,
+                15132819456
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 15133588488.0,
+              "samples": [
+                15133588488,
+                15133588488
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0001
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 15267749888.0,
+              "samples": [
+                15267708928,
+                15267790848
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 15771328512.0,
+              "samples": [
+                15771942912,
+                15770714112
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.033
+          },
+          "nuvec_raw": {
+            "peak_bytes": 15132819456,
+            "active_bytes": 15132819456,
+            "mapped_bytes": 0
+          }
+        },
+        "decode": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 15361124096.0,
+              "samples": [
+                15361124096,
+                15361124096
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 15414805494.0,
+              "samples": [
+                15414748150,
+                15414862838
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0035
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 15573499904.0,
+              "samples": [
+                15574564864,
+                15572434944
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 15768330240.0,
+              "samples": [
+                15767601152,
+                15769059328
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0125
+          },
+          "nuvec_raw": {
+            "peak_bytes": 15361124096,
+            "active_bytes": 15132820992,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_2048": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 18909982208.0,
+              "samples": [
+                18909982208,
+                18909982208
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 18129036340.0,
+              "samples": [
+                18129036340,
+                18129036340
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 0.9587
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 15558336512.0,
+              "samples": [
+                15560409088,
+                15556263936
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 15767552000.0,
+              "samples": [
+                15767453696,
+                15767650304
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0134
+          },
+          "nuvec_raw": {
+            "peak_bytes": 18909982208,
+            "active_bytes": 15132820992,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_32768": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 23925568768.0,
+              "samples": [
+                23925568768,
+                23925568768
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 23166753858.0,
+              "samples": [
+                23166917698,
+                23166590018
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 0.9683
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 15559983104.0,
+              "samples": [
+                15560998912,
+                15558967296
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 15768666112.0,
+              "samples": [
+                15769731072,
+                15767601152
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0134
+          },
+          "nuvec_raw": {
+            "peak_bytes": 23925568768,
+            "active_bytes": 15132821504,
+            "mapped_bytes": 0
+          }
+        }
+      },
+      "load": {
+        "warm": {
+          "model_ready_s": {
+            "nuvec": {
+              "median": 0.8981,
+              "samples": [
+                0.9014,
+                0.8867,
+                0.8981
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 1.0873930839952664,
+              "samples": [
+                1.0647339999995893,
+                1.1030585420012358,
+                1.0873930839952664
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.2108,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "first_token_s": {
+            "nuvec": {
+              "median": 1.2776,
+              "samples": [
+                1.2786,
+                1.2776,
+                1.2776
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 1.5801433339947835,
+              "samples": [
+                1.567826917002094,
+                1.5996701249969192,
+                1.5801433339947835
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.2368,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        "cold": {
+          "model_ready_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          },
+          "first_token_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          }
+        }
+      },
+      "concurrency": [
+        {
+          "level": 1,
+          "total_tokens": 128,
+          "wall_s": {
+            "nuvec": {
+              "median": 9.9427,
+              "samples": [
+                9.9427
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 10.00750616699952,
+              "samples": [
+                10.00750616699952
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0065,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 12.873766683094129,
+              "samples": [
+                12.873766683094129
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 12.79039931267685,
+              "samples": [
+                12.79039931267685
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0065,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 15.477235058984107,
+              "samples": [
+                15.477235058984107
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 15.513588257397757,
+              "samples": [
+                15.513588257397757
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9977,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 4,
+          "total_tokens": 512,
+          "wall_s": {
+            "nuvec": {
+              "median": 18.1525,
+              "samples": [
+                18.1525
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 17.897670875005133,
+              "samples": [
+                17.897670875005133
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.986,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 28.205481338658586,
+              "samples": [
+                28.205481338658586
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 28.607074271045516,
+              "samples": [
+                28.607074271045516
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.986,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 42.00985743111376,
+              "samples": [
+                42.00985743111376
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 43.3097341462427,
+              "samples": [
+                43.3097341462427
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.97,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 8,
+          "total_tokens": 1024,
+          "wall_s": {
+            "nuvec": {
+              "median": 35.2119,
+              "samples": [
+                35.2119
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 34.563595499996154,
+              "samples": [
+                34.563595499996154
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9816,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 29.08107770384444,
+              "samples": [
+                29.08107770384444
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 29.626547388569975,
+              "samples": [
+                29.626547388569975
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9816,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 43.58700455175313,
+              "samples": [
+                43.58700455175313
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 45.174411437199524,
+              "samples": [
+                45.174411437199524
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9649,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        }
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "mlx-community/Qwen3-30B-A3B-4bit",
+      "kind": "moe",
+      "snapshot": "d388dead1515f5e085ef7a0431dd8fadf0886c57",
+      "decode": [
+        {
+          "repeats": 1,
+          "prompt_tokens": {
+            "nuvec": 25,
+            "mlx_lm": 25
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 94.565,
+              "samples": [
+                94.25,
+                94.43,
+                94.72,
+                94.7
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 91.81659525450345,
+              "samples": [
+                91.74054571949823,
+                91.34746497434546,
+                91.95648095346365,
+                91.89264478950868
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0299,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 40,
+          "prompt_tokens": {
+            "nuvec": 961,
+            "mlx_lm": 961
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 85.955,
+              "samples": [
+                85.86,
+                85.78,
+                86.05,
+                86.15
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 83.31869452576606,
+              "samples": [
+                83.27999004074564,
+                83.37228876195861,
+                83.29817483538541,
+                83.33921421614671
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0316,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 160,
+          "prompt_tokens": {
+            "nuvec": 3841,
+            "mlx_lm": 3841
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 76.63,
+              "samples": [
+                76.56,
+                76.48,
+                76.7,
+                76.74
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 74.31053305960236,
+              "samples": [
+                74.57133045025076,
+                74.37303929019525,
+                74.08726640428412,
+                74.24802682900946
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0312,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        }
+      ],
+      "ttft": {
+        "legacy": [
+          {
+            "repeats": 1,
+            "prompt_tokens": {
+              "nuvec": 25,
+              "mlx_lm": 25
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 250.015,
+                "samples": [
+                  249.0,
+                  249.21,
+                  252.04,
+                  250.82
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 228.84939536911583,
+                "samples": [
+                  229.47446593043512,
+                  228.53712762770647,
+                  227.3287844889743,
+                  229.1616631105252
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.0925,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 40,
+            "prompt_tokens": {
+              "nuvec": 961,
+              "mlx_lm": 961
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 934.91,
+                "samples": [
+                  927.58,
+                  935.8,
+                  934.02,
+                  937.79
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 941.6176161106121,
+                "samples": [
+                  938.4552172260644,
+                  943.7865906486303,
+                  940.2618580747969,
+                  942.9733741464271
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9929,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          },
+          {
+            "repeats": 160,
+            "prompt_tokens": {
+              "nuvec": 3841,
+              "mlx_lm": 3841
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 841.77,
+                "samples": [
+                  840.32,
+                  841.96,
+                  841.58,
+                  842.64
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 853.117176723954,
+                "samples": [
+                  853.494001379061,
+                  852.9722726443739,
+                  852.870234899317,
+                  853.2620808035341
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9867,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          }
+        ],
+        "lengths": [
+          {
+            "prompt_tokens": 2048,
+            "ttft_s": {
+              "nuvec": {
+                "median": 2.2344,
+                "samples": [
+                  2.2363,
+                  2.2309,
+                  2.2371,
+                  2.2325
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 2.2056513960014854,
+                "samples": [
+                  2.2068064580016653,
+                  2.2046055419996264,
+                  2.2066972500033444,
+                  2.203140874997189
+                ],
+                "unit": "s"
+              },
+              "ratio": 0.9871,
+              "gate_pass": true,
+              "goal_pass": false
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 916.5699999999999,
+                "samples": [
+                  915.79,
+                  918.0,
+                  915.49,
+                  917.35
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 928.5240923292001,
+                "samples": [
+                  928.0378859569454,
+                  928.9643707156874,
+                  928.0838139427128,
+                  929.5819542191614
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9871,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          }
+        ]
+      },
+      "memory": {
+        "load": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 17174708224.0,
+              "samples": [
+                17174708224,
+                17174708224
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 17174654984.0,
+              "samples": [
+                17174654984,
+                17174654984
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 11893760000.0,
+              "samples": [
+                11895390208,
+                11892129792
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 13465493504.0,
+              "samples": [
+                14629912576,
+                12301074432
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.1321
+          },
+          "nuvec_raw": {
+            "peak_bytes": 11810013184,
+            "active_bytes": 11810013184,
+            "mapped_bytes": 5364695040
+          }
+        },
+        "decode": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 17229489280.0,
+              "samples": [
+                17229481216,
+                17229497344
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 17252849792.0,
+              "samples": [
+                17252849792,
+                17252849792
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0014
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 12033171456.0,
+              "samples": [
+                12033032192,
+                12033310720
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 12943589376.0,
+              "samples": [
+                12927107072,
+                12960071680
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0757
+          },
+          "nuvec_raw": {
+            "peak_bytes": 11864802304,
+            "active_bytes": 11810013184,
+            "mapped_bytes": 5364695040
+          }
+        },
+        "prefill_2048": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 17606699008.0,
+              "samples": [
+                17606699008,
+                17606699008
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 18141952760.0,
+              "samples": [
+                18141952760,
+                18141952760
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0304
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 12025307136.0,
+              "samples": [
+                12025282560,
+                12025331712
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 14503878656.0,
+              "samples": [
+                14606532608,
+                14401224704
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.2061
+          },
+          "nuvec_raw": {
+            "peak_bytes": 12242003968,
+            "active_bytes": 11810013184,
+            "mapped_bytes": 5364695040
+          }
+        },
+        "prefill_32768": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 20626597888.0,
+              "samples": [
+                20626597888,
+                20626597888
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 21067602568.0,
+              "samples": [
+                21067602568,
+                21067602568
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0214
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 12032786432.0,
+              "samples": [
+                12031033344,
+                12034539520
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 17548025856.0,
+              "samples": [
+                17548902400,
+                17547149312
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.4584
+          },
+          "nuvec_raw": {
+            "peak_bytes": 15261902848,
+            "active_bytes": 11810013184,
+            "mapped_bytes": 5364695040
+          }
+        }
+      },
+      "load": {
+        "warm": {
+          "model_ready_s": {
+            "nuvec": {
+              "median": 0.6613,
+              "samples": [
+                0.6613,
+                0.6663,
+                0.6585
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.6668732499965699,
+              "samples": [
+                0.6691032920061843,
+                0.6668732499965699,
+                0.6586250840045977
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0084,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "first_token_s": {
+            "nuvec": {
+              "median": 0.7869,
+              "samples": [
+                0.7869,
+                0.7902,
+                0.7834
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 0.8879609580035321,
+              "samples": [
+                0.9000745420053136,
+                0.8879609580035321,
+                0.8833606669941219
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.1284,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        "cold": {
+          "model_ready_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          },
+          "first_token_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          }
+        }
+      },
+      "concurrency": [
+        {
+          "level": 1,
+          "total_tokens": 128,
+          "wall_s": {
+            "nuvec": {
+              "median": 1.6235,
+              "samples": [
+                1.6235
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 1.661666250001872,
+              "samples": [
+                1.661666250001872
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0235,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 78.84200800739144,
+              "samples": [
+                78.84200800739144
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 77.03111259547806,
+              "samples": [
+                77.03111259547806
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0235,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 94.38870308435527,
+              "samples": [
+                94.38870308435527
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 92.79988301196636,
+              "samples": [
+                92.79988301196636
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0171,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 4,
+          "total_tokens": 512,
+          "wall_s": {
+            "nuvec": {
+              "median": 3.9219,
+              "samples": [
+                3.9219
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 3.91342799999984,
+              "samples": [
+                3.91342799999984
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9978,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 130.54896861215227,
+              "samples": [
+                130.54896861215227
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 130.8315880603964,
+              "samples": [
+                130.8315880603964
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9978,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 165.16565334720553,
+              "samples": [
+                165.16565334720553
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 165.43251955445132,
+              "samples": [
+                165.43251955445132
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9984,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 8,
+          "total_tokens": 1024,
+          "wall_s": {
+            "nuvec": {
+              "median": 6.3018,
+              "samples": [
+                6.3018
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 6.3058913339918945,
+              "samples": [
+                6.3058913339918945
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0006,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 162.49325589514106,
+              "samples": [
+                162.49325589514106
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 162.38782842326034,
+              "samples": [
+                162.38782842326034
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0006,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 216.13342409802587,
+              "samples": [
+                216.13342409802587
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 214.7140479951962,
+              "samples": [
+                214.7140479951962
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0066,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "nuvec_matches_solo": true
+        }
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "mlx-community/Qwen3.6-35B-A3B-4bit",
+      "kind": "hybrid-moe",
+      "snapshot": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+      "decode": [
+        {
+          "repeats": 1,
+          "prompt_tokens": {
+            "nuvec": 25,
+            "mlx_lm": 25
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 91.16,
+              "samples": [
+                91.08,
+                91.04,
+                91.24,
+                91.29
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 90.57439017079736,
+              "samples": [
+                90.56389847416001,
+                90.58408455064975,
+                90.57145239931167,
+                90.57732794228303
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0065,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 40,
+          "prompt_tokens": {
+            "nuvec": 961,
+            "mlx_lm": 961
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 89.37,
+              "samples": [
+                89.22,
+                89.24,
+                89.5,
+                89.73
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 88.80152765974098,
+              "samples": [
+                88.6772479054216,
+                88.77061350188823,
+                88.83244181759373,
+                88.86464487234372
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0064,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        {
+          "repeats": 160,
+          "prompt_tokens": {
+            "nuvec": 3841,
+            "mlx_lm": 3841
+          },
+          "tok_s": {
+            "nuvec": {
+              "median": 87.28,
+              "samples": [
+                87.31,
+                87.15,
+                87.5,
+                87.25
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 86.63582694375992,
+              "samples": [
+                86.61250806564412,
+                86.37147155142088,
+                86.65914582187574,
+                86.67864170544591
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0074,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        }
+      ],
+      "ttft": {
+        "legacy": [
+          {
+            "repeats": 1,
+            "prompt_tokens": {
+              "nuvec": 25,
+              "mlx_lm": 25
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 318.58000000000004,
+                "samples": [
+                  317.81,
+                  319.35,
+                  316.02,
+                  322.1
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 287.62031773876936,
+                "samples": [
+                  287.2475012485879,
+                  288.19537453094364,
+                  287.99313422895074,
+                  286.3439675557647
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 1.1076,
+              "gate_pass": true,
+              "goal_pass": true
+            }
+          },
+          {
+            "repeats": 40,
+            "prompt_tokens": {
+              "nuvec": 961,
+              "mlx_lm": 961
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 979.215,
+                "samples": [
+                  977.82,
+                  980.61,
+                  975.87,
+                  981.63
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 997.2649191524163,
+                "samples": [
+                  994.9081274964858,
+                  997.6579434797558,
+                  996.8718948250767,
+                  999.4565909777549
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9819,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          },
+          {
+            "repeats": 160,
+            "prompt_tokens": {
+              "nuvec": 3841,
+              "mlx_lm": 3841
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 999.175,
+                "samples": [
+                  998.49,
+                  999.86,
+                  998.2,
+                  1000.28
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 1019.113993229582,
+                "samples": [
+                  1019.0840581624191,
+                  1019.8146657427386,
+                  1019.1439282967449,
+                  1019.0195988814202
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9804,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          }
+        ],
+        "lengths": [
+          {
+            "prompt_tokens": 2048,
+            "ttft_s": {
+              "nuvec": {
+                "median": 2.00535,
+                "samples": [
+                  2.0094,
+                  2.0021,
+                  2.0086,
+                  2.0013
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 1.9977364165024483,
+                "samples": [
+                  2.0053977079951437,
+                  2.001921292001498,
+                  1.9935515410033986,
+                  1.9838442499967641
+                ],
+                "unit": "s"
+              },
+              "ratio": 0.9962,
+              "gate_pass": true,
+              "goal_pass": false
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 1021.27,
+                "samples": [
+                  1019.23,
+                  1022.92,
+                  1019.62,
+                  1023.33
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 1025.164766584256,
+                "samples": [
+                  1021.2438120553389,
+                  1023.0172425772209,
+                  1027.3122905912912,
+                  1032.3391062596475
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9962,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          },
+          {
+            "prompt_tokens": 32768,
+            "ttft_s": {
+              "nuvec": {
+                "median": 44.7093,
+                "samples": [
+                  44.8443,
+                  44.6079,
+                  44.8107,
+                  44.5812
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 43.890339707999374,
+                "samples": [
+                  43.89895675000298,
+                  43.82672375000402,
+                  43.88172266599577,
+                  44.314664790996176
+                ],
+                "unit": "s"
+              },
+              "ratio": 0.9817,
+              "gate_pass": true,
+              "goal_pass": false
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 732.915,
+                "samples": [
+                  730.71,
+                  734.58,
+                  731.25,
+                  735.02
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 746.5880073172655,
+                "samples": [
+                  746.4414288159086,
+                  747.6716760056014,
+                  746.7345858186223,
+                  739.4391936517092
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9817,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          },
+          {
+            "prompt_tokens": 65536,
+            "ttft_s": {
+              "nuvec": {
+                "median": 117.1094,
+                "samples": [
+                  116.5529,
+                  117.6659
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": {
+                "median": 114.93675585449819,
+                "samples": [
+                  114.23013312499825,
+                  115.64337858399813
+                ],
+                "unit": "s"
+              },
+              "ratio": 0.9814,
+              "gate_pass": true,
+              "goal_pass": false
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 559.63,
+                "samples": [
+                  562.29,
+                  556.97
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": {
+                "median": 570.2133897081721,
+                "samples": [
+                  573.7190197291123,
+                  566.7077596872319
+                ],
+                "unit": "tok/s"
+              },
+              "ratio": 0.9814,
+              "gate_pass": true,
+              "goal_pass": false
+            }
+          },
+          {
+            "prompt_tokens": 261952,
+            "ttft_s": {
+              "nuvec": {
+                "median": 1231.9852,
+                "samples": [
+                  1231.9852
+                ],
+                "unit": "s"
+              },
+              "mlx_lm": null,
+              "ratio": null,
+              "reason": "mlx-lm: exit 1: RuntimeError: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+            },
+            "prefill_tok_s": {
+              "nuvec": {
+                "median": 212.63,
+                "samples": [
+                  212.63
+                ],
+                "unit": "tok/s"
+              },
+              "mlx_lm": null,
+              "ratio": null,
+              "reason": "mlx-lm: exit 1: RuntimeError: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+            }
+          }
+        ]
+      },
+      "memory": {
+        "load": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 19508822016.0,
+              "samples": [
+                19508822016,
+                19508822016
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 19508787464.0,
+              "samples": [
+                19508787464,
+                19508787464
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 19587522560.0,
+              "samples": [
+                19533676544,
+                19641368576
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 19836600320.0,
+              "samples": [
+                19787251712,
+                19885948928
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0127
+          },
+          "nuvec_raw": {
+            "peak_bytes": 19508822016,
+            "active_bytes": 19508822016,
+            "mapped_bytes": 0
+          }
+        },
+        "decode": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 19610407424.0,
+              "samples": [
+                19610905856,
+                19609908992
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 19654036909.0,
+              "samples": [
+                19654036909,
+                19654036909
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0022
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 19824402432.0,
+              "samples": [
+                19824246784,
+                19824558080
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 19711959040.0,
+              "samples": [
+                19801227264,
+                19622690816
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 0.9943
+          },
+          "nuvec_raw": {
+            "peak_bytes": 19609908992,
+            "active_bytes": 19508823552,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_2048": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 21344803840.0,
+              "samples": [
+                21344803840,
+                21344803840
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 21452473854.0,
+              "samples": [
+                21452482046,
+                21452465662
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.005
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 19827679232.0,
+              "samples": [
+                19833847808,
+                19821510656
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 19635470336.0,
+              "samples": [
+                19729448960,
+                19541491712
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 0.9903
+          },
+          "nuvec_raw": {
+            "peak_bytes": 21344803840,
+            "active_bytes": 19508823552,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_32768": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 23931588864.0,
+              "samples": [
+                23931588864,
+                23931588864
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 23998842288.0,
+              "samples": [
+                23998866864,
+                23998817712
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0028
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 19780460544.0,
+              "samples": [
+                19718062080,
+                19842859008
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 20146151424.0,
+              "samples": [
+                20147601408,
+                20144701440
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0185
+          },
+          "nuvec_raw": {
+            "peak_bytes": 23931588864,
+            "active_bytes": 19508824064,
+            "mapped_bytes": 0
+          }
+        },
+        "prefill_65536": {
+          "peak_bytes": {
+            "nuvec": {
+              "median": 26816205056.0,
+              "samples": [
+                26816205056,
+                26816205056
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 26883597744.0,
+              "samples": [
+                26883597744,
+                26883597744
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0025
+          },
+          "os_peak_rss_bytes": {
+            "nuvec": {
+              "median": 19842932736.0,
+              "samples": [
+                19843629056,
+                19842236416
+              ],
+              "unit": "bytes"
+            },
+            "mlx_lm": {
+              "median": 20144848896.0,
+              "samples": [
+                20144734208,
+                20144963584
+              ],
+              "unit": "bytes"
+            },
+            "ratio": 1.0152
+          },
+          "nuvec_raw": {
+            "peak_bytes": 26816205056,
+            "active_bytes": 19508824064,
+            "mapped_bytes": 0
+          }
+        }
+      },
+      "load": {
+        "warm": {
+          "model_ready_s": {
+            "nuvec": {
+              "median": 1.4563,
+              "samples": [
+                1.4563,
+                1.516,
+                1.4352
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 1.5778818749968195,
+              "samples": [
+                1.5822892500000307,
+                1.5778818749968195,
+                1.560168458003318
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.0835,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "first_token_s": {
+            "nuvec": {
+              "median": 1.5671,
+              "samples": [
+                1.5671,
+                1.6307,
+                1.5482
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 2.0712242500012508,
+              "samples": [
+                2.1313970829942264,
+                2.0712242500012508,
+                2.0544500000105472
+              ],
+              "unit": "s"
+            },
+            "ratio": 1.3217,
+            "gate_pass": true,
+            "goal_pass": true
+          }
+        },
+        "cold": {
+          "model_ready_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          },
+          "first_token_s": {
+            "nuvec": null,
+            "mlx_lm": null,
+            "ratio": null,
+            "reason": "not run (--no-cold)"
+          }
+        }
+      },
+      "concurrency": [
+        {
+          "level": 1,
+          "total_tokens": 128,
+          "wall_s": {
+            "nuvec": {
+              "median": 1.6845,
+              "samples": [
+                1.6845
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 1.6839494580053724,
+              "samples": [
+                1.6839494580053724
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9997,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 75.98693974473137,
+              "samples": [
+                75.98693974473137
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 76.01178253391001,
+              "samples": [
+                76.01178253391001
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9997,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 90.935128168409,
+              "samples": [
+                90.935128168409
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 92.08656182967526,
+              "samples": [
+                92.08656182967526
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9875,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 4,
+          "total_tokens": 512,
+          "wall_s": {
+            "nuvec": {
+              "median": 3.7043,
+              "samples": [
+                3.7043
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 3.606938957993407,
+              "samples": [
+                3.606938957993407
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9737,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 138.21774694274222,
+              "samples": [
+                138.21774694274222
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 141.9486179175134,
+              "samples": [
+                141.9486179175134
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9737,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 177.1454475712243,
+              "samples": [
+                177.1454475712243
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 183.63963633085737,
+              "samples": [
+                183.63963633085737
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9646,
+            "gate_pass": false,
+            "goal_pass": false
+          },
+          "nuvec_matches_solo": true
+        },
+        {
+          "level": 8,
+          "total_tokens": 1024,
+          "wall_s": {
+            "nuvec": {
+              "median": 6.1699,
+              "samples": [
+                6.1699
+              ],
+              "unit": "s"
+            },
+            "mlx_lm": {
+              "median": 6.166077958012465,
+              "samples": [
+                6.166077958012465
+              ],
+              "unit": "s"
+            },
+            "ratio": 0.9994,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "aggregate_tok_s": {
+            "nuvec": {
+              "median": 165.96703350135334,
+              "samples": [
+                165.96703350135334
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 166.06990812845152,
+              "samples": [
+                166.06990812845152
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 0.9994,
+            "gate_pass": true,
+            "goal_pass": false
+          },
+          "decode_aggregate_tok_s": {
+            "nuvec": {
+              "median": 220.72561373017598,
+              "samples": [
+                220.72561373017598
+              ],
+              "unit": "tok/s"
+            },
+            "mlx_lm": {
+              "median": 220.6517136220744,
+              "samples": [
+                220.6517136220744
+              ],
+              "unit": "tok/s"
+            },
+            "ratio": 1.0003,
+            "gate_pass": true,
+            "goal_pass": true
+          },
+          "nuvec_matches_solo": true
+        }
+      ],
+      "status": "ok",
+      "reason": "ttft-261952 mlx-lm: exit 1: RuntimeError: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+    }
+  ],
+  "summary": {
+    "below_gate": {
+      "concurrency_8": [
+        {
+          "model": "mlx-community/Qwen3-0.6B-4bit",
+          "ratio": 0.97
+        },
+        {
+          "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+          "ratio": 0.97
+        }
+      ],
+      "concurrency_4": [
+        {
+          "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "ratio": 0.9737
+        }
+      ]
+    },
+    "below_goal": {
+      "concurrency_4": [
+        {
+          "model": "mlx-community/Qwen3-0.6B-4bit",
+          "ratio": 0.9825
+        },
+        {
+          "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+          "ratio": 0.9951
+        },
+        {
+          "model": "mlx-community/Qwen3-8B-4bit",
+          "ratio": 0.9931
+        },
+        {
+          "model": "mlx-community/Qwen3.8-27B-4bit",
+          "ratio": 0.986
+        },
+        {
+          "model": "mlx-community/Qwen3-30B-A3B-4bit",
+          "ratio": 0.9978
+        },
+        {
+          "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "ratio": 0.9737
+        }
+      ],
+      "concurrency_8": [
+        {
+          "model": "mlx-community/Qwen3-0.6B-4bit",
+          "ratio": 0.97
+        },
+        {
+          "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+          "ratio": 0.97
+        },
+        {
+          "model": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+          "ratio": 0.9987
+        },
+        {
+          "model": "mlx-community/Qwen3.5-9B-4bit",
+          "ratio": 0.9986
+        },
+        {
+          "model": "mlx-community/Qwen3.8-27B-4bit",
+          "ratio": 0.9816
+        },
+        {
+          "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "ratio": 0.9994
+        }
+      ],
+      "decode": [
+        {
+          "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+          "ratio": 0.998
+        },
+        {
+          "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+          "ratio": 0.9993
+        },
+        {
+          "model": "mlx-community/Qwen3.5-9B-4bit",
+          "ratio": 0.9862
+        },
+        {
+          "model": "mlx-community/Qwen3.5-9B-4bit",
+          "ratio": 0.9853
+        },
+        {
+          "model": "mlx-community/Qwen3.5-9B-4bit",
+          "ratio": 0.9857
+        }
+      ],
+      "concurrency_1": [
+        {
+          "model": "mlx-community/Qwen3-8B-4bit",
+          "ratio": 0.9809
+        },
+        {
+          "model": "mlx-community/Qwen3.5-9B-4bit",
+          "ratio": 0.9928
+        },
+        {
+          "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "ratio": 0.9997
+        }
+      ],
+      "prefill_legacy": [
+        {
+          "model": "mlx-community/Qwen3.5-9B-4bit",
+          "ratio": 0.9987
+        },
+        {
+          "model": "mlx-community/Qwen3.5-9B-4bit",
+          "ratio": 0.9966
+        },
+        {
+          "model": "mlx-community/Qwen3-30B-A3B-4bit",
+          "ratio": 0.9929
+        },
+        {
+          "model": "mlx-community/Qwen3-30B-A3B-4bit",
+          "ratio": 0.9867
+        },
+        {
+          "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "ratio": 0.9819
+        },
+        {
+          "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "ratio": 0.9804
+        }
+      ],
+      "ttft_2048": [
+        {
+          "model": "mlx-community/Qwen3-30B-A3B-4bit",
+          "ratio": 0.9871
+        },
+        {
+          "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "ratio": 0.9962
+        }
+      ],
+      "ttft_32768": [
+        {
+          "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "ratio": 0.9817
+        }
+      ],
+      "ttft_65536": [
+        {
+          "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "ratio": 0.9814
+        }
+      ]
+    },
+    "correctness_flags": [],
+    "decode_geomean": {
+      "value": 1.0164,
+      "n": 24
+    },
+    "memory_geomean": {
+      "value": 1.0216,
+      "n": 33
+    },
+    "load_warm_geomean": {
+      "value": 1.633,
+      "n": 8
+    },
+    "ttft_geomean": {
+      "2048": {
+        "value": 1.0051,
+        "n": 8
+      },
+      "32768": {
+        "value": 0.9817,
+        "n": 1
+      },
+      "65536": {
+        "value": 0.9814,
+        "n": 1
+      },
+      "legacy_prefill": {
+        "value": 1.003,
+        "n": 16
+      }
+    },
+    "concurrency_geomean": {
+      "1": {
+        "value": 1.0189,
+        "n": 8
+      },
+      "4": {
+        "value": 0.9917,
+        "n": 8
+      },
+      "8": {
+        "value": 0.9899,
+        "n": 8
+      }
+    }
+  }
+}

@@ -7,56 +7,38 @@
 //!
 //! With `--async`, each step's parameters are submitted with `async_eval`, so the next batch
 //! and graph are built while the GPU runs the step. With `--compile`, the training step
-//! (forward, gradients and update) is compiled, as MLX's example does with `mx.compile`.
+//! (forward, gradients and update) is compiled with `compile_mut`, the model and the
+//! optimizer as its state, as MLX's example does with
+//! `mx.compile(step, inputs=state, outputs=state)`.
 //!
 //! `just mnist` downloads MNIST and compares with MLX.
 
 use std::time::Instant;
 
-use nuvec::{
-    Array, DType, Device, Result, Stream, argmax, astype, equal, io, mean, random,
-    set_default_stream,
-};
+use nuvec::{Array, DType, Device, Result, Stream, io, random, set_default_stream, value_and_grad};
 use nuvec_nn::losses::{Reduction, cross_entropy};
 use nuvec_nn::optim::{Optimizer, Sgd};
-use nuvec_nn::{Linear, Module, Parameters, relu, value_and_grad};
+use nuvec_nn::{Linear, Module, relu};
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 struct Mlp {
     layers: Vec<Linear>,
 }
 
 impl Mlp {
-    fn new(sizes: &[usize]) -> Result<Self> {
-        let layers = sizes
-            .windows(2)
-            .map(|w| Linear::new(w[0], w[1], true))
-            .collect::<Result<_>>()?;
-        Ok(Self { layers })
+    fn new(sizes: &[i32]) -> Self {
+        let layers = sizes.windows(2).map(|w| Linear::new(w[0], w[1])).collect();
+        Self { layers }
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array) -> Array {
         let (last, hidden) = self.layers.split_last().expect("at least one layer");
         let mut h = x.clone();
         for layer in hidden {
-            h = relu(&layer.forward(&h)?)?;
+            h = relu(&layer.forward(&h));
         }
         last.forward(&h)
     }
-}
-
-impl Module for Mlp {
-    fn visit(&mut self, p: &mut Parameters<'_>) {
-        p.module("layers", &mut self.layers);
-    }
-}
-
-/// The model's trainable parameters, without names.
-fn arrays(m: &Mlp) -> Vec<Array> {
-    m.trainable_parameters()
-        .into_iter()
-        .map(|(_, a)| a)
-        .collect()
 }
 
 /// Images as float32 rows in `[0, 1]` and labels as uint32, as in MLX's example.
@@ -120,26 +102,20 @@ fn main() -> Result<()> {
     })?;
     let (test_x, test_y, n_test) = load(&dir, "t10k")?;
     let pixels = train_x.len() / n;
-    let test_x = Array::from_slice(&test_x, &[n_test, pixels])?;
-    let test_y = Array::from_slice(&test_y, &[n_test])?;
+    let test_x = Array::from_slice(&test_x, [n_test, pixels]);
+    let test_y = Array::from_slice(&test_y, [n_test]);
 
-    let (batch, lr) = (256, 0.1);
+    let (batch_size, lr) = (256, 0.1);
     random::seed(0);
-    let mut model = Mlp::new(&[pixels, 32, 32, 10])?;
-    nuvec::eval(&arrays(&model))?;
-    let mut optimizer = Sgd::new(lr);
-    // The step as a function of the parameters and the batch, returning new parameters.
-    let k = arrays(&model).len();
-    let template = model.clone();
-    let step = nuvec::compile(move |xs: &[Array]| {
-        let mut m = template.clone();
-        m.update_trainable(&xs[..k])?;
-        let (x, y) = (&xs[k], &xs[k + 1]);
-        let (_, grads) = value_and_grad(&m, |m: &Mlp| {
-            cross_entropy(&m.forward(x)?, y, Reduction::Mean)
-        })?;
-        Sgd::new(lr).update(&mut m, &grads)?;
-        Ok(arrays(&m))
+    let mut state = (Mlp::new(&[pixels as i32, 32, 32, 10]), Sgd::new(lr));
+    state.1.init(&state.0); // the optimizer's state exists before the first step
+    nuvec::eval(&state)?;
+    // The training step, compiled with the model and the optimizer as its state.
+    let step = nuvec::compile_mut(|(model, opt): &mut (Mlp, Sgd), (x, y): &(Array, Array)| {
+        let loss_fn = |m: &Mlp| cross_entropy(&m.forward(x), y, Reduction::Mean);
+        let (loss, grads) = value_and_grad(loss_fn)(model)?;
+        opt.update(model, &grads)?;
+        Ok(loss)
     });
     let mut shuffle = Shuffle(0);
     let device = nuvec::default_stream().device;
@@ -148,33 +124,33 @@ fn main() -> Result<()> {
     for epoch in 0..epochs {
         let tic = Instant::now();
         let perm = shuffle.permutation(n);
-        for ids in perm.chunks(batch) {
+        for ids in perm.chunks(batch_size) {
             let mut xb = Vec::with_capacity(ids.len() * pixels);
             for &i in ids {
                 xb.extend_from_slice(&train_x[i * pixels..(i + 1) * pixels]);
             }
             let yb: Vec<u32> = ids.iter().map(|&i| train_y[i]).collect();
-            let x = Array::from_slice(&xb, &[ids.len(), pixels])?;
-            let y = Array::from_slice(&yb, &[ids.len()])?;
+            let x = Array::from_slice(&xb, [ids.len(), pixels]);
+            let y = Array::from_slice(&yb, [ids.len()]);
+            let batch = (x, y);
             if compiled {
-                let mut args = arrays(&model);
-                args.extend([x, y]);
-                model.update_trainable(&step(&args)?)?;
+                let _loss = step(&mut state, &batch)?;
             } else {
-                let (_, grads) = value_and_grad(&model, |m: &Mlp| {
-                    cross_entropy(&m.forward(&x)?, &y, Reduction::Mean)
-                })?;
-                optimizer.update(&mut model, &grads)?;
+                let (model, opt) = &mut state;
+                let loss_fn =
+                    |m: &Mlp| cross_entropy(&m.forward(&batch.0), &batch.1, Reduction::Mean);
+                let (_, grads) = value_and_grad(loss_fn)(&*model)?;
+                opt.update(model, &grads)?;
             }
             if asynchronous {
-                nuvec::async_eval(&arrays(&model))?;
+                nuvec::async_eval(&state.0)?;
             } else {
-                nuvec::eval(&arrays(&model))?;
+                nuvec::eval(&state.0)?;
             }
         }
-        let predictions = argmax(&model.forward(&test_x)?, Some(1), false)?;
-        let hits = astype(&equal(&predictions, &test_y)?, DType::F32)?;
-        accuracy = mean(&hits, &[], false)?.item::<f32>()?;
+        let predictions = state.0.forward(&test_x).argmax(1);
+        let hits = predictions.equal(&test_y).astype(DType::F32);
+        accuracy = hits.mean(..).item::<f32>()?;
         let seconds = tic.elapsed().as_secs_f64();
         times.push(seconds);
         println!("Epoch {epoch}: Test accuracy {accuracy:.3}, Time {seconds:.3} (s)");

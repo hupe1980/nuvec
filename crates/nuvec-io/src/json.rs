@@ -87,9 +87,15 @@ fn invalid(msg: &str, at: usize) -> Error {
     Error::InvalidArgument(format!("JSON: {msg} at byte {at}"))
 }
 
+/// The deepest nesting of arrays and objects accepted (serde_json's default): deeper
+/// input is an error instead of a stack overflow.
+const MAX_DEPTH: usize = 128;
+
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    /// Arrays and objects currently open.
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -109,15 +115,26 @@ impl Parser<'_> {
         }
     }
 
+    /// Enters the array or object at the current byte.
+    fn open(&mut self) -> Result<()> {
+        if self.depth == MAX_DEPTH {
+            return Err(invalid("nesting too deep", self.i));
+        }
+        self.depth += 1;
+        self.i += 1;
+        Ok(())
+    }
+
     fn value(&mut self) -> Result<Json> {
         self.ws();
         match self.s.get(self.i) {
             Some(b'{') => {
-                self.i += 1;
+                self.open()?;
                 let mut items = Vec::new();
                 self.ws();
                 if self.s.get(self.i) == Some(&b'}') {
                     self.i += 1;
+                    self.depth -= 1;
                     return Ok(Json::Object(items));
                 }
                 loop {
@@ -130,6 +147,7 @@ impl Parser<'_> {
                         Some(b',') => self.i += 1,
                         Some(b'}') => {
                             self.i += 1;
+                            self.depth -= 1;
                             return Ok(Json::Object(items));
                         }
                         _ => return Err(invalid("expected `,` or `}`", self.i)),
@@ -137,11 +155,12 @@ impl Parser<'_> {
                 }
             }
             Some(b'[') => {
-                self.i += 1;
+                self.open()?;
                 let mut items = Vec::new();
                 self.ws();
                 if self.s.get(self.i) == Some(&b']') {
                     self.i += 1;
+                    self.depth -= 1;
                     return Ok(Json::Array(items));
                 }
                 loop {
@@ -151,6 +170,7 @@ impl Parser<'_> {
                         Some(b',') => self.i += 1,
                         Some(b']') => {
                             self.i += 1;
+                            self.depth -= 1;
                             return Ok(Json::Array(items));
                         }
                         _ => return Err(invalid("expected `,` or `]`", self.i)),
@@ -170,23 +190,55 @@ impl Parser<'_> {
                 self.i += 4;
                 Ok(Json::Null)
             }
-            Some(c) if *c == b'-' || c.is_ascii_digit() => {
-                let start = self.i;
-                self.i += 1;
-                while self
-                    .s
-                    .get(self.i)
-                    .is_some_and(|c| c.is_ascii_digit() || b".eE+-".contains(c))
-                {
-                    self.i += 1;
-                }
-                let text = std::str::from_utf8(&self.s[start..self.i]).unwrap_or("");
-                text.parse()
-                    .map(Json::Int)
-                    .or_else(|_| text.parse().map(Json::Float))
-                    .map_err(|_| invalid("number expected", start))
-            }
+            Some(c) if *c == b'-' || c.is_ascii_digit() => self.number(),
             _ => Err(invalid("value expected", self.i)),
+        }
+    }
+
+    /// The digits at the current byte (at least one); returns how many.
+    fn digits(&mut self, start: usize) -> Result<usize> {
+        let from = self.i;
+        while self.s.get(self.i).is_some_and(u8::is_ascii_digit) {
+            self.i += 1;
+        }
+        match self.i - from {
+            0 => Err(invalid("number expected", start)),
+            n => Ok(n),
+        }
+    }
+
+    /// A number in RFC 8259's grammar: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+    fn number(&mut self) -> Result<Json> {
+        let start = self.i;
+        if self.s.get(self.i) == Some(&b'-') {
+            self.i += 1;
+        }
+        let first = self.i;
+        if self.digits(start)? > 1 && self.s[first] == b'0' {
+            return Err(invalid("leading zero", start));
+        }
+        let mut integer = true;
+        if self.s.get(self.i) == Some(&b'.') {
+            self.i += 1;
+            self.digits(start)?;
+            integer = false;
+        }
+        if matches!(self.s.get(self.i), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.s.get(self.i), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            self.digits(start)?;
+            integer = false;
+        }
+        // ASCII by construction.
+        let text = std::str::from_utf8(&self.s[start..self.i]).unwrap_or("");
+        match text.parse() {
+            Ok(n) if integer => Ok(Json::Int(n)),
+            _ => text
+                .parse()
+                .map(Json::Float)
+                .map_err(|_| invalid("number expected", start)),
         }
     }
 
@@ -226,17 +278,25 @@ impl Parser<'_> {
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
                         b'u' => {
+                            let at = self.i - 2;
                             let mut code = self.hex4()?;
-                            if (0xD800..0xDC00).contains(&code)
-                                && self.s[self.i..].starts_with(b"\\u")
-                            {
+                            // A high surrogate must be followed by an escaped low one; a
+                            // lone surrogate of either kind is not a character.
+                            if (0xD800..0xDC00).contains(&code) {
+                                if !self.s[self.i..].starts_with(b"\\u") {
+                                    return Err(invalid("lone surrogate", at));
+                                }
                                 self.i += 2;
                                 let low = self.hex4()?;
-                                code = 0x10000
-                                    + ((code - 0xD800) << 10)
-                                    + (low.wrapping_sub(0xDC00) & 0x3FF);
+                                if !(0xDC00..0xE000).contains(&low) {
+                                    return Err(invalid("invalid surrogate pair", at));
+                                }
+                                code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
                             }
-                            out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                            out.push(
+                                char::from_u32(code)
+                                    .ok_or_else(|| invalid("lone surrogate", at))?,
+                            );
                         }
                         _ => return Err(invalid("bad escape", self.i - 1)),
                     }
@@ -251,6 +311,10 @@ impl Parser<'_> {
             .s
             .get(self.i..self.i + 4)
             .ok_or_else(|| invalid("bad \\u escape", self.i))?;
+        // Exactly four hex digits: `from_str_radix` alone would accept a sign.
+        if !digits.iter().all(u8::is_ascii_hexdigit) {
+            return Err(invalid("bad \\u escape", self.i));
+        }
         self.i += 4;
         std::str::from_utf8(digits)
             .ok()
@@ -260,8 +324,16 @@ impl Parser<'_> {
 }
 
 /// Parses one JSON value (trailing whitespace allowed).
+///
+/// Strict RFC 8259: lone surrogates, leading zeros and malformed numbers are errors, and
+/// arrays and objects nest at most 128 deep (deeper input is an error, not a stack
+/// overflow).
 pub fn parse(bytes: &[u8]) -> Result<Json> {
-    let mut p = Parser { s: bytes, i: 0 };
+    let mut p = Parser {
+        s: bytes,
+        i: 0,
+        depth: 0,
+    };
     let v = p.value()?;
     p.ws();
     if p.i != bytes.len() {

@@ -12,15 +12,16 @@ group = "Project"
 |---|---|
 | `nuvec` | Facade: re-exports the everyday API and the layers below |
 | `nuvec-core` | Arrays, graph nodes, primitives, dtypes, evaluation, derivative and batching rules, GPU dispatch |
-| `nuvec-compile` | Tracing, graph simplification, element-wise fusion |
+| `nuvec-compile` | Tracing, graph simplification, element-wise fusion; `compile_mut` for training steps |
+| `nuvec-macros` | `#[derive(Tree)]`, `#[derive(Module)]`, `#[derive(Static)]` |
 | `nuvec-gpu` | Metal runtime: device, pipelines, buffers, command encoding, allocator, residency sets, profiler |
 | `nuvec-kernels` | Metal kernel sources and the precompiled library |
 | `nuvec-cpu` | Pure-Rust CPU kernels over typed slices |
 | `nuvec-io` | safetensors, npy, IDX; memory-mapped files |
-| `nuvec-nn` | Modules, layers, losses, optimizers |
+| `nuvec-nn` | Modules (every tree is one), layers, losses, optimizers |
 | `nuvec-lm` | Models, tokenizer, KV cache, generation, speculative decoding |
 
-`unsafe` code is confined to the Metal runtime (`nuvec-gpu`, including file mapping) and one call into a SIMD matrix-product library in `nuvec-cpu`; every other crate forbids it.
+`unsafe` code stays in the Metal runtime (`nuvec-gpu`, including file mapping), `nuvec-core`'s three kernel-dispatch calls and one CPU matrix-product call in `nuvec-cpu`; the other crates contain none.
 
 ## The graph
 
@@ -42,6 +43,6 @@ The allocator rounds sizes into buckets, caches freed buffers, evicts least rece
 
 ## Design choices
 
-- **MLX semantics, Rust idioms.** Same promotion table, broadcasting, transforms and kernels as MLX; `Result` instead of exceptions, ownership instead of reference-count heuristics, `Send + Sync` arrays.
+- **MLX semantics, Rust idioms.** Same promotion table, broadcasting, transforms and kernels as MLX; failed arrays and `Result` at evaluation boundaries instead of exceptions, ownership instead of reference-count heuristics, `Send + Sync` arrays.
 - **Ported kernels first.** MLX's Metal kernels are the reference for speed; nuvec ports them, keeps their attribution, and tests against MLX. Its own kernels cover what MLX does not fuse or tile for (residual norms, norm + RoPE + cache writes, few-row quantized products).
 - **No C++.** Metal is reached through Apple's system frameworks via [`objc2-metal`](https://crates.io/crates/objc2-metal); the CPU path is pure Rust.

@@ -7,8 +7,9 @@
 
 use crate::array::Array;
 use crate::cast::Canon;
-use crate::ops::{
-    self, broadcast_to, conjugate, cos, divide, equal, exp, greater, greater_equal, less,
+use crate::indexing::{put_along_axis, take_along_axis};
+use crate::ops::imp::{
+    self as ops, broadcast_to, conjugate, cos, divide, equal, exp, greater, greater_equal, less,
     less_equal, log, matmul, multiply, negative, not_equal, reshape, sin, stop_gradient, subtract,
     sum, transpose, where_,
 };
@@ -16,7 +17,6 @@ use crate::primitive::{BinaryOp, Primitive, ReduceOp, ScanOp, ScatterReduce, Una
 use crate::quantized::{dequantize, quantized_matmul};
 use crate::sorting::{argsort, cummax, cummin, cumprod, cumsum, logcumsumexp};
 use crate::{DType, Error, Result};
-use crate::{put_along_axis, take_along_axis};
 
 /// Records `primitive` on `inputs` (single output).
 fn record(primitive: Primitive, inputs: Vec<Array>) -> Result<Array> {
@@ -62,7 +62,9 @@ fn scan_owner(
     reverse: bool,
     inclusive: bool,
 ) -> Result<(Array, (usize, usize))> {
-    let n = x.shape()[axis];
+    // Callers handle an empty axis (the windows below would underflow).
+    let n = x.dims()[axis];
+    debug_assert!(n > 0, "scan_owner over an empty axis");
     let (in_window, extreme_window, out_range, (first, last)) = if inclusive {
         (x.clone(), out.clone(), (0, n), (0, n))
     } else if reverse {
@@ -86,7 +88,7 @@ fn scan_owner(
     } else {
         cummax(&masked, a, false, true)?
     };
-    Ok((stop_gradient(&owner.astype(DType::U32)?)?, out_range))
+    Ok((stop_gradient(&owner.try_astype(DType::U32)?)?, out_range))
 }
 
 /// For a cumulative product: the mask of each lane's first zero (in scan order), the
@@ -140,13 +142,16 @@ fn scan_vjp(
             where_(&first, &partial(&with_one)?, &where_(&zero, 0.0, &regular)?)
         }
         ScanOp::Max | ScanOp::Min => {
+            if x.dims()[axis] == 0 {
+                return zeros_like(x); // nothing to scan (and no window to take)
+            }
             let (owner, (start, stop)) = scan_owner(x, out, axis, reverse, inclusive)?;
             let g = if inclusive {
                 g.clone()
             } else {
                 window(g, axis, start, stop)?
             };
-            crate::scatter_add_along_axis(&zeros_like(x)?, &owner, &g, axis as isize)
+            crate::indexing::scatter_add_along_axis(&zeros_like(x)?, &owner, &g, axis as isize)
         }
     }
 }
@@ -187,6 +192,9 @@ fn scan_jvp(
             where_(&zero, &multiply(&with_one, &t_zero)?, &regular)
         }
         ScanOp::Max | ScanOp::Min => {
+            if x.dims()[axis] == 0 {
+                return zeros_like(out);
+            }
             let (owner, (start, _)) = scan_owner(x, out, axis, reverse, inclusive)?;
             let moved = take_along_axis(t, &owner, axis as isize)?;
             if inclusive {
@@ -199,7 +207,7 @@ fn scan_jvp(
             } else {
                 [edge, moved]
             };
-            crate::concatenate(&parts, axis as isize)
+            crate::indexing::concatenate(&parts, axis as isize)
         }
     }
 }
@@ -207,18 +215,18 @@ fn scan_jvp(
 /// Zeros shaped like `a`, as a broadcast scalar (no allocation).
 pub(crate) fn zeros_like(a: &Array) -> Result<Array> {
     let zero = ops::filled(&[], a.dtype(), |_| Canon::Int(0))?;
-    broadcast_to(&zero, a.shape())
+    broadcast_to(&zero, a.dims())
 }
 
 /// Ones shaped like `a`, as a broadcast scalar.
 fn ones_like(a: &Array) -> Result<Array> {
     let one = ops::filled(&[], a.dtype(), |_| Canon::Int(1))?;
-    broadcast_to(&one, a.shape())
+    broadcast_to(&one, a.dims())
 }
 
 /// `a` with its last axis split into groups: `[..., C]` → `[..., C / size, size]`.
 fn grouped(a: &Array, size: usize) -> Result<Array> {
-    let mut shape = isize_shape(a.shape());
+    let mut shape = isize_shape(a.dims());
     let last = shape.pop().expect("at least 1-D");
     shape.extend([last / size as isize, size as isize]);
     reshape(a, &shape)
@@ -227,7 +235,7 @@ fn grouped(a: &Array, size: usize) -> Result<Array> {
 /// `a` with its leading axes flattened into one, leaving `ndim` axes.
 fn flatten_front(a: &Array, ndim: usize) -> Result<Array> {
     let mut shape = vec![-1];
-    shape.extend(isize_shape(&a.shape()[a.ndim() + 1 - ndim..]));
+    shape.extend(isize_shape(&a.dims()[a.ndim() + 1 - ndim..]));
     reshape(a, &shape)
 }
 
@@ -287,8 +295,8 @@ fn swap_last(a: &Array) -> Result<Array> {
 /// `-1`, `0` or `1` per element, in `x`'s dtype.
 fn sign(x: &Array) -> Result<Array> {
     subtract(
-        greater(x, 0)?.astype(x.dtype())?,
-        less(x, 0)?.astype(x.dtype())?,
+        greater(x, 0)?.try_astype(x.dtype())?,
+        less(x, 0)?.try_astype(x.dtype())?,
     )
 }
 
@@ -296,7 +304,7 @@ fn sign(x: &Array) -> Result<Array> {
 fn sum_to(g: &Array, shape: &[usize]) -> Result<Array> {
     let extra = g.ndim() - shape.len();
     let axes: Vec<isize> = (0..g.ndim())
-        .filter(|&i| i < extra || (shape[i - extra] == 1 && g.shape()[i] != 1))
+        .filter(|&i| i < extra || (shape[i - extra] == 1 && g.dims()[i] != 1))
         .map(|i| i as isize)
         .collect();
     let summed = if axes.is_empty() {
@@ -311,7 +319,7 @@ fn sum_to(g: &Array, shape: &[usize]) -> Result<Array> {
 fn prod_weights(x: &Array, out: &Array, axes: &[usize]) -> Result<Array> {
     let axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
     let zero = equal(x, 0)?;
-    let zeros = sum(&zero.astype(x.dtype())?, &axes, true)?;
+    let zeros = sum(&zero.try_astype(x.dtype())?, &axes, true)?;
     let others = ops::prod(&where_(&zero, 1, x)?, &axes, true)?;
     let only_zero = multiply(&zero, equal(&zeros, 1)?)?;
     where_(
@@ -328,8 +336,8 @@ fn first_extreme(x: &Array, axes: &[usize], op: ReduceOp) -> Result<Array> {
     let kept: Vec<usize> = (0..x.ndim()).filter(|a| !axes.contains(a)).collect();
     let perm: Vec<usize> = kept.iter().chain(axes).copied().collect();
     let moved = transpose(x, &perm)?;
-    let mut flat = isize_shape(&moved.shape()[..kept.len()]);
-    let reduced: usize = axes.iter().map(|&a| x.shape()[a]).product();
+    let mut flat = isize_shape(&moved.dims()[..kept.len()]);
+    let reduced: usize = axes.iter().map(|&a| x.dims()[a]).product();
     flat.push(reduced as isize);
     let rows = reshape(&moved, &flat)?;
     let index = match op {
@@ -337,24 +345,24 @@ fn first_extreme(x: &Array, axes: &[usize], op: ReduceOp) -> Result<Array> {
         _ => ops::argmin(&rows, Some(-1), true)?,
     };
     let positions = ops::arange(0.0, reduced as f64, 1.0, DType::U32)?;
-    let onehot = equal(&positions, &index)?.astype(x.dtype())?;
+    let onehot = equal(&positions, &index)?.try_astype(x.dtype())?;
     let mut inverse = vec![0; perm.len()];
     for (i, &a) in perm.iter().enumerate() {
         inverse[a] = i;
     }
-    transpose(&reshape(&onehot, &isize_shape(moved.shape()))?, &inverse)
+    transpose(&reshape(&onehot, &isize_shape(moved.dims()))?, &inverse)
 }
 
 /// `z / |z|` as complex64 (0 at 0): the reverse-mode derivative of complex `abs`.
 fn complex_sign(z: &Array, magnitude: &Array) -> Result<Array> {
-    let unit = divide(z, magnitude.astype(DType::Complex64)?)?;
+    let unit = divide(z, magnitude.try_astype(DType::Complex64)?)?;
     where_(equal(magnitude, 0)?, 0, &unit)
 }
 
 /// `∂out/∂x` of `max`/`min` over reduced axes: ties share the derivative evenly.
 fn extreme_weights(x: &Array, out: &Array, axes: &[usize]) -> Result<Array> {
     let axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
-    let mask = equal(x, out)?.astype(x.dtype())?;
+    let mask = equal(x, out)?.try_astype(x.dtype())?;
     let count = sum(&mask, &axes, true)?;
     divide(&mask, &count)
 }
@@ -400,10 +408,14 @@ impl Primitive {
                     (BinaryOp::Divide, 0) => divide(v, b)?,
                     (BinaryOp::Divide, _) => negative(&divide(multiply(v, a)?, multiply(b, b)?)?)?,
                     // Ties go to `b`, as in MLX.
-                    (BinaryOp::Maximum, 0) => multiply(v, greater(a, b)?.astype(a.dtype())?)?,
-                    (BinaryOp::Maximum, _) => multiply(v, less_equal(a, b)?.astype(a.dtype())?)?,
-                    (BinaryOp::Minimum, 0) => multiply(v, less(a, b)?.astype(a.dtype())?)?,
-                    (BinaryOp::Minimum, _) => multiply(v, greater_equal(a, b)?.astype(a.dtype())?)?,
+                    (BinaryOp::Maximum, 0) => multiply(v, greater(a, b)?.try_astype(a.dtype())?)?,
+                    (BinaryOp::Maximum, _) => {
+                        multiply(v, less_equal(a, b)?.try_astype(a.dtype())?)?
+                    }
+                    (BinaryOp::Minimum, 0) => multiply(v, less(a, b)?.try_astype(a.dtype())?)?,
+                    (BinaryOp::Minimum, _) => {
+                        multiply(v, greater_equal(a, b)?.try_astype(a.dtype())?)?
+                    }
                     // As MLX: σ(a − b) for `a`, 1 − σ(a − b) for `b`.
                     (BinaryOp::LogAddExp, 0) => multiply(v, ops::sigmoid(&subtract(a, b)?)?)?,
                     (BinaryOp::LogAddExp, _) => {
@@ -438,7 +450,7 @@ impl Primitive {
         let g = &cotangents[0];
         if let (Self::Unary(UnaryOp::Abs), DType::Complex64) = (self, inputs[0].dtype()) {
             return Ok(vec![Some(multiply(
-                g.astype(DType::Complex64)?,
+                g.try_astype(DType::Complex64)?,
                 complex_sign(&inputs[0], &outputs[0])?,
             )?)]);
         }
@@ -458,8 +470,15 @@ impl Primitive {
         let x = &inputs[0];
         let one = |a: Result<Array>| a.map(|a| vec![Some(a)]);
         match self {
-            Self::AsType(_) => one(g.astype(x.dtype())),
-            Self::Reshape(_) => one(reshape(g, &isize_shape(x.shape()))),
+            Self::Copy => one(Ok(g.clone())),
+            Self::Depends { .. } => {
+                // The cotangent goes to `x`; the dependencies get none (zero).
+                let mut grads = vec![None; inputs.len()];
+                grads[0] = wanted[0].then(|| g.clone());
+                Ok(grads)
+            }
+            Self::AsType(_) => one(g.try_astype(x.dtype())),
+            Self::Reshape(_) => one(reshape(g, &isize_shape(x.dims()))),
             Self::Transpose(axes) => {
                 let mut inverse = vec![0; axes.len()];
                 for (i, &a) in axes.iter().enumerate() {
@@ -537,7 +556,7 @@ impl Primitive {
                     .zip(wanted)
                     .map(|(a, &w)| {
                         let first = start;
-                        start += a.shape()[*axis];
+                        start += a.dims()[*axis];
                         if !w {
                             return Ok(None);
                         }
@@ -546,7 +565,7 @@ impl Primitive {
                         let part = Self::Slice {
                             start: begin,
                             step: vec![1; a.ndim()],
-                            len: a.shape().to_vec(),
+                            len: a.dims().to_vec(),
                         };
                         Ok(Some(record(part, vec![g.clone()])?))
                     })
@@ -569,10 +588,10 @@ impl Primitive {
                 };
                 Ok(vec![base, update])
             }
-            Self::Broadcast(_) => one(sum_to(g, x.shape())),
+            Self::Broadcast(_) => one(sum_to(g, x.dims())),
             Self::StopGradient | Self::ArgReduce { .. } | Self::RandomBits { .. } => Ok(vec![None]),
             Self::Reduce { op, axes } => match op {
-                ReduceOp::Sum => one(broadcast_to(g, x.shape())),
+                ReduceOp::Sum => one(broadcast_to(g, x.dims())),
                 ReduceOp::Prod => one(multiply(
                     g,
                     conjugate(&prod_weights(x, &outputs[0], axes)?)?,
@@ -667,7 +686,16 @@ impl Primitive {
                 let primals = &inputs[..n];
                 let grads = match &call.rules.vjp {
                     Some(rule) => rule(primals, outputs, cotangents)?,
-                    None => crate::vjp(|xs| (call.rules.body)(xs), primals, cotangents)?.1,
+                    None => {
+                        // Recompute from inputs that depend on the cotangents (as MLX's
+                        // `checkpoint`): the recomputation then cannot be merged with the
+                        // forward pass by `compile`, which would keep its intermediates.
+                        let remat = primals
+                            .iter()
+                            .map(|p| crate::primitive::depends(p, cotangents))
+                            .collect::<Result<Vec<_>>>()?;
+                        crate::vjp_flat(|xs| (call.rules.body)(xs), &remat, cotangents)?.1
+                    }
                 };
                 if grads.len() != n {
                     return Err(Error::InvalidArgument(format!(
@@ -708,7 +736,7 @@ impl Primitive {
             // d|z| = Re(conj(z) dz) / |z|, zero at z = 0 (MLX).
             let (z, out) = (&inputs[0], &outputs[0]);
             let t = tangents[0].clone().map_or_else(|| zeros_like(z), Ok)?;
-            let re = multiply(conjugate(z)?, &t)?.astype(DType::F32)?;
+            let re = multiply(conjugate(z)?, &t)?.try_astype(DType::F32)?;
             return Ok(vec![where_(equal(out, 0)?, 0, divide(&re, out)?)?]);
         }
         let tangent = |i: usize| -> Result<Array> {
@@ -737,8 +765,9 @@ impl Primitive {
         let x = &inputs[0];
         let one = |a: Result<Array>| a.map(|a| vec![a]);
         match self {
-            Self::AsType(dtype) => one(tangent(0)?.astype(*dtype)),
-            Self::Reshape(_) => one(reshape(&tangent(0)?, &isize_shape(out.shape()))),
+            Self::Copy | Self::Depends { .. } => one(tangent(0)),
+            Self::AsType(dtype) => one(tangent(0)?.try_astype(*dtype)),
+            Self::Reshape(_) => one(reshape(&tangent(0)?, &isize_shape(out.dims()))),
             Self::Transpose(axes) => one(transpose(&tangent(0)?, axes)),
             Self::Slice { .. } | Self::Broadcast(_) => one(record(self.clone(), vec![tangent(0)?])),
             Self::SliceUpdate { .. } => one(record(self.clone(), vec![tangent(0)?, tangent(1)?])),
@@ -865,7 +894,7 @@ impl Primitive {
                 let tangents = (0..n).map(tangent).collect::<Result<Vec<_>>>()?;
                 let result = match &call.rules.jvp {
                     Some(rule) => rule(primals, &tangents)?,
-                    None => crate::jvp(|xs| (call.rules.body)(xs), primals, &tangents)?.1,
+                    None => crate::jvp_flat(|xs| (call.rules.body)(xs), primals, &tangents)?.1,
                 };
                 if result.len() != outputs.len() {
                     return Err(Error::InvalidArgument(format!(

@@ -9,19 +9,33 @@ Each case is a directory under `crates/nuvec-lm/tests/fixtures/` with `config.js
 `model.safetensors` (as a Hugging Face or MLX checkpoint) and `expected.safetensors`: the
 logits of a fixed prompt (run at once) and 12 greedy tokens generated after it
 (`generate_step`, with the KV cache). `samplers.safetensors` holds log-probabilities and
-mlx-lm's top-p, min-p and top-k filters of them. Runs on MLX's GPU, as nuvec's tests do.
+mlx-lm's top-p, min-p and top-k filters of them, `samplers_chained.safetensors` the three
+chained by `make_sampler`, and `eos/` end-of-sequence ids with a `generation_config.json`.
+Runs on MLX's GPU, as nuvec's tests do.
 
-Usage: `just lm-fixtures` (or `uv run scripts/lm_fixtures.py`).
+`adapters_qwen3/` and `adapters_qwen2_q4/` are LoRA adapter directories in mlx-lm's layout
+(`adapters.safetensors`, `adapter_config.json`) for the `qwen3_f32` and `qwen2_q4` models (made
+by mlx-lm's `linear_to_lora_layers`, with random `lora_b`), with the adapted models' logits in
+evaluation mode (`expected.safetensors`).
+
+Usage: `just lm-fixtures` (or `uv run scripts/lm_fixtures.py`; `--only chained_sampler,eos`
+records just those).
+
+`--cached` records, for each model of `CACHED` in the local Hugging Face cache, mlx-lm's 32
+greedy tokens after a fixed prompt with the log-probability of each and the top 5 ids and
+log-probabilities at every step (teacher-forced, one forward pass) in
+`cached/<model>.safetensors`, for the ignored tests in `tests/cached.rs`.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 from mlx_lm.generate import generate_step
 from mlx_lm.models import llama, qwen2, qwen3, qwen3_5, qwen3_5_moe, qwen3_moe
 from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
@@ -87,7 +101,55 @@ CASES = {
 }
 
 
+CACHED = ["mlx-community/Qwen3.8-27B-4bit", "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"]
+CACHED_PROMPT = "The history of the lighthouse begins with the fires that sailors lit on hills"
+
+
+def cached() -> None:
+    import os
+
+    from mlx_lm import load
+
+    hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / "hub"
+    for repo in CACHED:
+        if not (hub / f"models--{repo.replace('/', '--')}").exists():
+            print(f"skipped (not cached): {repo}")
+            continue
+        model, tokenizer = load(repo)
+        prompt = tokenizer.encode(CACHED_PROMPT)
+        greedy = []
+        for token, _ in generate_step(mx.array(prompt), model, max_tokens=32):
+            greedy.append(int(token))
+        full = mx.array(prompt + greedy[:-1])[None]
+        logits = model(full)[0, len(prompt) - 1:].astype(mx.float32)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        top5 = mx.argsort(-logprobs, axis=-1)[:, :5]
+        out = OUT / "cached"
+        out.mkdir(parents=True, exist_ok=True)
+        ids = mx.array(greedy)
+        mx.save_safetensors(str(out / f"{repo.split('/')[1]}.safetensors"), {
+            "prompt": mx.array(prompt, dtype=mx.uint32),
+            "greedy": ids.astype(mx.uint32),
+            "greedy_logprob": mx.take_along_axis(logprobs, ids[:, None], axis=-1)[:, 0],
+            "top5_ids": top5.astype(mx.uint32),
+            "top5_logprobs": mx.take_along_axis(logprobs, top5, axis=-1),
+        })
+        print(f"recorded {repo}")
+
+
 def main() -> None:
+    if "--cached" in sys.argv:
+        cached()
+        return
+    # `--only chained_sampler,eos` records just those (the models are kept as they are).
+    only = None
+    if "--only" in sys.argv:
+        only = sys.argv[sys.argv.index("--only") + 1].split(",")
+    if only is not None:
+        for name in only:
+            {"chained_sampler": chained_sampler, "eos": eos, "samplers": samplers,
+             "adapters": adapters}[name]()
+        return
     mx.random.seed(20261018)
     for name, (family, args, dtype, quant) in CASES.items():
         model = family.Model(family.ModelArgs.from_dict(args))
@@ -125,6 +187,96 @@ def main() -> None:
         if name == "qwen3_moe_f32":
             hugging_face_experts(out, config, dict(tree_flatten(model.parameters())))
     samplers()
+    chained_sampler()
+    eos()
+    adapters()
+
+
+def adapters() -> None:
+    """LoRA adapter directories in mlx-lm's layout for two fixture models: `qwen3_f32` with
+    mlx-lm's default keys (every linear layer) on its last block, rank 4, dropout 0.1; and
+    the 4-bit `qwen2_q4` with `self_attn.q_proj` and `self_attn.v_proj` on both blocks,
+    rank 2. `lora_b` is drawn at random so the adapters change the logits; the logits are
+    taken in evaluation mode, as `mlx_lm.load(..., adapter_path=...)` leaves the model."""
+    from mlx_lm.tuner.utils import linear_to_lora_layers
+    from mlx_lm.utils import load_model
+
+    for base, name, num_layers, params in [
+        ("qwen3_f32", "adapters_qwen3", 1, {"rank": 4, "scale": 20.0, "dropout": 0.1}),
+        ("qwen2_q4", "adapters_qwen2_q4", 2,
+         {"rank": 2, "scale": 10.0, "dropout": 0.0, "keys": ["self_attn.q_proj", "self_attn.v_proj"]}),
+    ]:
+        mx.random.seed(20261023)
+        model, _ = load_model(OUT / base)
+        model.freeze()
+        linear_to_lora_layers(model, num_layers, params)
+        trainable = dict(tree_flatten(model.trainable_parameters()))
+        model.update(tree_unflatten([
+            (k, mx.random.normal(v.shape) * 0.05 if k.endswith("lora_b") else v)
+            for k, v in trainable.items()]))
+        model.eval()
+        mx.eval(model.parameters())
+        out = OUT / name
+        out.mkdir(parents=True, exist_ok=True)
+        adapters = dict(tree_flatten(model.trainable_parameters()))
+        mx.save_safetensors(str(out / "adapters.safetensors"), adapters)
+        config = {"fine_tune_type": "lora", "num_layers": num_layers, "lora_parameters": params}
+        (out / "adapter_config.json").write_text(json.dumps(config, indent=2))
+        prompt = mx.array(PROMPT, dtype=mx.uint32)
+        logits = model(prompt[None]).astype(mx.float32)
+        mx.save_safetensors(str(out / "expected.safetensors"), {"prompt": prompt, "logits": logits})
+        print(f"{name}: {len(adapters)} adapter tensors: {sorted(adapters)[:4]}...")
+
+
+def chained_sampler() -> None:
+    """mlx-lm's `make_sampler` with top-p 0.9, min-p 0.05 and top-k 20 chained, on random
+    log-probabilities [3, 128] (`samplers_chained.safetensors`): the filtered
+    log-probabilities in `make_sampler`'s order (top-p, min-p, then top-k; read from the
+    sampler itself by stubbing its final draw), and with top-k first, to show the order
+    matters."""
+    from mlx_lm import sample_utils
+
+    mx.random.seed(20261022)
+    logits = mx.random.normal((3, 128)) * 2.0
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    draw = sample_utils.categorical_sampling
+    sample_utils.categorical_sampling = lambda lp, _temp: lp
+    try:
+        chained = sample_utils.make_sampler(temp=1.0, top_p=0.9, min_p=0.05, top_k=20)(logprobs)
+    finally:
+        sample_utils.categorical_sampling = draw
+    top_k_first = apply_min_p(apply_top_p(apply_top_k(logprobs, 20), 0.9), 0.05)
+    mx.save_safetensors(str(OUT / "samplers_chained.safetensors"), {
+        "logprobs": logprobs, "chained": chained, "top_k_first": top_k_first})
+    kept = [int(mx.sum(row > -mx.inf).item()) for row in chained]
+    kept_first = [int(mx.sum(row > -mx.inf).item()) for row in top_k_first]
+    print(f"chained sampler: tokens kept {kept} (top-k first: {kept_first})")
+
+
+def eos() -> None:
+    """End-of-sequence ids with a `generation_config.json` (`eos/`): a Llama 3 style
+    config (`eos_token_id` 128001) and a generation config adding `<|eot_id|>` (128009).
+    `expected.json` holds the ids mlx-lm's `load_config` reads; mlx-lm's tokenizer wrapper
+    also adds the tokenizer's own `eos_token_id` (128001 for Llama 3), so its stop set is the
+    union of both files, as nuvec's."""
+    from mlx_lm.utils import load_config
+
+    out = OUT / "eos"
+    out.mkdir(parents=True, exist_ok=True)
+    config = dict(BASE, model_type="llama", vocab_size=128256, eos_token_id=128001)
+    (out / "config.json").write_text(json.dumps(config, indent=2))
+    (out / "generation_config.json").write_text(
+        json.dumps({"bos_token_id": 128000, "eos_token_id": [128001, 128009]}, indent=2))
+    ids = load_config(out)["eos_token_id"]
+    ids = sorted(set(ids if isinstance(ids, list) else [ids]) | {config["eos_token_id"]})
+    (out / "expected.json").write_text(json.dumps({"eos_token_ids": ids}) + "\n")
+    print(f"eos: {ids}")
+
+
+# mlx-lm 0.32.2's `qwen3_5.sanitize` drops `mtp.` weights and shifts the norms by one only
+# when the convolutions are unsanitized (Hugging Face layout), whether or not `mtp.`
+# weights are present (`qwen3_next`, which shifts on `mtp.` weights, is not a supported
+# model type). nuvec's `sanitize` does the same: verified equal, no fixture needed.
 
 
 def samplers() -> None:

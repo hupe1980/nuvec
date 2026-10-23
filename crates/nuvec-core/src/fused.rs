@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::array::Data;
 use crate::kernels::Operand;
 use crate::primitive::{BinaryOp, Primitive, UnaryOp};
-use crate::{Array, Category, DType, Device, Error, Result, Stream, default_stream};
+use crate::{Array, Category, DType, Error, Result};
 
 /// An operand of a fused step: an input of the fused computation or an earlier step's
 /// result.
@@ -170,26 +170,7 @@ impl Fused {
 
     /// Evaluates the expanded operations on the CPU, for work the GPU does not take.
     pub(crate) fn eval_cpu(&self, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
-        let leaves = operands
-            .iter()
-            .map(|(meta, data)| {
-                let buffer = crate::kernels::contiguous(meta, data)?;
-                Array::from_buffer(buffer, meta.dtype, &meta.shape)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let previous = default_stream();
-        crate::set_default_stream(Stream::default_for(Device::cpu()));
-        let outputs = self.expand(&leaves);
-        crate::set_default_stream(previous);
-        let outputs = outputs?;
-        crate::eval(&outputs)?;
-        outputs
-            .iter()
-            .map(|a| {
-                let data = a.data().expect("evaluated");
-                Ok(Data::new(crate::kernels::contiguous(a.out(), data)?))
-            })
-            .collect()
+        crate::fast::imp::run_on_cpu(operands, |leaves| self.expand(leaves))
     }
 
     /// Reverse mode through the expanded operations, for the wanted float inputs.
@@ -204,7 +185,7 @@ impl Fused {
             .collect();
         let primals: Vec<Array> = active.iter().map(|&i| inputs[i].clone()).collect();
         let f = |ps: &[Array]| self.expand(&substitute(inputs, &active, ps));
-        let (_, grads) = crate::vjp(f, &primals, cotangents)?;
+        let (_, grads) = crate::vjp_flat(f, &primals, cotangents)?;
         let mut out = vec![None; inputs.len()];
         for (g, &i) in grads.into_iter().zip(&active) {
             out[i] = Some(g);
@@ -230,7 +211,7 @@ impl Fused {
                 .collect();
         }
         let f = |ps: &[Array]| self.expand(&substitute(inputs, &active, ps));
-        Ok(crate::jvp(f, &primals, &ts)?.1)
+        Ok(crate::jvp_flat(f, &primals, &ts)?.1)
     }
 
     /// Batching rule: the expanded operations, batched.
@@ -388,7 +369,7 @@ fn binary_expr(op: BinaryOp, a: &str, b: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops;
+    use crate::ops::imp as ops;
 
     fn sigmoid_mul() -> Fused {
         // x * sigmoid(x) + y
@@ -451,11 +432,11 @@ mod tests {
 
     #[test]
     fn evaluates_like_its_operations_on_the_cpu() {
-        crate::set_default_stream(Stream::default_for(Device::cpu()));
-        let x = Array::from_slice(&[-2.0f32, 0.5, 3.0, 1.0, -1.0, 4.0], &[2, 3]).unwrap();
-        let y = Array::from_slice(&[1.0f32, 2.0], &[2, 1]).unwrap();
+        crate::set_default_stream(crate::Stream::default_for(crate::Device::cpu()));
+        let x = Array::from_slice(&[-2.0f32, 0.5, 3.0, 1.0, -1.0, 4.0], [2, 3]);
+        let y = Array::from_slice(&[1.0f32, 2.0], [2, 1]);
         let y = ops::broadcast_to(&y, &[2, 3]).unwrap();
-        let xt = x.t().unwrap().t().unwrap();
+        let xt = x.t().t();
         let fused = sigmoid_mul();
         let out = Array::from_op(Primitive::Compiled(fused.clone()), vec![xt, y.clone()]).unwrap();
         assert_eq!(out.len(), 2);
@@ -464,30 +445,30 @@ mod tests {
 
     #[test]
     fn differentiates_through_its_operations() {
-        crate::set_default_stream(Stream::default_for(Device::cpu()));
+        crate::set_default_stream(crate::Stream::default_for(crate::Device::cpu()));
         let fused = sigmoid_mul();
-        let x = Array::from_slice(&[-1.0f32, 0.0, 2.0], &[3]).unwrap();
-        let y = Array::from_slice(&[3.0f32, 1.0, 0.0], &[3]).unwrap();
-        let cot = Array::from_slice(&[1.0f32, 2.0, 0.5], &[3]).unwrap();
-        let cot2 = Array::from_slice(&[-1.0f32, 0.25, 3.0], &[3]).unwrap();
+        let x = Array::from_slice(&[-1.0f32, 0.0, 2.0], [3]);
+        let y = Array::from_slice(&[3.0f32, 1.0, 0.0], [3]);
+        let cot = Array::from_slice(&[1.0f32, 2.0, 0.5], [3]);
+        let cot2 = Array::from_slice(&[-1.0f32, 0.25, 3.0], [3]);
         let run = |expanded: bool| {
             let f = |xs: &[Array]| match expanded {
                 true => fused.expand(xs),
                 false => Array::from_op(Primitive::Compiled(fused.clone()), xs.to_vec()),
             };
             let primals = [x.clone(), y.clone()];
-            let (_, g) = crate::vjp(f, &primals, &[cot.clone(), cot2.clone()]).unwrap();
-            let (_, t) = crate::jvp(f, &primals, &[cot.clone(), cot2.clone()]).unwrap();
+            let (_, g) = crate::vjp_flat(f, &primals, &[cot.clone(), cot2.clone()]).unwrap();
+            let (_, t) = crate::jvp_flat(f, &primals, &[cot.clone(), cot2.clone()]).unwrap();
             values(&[g, t].concat())
         };
         assert_close(&run(false), &run(true));
-        let batched = crate::vmap(
+        let batched = crate::vmap_flat(
             |xs| Array::from_op(Primitive::Compiled(fused.clone()), xs.to_vec()),
             &[Some(0), None],
             &[],
         );
         let xs = ops::reshape(&x, &[3, 1]).unwrap();
-        let ys = Array::from_slice(&[3.0f32], &[1]).unwrap();
+        let ys = Array::from_slice(&[3.0f32], [1]);
         let out = batched(&[xs.clone(), ys.clone()]).unwrap();
         let expected = fused
             .expand(&[xs, ops::broadcast_to(&ys, &[3, 1]).unwrap()])

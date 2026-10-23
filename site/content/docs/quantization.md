@@ -12,18 +12,22 @@ nuvec implements MLX's **affine** quantization bit for bit, so mlx-community che
 
 Weights are split into groups of `group_size` values along each row (32, 64 or 128). Each group stores a scale and a bias, and each value becomes an integer code of `bits` bits (1 to 8), packed into `uint32` words:
 
-```
+```text
 w ≈ scale · code + bias
 ```
 
 4-bit weights with groups of 64 take about 4.5 bits per weight including scales and biases — a quarter of `bfloat16`'s memory and bandwidth, which is what decode speed depends on.
 
 ```rust
-use nuvec::{dequantize, quantize, quantized_matmul};
-
-let (wq, scales, biases) = quantize(&w, 64, 4)?;              // w: [out, in]
-let y = quantized_matmul(&x, &wq, &scales, &biases, true, 64, 4)?; // x · wᵀ
-let w_approx = dequantize(&wq, &scales, &biases, 64, 4)?;
+# use nuvec::prelude::*;
+# use nuvec::random;
+# let w = random::normal([256, 512], DType::F32, 0.0, 1.0, None);
+# let x = random::normal([4, 512], DType::F32, 0.0, 1.0, None);
+let (wq, scales, biases) = w.quantize(64, 4);                  // w: [out, in]
+let y = x.quantized_matmul(&wq, &scales, &biases, true, 64, 4); // x · wᵀ
+let w_approx = wq.dequantize(&scales, &biases, 64, 4);
+# assert_eq!(y.shape(), [4, 256]);
+# assert_eq!(w_approx.shape(), [256, 512]);
 ```
 
 On the GPU, products use MLX's kernels chosen by shape: matrix-vector kernels (`qmv`, `qmv_fast`) for single rows, as in decode, tiled kernels (`qmm_t`, `qmm_n`) for many rows, and split-K when the output is small but the inner dimension long. For 4-bit products of 4 or more rows below the tiled kernels' threshold (speculative verification, small batches), nuvec's own kernel unpacks each weight once for two rows; each row's result equals the single-row product bit for bit, so results do not depend on how many rows share a product.
@@ -33,10 +37,14 @@ On the GPU, products use MLX's kernels chosen by shape: matrix-vector kernels (`
 `gather_qmm` multiplies each row by the expert weights chosen for it, the core of an MoE layer, without gathering weights first:
 
 ```rust
-use nuvec::gather_qmm;
-
+# use nuvec::prelude::*;
+# use nuvec::random;
+# let (wq, scales, biases) = random::normal([8, 128, 256], DType::F32, 0.0, 1.0, None).quantize(64, 4);
+# let x = random::normal([4, 1, 256], DType::F32, 0.0, 1.0, None);
+# let experts = array![0u32, 0, 3, 5];
 // x: [rows, 1, in]; wq/scales/biases: [experts, out, …]; experts: [rows] (uint32)
-let y = gather_qmm(&x, &wq, &scales, &biases, None, Some(&experts), true, 64, 4, true)?;
+let y = x.gather_qmm(&wq, &scales, &biases, None, Some(&experts), true, 64, 4, true);
+# assert_eq!(y.shape(), [4, 1, 128]);
 ```
 
 With rows sorted by expert (the last argument) and at least four rows per expert on average, a grouped kernel reads each expert's weights once; with fewer, each row gets its own product, as in MLX. `gather_mm` is the same for full-precision weights.

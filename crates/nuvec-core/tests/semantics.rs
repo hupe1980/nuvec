@@ -3,6 +3,8 @@
 mod common;
 
 use common::{Ref, Rng, assert_matches, broadcast_shape, random_layout};
+use nuvec_core::graph::SliceArg;
+use nuvec_core::ops;
 use nuvec_core::*;
 
 /// Every dtype; without f16 under Miri, which cannot execute `half`'s hardware conversion.
@@ -32,49 +34,46 @@ const CASES: usize = if cfg!(miri) { 1 } else { 200 };
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot execute half's hardware f16 conversion")]
 fn broadcast_column_plus_row() {
-    let col = Array::from_slice(&[1i32, 2, 3], &[3, 1]).unwrap();
-    let row = Array::from_slice(&[0.5f32, 1.5, 2.5, 3.5].map(f16::from_f32), &[4]).unwrap();
+    let col = Array::from_slice(&[1i32, 2, 3], [3, 1]);
+    let row = Array::from([0.5f32, 1.5, 2.5, 3.5].map(f16::from_f32));
     let out = &col + &row;
-    assert_eq!(out.shape(), &[3, 4]);
+    assert_eq!(out.shape(), [3, 4]);
     assert_eq!(out.dtype(), DType::F16);
     assert_eq!(out.to_vec::<f16>().unwrap()[4], f16::from_f32(2.5));
 }
 
 #[test]
 fn broadcast_scalar_and_zero_size() {
-    let s = Array::scalar(2u8);
-    let e = zeros(&[3, 0], DType::U8).unwrap();
-    assert_eq!((&e * &s).shape(), &[3, 0]);
+    let s = Array::from(2u8);
+    let e = ops::zeros([3, 0], DType::U8);
+    assert_eq!((&e * &s).shape(), [3, 0]);
     assert_eq!(
-        multiply(&s, ones(&[2, 2], DType::U8).unwrap())
-            .unwrap()
+        s.multiply(ops::ones([2, 2], DType::U8))
             .to_vec::<u8>()
             .unwrap(),
         vec![2; 4]
     );
     assert!(
-        add(
-            zeros(&[2], DType::U8).unwrap(),
-            zeros(&[0], DType::U8).unwrap()
-        )
-        .is_err()
+        ops::zeros([2], DType::U8)
+            .add(ops::zeros([0], DType::U8))
+            .check()
+            .is_err()
     );
 }
 
 #[test]
 fn broadcast_mismatch_names_shapes() {
-    let err = add(
-        zeros(&[2, 3], DType::F32).unwrap(),
-        zeros(&[4], DType::F32).unwrap(),
-    )
-    .unwrap_err();
+    let err = ops::zeros([2, 3], DType::F32)
+        .add(ops::zeros([4], DType::F32))
+        .check()
+        .unwrap_err();
+    assert_eq!(err.op_name(), Some("add"));
     assert_eq!(
-        err,
-        Error::ShapeMismatch {
-            op: "add",
+        err.kind(),
+        Some(&OpErrorKind::ShapeMismatch {
             lhs: vec![2, 3],
             rhs: vec![4]
-        }
+        })
     );
 }
 
@@ -89,11 +88,11 @@ fn promotion_all_pairs() {
     };
     for &a in &all {
         for &b in &all {
-            let out = add(ones(&[2], a).unwrap(), ones(&[2], b).unwrap()).unwrap();
+            let out = ops::ones([2], a).add(ops::ones([2], b));
             assert_eq!(out.dtype(), promote_types(a, b), "{a} + {b}");
             let expected = if out.dtype() == Bool { 1.0 } else { 2.0 };
             assert_eq!(
-                out.astype(F64).unwrap().to_vec::<f64>().unwrap(),
+                out.astype(F64).to_vec::<f64>().unwrap(),
                 vec![expected; 2],
                 "{a} + {b}"
             );
@@ -103,29 +102,25 @@ fn promotion_all_pairs() {
 
 #[test]
 fn divide_promotes_integers_to_float() {
-    let q = divide(
-        Array::from_slice(&[7i32, -7], &[2]).unwrap(),
-        Array::scalar(2i32),
-    )
-    .unwrap();
+    let q = Array::from([7i32, -7]).divide(Array::from(2i32));
     assert_eq!(q.dtype(), DType::F32);
     assert_eq!(q.to_vec::<f32>().unwrap(), vec![3.5, -3.5]);
-    let half = divide(Array::scalar(1i64), Array::scalar(bf16::from_f32(4.0))).unwrap();
+    let half = Array::from(1i64).divide(Array::from(bf16::from_f32(4.0)));
     assert_eq!(half.dtype(), DType::BF16);
 }
 
 #[test]
 fn compare_returns_bool() {
-    let a = Array::from_slice(&[1i32, 5, 3], &[3, 1]).unwrap();
-    let b = Array::from_slice(&[2.0f32, 3.0], &[2]).unwrap();
-    let lt = less(&a, &b).unwrap();
-    assert_eq!((lt.dtype(), lt.shape()), (DType::Bool, &[3usize, 2][..]));
+    let a = Array::from_slice(&[1i32, 5, 3], [3, 1]);
+    let b = array![2.0, 3.0];
+    let lt = a.less(&b);
+    assert_eq!((lt.dtype(), lt.shape()), (DType::Bool, &[3, 2][..]));
     assert_eq!(
         lt.to_vec::<bool>().unwrap(),
         vec![true, true, false, false, false, false]
     );
     assert_eq!(
-        greater_equal(&a, &b).unwrap().to_vec::<bool>().unwrap(),
+        a.greater_equal(&b).to_vec::<bool>().unwrap(),
         vec![false, false, true, true, true, true]
     );
 }
@@ -144,10 +139,10 @@ macro_rules! binary_random_int {
             assert_matches(&(&x + &y), &rx.zip(&ry, <$t>::wrapping_add), ctx);
             assert_matches(&(&x - &y), &rx.zip(&ry, <$t>::wrapping_sub), ctx);
             assert_matches(&(&x * &y), &rx.zip(&ry, <$t>::wrapping_mul), ctx);
-            assert_matches(&maximum(&x, &y).unwrap(), &rx.zip(&ry, |a, b| a.max(b)), ctx);
-            assert_matches(&minimum(&x, &y).unwrap(), &rx.zip(&ry, |a, b| a.min(b)), ctx);
-            assert_matches(&equal(&x, &y).unwrap(), &rx.zip(&ry, |a, b| a == b), ctx);
-            assert_matches(&less_equal(&x, &y).unwrap(), &rx.zip(&ry, |a, b| a <= b), ctx);
+            assert_matches(&x.maximum(&y), &rx.zip(&ry, |a, b| a.max(b)), ctx);
+            assert_matches(&x.minimum(&y), &rx.zip(&ry, |a, b| a.min(b)), ctx);
+            assert_matches(&x.equal(&y), &rx.zip(&ry, |a, b| a == b), ctx);
+            assert_matches(&x.less_equal(&y), &rx.zip(&ry, |a, b| a <= b), ctx);
         }
     )*};
 }
@@ -168,8 +163,8 @@ macro_rules! binary_random_float {
             assert_matches(&(&x - &y), &rx.zip(&ry, |a, b| a - b), ctx);
             assert_matches(&(&x * &y), &rx.zip(&ry, |a, b| a * b), ctx);
             assert_matches(&(&x / &y), &rx.zip(&ry, |a, b| a / b), ctx);
-            assert_matches(&greater(&x, &y).unwrap(), &rx.zip(&ry, |a, b| a > b), ctx);
-            assert_matches(&not_equal(&x, &y).unwrap(), &rx.zip(&ry, |a, b| a != b), ctx);
+            assert_matches(&x.greater(&y), &rx.zip(&ry, |a, b| a > b), ctx);
+            assert_matches(&x.not_equal(&y), &rx.zip(&ry, |a, b| a != b), ctx);
         }
     )*};
 }
@@ -187,40 +182,36 @@ fn binary_random() {
 
 #[test]
 fn bool_and_complex_binary() {
-    let t = Array::from_slice(&[true, true, false, false], &[4]).unwrap();
-    let u = Array::from_slice(&[true, false, true, false], &[4]).unwrap();
+    let t = Array::from([true, true, false, false]);
+    let u = Array::from([true, false, true, false]);
     assert_eq!(
         (&t - &u).to_vec::<bool>().unwrap(),
         vec![false, true, true, false],
         "bool subtract is XOR"
     );
     assert_eq!(
-        maximum(&t, &u).unwrap().to_vec::<bool>().unwrap(),
+        t.maximum(&u).to_vec::<bool>().unwrap(),
         vec![true, true, true, false]
     );
-    let z =
-        Array::from_slice(&[Complex64::new(1.0, 2.0), Complex64::new(3.0, -1.0)], &[2]).unwrap();
-    let w = Array::scalar(Complex64::new(0.0, 1.0));
+    let z = Array::from([Complex64::new(1.0, 2.0), Complex64::new(3.0, -1.0)]);
+    let w = Array::from(Complex64::new(0.0, 1.0));
     assert_eq!(
         (&z / &w).to_vec::<Complex64>().unwrap(),
         vec![Complex64::new(2.0, -1.0), Complex64::new(-1.0, -3.0)]
     );
-    assert_eq!(
-        equal(&z, &z).unwrap().to_vec::<bool>().unwrap(),
-        vec![true, true]
-    );
+    assert_eq!(z.equal(&z).to_vec::<bool>().unwrap(), vec![true, true]);
 }
 
 #[test]
 fn nan_propagation() {
-    let a = Array::from_slice(&[f32::NAN, 1.0, 2.0], &[3]).unwrap();
-    let b = Array::from_slice(&[0.0f32, f32::NAN, 1.0], &[3]).unwrap();
-    let max = maximum(&a, &b).unwrap().to_vec::<f32>().unwrap();
+    let a = array![f32::NAN, 1.0, 2.0];
+    let b = array![0.0, f32::NAN, 1.0];
+    let max = a.maximum(&b).to_vec::<f32>().unwrap();
     assert!(max[0].is_nan() && max[1].is_nan() && max[2] == 2.0);
-    let min = minimum(&a, &b).unwrap().to_vec::<f32>().unwrap();
+    let min = a.minimum(&b).to_vec::<f32>().unwrap();
     assert!(min[0].is_nan() && min[1].is_nan() && min[2] == 1.0);
     assert_eq!(
-        equal(&a, &a).unwrap().to_vec::<bool>().unwrap(),
+        a.equal(&a).to_vec::<bool>().unwrap(),
         vec![false, true, true]
     );
 }
@@ -259,12 +250,12 @@ fn views_random() {
                     for i in (1..axes.len()).rev() {
                         axes.swap(i, rng.below(i + 1));
                     }
-                    a = transpose(&a, &axes).unwrap();
+                    a = a.transpose(&axes[..]);
                     r = r.transpose(&axes);
                 }
                 1 => {
                     let args = random_slice_args(&mut rng, &r.shape);
-                    a = slice(&a, &args).unwrap();
+                    a = graph::slice(&a, &args).unwrap();
                     r = r.slice(&args);
                 }
                 2 => {
@@ -274,16 +265,16 @@ fn views_random() {
                             .iter()
                             .map(|&d| if d == 1 { 1 + rng.below(3) } else { d }),
                     );
-                    a = broadcast_to(&a, &target).unwrap();
+                    a = a.broadcast_to(&target[..]);
                     r = r.broadcast(&target);
                 }
                 3 => {
-                    a = a.reshape(&[-1]).unwrap();
+                    a = a.reshape([-1]);
                     r = r.reshape(vec![r.data.len()]);
                 }
                 _ => {
                     let axis = rng.below(r.shape.len() + 1);
-                    a = expand_dims(&a, axis as isize).unwrap();
+                    a = a.expand_dims(axis);
                     let mut s = r.shape.clone();
                     s.insert(axis, 1);
                     r = r.reshape(s);
@@ -302,40 +293,45 @@ fn views_random() {
 
 #[test]
 fn slice_python_semantics() {
-    let a = arange(0.0, 10.0, 1.0, DType::I32).unwrap();
-    let get = |s: SliceArg| slice(&a, &[s]).unwrap().to_vec::<i32>().unwrap();
-    assert_eq!(
-        get(SliceArg::new(None, None, -1)),
-        (0..10).rev().collect::<Vec<_>>()
-    );
-    assert_eq!(get(SliceArg::new(Some(-3), None, 1)), vec![7, 8, 9]);
+    let a = ops::arange(0, 10, 1);
+    fn get(a: &Array, index: impl ArrayIndex) -> Vec<i32> {
+        a.i(index).to_vec::<i32>().unwrap()
+    }
+    assert_eq!(get(&a, (..).step(-1)), (0..10).rev().collect::<Vec<_>>());
+    assert_eq!(get(&a, -3..), vec![7, 8, 9]);
+    // ndarray's rule: a range selects positions, a negative step walks them from the end.
+    // Python's `a[8:2:-3]` is `(3..9).step(-3)`; `(1..4).step(-1)` is `a[3:0:-1]`.
+    assert_eq!(get(&a, (3..9).step(-3)), vec![8, 5]);
+    assert_eq!(get(&a, (1..4).step(-1)), vec![3, 2, 1]);
+    assert_eq!(get(&a, (-100..100).step(4)), vec![0, 4, 8]);
+    assert_eq!(get(&a, 5..5), Vec::<i32>::new());
+    assert_eq!(get(&a, (2..).step(50)), vec![2]);
+    assert_eq!(get(&a, -1..), vec![9]);
+    assert_eq!(get(&a, -1), vec![9]);
+    assert_eq!(a.i(-1).ndim(), 0);
+    assert_eq!(get(&a, 2..4), vec![2, 3]);
+    assert!(a.i((..).step(0)).check().is_err());
+    assert!(a.i((.., ..)).check().is_err());
+    // The graph-level form keeps the same rules.
+    let get = |s: SliceArg| graph::slice(&a, &[s]).unwrap().to_vec::<i32>().unwrap();
     assert_eq!(get(SliceArg::new(Some(8), Some(2), -3)), vec![8, 5]);
-    assert_eq!(get(SliceArg::new(Some(-100), Some(100), 4)), vec![0, 4, 8]);
-    assert_eq!(get(SliceArg::new(Some(5), Some(5), 1)), Vec::<i32>::new());
-    assert_eq!(get(SliceArg::new(Some(2), None, 50)), vec![2]);
     assert_eq!(get(SliceArg::from(-1)), vec![9]);
-    assert_eq!(get((2..4).into()), vec![2, 3]);
-    assert!(slice(&a, &[SliceArg::new(None, None, 0)]).is_err());
-    assert!(slice(&a, &[SliceArg::full(), SliceArg::full()]).is_err());
+    assert!(graph::slice(&a, &[SliceArg::new(None, None, 0)]).is_err());
+    assert!(graph::slice(&a, &[SliceArg::full(), SliceArg::full()]).is_err());
 }
 
 #[test]
 fn reshape_infer_and_errors() {
-    let a = arange(0.0, 12.0, 1.0, DType::F32).unwrap();
-    assert_eq!(a.reshape(&[3, -1]).unwrap().shape(), &[3, 4]);
-    assert!(a.reshape(&[5, -1]).is_err());
-    assert!(a.reshape(&[-1, -1]).is_err());
-    assert!(a.reshape(&[7]).is_err());
-    assert!(transpose(&a.reshape(&[3, 4]).unwrap(), &[0, 0]).is_err());
-    assert!(squeeze(&a.reshape(&[3, 4]).unwrap(), &[0]).is_err());
-    assert!(expand_dims(&a, 5).is_err());
-    assert_eq!(
-        squeeze(&a.reshape(&[1, 12, 1]).unwrap(), &[-1])
-            .unwrap()
-            .shape(),
-        &[1, 12]
-    );
-    assert!(broadcast_to(&a, &[2, 6]).is_err());
+    let a = ops::arange(0.0, 12.0, 1.0);
+    assert_eq!(a.reshape([3, -1]).shape(), [3, 4]);
+    assert!(a.reshape([5, -1]).check().is_err());
+    assert!(a.reshape([-1, -1]).check().is_err());
+    assert!(a.reshape([7]).check().is_err());
+    assert!(a.reshape([3, 4]).transpose([0, 0]).check().is_err());
+    assert!(a.reshape([3, 4]).squeeze(0).check().is_err());
+    assert!(a.expand_dims(5).check().is_err());
+    assert_eq!(a.reshape([1, 12, 1]).squeeze(-1).shape(), [1, 12]);
+    assert!(a.broadcast_to([2, 6]).check().is_err());
 }
 
 // ── User story 3: unary, where, astype ──────────────────────────────────────
@@ -349,19 +345,19 @@ fn sigmoid_ref(x: f64) -> f64 {
 }
 
 /// A unary operation under test: the operation, its f64 reference, and its name.
-type UnaryCase = (fn(&Array) -> Result<Array>, fn(f64) -> f64, &'static str);
+type UnaryCase = (fn(&Array) -> Array, fn(f64) -> f64, &'static str);
 
 #[test]
 fn unary_random() {
     let mut rng = Rng::new(0x07);
     let ops: [UnaryCase; 7] = [
-        (exp, f64::exp, "exp"),
-        (log, f64::ln, "log"),
-        (sqrt, f64::sqrt, "sqrt"),
-        (sin, f64::sin, "sin"),
-        (cos, f64::cos, "cos"),
-        (tanh, f64::tanh, "tanh"),
-        (sigmoid, sigmoid_ref, "sigmoid"),
+        (Array::exp, f64::exp, "exp"),
+        (Array::log, f64::ln, "log"),
+        (Array::sqrt, f64::sqrt, "sqrt"),
+        (Array::sin, f64::sin, "sin"),
+        (Array::cos, f64::cos, "cos"),
+        (Array::tanh, f64::tanh, "tanh"),
+        (Array::sigmoid, sigmoid_ref, "sigmoid"),
     ];
     for _ in 0..CASES / 4 {
         let shape = rng.shape();
@@ -370,7 +366,7 @@ fn unary_random() {
         let (x32, r32) = random_layout(&mut rng, &shape, v64.iter().map(|&v| v as f32).collect());
         let (xi, ri) = random_layout(&mut rng, &shape, v64.iter().map(|&v| v as i32).collect());
         for (op, f, name) in ops {
-            let got = op(&x64).unwrap().to_vec::<f64>().unwrap();
+            let got = op(&x64).to_vec::<f64>().unwrap();
             for (g, &x) in got.iter().zip(&r64.data) {
                 assert!(
                     close(*g, f(x), f64::EPSILON),
@@ -379,7 +375,7 @@ fn unary_random() {
                 );
             }
             // f32 computes in f32 with the same std functions; compare via f64 tolerance.
-            let got = op(&x32).unwrap().to_vec::<f32>().unwrap();
+            let got = op(&x32).to_vec::<f32>().unwrap();
             for (g, &x) in got.iter().zip(&r32.data) {
                 let e = f(x as f64) as f32;
                 assert!(
@@ -387,24 +383,26 @@ fn unary_random() {
                     "{name}({x}): {g} vs {e}"
                 );
             }
-            let promoted = op(&xi).unwrap();
+            let promoted = op(&xi);
             assert_eq!(promoted.dtype(), DType::F32, "{name} promotes int32");
-            assert_eq!(promoted.shape(), ri.shape.as_slice());
+            assert!(
+                promoted
+                    .shape()
+                    .iter()
+                    .map(|&d| d as usize)
+                    .eq(ri.shape.iter().copied())
+            );
         }
-        assert_matches(
-            &negative(&xi).unwrap(),
-            &ri.map(i32::wrapping_neg),
-            "negative",
-        );
-        assert_matches(&abs(&x64).unwrap(), &r64.map(f64::abs), "abs");
+        assert_matches(&xi.negative(), &ri.map(i32::wrapping_neg), "negative");
+        assert_matches(&x64.abs(), &r64.map(f64::abs), "abs");
         assert_matches(&(-&x32), &r32.map(|v| -v), "neg operator");
     }
 }
 
 #[test]
 fn unary_dtype_rules() {
-    let z = Array::from_slice(&[Complex64::new(3.0, 4.0)], &[1]).unwrap();
-    let m = abs(&z).unwrap();
+    let z = Array::from([Complex64::new(3.0, 4.0)]);
+    let m = z.abs();
     assert_eq!(m.dtype(), DType::F32);
     assert!(close(
         f64::from(m.item::<f32>().unwrap()),
@@ -412,36 +410,46 @@ fn unary_dtype_rules() {
         f64::from(f32::EPSILON)
     ));
     assert_eq!(
-        negative(&z).unwrap().to_vec::<Complex64>().unwrap(),
+        z.negative().to_vec::<Complex64>().unwrap(),
         vec![Complex64::new(-3.0, -4.0)]
     );
-    let b = Array::scalar(true);
+    let b = Array::from(true);
+    let err = b.negative().check().unwrap_err();
+    assert_eq!(err.op_name(), Some("negative"));
     assert_eq!(
-        negative(&b).unwrap_err(),
-        Error::UnsupportedDType {
-            op: "negative",
-            dtype: DType::Bool
-        }
+        err.kind(),
+        Some(&OpErrorKind::UnsupportedDType(DType::Bool))
     );
     assert!(matches!(
-        exp(&z),
-        Err(Error::UnsupportedDType { op: "exp", .. })
+        z.exp().check(),
+        Err(Error::Op {
+            op: "exp",
+            kind: OpErrorKind::UnsupportedDType(_),
+            ..
+        })
     ));
     assert!(matches!(
-        less(&z, &z),
-        Err(Error::UnsupportedDType { op: "less", .. })
+        z.less(&z).check(),
+        Err(Error::Op {
+            op: "less",
+            kind: OpErrorKind::UnsupportedDType(_),
+            ..
+        })
     ));
     assert!(matches!(
-        maximum(&z, &z),
-        Err(Error::UnsupportedDType { .. })
+        z.maximum(&z).check(),
+        Err(Error::Op {
+            kind: OpErrorKind::UnsupportedDType(_),
+            ..
+        })
     ));
     assert_eq!(
-        abs(&Array::scalar(-128i8)).unwrap().item::<i8>().unwrap(),
+        Array::from(-128i8).abs().item::<i8>().unwrap(),
         -128,
         "abs wraps"
     );
     if !cfg!(miri) {
-        let h = exp(&Array::scalar(f16::from_f32(1.0))).unwrap();
+        let h = Array::from(f16::from_f32(1.0)).exp();
         assert_eq!(h.item::<f16>().unwrap(), f16::from_f32(1.0f32.exp()));
     }
 }
@@ -463,7 +471,7 @@ fn where_random() {
         let (c, rc) = random_layout(&mut rng, &sc, cv);
         let (a, ra) = random_layout(&mut rng, &shape, av);
         let (b, rb) = random_layout(&mut rng, &sb, bv);
-        let out = where_(&c, &a, &b).unwrap();
+        let out = c.select(&a, &b);
         assert_eq!(out.dtype(), DType::F32);
         let full = broadcast_shape(&broadcast_shape(&sc, &shape).unwrap(), &sb).unwrap();
         let (rc, ra, rb) = (
@@ -499,7 +507,7 @@ macro_rules! cast_pairs {
                 .collect();
             let (x, r) = random_layout(&mut $rng, &shape, values);
             let dtype = <$d as Element>::DTYPE;
-            assert_matches(&x.astype(dtype).unwrap(), &r.map(|v| v as $d), concat!(stringify!($s), " -> ", stringify!($d)));
+            assert_matches(&x.astype(dtype), &r.map(|v| v as $d), concat!(stringify!($s), " -> ", stringify!($d)));
         }
     )*};
 }
@@ -512,21 +520,20 @@ fn astype_all_pairs() {
     } else {
         cast_pairs!(rng; u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
     }
-    let nan = Array::from_slice(&[f32::NAN, -0.0, 2.5], &[3]).unwrap();
+    let nan = array![f32::NAN, -0.0, 2.5];
     assert_eq!(
-        nan.astype(DType::I32).unwrap().to_vec::<i32>().unwrap(),
+        nan.astype(DType::I32).to_vec::<i32>().unwrap(),
         vec![0, 0, 2]
     );
     assert_eq!(
-        nan.astype(DType::Bool).unwrap().to_vec::<bool>().unwrap(),
+        nan.astype(DType::Bool).to_vec::<bool>().unwrap(),
         vec![true, false, true]
     );
-    let z = Array::scalar(Complex64::new(1.5, -2.0));
-    assert_eq!(z.astype(DType::F64).unwrap().item::<f64>().unwrap(), 1.5);
+    let z = Array::from(Complex64::new(1.5, -2.0));
+    assert_eq!(z.astype(DType::F64).item::<f64>().unwrap(), 1.5);
     assert_eq!(
-        Array::scalar(7u8)
+        Array::from(7u8)
             .astype(DType::Complex64)
-            .unwrap()
             .item::<Complex64>()
             .unwrap(),
         Complex64::new(7.0, 0.0)
@@ -537,47 +544,47 @@ fn astype_all_pairs() {
 
 #[test]
 fn arange_semantics() {
+    let a = ops::arange(0, 10, 3);
+    assert_eq!(a.dtype(), DType::I32);
+    assert_eq!(a.to_vec::<i32>().unwrap(), vec![0, 3, 6, 9]);
     assert_eq!(
-        arange(0.0, 10.0, 3.0, DType::I32)
-            .unwrap()
-            .to_vec::<i32>()
-            .unwrap(),
-        vec![0, 3, 6, 9]
-    );
-    assert_eq!(
-        arange(1.0, 0.0, -0.25, DType::F32)
-            .unwrap()
-            .to_vec::<f32>()
-            .unwrap(),
+        ops::arange(1.0, 0.0, -0.25).to_vec::<f32>().unwrap(),
         vec![1.0, 0.75, 0.5, 0.25]
     );
-    assert_eq!(arange(5.0, 1.0, 1.0, DType::F32).unwrap().size(), 0);
+    assert_eq!(ops::arange(5.0, 1.0, 1.0).size(), 0);
     assert_eq!(
-        arange(0.0, 1.0, f64::INFINITY, DType::F64)
-            .unwrap()
+        ops::arange(0.0, 1.0, f64::INFINITY)
+            .astype(DType::F64)
             .to_vec::<f64>()
             .unwrap(),
         vec![0.0]
     );
+    for bad in [
+        ops::arange(0.0, 1.0, 0.0),
+        ops::arange(0.0, f64::INFINITY, 1.0),
+        ops::arange(f64::NAN, 1.0, 1.0),
+        ops::arange(0.0, 1e12, 1.0),
+    ] {
+        let err = bad.check().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Op {
+                    op: "arange",
+                    kind: OpErrorKind::InvalidArgument(_),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+    // No dtype argument any more: a complex bound is the unsupported dtype.
     assert!(matches!(
-        arange(0.0, 1.0, 0.0, DType::F32),
-        Err(Error::InvalidArgument(_))
-    ));
-    assert!(matches!(
-        arange(0.0, f64::INFINITY, 1.0, DType::F32),
-        Err(Error::InvalidArgument(_))
-    ));
-    assert!(matches!(
-        arange(f64::NAN, 1.0, 1.0, DType::F32),
-        Err(Error::InvalidArgument(_))
-    ));
-    assert!(matches!(
-        arange(0.0, 1e12, 1.0, DType::F32),
-        Err(Error::InvalidArgument(_))
-    ));
-    assert!(matches!(
-        arange(0.0, 2.0, 1.0, DType::Bool),
-        Err(Error::UnsupportedDType { .. })
+        ops::arange(0, 2, Complex64::new(1.0, 0.0)).check(),
+        Err(Error::Op {
+            kind: OpErrorKind::UnsupportedDType(_),
+            ..
+        })
     ));
 }
 
@@ -585,19 +592,11 @@ fn arange_semantics() {
 fn zeros_ones_all_dtypes() {
     use DType::*;
     for d in all_dtypes() {
-        let z = zeros(&[2, 3], d).unwrap();
-        let o = ones(&[2, 3], d).unwrap();
-        assert_eq!((z.dtype(), o.shape()), (d, &[2usize, 3][..]));
-        assert_eq!(
-            z.astype(F64).unwrap().to_vec::<f64>().unwrap(),
-            vec![0.0; 6],
-            "{d}"
-        );
-        assert_eq!(
-            o.astype(F64).unwrap().to_vec::<f64>().unwrap(),
-            vec![1.0; 6],
-            "{d}"
-        );
+        let z = ops::zeros([2, 3], d);
+        let o = ops::ones([2, 3], d);
+        assert_eq!((z.dtype(), o.shape()), (d, &[2, 3][..]));
+        assert_eq!(z.astype(F64).to_vec::<f64>().unwrap(), vec![0.0; 6], "{d}");
+        assert_eq!(o.astype(F64).to_vec::<f64>().unwrap(), vec![1.0; 6], "{d}");
     }
 }
 
@@ -605,26 +604,40 @@ fn zeros_ones_all_dtypes() {
 
 #[test]
 fn errors_are_typed_and_deferred() {
-    let a = zeros(&[2], DType::F32).unwrap();
-    let b = zeros(&[3], DType::F32).unwrap();
+    let a = ops::zeros([2], DType::F32);
+    let b = ops::zeros([3], DType::F32);
     let bad = &a / &b;
     let chained = -(&bad - &a);
     assert!(matches!(
         chained.eval(),
-        Err(Error::ShapeMismatch { op: "divide", .. })
+        Err(Error::Op {
+            op: "divide",
+            kind: OpErrorKind::ShapeMismatch { .. },
+            ..
+        })
     ));
     assert!(matches!(
-        where_(Array::scalar(true), &a, &b),
-        Err(Error::ShapeMismatch { op: "where", .. })
+        ops::where_(Array::from(true), &a, &b).check(),
+        Err(Error::Op {
+            op: "where",
+            kind: OpErrorKind::ShapeMismatch { .. },
+            ..
+        })
     ));
-    assert!(matches!(reshape(&a, &[-2]), Err(Error::InvalidArgument(_))));
+    assert!(matches!(
+        a.reshape([-2]).check(),
+        Err(Error::Op {
+            kind: OpErrorKind::InvalidShape(_),
+            ..
+        })
+    ));
 }
 
 #[test]
 #[cfg(not(debug_assertions))]
 fn perf_add_1m() {
-    let a = ones(&[1_000_000], DType::F32).unwrap();
-    let b = ones(&[1_000_000], DType::F32).unwrap();
+    let a = ops::ones([1_000_000], DType::F32);
+    let b = ops::ones([1_000_000], DType::F32);
     // The inputs and the device's start-up (library, pipelines) are not what is timed.
     eval(&[a.clone(), b.clone(), &a * &b]).unwrap();
     let start = std::time::Instant::now();
@@ -634,4 +647,66 @@ fn perf_add_1m() {
         elapsed.as_secs_f64() < 0.005,
         "1M-element add took {elapsed:?}"
     );
+}
+
+// ── Shapes as i32: split_n, shape_n, dim ────────────────────────────────────
+
+#[test]
+fn split_n_destructures_equal_parts() {
+    let qg = ops::arange(0.0, 24.0, 1.0).reshape([2, 3, 4]);
+    let [q, g] = qg.split_n::<2>(-1);
+    assert_eq!((q.shape(), g.shape()), (&[2, 3, 2][..], &[2, 3, 2][..]));
+    let row = |base: f32| [base, base + 1.0];
+    let want_q: Vec<f32> = (0..6).flat_map(|r| row(r as f32 * 4.0)).collect();
+    let want_g: Vec<f32> = (0..6).flat_map(|r| row(r as f32 * 4.0 + 2.0)).collect();
+    assert_eq!(q.to_vec::<f32>().unwrap(), want_q);
+    assert_eq!(g.to_vec::<f32>().unwrap(), want_g);
+    // Along the first axis, with three parts.
+    let [a, b, c] = ops::arange(0, 6, 1).split_n::<3>(0);
+    assert_eq!(a.to_vec::<i32>().unwrap(), [0, 1]);
+    assert_eq!(b.to_vec::<i32>().unwrap(), [2, 3]);
+    assert_eq!(c.to_vec::<i32>().unwrap(), [4, 5]);
+}
+
+#[test]
+fn split_n_on_a_non_dividing_axis_gives_failed_arrays() {
+    let x = ops::arange(0.0, 6.0, 1.0).reshape([2, 3]);
+    let [q, g] = x.split_n::<2>(-1);
+    assert!(q.is_failed() && g.is_failed());
+    let err = q.check().unwrap_err();
+    assert_eq!(err.op_name(), Some("split"));
+    assert!(
+        err.location().unwrap().file().ends_with("semantics.rs"),
+        "{err}"
+    );
+    assert!(
+        matches!(err.kind(), Some(OpErrorKind::InvalidArgument(_))),
+        "{err:?}"
+    );
+    assert_eq!(g.check().unwrap_err(), err);
+}
+
+#[test]
+fn reshape_with_dims_from_shape_n() {
+    let x = ops::arange(0.0, 24.0, 1.0).reshape([2, 3, 4]);
+    let [b, l, _] = x.shape_n::<3>().unwrap();
+    assert_eq!((b, l), (2, 3));
+    let y = x.reshape([b, l, -1]);
+    assert_eq!(y.shape(), [2, 3, 4]);
+    let z = x.reshape([b * l, -1]);
+    assert_eq!(z.shape(), [6, 4]);
+    assert_eq!(z.to_vec::<f32>().unwrap(), x.to_vec::<f32>().unwrap());
+}
+
+#[test]
+fn shape_n_of_the_wrong_rank_is_an_error() {
+    let x = ops::zeros([2, 3], DType::F32);
+    assert_eq!(x.shape_n::<2>().unwrap(), [2, 3]);
+    assert_eq!((x.shape()[0], x.shape()[1]), (2, 3));
+    for err in [
+        x.shape_n::<4>().unwrap_err(),
+        x.shape_n::<1>().map(|_| [0; 4]).unwrap_err(),
+    ] {
+        assert!(err.to_string().contains("shape_n"), "{err}");
+    }
 }

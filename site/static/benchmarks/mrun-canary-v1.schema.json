@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hupe1980.github.io/nuvec/benchmarks/mrun-canary-v1.schema.json",
+  "title": "nuvec mrun canary result, version 1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "created",
+    "environment",
+    "mrun",
+    "nuvec",
+    "status"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "nuvec-mrun-canary"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "created": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "environment": {
+      "type": "object",
+      "description": "as in the parity record"
+    },
+    "mrun": {
+      "type": "object",
+      "required": [
+        "commit",
+        "ref_file"
+      ],
+      "properties": {
+        "commit": {
+          "type": "string"
+        },
+        "ref_file": {
+          "const": "ci/mrun.ref"
+        }
+      }
+    },
+    "nuvec": {
+      "type": "object",
+      "required": [
+        "version",
+        "commit",
+        "dirty"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "commit": {
+          "type": "string"
+        },
+        "dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "build-failed",
+        "bench-failed",
+        "not-run"
+      ]
+    },
+    "reason": {
+      "type": "string"
+    },
+    "cells": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "alias",
+          "cell",
+          "phase",
+          "mlx_tok_s",
+          "nuvec_tok_s",
+          "ratio",
+          "gate",
+          "goal",
+          "gate_pass",
+          "goal_pass"
+        ],
+        "properties": {
+          "alias": {
+            "enum": [
+              "qwen3",
+              "qwen3.6"
+            ]
+          },
+          "cell": {
+            "enum": [
+              "1K",
+              "8K",
+              "32K",
+              "max"
+            ]
+          },
+          "phase": {
+            "enum": [
+              "prefill",
+              "decode"
+            ]
+          },
+          "mlx_tok_s": {
+            "type": "number"
+          },
+          "nuvec_tok_s": {
+            "type": "number"
+          },
+          "ratio": {
+            "type": "number"
+          },
+          "gate": {
+            "type": "number"
+          },
+          "goal": {
+            "type": "number"
+          },
+          "gate_pass": {
+            "type": "boolean"
+          },
+          "goal_pass": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "memory_64k": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "mlx_bytes",
+            "nuvec_bytes",
+            "ratio",
+            "pass"
+          ],
+          "properties": {
+            "mlx_bytes": {
+              "type": "integer"
+            },
+            "nuvec_bytes": {
+              "type": "integer"
+            },
+            "ratio": {
+              "type": "number"
+            },
+            "pass": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "memory_64k_reason": {
+      "type": "string"
+    }
+  },
+  "if": {
+    "properties": {
+      "status": {
+        "not": {
+          "const": "ok"
+        }
+      }
+    }
+  },
+  "then": {
+    "required": [
+      "reason"
+    ]
+  },
+  "else": {
+    "required": [
+      "cells",
+      "memory_64k"
+    ]
+  }
+}

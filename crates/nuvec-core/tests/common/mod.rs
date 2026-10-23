@@ -6,7 +6,59 @@
 
 #![allow(dead_code, unreachable_pub)]
 
-use nuvec_core::{Array, Device, Element, SliceArg, Stream, set_default_stream, slice};
+use std::time::Duration;
+
+use nuvec_core::graph::SliceArg;
+use nuvec_core::{Array, Device, Element, Stream, default_stream, set_default_stream};
+
+/// `Some(())` when a Metal device evaluates here, `None` (the test skips) otherwise. With
+/// `NUVEC_REQUIRE_GPU=1` a missing device fails the test instead, so CI on a GPU machine
+/// never passes by skipping. The thread's default stream is left unchanged.
+pub fn require_gpu() -> Option<()> {
+    let ok = !cfg!(miri) && {
+        let previous = default_stream();
+        set_default_stream(Stream::default_for(Device::gpu(0)));
+        let ok = (&Array::from(1.0f32) + 1.0).eval().is_ok();
+        set_default_stream(previous);
+        ok
+    };
+    if ok {
+        return Some(());
+    }
+    if std::env::var("NUVEC_REQUIRE_GPU").is_ok_and(|v| v == "1") {
+        panic!("NUVEC_REQUIRE_GPU=1 but no Metal device is available");
+    }
+    eprintln!("skipped: no Metal device");
+    None
+}
+
+/// Runs `f` on a new thread and returns its result; fails the test if it takes longer
+/// than `limit` (a hang, such as a deadlock), or panics with `f`'s panic.
+pub fn with_timeout<R: Send + 'static>(
+    limit: Duration,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> R {
+    // Miri runs ~100× slower than native code, so wall-clock limits mean nothing there;
+    // its own deadlock detector reports hangs.
+    if cfg!(miri) {
+        return f();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let r = f();
+        let _ = tx.send(());
+        r
+    });
+    match rx.recv_timeout(limit) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match handle.join() {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("timed out after {limit:?} (hang or deadlock)")
+        }
+    }
+}
 
 /// Deterministic xorshift64* generator.
 pub struct Rng(u64);
@@ -250,14 +302,11 @@ pub fn random_layout<T: Element>(
         rng.below(3)
     };
     let array = match layout {
-        0 => Array::from_slice(&reference.data, shape).unwrap(),
+        0 => Array::from_slice(&reference.data, shape),
         1 => {
             let axes: Vec<usize> = (0..shape.len()).rev().collect();
             let stored = reference.transpose(&axes);
-            Array::from_slice(&stored.data, &stored.shape)
-                .unwrap()
-                .t()
-                .unwrap()
+            Array::from_slice(&stored.data, &stored.shape[..]).t()
         }
         _ => {
             // Every logical element sits at an even (or mirrored) position of a 2x-larger
@@ -280,7 +329,7 @@ pub fn random_layout<T: Element>(
                 .iter()
                 .map(|&r| SliceArg::new(None, None, if r { -2 } else { 2 }))
                 .collect();
-            slice(&Array::from_slice(&stored, &big).unwrap(), &args).unwrap()
+            nuvec_core::graph::slice(&Array::from_slice(&stored, &big[..]), &args).unwrap()
         }
     };
     (array, reference)
@@ -311,7 +360,15 @@ impl Same for nuvec_core::Complex64 {
 
 /// Asserts that `array` holds exactly the reference values.
 pub fn assert_matches<T: Element + Same>(array: &Array, expected: &Ref<T>, context: &str) {
-    assert_eq!(array.shape(), expected.shape.as_slice(), "{context}: shape");
+    assert_eq!(
+        array
+            .shape()
+            .iter()
+            .map(|&d| d as usize)
+            .collect::<Vec<_>>(),
+        expected.shape,
+        "{context}: shape"
+    );
     let got = array.to_vec::<T>().unwrap();
     for (i, (g, e)) in got.iter().zip(&expected.data).enumerate() {
         assert!(

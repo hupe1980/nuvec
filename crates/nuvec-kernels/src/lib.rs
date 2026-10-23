@@ -18,6 +18,9 @@
 //! - nuvec's own: residual add + RMS norm, norm + RoPE + cache write, few-row 4-bit
 //!   products, depthwise 1-D convolution and random bits.
 //!
+//! **Stability:** no promise when this crate is depended on directly; depend on `nuvec`,
+//! whose re-exports are semver-tracked.
+//!
 //! **Status:** pre-alpha.
 
 /// How the kernel library is provided in this build.
@@ -46,7 +49,6 @@ const METALLIB: Option<&[u8]> = Some(include_bytes!(concat!(env!("OUT_DIR"), "/n
 #[cfg(not(nuvec_metallib = "precompiled"))]
 const METALLIB: Option<&[u8]> = None;
 
-const KERNEL_NAMES: &[&str] = include!(concat!(env!("OUT_DIR"), "/kernel_names.rs"));
 const SOURCES: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/sources.rs"));
 
 include!("contracted.rs");
@@ -61,11 +63,6 @@ pub fn contracted(path: &str) -> bool {
 /// The precompiled library bytes, if [`MODE`] is [`MetallibMode::Precompiled`].
 pub fn metallib() -> Option<&'static [u8]> {
     METALLIB
-}
-
-/// The kernel function names in the precompiled library, sorted. Empty in other modes.
-pub fn kernel_names() -> &'static [&'static str] {
-    KERNEL_NAMES
 }
 
 /// `common.h`, the header of nuvec's element types, arithmetic, conversions and strided
@@ -85,21 +82,17 @@ mod tests {
     #[test]
     fn accessors_match_mode() {
         assert_eq!(MODE == MetallibMode::Precompiled, metallib().is_some());
-        assert_eq!(
-            MODE == MetallibMode::Precompiled,
-            !kernel_names().is_empty()
-        );
         assert_eq!(MODE == MetallibMode::RuntimeSource, !sources().is_empty());
     }
 
     #[test]
-    fn precompiled_library_contains_the_kernels() {
+    fn precompiled_library_is_a_metallib() {
+        // Its kernels are looked up by name in `nuvec-gpu`'s runtime tests.
         if MODE != MetallibMode::Precompiled {
             return;
         }
         let lib = metallib().expect("precompiled mode has a library");
         assert!(lib.starts_with(b"MTLB"), "not a metallib");
-        assert!(kernel_names().contains(&"nuvec_binary_add_float32_c"));
     }
 
     #[test]

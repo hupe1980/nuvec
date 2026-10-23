@@ -160,24 +160,77 @@ pub struct Config {
     pub eos_token_ids: Vec<u32>,
 }
 
+/// A parsed JSON file.
+fn read_json(path: &Path) -> Result<Json> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::InvalidArgument(format!("{}: {e}", path.display())))?;
+    json::parse(&bytes)
+}
+
+/// A non-negative integer.
+fn non_negative(k: &str, v: &Json) -> Result<usize> {
+    let v = v
+        .as_i64()
+        .ok_or_else(|| invalid(format!("`{k}` is not an integer")))?;
+    usize::try_from(v).map_err(|_| invalid(format!("`{k}` is negative ({v})")))
+}
+
+/// The ids of an `eos_token_id` entry (an id or a list of ids).
+fn eos_ids(ids: Option<&Json>) -> Result<Vec<u32>> {
+    let id = |v: &Json| {
+        let id = non_negative("eos_token_id", v)?;
+        u32::try_from(id).map_err(|_| invalid(format!("`eos_token_id` {id} is too large")))
+    };
+    match ids {
+        None | Some(Json::Null) => Ok(Vec::new()),
+        Some(Json::Array(ids)) => ids.iter().map(id).collect(),
+        Some(single) => Ok(vec![id(single)?]),
+    }
+}
+
 impl Config {
-    /// Reads a `config.json` file.
+    /// Reads a `config.json` file and, when there is one next to it,
+    /// `generation_config.json`: its `eos_token_id` (an id or a list) is added to the
+    /// end-of-sequence ids, as mlx-lm does.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let bytes = std::fs::read(path)
-            .map_err(|e| Error::InvalidArgument(format!("{}: {e}", path.display())))?;
-        Self::from_json(&json::parse(&bytes)?)
+        Ok(Self::read(path.as_ref())?.0)
+    }
+
+    /// [`Config::from_file`], and whether the file sets `tie_word_embeddings`.
+    pub(crate) fn read(path: &Path) -> Result<(Self, bool)> {
+        let top = read_json(path)?;
+        let mut config = Self::from_json(&top)?;
+        let generation = path.with_file_name("generation_config.json");
+        if generation.is_file() {
+            let ids = eos_ids(read_json(&generation)?.get("eos_token_id"))
+                .map_err(|e| Error::InvalidArgument(format!("{}: {e}", generation.display())))?;
+            for id in ids {
+                if !config.eos_token_ids.contains(&id) {
+                    config.eos_token_ids.push(id);
+                }
+            }
+        }
+        let c = top.get("text_config").unwrap_or(&top);
+        let tied = top
+            .get("tie_word_embeddings")
+            .or_else(|| c.get("tie_word_embeddings"))
+            .is_some_and(|t| *t != Json::Null);
+        Ok((config, tied))
     }
 
     /// Builds a configuration from a parsed `config.json`. Multimodal checkpoints' text
     /// settings (`text_config`) are used; the quantization is read from the top level.
+    /// Zero heads, intervals or group sizes and negative integers are errors.
     pub fn from_json(top: &Json) -> Result<Self> {
         let c = top.get("text_config").unwrap_or(top);
-        let int = |k: &str| {
-            c.get(k)
-                .and_then(Json::as_i64)
-                .map(|v| v as usize)
-                .ok_or_else(|| invalid(format!("`{k}` missing")))
+        let opt_int = |k: &str| match c.get(k) {
+            None | Some(Json::Null) => Ok(None),
+            Some(v) => non_negative(k, v).map(Some),
+        };
+        let int = |k: &str| opt_int(k)?.ok_or_else(|| invalid(format!("`{k}` missing")));
+        let positive = |k: &str, v: usize| match v {
+            0 => Err(invalid(format!("`{k}` must not be 0"))),
+            v => Ok(v),
         };
         let float = |k: &str| c.get(k).and_then(Json::as_f64).map(|v| v as f32);
         let flag = |k: &str| c.get(k).and_then(Json::as_bool).unwrap_or(false);
@@ -199,32 +252,38 @@ impl Config {
         };
         let hybrid = model_type == "qwen3_5";
         let qwen3_moe = model_type == "qwen3_moe";
-        let moe = match c.get("num_experts").and_then(Json::as_i64).unwrap_or(0) {
-            experts if (hybrid || qwen3_moe) && experts > 0 => Some(MixtureOfExperts {
-                experts: experts as usize,
-                experts_per_token: int("num_experts_per_tok")?,
-                intermediate_size: int("moe_intermediate_size")?,
-                shared_intermediate_size: match hybrid {
-                    true => Some(int("shared_expert_intermediate_size")?),
-                    false => None,
-                },
-                // mlx-lm's defaults: on for Qwen 3.5, off for Qwen 3.
-                norm_topk_prob: c
-                    .get("norm_topk_prob")
-                    .and_then(Json::as_bool)
-                    .unwrap_or(hybrid),
-                sparse_step: int("decoder_sparse_step").unwrap_or(1),
-                dense_layers: c
-                    .get("mlp_only_layers")
-                    .and_then(Json::as_array)
-                    .map(|l| {
-                        l.iter()
-                            .filter_map(Json::as_i64)
-                            .map(|i| i as usize)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            }),
+        let moe = match opt_int("num_experts")?.unwrap_or(0) {
+            experts if (hybrid || qwen3_moe) && experts > 0 => {
+                let experts_per_token =
+                    positive("num_experts_per_tok", int("num_experts_per_tok")?)?;
+                if experts_per_token > experts {
+                    return Err(invalid(format!(
+                        "{experts_per_token} experts per token of {experts}"
+                    )));
+                }
+                Some(MixtureOfExperts {
+                    experts,
+                    experts_per_token,
+                    intermediate_size: int("moe_intermediate_size")?,
+                    shared_intermediate_size: match hybrid {
+                        true => Some(int("shared_expert_intermediate_size")?),
+                        false => None,
+                    },
+                    // mlx-lm's defaults: on for Qwen 3.5, off for Qwen 3.
+                    norm_topk_prob: c
+                        .get("norm_topk_prob")
+                        .and_then(Json::as_bool)
+                        .unwrap_or(hybrid),
+                    sparse_step: opt_int("decoder_sparse_step")?.unwrap_or(1),
+                    dense_layers: c
+                        .get("mlp_only_layers")
+                        .and_then(Json::as_array)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|i| non_negative("mlp_only_layers", i))
+                        .collect::<Result<_>>()?,
+                })
+            }
             _ => None,
         };
         // Qwen 3.5 keeps its rotary settings in `rope_parameters`.
@@ -235,12 +294,16 @@ impl Config {
                 .map(|v| v as f32)
                 .or_else(|| float(k))
         };
-        let hidden_size = int("hidden_size")?;
-        let heads = int("num_attention_heads")?;
-        let head_dim = match c.get("head_dim") {
-            Some(Json::Int(d)) => *d as usize,
-            _ => hidden_size / heads,
-        };
+        let hidden_size = positive("hidden_size", int("hidden_size")?)?;
+        let heads = positive("num_attention_heads", int("num_attention_heads")?)?;
+        let kv_heads = positive(
+            "num_key_value_heads",
+            opt_int("num_key_value_heads")?.unwrap_or(heads),
+        )?;
+        let head_dim = positive(
+            "head_dim",
+            opt_int("head_dim")?.unwrap_or(hidden_size / heads),
+        )?;
         let layers = int("num_hidden_layers")?;
         let layer_types = if hybrid {
             match c.get("layer_types").and_then(Json::as_array) {
@@ -253,7 +316,10 @@ impl Config {
                     })
                     .collect::<Result<Vec<_>>>()?,
                 None => {
-                    let interval = int("full_attention_interval").unwrap_or(4);
+                    let interval = positive(
+                        "full_attention_interval",
+                        opt_int("full_attention_interval")?.unwrap_or(4),
+                    )?;
                     (0..layers)
                         .map(|i| match (i + 1) % interval {
                             0 => LayerType::Attention,
@@ -273,13 +339,16 @@ impl Config {
         }
         let linear_attention = if hybrid {
             let la = LinearAttention {
-                key_heads: int("linear_num_key_heads")?,
-                value_heads: int("linear_num_value_heads")?,
-                key_head_dim: int("linear_key_head_dim")?,
-                value_head_dim: int("linear_value_head_dim")?,
-                conv_kernel: int("linear_conv_kernel_dim").unwrap_or(4),
+                key_heads: positive("linear_num_key_heads", int("linear_num_key_heads")?)?,
+                value_heads: positive("linear_num_value_heads", int("linear_num_value_heads")?)?,
+                key_head_dim: positive("linear_key_head_dim", int("linear_key_head_dim")?)?,
+                value_head_dim: positive("linear_value_head_dim", int("linear_value_head_dim")?)?,
+                conv_kernel: positive(
+                    "linear_conv_kernel_dim",
+                    opt_int("linear_conv_kernel_dim")?.unwrap_or(4),
+                )?,
             };
-            if la.key_heads == 0 || !la.value_heads.is_multiple_of(la.key_heads) {
+            if !la.value_heads.is_multiple_of(la.key_heads) {
                 return Err(invalid(
                     "linear value heads must be a multiple of key heads",
                 ));
@@ -295,7 +364,7 @@ impl Config {
             num_hidden_layers: layers,
             intermediate_size: match &moe {
                 // MoE configs may have no dense MLP width.
-                Some(m) => int("intermediate_size").unwrap_or(m.intermediate_size),
+                Some(m) => opt_int("intermediate_size")?.unwrap_or(m.intermediate_size),
                 None => int("intermediate_size")?,
             },
             moe,
@@ -305,9 +374,9 @@ impl Config {
                 && c.get("attn_output_gate").and_then(Json::as_bool) != Some(false),
             rope_dims,
             num_attention_heads: heads,
-            num_key_value_heads: int("num_key_value_heads").unwrap_or(heads),
+            num_key_value_heads: kv_heads,
             head_dim,
-            vocab_size: int("vocab_size")?,
+            vocab_size: positive("vocab_size", int("vocab_size")?)?,
             rms_norm_eps: float("rms_norm_eps").unwrap_or(1e-6),
             rope_theta: rope_float("rope_theta").unwrap_or(10000.0),
             rope_scaling: match (hybrid, qwen3_moe) {
@@ -319,6 +388,7 @@ impl Config {
             },
             rope_traditional: !matches!(model_type.as_str(), "qwen3" | "qwen3_moe")
                 && flag("rope_traditional"),
+            // Without the setting, [`crate::load_model`] infers it from the checkpoint.
             tie_word_embeddings: top
                 .get("tie_word_embeddings")
                 .or_else(|| c.get("tie_word_embeddings"))
@@ -329,15 +399,7 @@ impl Config {
             mlp_bias: flag("mlp_bias"),
             qk_norm,
             quantization: quantization(top.get("quantization"))?,
-            eos_token_ids: match c.get("eos_token_id").or_else(|| top.get("eos_token_id")) {
-                Some(Json::Int(id)) => vec![*id as u32],
-                Some(Json::Array(ids)) => ids
-                    .iter()
-                    .filter_map(Json::as_i64)
-                    .map(|id| id as u32)
-                    .collect(),
-                _ => Vec::new(),
-            },
+            eos_token_ids: eos_ids(c.get("eos_token_id").or_else(|| top.get("eos_token_id")))?,
             model_type,
         })
     }
@@ -376,8 +438,24 @@ fn quantization(q: Option<&Json>) -> Result<Option<Quantization>> {
     let Some(q) = q.filter(|q| **q != Json::Null) else {
         return Ok(None);
     };
-    let get = |j: &Json, k: &str| j.get(k).and_then(Json::as_i64);
-    let (Some(group_size), Some(bits)) = (get(q, "group_size"), get(q, "bits")) else {
+    // A group size of at least 1 and 1 to 8 bits.
+    let settings = |j: &Json| -> Result<Option<(usize, u32)>> {
+        let (Some(g), Some(b)) = (j.get("group_size"), j.get("bits")) else {
+            return Ok(None);
+        };
+        let (g, b) = (
+            non_negative("quantization.group_size", g)?,
+            non_negative("quantization.bits", b)?,
+        );
+        if g == 0 || !(1..=8).contains(&b) {
+            return Err(invalid(format!(
+                "quantization: group size {g} and {b} bits (a group size of at least 1, \
+                 1 to 8 bits)"
+            )));
+        }
+        Ok(Some((g, b as u32)))
+    };
+    let Some((group_size, bits)) = settings(q)? else {
         return Err(invalid("quantization needs `group_size` and `bits`"));
     };
     if let Some(mode) = q.get("mode").and_then(Json::as_str)
@@ -390,7 +468,10 @@ fn quantization(q: Option<&Json>) -> Result<Option<Quantization>> {
         .unwrap_or_default()
         .iter()
         .filter_map(|(path, v)| {
-            let (g, b) = (get(v, "group_size")?, get(v, "bits")?);
+            let (g, b) = match settings(v) {
+                Ok(s) => s?,
+                Err(e) => return Some(Err(e)),
+            };
             // Under the text model's names, as the loader renames weights.
             let path = match (
                 path.strip_prefix("model.language_model."),
@@ -400,12 +481,12 @@ fn quantization(q: Option<&Json>) -> Result<Option<Quantization>> {
                 (_, Some(rest)) => rest.to_owned(),
                 _ => path.clone(),
             };
-            Some((path, g as usize, b as u32))
+            Some(Ok((path, g, b)))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     Ok(Some(Quantization {
-        group_size: group_size as usize,
-        bits: bits as u32,
+        group_size,
+        bits,
         layers,
     }))
 }
