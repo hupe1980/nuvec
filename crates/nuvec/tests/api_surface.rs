@@ -704,7 +704,7 @@ mod spec_063 {
     }
 }
 
-/// The engine surface: every `nuvec::` item a runtime built on nuvec (the mrun inference
+/// The engine surface: every `nuvec::` item a runtime built on nuvec (such as an inference
 /// server's tensor adapter) uses, and the engine items (attention plan, memory statistics, checkpoint footprint, snapshots, the
 /// row-independence constant). Changing any of these is a semver event for runtimes.
 mod engine_surface {

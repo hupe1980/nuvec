@@ -1,4 +1,4 @@
-//! Attention under a score-memory cap at mrun's chunk shapes, for the capped routing table
+//! Attention under a score-memory cap at long-prefill chunk shapes, for the capped routing table
 //! (`scripts/bench_attention_route.py`, `just bench-attention-route`). Prints
 //! `variant<TAB>d<TAB>lq<TAB>lk<TAB>dtype<TAB>ms` per cell: the median of a few causal
 //! attention calls over a key cache, after a warm-up.

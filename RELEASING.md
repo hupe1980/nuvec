@@ -12,10 +12,6 @@
      `--resume`; `--budget SECONDS` stops between children.
    - `just bench-compare target/bench-parity/base.json site/static/benchmarks/X.Y.Z/<machine>.json`:
      a cell that fell by more than 2% blocks the release or is explained in the notes.
-   - `scripts/mrun_canary.sh [MRUN_DIR]`: mrun's own benchmark at the commit pinned in
-     `ci/mrun.ref`, MLX and nuvec builds; cells below their gate go into the release notes.
-     Manual, never part of CI. Moving `ci/mrun.ref` is a reviewed change (the CI exactness
-     job uses the same pin).
    - `just bench-validate`; update the README and the benchmarks page from the record.
 5. `just api-check` (the pinned surface and `cargo semver-checks` on `nuvec` and `nuvec-lm`).
 6. Commit (records under `site/static/benchmarks/` included), push to `main`, wait for CI.

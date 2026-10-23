@@ -266,13 +266,13 @@ fn tiled_uncapped(key: &RouteKey) -> bool {
     let (lq, lk) = (key.lq, key.lk);
     let causal = key.mask == MaskKind::Causal;
     // MLX: the composition is faster for these head sizes, except long causal
-    // self-attention in half precision. Measured on an M4 Pro (re-measured with mrun's
+    // self-attention in half precision. Measured on an M4 Pro (re-measured with long-prefill
     // chunks, `just bench-attention-route`), the tiled kernel is faster for causal chunks
     // of 1,024 queries or more over up to 4,096 keys (2,048 over 4,096: 19.9 ms against
     // 23.5) and ties for 2,048 queries over 8,192 keys; the composition is faster beyond
     // (1,024 over 8,192: 23.7 ms against 24.9) and for shorter chunks. The
     // composition materialises the scores, so from 4 GiB of them (a 2,048-token chunk
-    // over ~64K keys and more) the tiled kernel runs anyway: re-measured at mrun's chunks
+    // over ~64K keys and more) the tiled kernel runs anyway: re-measured at long-prefill chunks
     // (16 query heads, half precision), the tiled kernel is 5–7% faster at exactly 4 GiB
     // (1,024 queries over 131K keys), 1–6% slower below (342 queries over 8K–32K keys).
     let scores = key.b * key.hq * lq * lk * key.dtype.size();

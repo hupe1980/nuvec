@@ -5,7 +5,7 @@
 """Validates benchmark records, or compares two parity records.
 
 `uv run scripts/validate_parity.py [paths…]`: every record (default: every JSON file under
-site/static/benchmarks) against its schema (`schema` field: parity record or mrun canary),
+site/static/benchmarks) against its schema (`schema` field),
 and every path in index.json. Exit 1 on any error.
 
 `uv run scripts/validate_parity.py --compare BASE CANDIDATE [--max-drop 0.02]`: the
@@ -24,8 +24,7 @@ import jsonschema
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "site/static/benchmarks"
-SCHEMAS = {"nuvec-parity-record": "parity-record-v1.schema.json",
-           "nuvec-mrun-canary": "mrun-canary-v1.schema.json"}
+SCHEMAS = {"nuvec-parity-record": "parity-record-v1.schema.json"}
 
 
 def validate(paths: list[Path]) -> int:

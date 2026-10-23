@@ -103,6 +103,7 @@ servers: attention plans, memory accounting comparable with MLX, row-independent
   of crashing; paged attention and cache writes stay inside the cache.
 - CPU matrix products check sizes, and f16 products accumulate in f32.
 - A panic in a `commit_then` completion handler is reported instead of aborting the process.
+- Vector and paged attention kernels declare their 1,024-thread limit, so they also dispatch under Metal shader validation on M1.
 - Long prefills no longer fail with a GPU out-of-memory error (Qwen3-30B-A3B at 32K tokens):
   the allocator counts mapped weights when it releases cached buffers.
 - `Batcher`: one-token prompts, prompts that never fit (rejected at `submit`), requests

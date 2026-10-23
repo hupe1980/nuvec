@@ -30,7 +30,7 @@ nuvec brings [MLX](https://github.com/ml-explore/mlx)'s programming model to Rus
 - 🧪 **Tested against MLX.** Nearly a thousand cases replay results recorded from real MLX, with random layouts, gradients and every dtype.
 - 🤖 **LLM runtime.** Llama, Mistral and Qwen 2/3/3.5, dense, hybrid (Gated DeltaNet) or mixture-of-experts, straight from mlx-community or Hugging Face checkpoints; speculative decoding and batched serving included.
 - 💾 **Memory-mapped weights.** Checkpoints whose tensors are aligned (files nuvec writes are) are mapped and handed to the GPU without a copy; mlx-community checkpoints have unpadded headers and are read once at load, in parallel, using no more memory than MLX.
-- ⚙️ **An engine for servers.** Attention plans and score-memory caps, one peak-memory metric comparable with MLX's, a memory limit that refuses instead of swapping, checkpoint footprints before loading, row-independent few-row products and documented determinism (the engine under [mrun](https://github.com/hupe1980/mrun)).
+- ⚙️ **An engine for servers.** Attention plans and score-memory caps, one peak-memory metric comparable with MLX's, a memory limit that refuses instead of swapping, checkpoint footprints before loading, row-independent few-row products and documented determinism (used, for example, by the [mrun](https://github.com/hupe1980/mrun) inference server).
 
 ## 📊 Performance
 

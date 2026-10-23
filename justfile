@@ -137,7 +137,7 @@ bench-compare base candidate:
 bench-load:
     uv run scripts/bench_load.py
 
-# Attention under a score-memory cap (tiled kernel vs blocked composition) at mrun's chunk
+# Attention under a score-memory cap (tiled kernel vs blocked composition) at long-prefill chunk
 # shapes: nuvec vs MLX; the table behind the capped routing rule.
 bench-attention-route *filter:
     uv run scripts/bench_attention_route.py {{filter}}
@@ -148,11 +148,6 @@ bench-rows *filter:
     uv run scripts/bench_rows.py {{filter}}
 
 # ── Downstream and long-running checks ────────────────────────────────────────
-
-# Builds mrun at ci/mrun.ref against this workspace and runs its tiny-model exactness
-# suites with the nuvec backend (CPU, and the GPU where Metal is present).
-mrun-exactness MRUN_DIR="":
-    scripts/mrun_exactness.sh {{MRUN_DIR}}
 
 # A server-like workload on a caller-owned thread for HOURS hours: fails if the process
 # footprint grows by 64 MiB or more after warm-up (CSV in target/soak/).

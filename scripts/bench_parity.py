@@ -30,8 +30,7 @@ goal (1.0).
 
 Usage: `just bench-parity [models…] [--sections decode,ttft] [--out PATH] [--release]
 [--resume] [--budget SECONDS] [--nuvec-ref REF] [--no-cold] [--no-max-context]
-[--prompt-tokens 2048,32768] [--concurrency 1,4,8]`; `--mrun-canary-report DIR` converts
-a canary run directory into its result file.
+[--prompt-tokens 2048,32768] [--concurrency 1,4,8]`.
 
 Each child's output is cached under `target/bench-parity/<model>/jobs/`; `--resume` reuses
 it, and `--budget` stops starting children after that many seconds (exit 3), so a long run
@@ -755,7 +754,7 @@ def markdown(record: dict) -> str:
     return "\n".join(out)
 
 
-# ── Release index and the mrun canary ─────────────────────────────────────────────────
+# ── Release index ─────────────────────────────────────────────────────────────
 
 def add_to_index(version: str, machine: str, path: str, kind: str) -> None:
     index_path = BENCH_DIR / "index.json"
@@ -768,65 +767,6 @@ def add_to_index(version: str, machine: str, path: str, kind: str) -> None:
     release["records"] = [r for r in release["records"] if r["path"] != path]
     release["records"].append({"machine": machine, "path": path, "kind": kind})
     write_atomic(index_path, index)
-
-
-def canary_gate(alias: str, cell: str, phase: str) -> tuple[float, float]:
-    if alias == "qwen3.6" and phase == "prefill" and cell in ("8K", "32K", "max"):
-        return 0.97, {"8K": 0.98, "32K": 0.98, "max": 1.0}[cell]
-    return GATE, GOAL
-
-
-def canary_cells(result: dict) -> dict[tuple[str, str], float]:
-    """{(cell, phase): median tok/s} from an mrun `result.json` (synthetic suite)."""
-    out = {}
-    for c in result.get("cells", []):
-        name = c.get("cell", "").lower()
-        size = re.search(r"\b(1k|8k|32k|max)\b", name)
-        phase = re.search(r"\b(prefill|decode)\b", name)
-        if size and phase and c.get("unit") == "tok/s" and c.get("median"):
-            out[(size.group(1).upper().replace("MAX", "max"), phase.group(1))] = c["median"]
-    return out
-
-
-def canary_report(run_dir: Path) -> Path:
-    env = environment(None)
-    meta = json.loads((run_dir / "canary.json").read_text())
-    record: dict = {
-        "schema": "nuvec-mrun-canary", "schema_version": 1,
-        "created": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
-        "environment": env,
-        "mrun": {"commit": meta["mrun_commit"], "ref_file": "ci/mrun.ref"},
-        "nuvec": env["nuvec"],
-        "status": meta["status"],
-    }
-    if meta["status"] != "ok":
-        record["reason"] = meta.get("reason") or meta["status"]
-    else:
-        cells: list[dict] = []
-        for alias in ("qwen3", "qwen3.6"):
-            sides = [json.loads((run_dir / f"{b}-{alias}" / "result.json").read_text())
-                     for b in ("mlx", "nuvec")]
-            medians = [canary_cells(x) for x in sides]
-            for key, mlx_tok_s in medians[0].items():
-                if key not in medians[1]:
-                    continue
-                gate, goal = canary_gate(alias, *key)
-                ratio = medians[1][key] / mlx_tok_s
-                cells.append({"alias": alias, "cell": key[0], "phase": key[1],
-                              "mlx_tok_s": mlx_tok_s, "nuvec_tok_s": medians[1][key],
-                              "ratio": round(ratio, 4), "gate": gate, "goal": goal,
-                              "gate_pass": ratio >= gate, "goal_pass": ratio >= goal})
-        record["cells"] = cells
-        mem = meta.get("memory_64k")
-        record["memory_64k"] = mem
-        if mem is None:
-            record["memory_64k_reason"] = meta.get("memory_64k_reason", "not measured")
-    validate(record, "mrun-canary-v1.schema.json")
-    out = BENCH_DIR / env["nuvec"]["version"] / f"mrun-canary-{machine_slug(env)}.json"
-    write_atomic(out, record)
-    add_to_index(env["nuvec"]["version"], machine_slug(env),
-                 str(out.relative_to(BENCH_DIR)), "mrun-canary")
-    return out
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────────────
@@ -875,12 +815,8 @@ def main() -> int:
     ap.add_argument("--runs", type=int, default=RUNS)
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--no-build", action="store_true", help="use the built bench example")
-    ap.add_argument("--mrun-canary-report", type=Path)
     args = ap.parse_args()
 
-    if args.mrun_canary_report:
-        print(canary_report(args.mrun_canary_report))
-        return 0
     sections = [s for s in args.sections.split(",") if s]
     if unknown := set(sections) - set(SECTIONS):
         ap.error(f"unknown sections {sorted(unknown)}")

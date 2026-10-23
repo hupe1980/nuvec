@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["mlx==0.32.4"]
 # ///
-"""Attention under a score-memory cap at mrun's chunk shapes: the measurements behind
+"""Attention under a score-memory cap at long-prefill chunk shapes: the measurements behind
 nuvec's capped routing rule (`capped_tiled` in the attention planner) and its uncapped
 head-size-256 rule.
 

@@ -751,12 +751,12 @@ fn a_cap_below_one_row_runs_tiled_or_fails_naming_the_minimum() {
     });
 }
 
-/// mrun's real prefill schedule (Qwen3.6: 16 query heads, 2 key heads, head size 256,
-/// bf16) under its 512 MiB score budget: the plan holds the budget and its scratch, and
+/// A real long-prefill schedule (Qwen3.6: 16 query heads, 2 key heads, head size 256,
+/// bf16) under a 512 MiB score budget: the plan holds the budget and its scratch, and
 /// the kernel it names runs. Benchmark tier (large; run in the release checklist).
 #[test]
-#[ignore = "benchmark tier: mrun's chunk schedule up to 262,144 keys"]
-fn mrun_schedule_plans_hold_the_budget() {
+#[ignore = "benchmark tier: a long-prefill chunk schedule up to 262,144 keys"]
+fn long_prefill_schedule_plans_hold_the_budget() {
     if common::require_gpu().is_none() {
         return;
     }

@@ -29,8 +29,10 @@ inline uint paged_block(const device int* table, int i, int shift, int num_block
 // log2(block_size), max_blocks, num_blocks. Query `l` of a sequence of length `N` attends
 // keys `0..=N - L + l` (causal at the end, as `sdpa_vector`). One threadgroup of 32
 // SIMD-groups per (sequence, query head, query).
+// The declared limit keeps 1,024 threads per threadgroup available where instrumented
+// builds (shader validation) or smaller register files would otherwise lower it.
 template <typename T, int D>
-[[kernel]] void paged_attention(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void paged_attention(
     const device T* queries [[buffer(0)]],
     const device T* k_cache [[buffer(1)]],
     const device T* v_cache [[buffer(2)]],
@@ -140,7 +142,7 @@ template <typename T, int D>
 // and maxima per block), reduced by `sdpa_vector_2pass_2`. `params`: Hkv, L,
 // log2(block_size), max_blocks, blocks, num_blocks.
 template <typename T, int D, int TK = 4>
-[[kernel]] void paged_attention_2pass_1(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void paged_attention_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* k_cache [[buffer(1)]],
     const device T* v_cache [[buffer(2)]],

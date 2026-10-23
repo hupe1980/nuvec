@@ -32,8 +32,10 @@ constant bool att_save_lse [[function_constant(313)]];
 namespace mlx {
 namespace sdpa_vec {
 
+// The declared limit keeps 1,024 threads per threadgroup available where instrumented
+// builds (shader validation) or smaller register files would otherwise lower it.
 template <typename T, int D, int V = D>
-[[kernel]] void sdpa_vector(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void sdpa_vector(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
@@ -198,7 +200,7 @@ template <typename T, int D, int V = D>
 }
 
 template <typename T, int D, int V = D, int TK = 4>
-[[kernel]] void sdpa_vector_2pass_1(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void sdpa_vector_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
@@ -409,7 +411,7 @@ template <typename T, int D, int V = D, int TK = 4>
 // queries without mask or sinks only; the partials layout matches
 // sdpa_vector_2pass_2.
 template <typename T, int D, int V, int G, int HPT>
-[[kernel]] void sdpa_vector_2pass_1_gqa(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void sdpa_vector_2pass_1_gqa(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
@@ -548,7 +550,7 @@ template <typename T, int D, int V, int G, int HPT>
 }
 
 template <typename T, int D>
-[[kernel]] void sdpa_vector_2pass_2(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void sdpa_vector_2pass_2(
     const device T* partials [[buffer(0)]],
     const device float* sums [[buffer(1)]],
     const device float* maxs [[buffer(2)]],
