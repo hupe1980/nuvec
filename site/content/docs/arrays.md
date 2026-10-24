@@ -1,12 +1,39 @@
 +++
 title = "Arrays and lazy evaluation"
-description = "How nuvec arrays work: lazy graphs on unified memory, 14 dtypes, MLX type promotion, broadcasting, zero-copy views, indexing, reductions and asynchronous evaluation."
+description = "How nuvec arrays (tensors) work: lazy graphs on unified memory, 14 dtypes, MLX type promotion, broadcasting, zero-copy views, indexing, reductions and asynchronous evaluation."
 weight = 20
 [extra]
 group = "Core"
 +++
 
 An `Array` is a cheap handle to a node in a computation graph. Cloning it shares the node; operations return new handles immediately and compute nothing until a value is needed.
+
+## Arrays and tensors
+
+An `Array` is what PyTorch, Candle and Burn call a tensor: an n-dimensional value with a shape and a dtype. The name follows MLX, JAX and NumPy, whose model nuvec shares: gradients come from transforming functions, not from a tape on each value, and nothing runs until a result is read. Coming from PyTorch:
+
+| PyTorch | nuvec |
+|---|---|
+| `torch.tensor([[1., 2.]])` | `array![[1.0, 2.0]]` |
+| `w.requires_grad_()`, `loss(w).backward()`, `w.grad` | `grad(loss)(&w)?`, or `value_and_grad` for both |
+| `x.detach()` | `x.stop_gradient()` |
+| `with torch.no_grad():` | not needed: only the function given to `grad` is differentiated |
+| each operation runs at once | operations run at `eval`, `item` or `to_vec` |
+| `x.to("mps")`, `x.cpu()` | no copies (unified memory); choose where work runs with `with_stream(Device::cpu(), …)` |
+| `x.view(shape)`, `x.contiguous()` | `x.reshape(shape)` (a view when the layout allows), `x.contiguous()` |
+| `x.item()`, `x.tolist()` | `x.item::<f32>()?`, `x.to_vec::<f32>()?` |
+| `torch.func.vmap(f)`, `torch.compile(f)` | `vmap(f)`, `compile(f)` |
+
+```rust
+use nuvec::{Array, Result, array, grad};
+# fn main() -> Result<()> {
+let loss = |w: &Array| w.multiply(w).sum(..); // sum(w²)
+let w = array![1.0, 2.0];
+let g = grad(loss)(&w)?;                      // PyTorch: loss(w).backward(); w.grad
+assert_eq!(g.to_vec::<f32>()?, [2.0, 4.0]);
+# Ok(())
+# }
+```
 
 ## Creating arrays
 
@@ -61,7 +88,7 @@ assert_eq!(row.sum(..).item::<f32>().unwrap(), 38.0);
 
 ## Indexing and joining
 
-`x.i(...)` is MLX's `x[...]`: integers (negative from the end), ranges (`1..3`, `..=2`, `1..`), `..` for a whole axis, stepped ranges (`(0..6).step(2)`), `Ellipsis`, `NewAxis` and integer arrays (gathers), combined in a tuple. `x.at(...)` is MLX's `x.at[...]`: `set` and `add` return the updated array.
+`x.i(...)` is MLX's `x[...]`: integers (negative from the end), ranges (`1..3`, `..=2`, `1..`), `..` for a whole axis, stepped ranges (`(0..6).step(2)`), `Ellipsis`, `NewAxis` and integer arrays (gathers), combined in a tuple. When the rank is known only at run time, a slice or `Vec` of ranges indexes the leading axes, one range each (`x.i(&ranges)`, `x.slice_update(&u, &ranges)`). `x.at(...)` is MLX's `x.at[...]`: `set` and `add` return the updated array.
 
 ```rust
 # use nuvec::prelude::*;

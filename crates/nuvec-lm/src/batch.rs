@@ -801,8 +801,8 @@ mod tests {
                 solo(&model, prompts[1], 4),
                 "{name}: before the fault"
             );
-            // TODO: the one-row step after the fault equals the batched row bit for
-            // bit; until then the greedy tokens are compared.
+            // The one-row step after the fault can differ from the batched row in its
+            // low bits, so the greedy tokens are compared.
             for i in [0, 2] {
                 assert_eq!(
                     tokens[i],

@@ -2,7 +2,7 @@
 
 # ⚡ nuvec
 
-**MLX for Rust, written in Rust.** Lazy arrays, composable transforms and Metal kernels for Apple Silicon, with no bindings to MLX or any C/C++ library.
+**MLX for Rust, written in Rust.** Lazy n-dimensional arrays (tensors), composable transforms and Metal kernels for Apple Silicon, with no bindings to MLX or any C/C++ library.
 
 [![CI](https://github.com/hupe1980/nuvec/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/nuvec/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-hupe1980.github.io%2Fnuvec-blue)](https://hupe1980.github.io/nuvec)

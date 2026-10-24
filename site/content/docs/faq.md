@@ -1,6 +1,6 @@
 +++
 title = "FAQ"
-description = "Frequently asked questions about nuvec: how it relates to MLX, mlx-rs, Candle and Burn, hardware support, Python, stability and licensing."
+description = "Frequently asked questions about nuvec: how it relates to MLX, mlx-rs, Candle and Burn, why arrays and not tensors, hardware support, Python, stability and licensing."
 weight = 150
 [extra]
 group = "Project"
@@ -17,6 +17,10 @@ No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ 
 ## And with Candle or Burn?
 
 [Candle](https://github.com/huggingface/candle) is an eager tensor library; [Burn](https://github.com/tracel-ai/burn) is a portable deep-learning framework whose kernels are generated for many backends. nuvec targets one platform — Apple Silicon — and MLX's model: lazy evaluation, composable `grad`/`vmap`/`compile`, and MLX's hand-tuned Metal kernels.
+
+## Why `Array` and not `Tensor`?
+
+nuvec follows MLX, JAX and NumPy, where gradients come from transforming functions (`grad(f)`), not from `.backward()` on a value. The type is the same thing PyTorch calls a tensor; [Arrays and tensors](@/docs/arrays.md#arrays-and-tensors) maps PyTorch habits to nuvec.
 
 ## How fast is it?
 
@@ -36,7 +40,7 @@ Yes: autodiff covers every operation, models are structs with `#[derive(Module)]
 
 ## Is the API stable?
 
-Not yet. nuvec is pre-alpha (0.x): minor versions may change the API; patch versions do not. Semantic versioning covers every item reachable through `nuvec::` paths, and `nuvec-lm`; the other crates make no promise when depended on directly, so depend on `nuvec`. Changes are listed in the [changelog](https://github.com/hupe1980/nuvec/blob/main/CHANGELOG.md).
+Not yet. nuvec is pre-alpha (0.x): minor versions may break the API; patch versions only add to it. Semantic versioning covers every item reachable through `nuvec::` paths, and `nuvec-lm`; the other crates make no promise when depended on directly, so depend on `nuvec`. Changes are listed in the [changelog](https://github.com/hupe1980/nuvec/blob/main/CHANGELOG.md).
 
 ## What is the license?
 

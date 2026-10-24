@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -11,21 +11,21 @@ repository = "https://github.com/hupe1980/nuvec"
 homepage = "https://hupe1980.github.io/nuvec"
 readme = "README.md"
 authors = ["hupe1980"]
-keywords = ["mlx", "metal", "apple-silicon", "machine-learning", "llm"]
+keywords = ["mlx", "metal", "apple-silicon", "machine-learning", "tensor"]
 categories = ["science", "mathematics"]
 exclude = ["tests/fixtures"]
 
 [workspace.dependencies]
-nuvec = { path = "crates/nuvec", version = "0.4.0" }
-nuvec-core = { path = "crates/nuvec-core", version = "0.4.0" }
-nuvec-compile = { path = "crates/nuvec-compile", version = "0.4.0" }
-nuvec-cpu = { path = "crates/nuvec-cpu", version = "0.4.0" }
-nuvec-gpu = { path = "crates/nuvec-gpu", version = "0.4.0" }
-nuvec-io = { path = "crates/nuvec-io", version = "0.4.0" }
-nuvec-kernels = { path = "crates/nuvec-kernels", version = "0.4.0" }
-nuvec-lm = { path = "crates/nuvec-lm", version = "0.4.0" }
-nuvec-nn = { path = "crates/nuvec-nn", version = "0.4.0" }
-nuvec-macros = { path = "crates/nuvec-macros", version = "0.4.0" }
+nuvec = { path = "crates/nuvec", version = "0.4.1" }
+nuvec-core = { path = "crates/nuvec-core", version = "0.4.1" }
+nuvec-compile = { path = "crates/nuvec-compile", version = "0.4.1" }
+nuvec-cpu = { path = "crates/nuvec-cpu", version = "0.4.1" }
+nuvec-gpu = { path = "crates/nuvec-gpu", version = "0.4.1" }
+nuvec-io = { path = "crates/nuvec-io", version = "0.4.1" }
+nuvec-kernels = { path = "crates/nuvec-kernels", version = "0.4.1" }
+nuvec-lm = { path = "crates/nuvec-lm", version = "0.4.1" }
+nuvec-nn = { path = "crates/nuvec-nn", version = "0.4.1" }
+nuvec-macros = { path = "crates/nuvec-macros", version = "0.4.1" }
 
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2", "block2"] }

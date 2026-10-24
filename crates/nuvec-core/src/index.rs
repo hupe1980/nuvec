@@ -2,7 +2,8 @@
 //! `x.at[...].set(v)`).
 //!
 //! An index is an integer, a range (over `i32` or `usize`, optionally `.step(n)`), `..`,
-//! [`Ellipsis`], [`NewAxis`], an integer array, or a tuple of up to eight of these. Basic
+//! [`Ellipsis`], [`NewAxis`], an integer array, or a tuple of up to eight of these. A rank
+//! known only at run time takes a slice or `Vec` of ranges, one per leading axis. Basic
 //! indices (no arrays) give views; integer arrays gather, following MLX's (NumPy's) rules for
 //! broadcasting the index arrays and placing their dimensions.
 
@@ -123,10 +124,12 @@ bounds! {
 /// An index of [`Array::i`] and [`Array::at`]: an `i32` or `usize`, a range over either
 /// (`1..3`, `1..`, `..3`, `1..=2`, `..=2`, with an optional `.step(n)`), `..`, [`Ellipsis`],
 /// [`NewAxis`], an integer index array (`&Array` or `Array`), or a tuple of up to eight of
-/// these.
+/// these. For a rank known only at run time, a slice or `Vec` of ranges indexes the leading
+/// axes, one range each (`&[1..3, 0..2]`); integers are not accepted there, so a list is
+/// never mistaken for a gather.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not an index",
-    label = "expected an integer, a range (`1..3`, `..=2`, `(0..6).step(2)`), `..`, `Ellipsis`, `NewAxis`, an index array (`&idx`) or a tuple of these"
+    label = "expected an integer, a range (`1..3`, `..=2`, `(0..6).step(2)`), `..`, `Ellipsis`, `NewAxis`, an index array (`&idx`), a tuple of these, or a slice of ranges"
 )]
 pub trait ArrayIndex: sealed::Sealed {
     #[doc(hidden)]
@@ -241,6 +244,23 @@ macro_rules! tuple_index {
         }
     };
 }
+
+/// One range per leading axis: an index whose rank is known only at run time.
+macro_rules! ranges_index {
+    ($($t:ty),*) => {$(
+        impl<R: Bounds> sealed::Sealed for $t {}
+        impl<R: Bounds> ArrayIndex for $t {
+            fn index_items(self, out: &mut SmallVec<[IndexItem; 4]>) {
+                for r in self.iter() {
+                    let (start, stop) = r.bounds();
+                    out.push(slice_item(start, stop, 1));
+                }
+            }
+        }
+    )*};
+}
+
+ranges_index!(&[R], Vec<R>, &Vec<R>);
 
 tuple_index!(A);
 tuple_index!(A B);

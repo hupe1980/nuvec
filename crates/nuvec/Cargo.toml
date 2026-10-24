@@ -1,6 +1,6 @@
 [package]
 name = "nuvec"
-description = "Pure-Rust array framework for Apple Silicon in the spirit of MLX: lazy arrays, unified memory, composable transforms"
+description = "Pure-Rust array framework for Apple Silicon in the spirit of MLX: lazy n-dimensional arrays (tensors), unified memory, composable transforms"
 exclude.workspace = true
 version.workspace = true
 edition.workspace = true

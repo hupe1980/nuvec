@@ -52,3 +52,6 @@ rustc-ice-*.txt
 __pycache__/
 *.pyc
 /site/public
+
+# Feedback notes for downstream projects (handed over, not part of nuvec).
+/FEEDBACK*.md

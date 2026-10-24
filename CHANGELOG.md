@@ -6,6 +6,12 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-24
+
+### Added
+
+- Indexes for a rank known only at run time: a slice or `Vec` of ranges, one per leading axis, for `i`, `at` and `slice_update`.
+
 ## [0.4.0] - 2026-10-23
 
 A new array API (operations are methods that return arrays; errors are sticky and located),
@@ -240,7 +246,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/hupe1980/nuvec/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/hupe1980/nuvec/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hupe1980/nuvec/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/nuvec/compare/v0.1.0...v0.2.0

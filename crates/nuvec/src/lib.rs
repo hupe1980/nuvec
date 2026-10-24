@@ -1,6 +1,6 @@
 //! A pure-Rust array framework for Apple Silicon in the spirit of
-//! [MLX](https://github.com/ml-explore/mlx): lazy arrays on unified memory and
-//! composable function transforms, with no bindings to any C/C++ library.
+//! [MLX](https://github.com/ml-explore/mlx): lazy n-dimensional arrays (tensors) on unified
+//! memory and composable function transforms, with no bindings to any C/C++ library.
 //!
 //! ```
 //! use nuvec::prelude::*;

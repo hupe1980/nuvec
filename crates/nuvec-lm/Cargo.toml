@@ -10,7 +10,7 @@ repository.workspace = true
 authors.workspace = true
 homepage.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["mlx", "metal", "apple-silicon", "llm", "inference"]
 categories.workspace = true
 
 [dependencies]

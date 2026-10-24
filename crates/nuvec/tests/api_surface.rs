@@ -319,6 +319,9 @@ mod spec_062 {
             index::<(i32, i32, i32, i32, i32, i32, i32, i32)>();
             index::<Array>();
             index::<nuvec::Stepped<std::ops::Range<usize>>>();
+            index::<&[std::ops::Range<i32>]>();
+            index::<Vec<std::ops::RangeFull>>();
+            index::<&Vec<std::ops::Range<usize>>>();
         }
 
         const SLICE_UPDATE: fn(&Array, &Array) -> Array = |a, u| a.slice_update(u, (.., 0..2));

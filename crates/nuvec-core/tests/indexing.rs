@@ -210,6 +210,40 @@ fn basic_indices_are_views() {
     });
 }
 
+/// A slice or `Vec` of ranges (a rank known only at run time) indexes, updates and views as
+/// the tuple of the same ranges.
+#[test]
+fn ranges_of_run_time_rank_match_tuples() {
+    with_stream(Device::cpu(), || {
+        let x = ops::arange(0, 24, 1).reshape([2, 3, 4]);
+        let u = ops::full([1, 2, 2], -1);
+        let values = |a: &Array| a.to_vec::<i32>().unwrap();
+        let ranges: Vec<std::ops::Range<i32>> = vec![1..2, 1..3, 2..4];
+        let tuple = (1..2, 1..3, 2..4);
+
+        assert_eq!(values(&x.i(&ranges)), values(&x.i(tuple.clone())));
+        assert_eq!(values(&x.i(&ranges[..2])), values(&x.i((1..2, 1..3))));
+        assert_eq!(values(&x.i(ranges.clone())), values(&x.i(tuple.clone())));
+        assert_eq!(values(&x.i(&[.., ..][..])), values(&x));
+        let empty: &[std::ops::Range<i32>] = &[];
+        assert_eq!(values(&x.i(empty)), values(&x));
+        assert_eq!(
+            values(&x.slice_update(&u, &ranges)),
+            values(&x.slice_update(&u, tuple.clone()))
+        );
+        assert_eq!(
+            values(&x.clone().at(&ranges).set(7)),
+            values(&x.clone().at(tuple).set(7))
+        );
+        // A view: one slice node over `x`.
+        let view = x.i(&ranges);
+        assert!(matches!(
+            graph::primitive(&view),
+            Some(graph::Primitive::Slice { .. })
+        ));
+    });
+}
+
 #[test]
 fn invalid_indices_fail_without_panicking() {
     let x = ops::zeros([4, 5], DType::F32);

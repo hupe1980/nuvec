@@ -1,6 +1,6 @@
 base_url = "https://hupe1980.github.io/nuvec"
 title = "nuvec — MLX for Rust: lazy arrays, autodiff and Metal kernels on Apple Silicon"
-description = "nuvec is a pure-Rust array and machine-learning framework for Apple Silicon in the spirit of MLX: lazy arrays on unified memory, grad, vmap and compile, MLX's Metal kernels, and an LLM runtime as fast as mlx-lm."
+description = "nuvec is a pure-Rust array and machine-learning framework for Apple Silicon in the spirit of MLX: lazy n-dimensional arrays (tensors) on unified memory, grad, vmap and compile, MLX's Metal kernels, and an LLM runtime as fast as mlx-lm."
 default_language = "en"
 compile_sass = true
 minify_html = true
