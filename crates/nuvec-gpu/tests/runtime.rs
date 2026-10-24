@@ -8,6 +8,17 @@ use nuvec_gpu::{Arg, Buffer, Device, GpuError};
 /// would only be reported, so tests record errors here and check them at the end).
 static GPU_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// Held by the tests that keep the GPU or its compiler busy for long, so they do not overlap:
+/// on virtualised GPUs (CI) a command buffer waiting on its fence behind the others' work can
+/// exceed the GPU watchdog.
+static LONG_RUNNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn long_running() -> std::sync::MutexGuard<'static, ()> {
+    LONG_RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A completion handler that records a GPU error for [`assert_gpu_ok`].
 fn record_failure(result: nuvec_gpu::Result<()>) {
     if let Err(e) = result {
@@ -592,6 +603,7 @@ fn same_must_refer_to_a_written_argument() {
 
 #[test]
 fn wait_returns_after_the_completion_has_run() {
+    let _long = long_running();
     let Some(device) = device() else { return };
     let a = device.buffer_from(&f32s(&[1.0; 64])).unwrap();
     let mut out = device.new_buffer(64 * 4).unwrap();
@@ -738,6 +750,7 @@ fn slow_source(name: &str, count: usize, salt: u128) -> String {
 #[test]
 fn compiling_does_not_block_cached_pipelines() {
     use std::time::{Duration, Instant};
+    let _long = long_running();
     let Some(device) = device() else { return };
     // Loaded and cached before the slow compilation starts.
     device.pipeline("nuvec_add_f32").unwrap();
@@ -818,6 +831,7 @@ fn source_pipelines_have_their_own_namespace_and_language_version() {
 /// reads the other's in-flight result through its fence.
 #[test]
 fn ordered_command_buffers_from_two_threads_stay_ordered() {
+    let _long = long_running();
     let Some(device) = device() else { return };
     let n = 1024;
     let steps = 4_000;
@@ -833,10 +847,10 @@ fn ordered_command_buffers_from_two_threads_stay_ordered() {
             let failure = failure.clone();
             std::thread::spawn(move || {
                 for _ in 0..steps / 2 {
-                    // A short chain of dependent command buffers in flight: each waits on its
-                    // predecessor's fence on the GPU, and slow (virtualised) GPUs time out
-                    // long chains.
-                    device.wait_for_capacity(8);
+                    // At most one predecessor in flight: each command buffer still reads an
+                    // in-flight result through its fence, but never waits behind a chain
+                    // (virtualised GPUs time out long waits).
+                    device.wait_for_capacity(2);
                     let mut acc = acc.lock().unwrap();
                     let mut next = device.new_gpu_buffer(n * 4).unwrap();
                     let mut cmd = device.ordered_command_buffer().unwrap();
