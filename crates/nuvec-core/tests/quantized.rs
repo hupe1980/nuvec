@@ -451,6 +451,16 @@ mod gpu {
             (&[2, 3, 128], &[2, 24], 128, true, 4, 64),
             (&[2, 6, 32], &[2, 32], 64, false, 8, 32),
             (&[3, 20, 128], &[24], 128, true, 2, 32),
+            // Small models' projections (hidden size 64, K of 32 or 64): decode, few rows,
+            // prefill.
+            (&[1, 64], &[32], 64, true, 4, 32),
+            (&[2, 64], &[64], 64, true, 4, 64),
+            (&[3, 64], &[64], 64, true, 4, 64),
+            (&[5, 64], &[32], 64, true, 4, 32),
+            (&[16, 64], &[64], 64, true, 4, 64),
+            (&[24, 64], &[96], 64, true, 4, 32),
+            (&[2, 32], &[64], 32, true, 4, 32),
+            (&[5, 32], &[64], 32, true, 4, 32),
         ];
         for &(xs, wb, cols, t, bits, gs) in cases {
             for dtype in [DType::F32, DType::F16, DType::BF16] {
@@ -672,13 +682,25 @@ mod gather_gpu {
             (8, 64, 256, 1, 100, true), // grouped, sorted rows
             (8, 64, 256, 1, 20, true),  // sorted, too few rows per expert to group (MLX's rule)
             (16, 48, 192, 1, 70, true), // grouped, unaligned N
+            // Small mixture-of-experts layers (top-2 of 8 experts, hidden size 64): the
+            // gate/up and down products of a decode step and of a sorted prefill.
+            (8, 64, 64, 1, 2, false),
+            (8, 32, 64, 1, 2, false),
+            (8, 64, 32, 1, 2, false),
+            (8, 64, 64, 1, 40, true),
+            (8, 32, 64, 1, 40, true),
+            (8, 64, 32, 1, 40, true),
         ];
         for &(e, n, k, m, batches, sorted) in cases {
             for (dtype, gs, bits) in [
                 (DType::F32, 32, 4),
                 (DType::BF16, 64, 4),
                 (DType::F16, 32, 8),
+                (DType::BF16, 32, 4),
             ] {
+                if k % gs != 0 {
+                    continue;
+                }
                 let w = random(&mut rng, &[e, n, k], dtype);
                 let (wq, s, b) = parts(aq(&w, gs, bits));
                 let x = random(&mut rng, &[batches, m, k], dtype);

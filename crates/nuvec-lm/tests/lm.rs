@@ -120,9 +120,17 @@ fn fp_quantized_models_match_mlx_lm() {
 /// affine layout under mlx-lm (which loads the AWQ files to the same logits itself).
 #[test]
 fn awq_and_gptq_checkpoints_match_mlx_lm() {
+    // Bit for bit on the GPU the logits were recorded on (an M4 Pro); other generations
+    // round their kernels' sums differently (0.07% of the largest logit on an M1).
+    let tol = if recorded_gpu() { 1e-6 } else { 2e-3 };
     for name in ["qwen3_awq", "llama_gptq", "qwen3_gptq8_v2"] {
-        check(name, 1e-6);
+        check(name, tol);
     }
+}
+
+/// Whether this is the GPU architecture the fixtures' mlx-lm outputs were recorded on.
+fn recorded_gpu() -> bool {
+    nuvec::gpu::Device::shared().is_some_and(|d| d.info().architecture == "applegpu_g16s")
 }
 
 /// Gemma 4's model types (`gemma4`, `gemma4_text`, `gemma4_unified`, `gemma4_unified_text`)
