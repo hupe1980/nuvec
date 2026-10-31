@@ -44,7 +44,7 @@ The memory limit bounds `active + mapped` and refuses with `OutOfMemory`; MLX tr
 
 ## Wired memory
 
-`set_wired_limit` keeps buffers resident while the GPU runs, through a Metal **residency set** attached to the command queue, instead of making them resident per command buffer (which can page memory back in under pressure). New buffers and memory-mapped checkpoints join the set up to the limit; raising the limit wires waiting buffers, lowering it unwires them. Mapped checkpoints are not in `active` or `peak` (which count the allocator's buffers): `mapped`, `wired_mapped`, `active_with_mapped` and `peak_with_mapped` include them. It needs macOS 15 and a Metal 3 GPU (`can_wire`), and the default is 0, as in MLX.
+`set_wired_limit` keeps buffers resident while the GPU runs, through a Metal **residency set** attached to the command queue. New buffers and memory-mapped checkpoints join the set up to the limit; raising the limit wires waiting buffers, lowering it unwires them. Mapped checkpoints are not in `active` or `peak` (which count the allocator's buffers): `mapped`, `wired_mapped`, `active_with_mapped` and `peak_with_mapped` include them. It needs macOS 15 and a Metal 3 GPU (`can_wire`), and the default is 0, as in MLX.
 
 ```rust,no_run
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,14 +58,12 @@ gpu.set_wired_limit(gpu.info().recommended_working_set as usize)?;
 
 ## Neural Accelerators (M5)
 
-M5-class GPUs have a Neural Accelerator in every GPU core, reached through Metal 4's TensorOps (`matmul2d` from Metal Performance Primitives). nuvec ships kernels for them in a second kernel library for macOS 26.2 and later, so the baseline still runs on macOS 15: dense GEMM (64 × 64 tiles, thin tiles of 16 or 32 rows or columns, and split K), affine 2/4/8-bit quantized products, and the sorted mixture-of-experts gather.
+M5-class GPUs have a Neural Accelerator in every GPU core, reached through Metal 4's TensorOps (`matmul2d` from Metal Performance Primitives). nuvec ships kernels for them in a second kernel library for macOS 26.2 and later; the baseline still runs on macOS 15. They cover dense GEMM (64 × 64 tiles, thin tiles of 16 or 32 rows or columns, and split K), affine 2/4/8-bit quantized products, and the sorted mixture-of-experts gather.
 
 - `NUVEC_NAX=auto` (default), `on` or `off`; `nuvec::gpu::Device::nax()` reports whether they run and why not.
-- Under `auto` they stay **off** until someone measures them on an M5: nobody on the project has one yet. An eligible M5 reports `Off(Unmeasured)`.
-- `NUVEC_NAX=on` forces them on any GPU with TensorOps (every Apple GPU on macOS 26.2). On earlier GPUs they run on the ordinary GPU cores at about the speed of the SIMD kernels, which is how they are tested.
-- The kernels let `matmul2d` load its operands as tensors and read results through each element's reported coordinates, so they do not depend on the GPU's register layout (MLX's NAX kernels hard-code the M5's, which differs on earlier GPUs).
-
-**Have an M5?** `just nax-report` checks correctness and benchmarks nuvec's NAX kernels against its SIMD kernels and MLX's own NAX path, and writes a report to attach to an issue. That measurement is what turns `auto` on.
+- Under `auto` they are off: they have not been measured on an M5, and an eligible M5 reports `Off(Unmeasured)`.
+- `NUVEC_NAX=on` forces them on any GPU with TensorOps (every Apple GPU on macOS 26.2). On earlier GPUs they run on the ordinary GPU cores at about the speed of the SIMD kernels.
+- `just nax-report` checks their correctness, benchmarks them against nuvec's SIMD kernels and MLX's NAX path, and writes a report.
 
 ## Profiling
 
@@ -83,6 +81,4 @@ GPU time, 961 prompt tokens: 823.0 ms
    24.24 ms   2.9%    336  nuvec_copy_into_128_g3
 ```
 
-In this mode every dispatch runs alone and is waited for, so kernels never overlap and each total is that kernel's own cost. `NUVEC_PROFILE=shapes` also splits totals by grid size. Your own programs can read the table with `nuvec::gpu::profile::report()`.
-
-Because the GPU idles between dispatches in this mode, its clocks drop and absolute times are inflated; use the shares to find hotspots and the benchmarks to measure speed.
+In this mode every dispatch runs alone and is waited for, so each total is that kernel's own cost. The GPU idles between dispatches and its clocks drop, so absolute times are inflated: use the shares to find hotspots and the benchmarks to measure speed. `NUVEC_PROFILE=shapes` also splits totals by grid size; `nuvec::gpu::profile::report()` returns the table to your program.

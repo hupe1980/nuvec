@@ -3,8 +3,9 @@
 //! Work is committed in chunks without waiting; an evaluation's chunks are ordered on the GPU
 //! by a timeline. Outputs of encoded kernels stay *pending* (exposed to later GPU work as
 //! in-flight data, not yet in the nodes' slots) until their chunk has completed; completion
-//! publishes them, chunk by chunk in commit order, so data in a slot is always complete and a failure
-//! marks the outputs of its chunk and of every later chunk of the evaluation as failed.
+//! publishes them, chunk by chunk in commit order, so data in a slot is always complete,
+//! and a failure marks the outputs of its chunk and of every later chunk of the evaluation
+//! as failed.
 //! Primitives without a GPU kernel fall back to the CPU after [`GpuEval::flush`], which waits
 //! for this evaluation's outstanding work (unified memory needs no copies).
 

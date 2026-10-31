@@ -18,6 +18,7 @@ group = "Project"
 | `nuvec-kernels` | Metal kernel sources and the precompiled library |
 | `nuvec-cpu` | Pure-Rust CPU kernels over typed slices |
 | `nuvec-io` | safetensors, npy, IDX; memory-mapped files |
+| `nuvec-distributed` | MLX's TCP ring backend for `nuvec::distributed` |
 | `nuvec-nn` | Modules (every tree is one), layers, losses, optimizers |
 | `nuvec-lm` | Models, tokenizer, KV cache, generation, speculative decoding |
 
@@ -44,5 +45,5 @@ The allocator rounds sizes into buckets, caches freed buffers, evicts least rece
 ## Design choices
 
 - **MLX semantics, Rust idioms.** Same promotion table, broadcasting, transforms and kernels as MLX; failed arrays and `Result` at evaluation boundaries instead of exceptions, ownership instead of reference-count heuristics, `Send + Sync` arrays.
-- **Ported kernels first.** MLX's Metal kernels are the reference for speed; nuvec ports them, keeps their attribution, and tests against MLX. Its own kernels cover what MLX does not fuse or tile for (residual norms, norm + RoPE + cache writes, few-row quantized products).
+- **Ported kernels.** MLX's Metal kernels are ported with their attribution and tested against MLX. nuvec's own kernels cover what MLX does not fuse (residual norms, norm + RoPE + cache writes, few-row quantized products).
 - **No C++.** Metal is reached through Apple's system frameworks via [`objc2-metal`](https://crates.io/crates/objc2-metal); the CPU path is pure Rust.

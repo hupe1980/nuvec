@@ -64,9 +64,8 @@ pub enum NaxReason {
     Generation,
     /// This build has no NAX kernel library (an SDK older than 26.2 or no Metal).
     NoLibrary,
-    /// An eligible GPU, but nobody has measured nuvec's NAX kernels on one yet: `auto`
-    /// keeps them off until an M5 measurement is recorded (D-078). `NUVEC_NAX=on` forces
-    /// them.
+    /// An eligible GPU, but nuvec's NAX kernels have no recorded M5 measurement, so `auto`
+    /// keeps them off. `NUVEC_NAX=on` forces them.
     Unmeasured,
     /// A NAX pipeline failed to build; the existing kernels are used from then on.
     PipelineError,
@@ -132,7 +131,7 @@ pub(crate) fn nax_eligible(generation: Option<u32>, class: Option<char>, os: (u3
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// The NAX decision: the override, the OS (TensorOps need macOS 26.2 even when forced),
-/// the library, then MLX's rule, with `auto` off on eligible GPUs until measured.
+/// the library, then MLX's rule, with `auto` off on eligible GPUs (no recorded M5 measurement).
 pub(crate) fn nax_status(
     generation: Option<u32>,
     class: Option<char>,

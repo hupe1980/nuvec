@@ -18,20 +18,20 @@
 
 nuvec brings [MLX](https://github.com/ml-explore/mlx)'s programming model to Rust: arrays that are evaluated lazily on unified memory, `grad`/`vjp`/`jvp`/`vmap`/`compile` that compose freely, and the Metal kernels that make MLX fast, ported and tested against MLX itself. On top sits an LLM runtime that loads mlx-community checkpoints and generates as fast as mlx-lm.
 
-> 🚧 **Pre-alpha.** The API can still change between releases. Everything listed below works today and is covered by tests.
+> 🚧 **Pre-alpha.** The API can change between releases.
 
 ## ✨ Highlights
 
-- 🦀 **Pure Rust.** No C++ build, no FFI to MLX. Metal is reached through Apple's system frameworks ([`objc2-metal`](https://crates.io/crates/objc2-metal)); `unsafe` stays in the Metal runtime, nuvec-core's three kernel-dispatch calls and one CPU matrix-product call, and the other crates contain none.
-- 💤 **Lazy arrays on unified memory.** Operations build a graph; nothing runs until you read a result. The CPU and GPU share memory, so there are no copies between them.
-- 🔁 **Composable transforms.** `grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`, `checkpoint` and `compile` (shaped or shapeless) nest in any order, through complex numbers too, over tuples, maps and your own structs (gradients come back with the same shape).
+- 🦀 **Pure Rust.** No C++ build, no FFI to MLX. Metal goes through [`objc2-metal`](https://crates.io/crates/objc2-metal). `unsafe` is confined to the Metal runtime, three kernel dispatches in nuvec-core and the CPU matrix product.
+- 💤 **Lazy arrays on unified memory.** Operations build a graph that runs when you read a result. CPU and GPU share memory, with no copies between them.
+- 🔁 **Composable transforms.** `grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`, `checkpoint` and `compile` (shaped or shapeless) nest in any order, over complex numbers, tuples, maps and your own structs.
 - 🧠 **Models as plain structs.** `#[derive(Module)]` gives MLX's parameter names; optimizers, freezing, LoRA, `save_weights` and a compiled training step (`compile_mut`) work on the model's own type.
-- 🔥 **MLX's Metal kernels.** GEMM and GEMV, quantized products (affine 1, 2, 3, 4, 5, 6 and 8 bits; MXFP4, MXFP8, NVFP4), fused attention, RMSNorm, RoPE, sort, scan, mixture-of-experts gather kernels, plus your own kernels from source (`fast::MetalKernel`). Metal 4 TensorOps kernels for M5 Neural Accelerators ship off until measured on an M5 (`NUVEC_NAX=on` forces them).
+- 🔥 **MLX's Metal kernels.** GEMM and GEMV, quantized products (affine 1, 2, 3, 4, 5, 6 and 8 bits; MXFP4, MXFP8, NVFP4), fused attention, RMSNorm, RoPE, sort, scan, mixture-of-experts gather kernels, and your own kernels from source (`fast::MetalKernel`). Metal 4 TensorOps kernels for M5 Neural Accelerators are opt-in (`NUVEC_NAX=on`).
 - 🌐 **Several Macs.** MLX's collectives (`all_sum`, `all_gather`, `send`/`recv`, …) as lazy, differentiable array operations over MLX's TCP ring, with tensor-parallel layers.
-- 🧪 **Tested against MLX.** Nearly a thousand cases replay results recorded from real MLX, with random layouts, gradients and every dtype.
-- 🤖 **LLM runtime.** Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4, dense, hybrid (Gated DeltaNet) or mixture-of-experts, straight from mlx-community or Hugging Face checkpoints; speculative decoding (MTP heads, prompt lookup, SuffixDecoding; greedy or sampled) and batched serving included.
-- 💾 **Memory-mapped weights.** Checkpoints whose tensors are aligned (files nuvec writes are) are mapped and handed to the GPU without a copy; mlx-community checkpoints have unpadded headers and are read once at load, in parallel, using no more memory than MLX.
-- ⚙️ **An engine for servers.** Attention plans and score-memory caps, one peak-memory metric comparable with MLX's, a memory limit that refuses instead of swapping, checkpoint footprints before loading, batch-invariant serving on request and documented determinism (used, for example, by the [mrun](https://github.com/hupe1980/mrun) inference server).
+- 🧪 **Tested against MLX.** Over a thousand cases replay results recorded from MLX, with random layouts, gradients and every dtype.
+- 🤖 **LLM runtime.** Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 (dense, hybrid Gated DeltaNet, mixture-of-experts) from mlx-community or Hugging Face checkpoints. Speculative decoding (MTP heads, prompt lookup, SuffixDecoding) and batched serving.
+- 💾 **Memory-mapped weights.** Aligned checkpoints (such as those nuvec writes) go to the GPU without a copy. Unaligned ones (mlx-community's) are read once, in parallel, with no more memory than MLX.
+- ⚙️ **Built for servers.** Attention plans and score-memory caps, a memory limit that refuses instead of swapping, checkpoint footprints before loading, batch-invariant serving and documented determinism. Used by the [mrun](https://github.com/hupe1980/mrun) inference server.
 
 ## 📊 Performance
 
@@ -52,10 +52,11 @@ nuvec-lm against mlx-lm 0.32.2 with the same token ids on an Apple M4 Pro (48 GB
 | Gemma 4 E4B 4-bit | dense, sliding window | 0.98× / 1.00× / 1.00× | 1.07× / 1.07× | 1.02× |
 | Gemma 4 26B-A4B 4-bit | MoE, sliding window | 1.01× / 1.01× / 1.01× | 1.06× / 1.08× | 0.99× |
 
-- **Geometric means:** decode 1.01×, time to first token 1.02× at 2K and 32K tokens, peak memory 1.02× (slightly below mlx-lm's), warm load to the first token 1.80× faster, 1 / 4 / 8 concurrent requests 1.01× / 1.00× / 1.00×.
-- **Longest contexts:** Qwen3.6-35B-A3B's first token at 64K tokens is 0.98×; at 261,952 tokens nuvec prefills it in 20.4 minutes, where mlx-lm runs out of GPU memory on the same 48 GB machine.
+- **Geometric means:** decode 1.01×, time to first token 1.02× at 2K and 32K tokens, peak memory 1.02× (nuvec uses slightly less), warm load to the first token 1.80×, 1 / 4 / 8 concurrent requests 1.01× / 1.00× / 1.00×.
+- **Longest contexts:** Qwen3.6-35B-A3B's first token at 64K tokens is 0.98×. At 261,952 tokens nuvec prefills it in 20.4 minutes; mlx-lm runs out of GPU memory on the same machine.
+- **Speculative decoding** with the model's multi-token-prediction head: Qwen3.8-27B 1.66× and Qwen3.5-9B 1.36× faster than plain decoding on natural text, with identical output.
 
-The full record (JSON) and the method are on the [benchmarks](https://hupe1980.github.io/nuvec/docs/benchmarks/) page. Speculative decoding with the model's own multi-token-prediction head decodes Qwen3.8-27B 1.66× and Qwen3.5-9B 1.36× faster on natural text, with output identical to plain decoding.
+The full record (JSON) and method are on the [benchmarks](https://hupe1980.github.io/nuvec/docs/benchmarks/) page.
 
 ## 🚀 Quick start
 
@@ -105,7 +106,7 @@ fn main() -> Result<()> {
 }
 ```
 
-Operations are methods that chain and return arrays, never `Result`. An invalid call gives a *failed array* that remembers the operation, where you called it and why; everything computed from it fails the same way, and the error surfaces at a boundary: `check()?` (no evaluation), `eval()?`, `item()?`, `to_vec()?`, I/O and transforms. Arrays come from `array![...]`, `From` (Rust numbers, arrays, `Vec`s and iterators) and `Array::from_slice(&data, shape)`; MLX's free functions (`zeros`, `arange`, `concatenate`, …) are in `nuvec::ops`.
+Operations return arrays, never `Result`. An invalid call gives a *failed array* that records the operation, call site and reason; anything computed from it fails too. The error surfaces at `check()?`, `eval()?`, `item()?`, `to_vec()?`, I/O and transforms.
 
 **Train a model: a struct with `#[derive(Module)]`, a compiled step over `(model, optimizer)`:**
 
@@ -154,7 +155,7 @@ fn main() -> nuvec::Result<()> {
 }
 ```
 
-Or from the command line (the model must be in the local Hugging Face cache, e.g. `hf download mlx-community/Qwen3-8B-4bit`):
+From the command line (after `hf download mlx-community/Qwen3-8B-4bit`):
 
 ```sh
 cargo run --release -p nuvec-lm --example generate -- \
@@ -198,15 +199,15 @@ git clone https://github.com/hupe1980/nuvec && cd nuvec
 just ci        # CI's gates: fmt, clippy, tests, docs, Miri, cargo-deny, kernel and hygiene checks
 ```
 
-Without the Metal toolchain the build still succeeds: the shader sources are embedded and compiled at runtime (`NUVEC_METALLIB=off` selects this mode explicitly).
+Without the Metal toolchain, kernels are compiled from embedded sources at runtime (`NUVEC_METALLIB=off` forces this).
 
 ### 🧪 Against MLX
 
-Python is not needed to build or test: the fixtures recorded from MLX are checked in. With [uv](https://docs.astral.sh/uv/) installed you can re-record them and compare speed on your own machine:
+Building and testing need no Python: the MLX fixtures are checked in. With [uv](https://docs.astral.sh/uv/) you can re-record them and benchmark against MLX:
 
 | Command | Compares |
 |---|---|
-| `just bench-parity` | nuvec-lm vs mlx-lm and vs the previous release, one model per architecture (about 45 minutes; fails on a confirmed regression); `--tier full` for the whole roster and long contexts (a JSON record; the table above) |
+| `just bench-parity` | nuvec-lm vs mlx-lm and the previous release, one model per architecture (about 45 minutes); `--tier full` for all models and long contexts (the table above) |
 | `just bench-gemm` / `bench-quant` / `bench-fast` | matrix products, quantized products, fused kernels |
 | `just bench-compile`, `just bench-load`, `just mnist` | compiled functions, checkpoint loading, MNIST training |
 | `just fixtures`, `lm-fixtures`, `nn-fixtures`, `io-fixtures` | re-record the reference results |
@@ -215,7 +216,7 @@ Python is not needed to build or test: the fixtures recorded from MLX are checke
 
 ## 🧭 Stability
 
-nuvec is 0.x: a minor release may break the API, and the [changelog](CHANGELOG.md) lists every break with a migration table. Semver covers every item reachable through `nuvec::` paths and `nuvec-lm`; the pinned items are listed in [`crates/nuvec/tests/api_surface.rs`](crates/nuvec/tests/api_surface.rs). The sub-crates (`nuvec-core`, `nuvec-gpu`, …) make no promise when depended on directly. The minimum supported Rust version is 1.99 (`rust-version` in `Cargo.toml`); raising it is a minor release.
+nuvec is 0.x: a minor release may break the API; the [changelog](CHANGELOG.md) lists every break. Semver covers items reachable through `nuvec::` paths and `nuvec-lm` (pinned in [`crates/nuvec/tests/api_surface.rs`](crates/nuvec/tests/api_surface.rs)); the sub-crates (`nuvec-core`, `nuvec-gpu`, …) make no promise when used directly. MSRV is Rust 1.99; raising it is a minor release.
 
 ## 📄 License
 

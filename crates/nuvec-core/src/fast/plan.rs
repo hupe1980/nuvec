@@ -273,16 +273,14 @@ fn tiled_uncapped(key: &RouteKey) -> bool {
     let (lq, lk) = (key.lq, key.lk);
     let causal = key.mask == MaskKind::Causal;
     // MLX: the composition is faster for these head sizes, except long causal
-    // self-attention in half precision. Measured on an M4 Pro (re-measured with long-prefill
-    // chunks, `just bench-attention-route`), the tiled kernel is faster for causal chunks
-    // of 1,024 queries or more over up to 4,096 keys (2,048 over 4,096: 19.9 ms against
-    // 23.5) and ties for 2,048 queries over 8,192 keys; the composition is faster beyond
-    // (1,024 over 8,192: 23.7 ms against 24.9) and for shorter chunks, up to 8 GiB of
-    // scores (2,048 queries over 64K keys: 400 ms against 416; over 131K, 8 GiB: 813
-    // against 841, MLX 809). Beyond, the scores no longer fit beside a large model: MLX's
-    // composition swaps (Qwen3.6-35B-A3B over 262K tokens: 44 GB, 1,572 s on 48 GB) and
-    // nuvec's ran out of memory, so the tiled kernel runs (a fixed size, so results do not
-    // depend on the machine).
+    // self-attention in half precision. On an M4 Pro (`just bench-attention-route`), the
+    // tiled kernel is faster for causal chunks of 1,024 queries or more over up to 4,096
+    // keys (2,048 over 4,096: 19.9 ms against 23.5) and ties for 2,048 queries over 8,192
+    // keys; the composition is faster beyond (1,024 over 8,192: 23.7 ms against 24.9) and
+    // for shorter chunks, up to 8 GiB of scores (2,048 queries over 131K keys: 813 ms
+    // against 841, MLX 809). Above 8 GiB the scores do not fit beside a large model (MLX's
+    // composition swaps: Qwen3.6-35B-A3B over 262K tokens, 44 GB on a 48 GB Mac), so the
+    // tiled kernel runs. The bound is fixed, so results do not depend on the machine.
     let scores = key.b * key.hq * lq * lk * key.dtype.size();
     let huge = scores > 8 << 30;
     let slow = match key.d {

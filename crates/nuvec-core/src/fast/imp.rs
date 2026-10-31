@@ -26,7 +26,8 @@ pub enum FastOp {
         /// `f32::to_bits` of epsilon.
         eps: u32,
     },
-    /// `(x, r, w)`: `h = x + r` and [`FastOp::RmsNorm`] of `h` (see [`add_rms_norm`](crate::fast::add_rms_norm)).
+    /// `(x, r, w)`: `h = x + r` and [`FastOp::RmsNorm`] of `h` (see
+    /// [`add_rms_norm`](crate::fast::add_rms_norm)).
     AddRmsNorm {
         /// `f32::to_bits` of epsilon.
         eps: u32,
@@ -60,9 +61,10 @@ pub enum FastOp {
         /// Rotate forwards (`false`: the inverse rotation, the gradient).
         forward: bool,
     },
-    /// `([cache,] x, w[, freqs])`: [`norm_rope`](crate::fast::norm_rope): each `[b, h, l]` row of `x` RMS-normalised
-    /// (with `eps`) and rotated as [`FastOp::Rope`] at position `offset + l`; written into
-    /// `cache` at the same positions, or returned as a new `[B, H, L, D]` array.
+    /// `([cache,] x, w[, freqs])`: [`norm_rope`](crate::fast::norm_rope): each `[b, h, l]`
+    /// row of `x` RMS-normalised (with `eps`) and rotated as [`FastOp::Rope`] at position
+    /// `offset + l`; written into `cache` at the same positions, or returned as a new
+    /// `[B, H, L, D]` array.
     NormRope {
         /// `f32::to_bits` of epsilon, or no normalisation.
         eps: Option<u32>,
@@ -139,14 +141,15 @@ pub enum FastOp {
         /// The one-key-per-step variant of the two-pass kernel.
         tk1: bool,
     },
-    /// `(q, k, v, g, beta, state)`: the gated delta rule (see [`gated_delta`](crate::fast::gated_delta)), with the
-    /// outputs and the final state (or every step's, [`gated_delta_steps`](crate::fast::gated_delta_steps)).
+    /// `(q, k, v, g, beta, state)`: the gated delta rule (see
+    /// [`gated_delta`](crate::fast::gated_delta)), with the outputs and the final state (or
+    /// every step's, [`gated_delta_steps`](crate::fast::gated_delta_steps)).
     GatedDelta {
         /// The state after every step (`[B, T, Hv, Dv, Dk]`) instead of the final one.
         steps: bool,
     },
-    /// `(q, k, v, g, beta, pool, slots)`: [`gated_delta_slots`](crate::fast::gated_delta_slots), with the outputs and the
-    /// updated pool.
+    /// `(q, k, v, g, beta, pool, slots)`: [`gated_delta_slots`](crate::fast::gated_delta_slots),
+    /// with the outputs and the updated pool.
     GatedDeltaSlots,
     /// `(a, b, lhs_indices, rhs_indices[, offsets])`: matrix products of gathered batches
     /// (see [`gather_mm`](crate::ops::gather_mm)), as [`FastOp::GatherQmm`] in full precision.

@@ -20,7 +20,13 @@ group = "Libraries"
 | gpt-oss | `gpt_oss` | sliding and full layers, attention sinks, YaRN, biased router and experts with the clamped SwiGLU; MXFP4 and affine checkpoints, Hugging Face's MXFP4 originals converted at load |
 | Gemma 4 | `gemma4`, `gemma4_text`, `gemma4_unified`, `gemma4_unified_text` | sliding and full layers with their own head sizes and RoPE, per-layer inputs, KV-shared layers, K = V, the experts branch, the logit soft cap; vision and audio weights are skipped |
 
-Checkpoints load from a directory or a Hugging Face repository id found in the local cache — mlx-community's quantized checkpoints (affine, MXFP4, MXFP8 and NVFP4, with per-layer modes) as well as original Hugging Face ones (fused or per-expert MoE weights, multimodal wrappers), including AutoAWQ and GPTQ checkpoints (4-bit, and 8-bit GPTQ), converted at load to MLX's affine layout. Hugging Face MXFP4 (except gpt-oss's originals), FP8, compressed-tensors and ModelOpt checkpoints need an MLX conversion first (`mlx_lm.convert`). Checkpoints whose tensors are aligned (files nuvec writes are) are memory-mapped without a copy; mlx-community checkpoints have unpadded headers and are read once at load, in parallel, without the vision and multi-token-prediction weights the language model does not use (as mlx-lm). Loading runs nothing through the model; `Model::warm_up` builds its kernels ahead of a first request. Nothing is downloaded.
+`load` takes a directory or a Hugging Face repository id found in the local cache; nothing is downloaded.
+
+- **mlx-community checkpoints:** affine, MXFP4, MXFP8 and NVFP4, with per-layer modes.
+- **Original Hugging Face checkpoints:** fused or per-expert MoE weights and multimodal wrappers; AutoAWQ (4-bit) and GPTQ (4- and 8-bit) are converted at load to MLX's affine layout.
+- **Not loaded directly:** Hugging Face MXFP4 (except gpt-oss's originals), FP8, compressed-tensors and ModelOpt checkpoints; convert them with `mlx_lm.convert` first.
+- **Memory:** aligned checkpoints (files nuvec writes are) are memory-mapped without a copy. mlx-community checkpoints have unpadded headers and are read once, in parallel, skipping the vision and multi-token-prediction weights the language model does not use (as mlx-lm).
+- Loading runs nothing through the model; `Model::warm_up` builds its kernels ahead of a first request.
 
 ## Generating
 
@@ -84,7 +90,7 @@ Each sequence gets exactly the tokens it would get decoding alone. Hybrid models
 
 ## Serving many requests
 
-`Batcher` puts it together: requests are queued, admitted while there is room, prefilled (on quantized models, prompts of the same length over 64 tokens admitted together in one batch), and decoded together; each finishes at an end-of-sequence token or its `max_tokens`. Decoding is pipelined as `generate`: each `step` submits the next step before reading the previous one's tokens, so one step can be in flight between calls; a request that ends meanwhile emits nothing more.
+`Batcher` queues requests, admits them while there is room, prefills them (on quantized models, prompts of the same length over 64 tokens admitted together are prefilled in one batch) and decodes them together; each finishes at an end-of-sequence token or its `max_tokens`. Decoding is pipelined as in `generate`: each `step` submits the next step before reading the previous one's tokens, so one step can be in flight between calls; a request that ends meanwhile emits nothing more.
 
 Products route as MLX routes them, so a request's output can differ in its low bits depending on what it is batched with, as with mlx-lm's `BatchGenerator`. `Batcher::new(..)?.batch_invariant(true)` serves every request exactly the tokens it gets alone, at some cost in throughput (up to about 20% on mixture-of-experts models at 8 requests).
 

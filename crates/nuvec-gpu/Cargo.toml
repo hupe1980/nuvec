@@ -1,6 +1,6 @@
 [package]
 name = "nuvec-gpu"
-description = "Metal backend for nuvec: device, command encoding, memory and kernel dispatch"
+description = "Metal runtime for nuvec: device, pipelines, buffers, command encoding, allocator and profiler"
 exclude.workspace = true
 version.workspace = true
 edition.workspace = true

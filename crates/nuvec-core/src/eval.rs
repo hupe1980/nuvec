@@ -465,8 +465,9 @@ fn in_place_inputs(
 /// node no other handle refers to is out of every graph: another thread can reach a node
 /// only through an `Arc` (an array, a consumer's inputs, or its own evaluation order),
 /// and each of those counts. Weak references from committed GPU work upgrade only to
-/// publish, under the in-flight lock that donation takes too. Arrays put in order by [`schedule`] hold their nodes strongly until started,
-/// so scheduled-but-unstarted work disables donation of what it reads.
+/// publish, under the in-flight lock that donation takes too. Arrays put in order by
+/// [`schedule`] hold their nodes strongly until started, so scheduled-but-unstarted work
+/// disables donation of what it reads.
 fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
     // Output `at` of the node (another output, if any, has no holder either: the node's
     // only strong handle is this input).

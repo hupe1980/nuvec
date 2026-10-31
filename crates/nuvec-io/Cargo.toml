@@ -1,6 +1,6 @@
 [package]
 name = "nuvec-io"
-description = "safetensors and npy I/O for nuvec: fast checkpoint loading and saving of any tree of arrays"
+description = "safetensors, npy and IDX I/O for nuvec: load and save any tree of arrays"
 exclude.workspace = true
 version.workspace = true
 edition.workspace = true

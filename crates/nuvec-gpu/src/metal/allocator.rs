@@ -33,13 +33,13 @@ const SMALL: usize = 256;
 /// it, so a new allocation is preferred (the cache then holds one buffer per command buffer
 /// in flight). Decode-sized work (activations, attention partials, softmax outputs) is
 /// latency-bound; larger buffers belong to GPU-bound work (long prefill), where waiting costs
-/// little and reusing them keeps the peak (D-100; raised from 4 MiB by D-102).
+/// little and reusing them keeps the peak (D-100, D-102).
 const OVERLAP_MAX: usize = 64 << 20;
 
 /// Cached bytes past which smaller buffers are taken from the latest committed command
 /// buffer too: decode never holds that much it cannot take yet, while a long prefill's
 /// command buffers, each allocating its intermediates anew, would add up to gigabytes (a
-/// 27B model at 32K tokens ran out of GPU memory) (D-102).
+/// 27B model at 32K tokens runs out of GPU memory) (D-102).
 const OVERLAP_CACHE: usize = 1 << 30;
 
 /// Number of small size classes: 256 B steps up to one page.

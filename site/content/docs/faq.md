@@ -24,7 +24,7 @@ nuvec follows MLX, JAX and NumPy, where gradients come from transforming functio
 
 ## How fast is it?
 
-On par with MLX: on an M4 Pro (nuvec 0.5.0, 12 models), nuvec-lm decodes at 0.97–1.09× the speed of mlx-lm on dense, hybrid, mixture-of-experts, gpt-oss and Gemma 4 models (geometric mean 1.01×), and its time to first token is 1.02× at 2,048 and 32,768 tokens (0.97× at 64K). Serving four or eight requests at once is 1.00×, and models load 1.7× faster. See [benchmarks](@/docs/benchmarks.md).
+On par with MLX. On an M4 Pro (nuvec 0.5.0 against mlx-lm 0.32.2, 12 models), nuvec-lm decodes at 0.98–1.10× mlx-lm's speed on dense, hybrid, mixture-of-experts, gpt-oss and Gemma 4 models (geometric mean 1.01×); time to first token is 1.02× at 2,048 and 32,768 tokens (0.98× at 64K), serving four or eight requests at once is 1.00×, and warm loads are 1.80× faster. See [benchmarks](@/docs/benchmarks.md).
 
 ## Which Macs are supported?
 
@@ -36,11 +36,18 @@ Not today; nuvec is a Rust library. The `nuvec` name on PyPI is reserved.
 
 ## Can I train models?
 
-Yes: autodiff covers every operation, models are structs with `#[derive(Module)]` whose gradients have the model's type, `nuvec-nn` has layers, dropout, LoRA and optimizers (with parameter groups), quantized layers support QLoRA-style fine-tuning, nuvec-lm applies LoRA to loaded models by path and reads and writes mlx-lm's adapter directories, and a whole training step compiles with `compile_mut`. The repository trains MLX's MNIST example and matches MLX's accuracy.
+Yes:
+
+- autodiff covers every operation; models are structs with `#[derive(Module)]` whose gradients have the model's type;
+- `nuvec-nn` has layers, dropout, LoRA and optimizers (with parameter groups); quantized layers support QLoRA-style fine-tuning;
+- nuvec-lm applies LoRA to loaded models by path and reads and writes mlx-lm's adapter directories;
+- a whole training step compiles with `compile_mut`.
+
+The repository trains MLX's MNIST example and matches MLX's accuracy.
 
 ## Is the API stable?
 
-Not yet. nuvec is pre-alpha (0.x): minor versions may break the API; patch versions only add to it. Semantic versioning covers every item reachable through `nuvec::` paths, and `nuvec-lm`; the other crates make no promise when depended on directly, so depend on `nuvec`. Changes are listed in the [changelog](https://github.com/hupe1980/nuvec/blob/main/CHANGELOG.md).
+No. nuvec is pre-alpha (0.x): minor versions may break the API; patch versions only add to it. Semantic versioning covers every item reachable through `nuvec::` paths, and `nuvec-lm`; the other crates make no promise when depended on directly, so depend on `nuvec`. Changes are listed in the [changelog](https://github.com/hupe1980/nuvec/blob/main/CHANGELOG.md).
 
 ## What is the license?
 

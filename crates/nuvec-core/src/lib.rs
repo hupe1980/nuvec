@@ -168,7 +168,7 @@ thread_local! {
 /// each row the bits of its one-row product, through one matrix-vector product per row
 /// (or nuvec's few-row kernels with the same arithmetic). Outside it they route as MLX
 /// does, whose multi-vector kernels are faster from 2 rows on but give a row other bits
-/// than its one-row product (D-103). Speculative verification runs in this mode, and so
+/// than its one-row product. Speculative verification runs in this mode, and so
 /// can batched serving that must equal each request run alone.
 pub fn with_row_exact<R>(f: impl FnOnce() -> R) -> R {
     struct Restore(bool);
@@ -181,7 +181,7 @@ pub fn with_row_exact<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Whether products evaluated or built on this thread now are row-exact
+/// Whether products evaluated or built on this thread are row-exact
 /// ([`with_row_exact`]).
 pub fn row_exact() -> bool {
     ROW_EXACT.with(std::cell::Cell::get)

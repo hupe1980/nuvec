@@ -412,7 +412,7 @@ fn wired_limit_wires_buffers_up_to_it() {
 #[test]
 fn sizes_near_usize_max_are_out_of_memory() {
     let Some(device) = device() else { return };
-    // Rounding up to a page used to wrap to 0: a bogus empty buffer.
+    // Rounding these up to a page must not wrap to 0 (a bogus empty buffer).
     for len in [usize::MAX - 10, usize::MAX - PAGE + 2, usize::MAX] {
         assert!(
             matches!(device.new_buffer(len), Err(GpuError::OutOfMemory(_))),

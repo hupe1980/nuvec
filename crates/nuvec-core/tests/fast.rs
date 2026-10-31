@@ -957,7 +957,7 @@ mod gpu {
             });
         }
         // In place, with a canary allocated right after the cache: a slot one past the
-        // end used to write into the next allocation.
+        // end must not write into the next allocation.
         on(Device::gpu(0), || {
             for _ in 0..8 {
                 let cache = ops::zeros([blocks, hkv, bs, d], DType::F32);

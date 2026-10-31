@@ -11,7 +11,7 @@
 //! on the requests batched with it, as in mlx-lm. With
 //! [`batch_invariant`](Batcher::batch_invariant), every step runs row-exact
 //! ([`nuvec::with_row_exact`]): each request gets the tokens it gets alone, at some cost in
-//! throughput (D-103).
+//! throughput.
 //!
 //! Decoding is pipelined as [`generate`](crate::generate()): a step submits the next
 //! decoding step, fed with the tokens of the step before, then reads those tokens (one
@@ -800,8 +800,8 @@ mod tests {
     }
 
     /// A forward pass that fails for one request finishes that request with an error (after
-    /// the token in flight); the others go on with the tokens of a run without the fault, and the cache's blocks
-    /// and pools are intact.
+    /// the token in flight); the others go on with the tokens of a run without the fault, and
+    /// the cache's blocks and pools are intact.
     #[test]
     fn a_failing_request_does_not_poison_the_batch() {
         for name in ["qwen3_f32", "qwen3_5_f32"] {

@@ -1,6 +1,6 @@
 //! Helpers of the array API tests: the API fixtures recorded from MLX
 //! (`fixtures/mlx_api.bin`, written by `scripts/mlx_fixtures.py`) and a gradient checker
-//! in the new style.
+//! (`vjp` and `jvp` against central finite differences).
 
 #![allow(dead_code, unreachable_pub)]
 

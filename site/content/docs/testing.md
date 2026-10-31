@@ -6,11 +6,11 @@ weight = 130
 group = "Project"
 +++
 
-A reimplementation is only useful if it computes the same thing. nuvec treats MLX as the oracle.
+nuvec treats MLX as the oracle: tests compare its results with MLX's.
 
 ## Recorded MLX results
 
-`scripts/mlx_fixtures.py` runs nearly a thousand cases through the pinned MLX version and records inputs and outputs into a binary file that the Rust test suite replays — no Python needed to run the tests. Cases cover:
+`scripts/mlx_fixtures.py` runs over a thousand cases through the pinned MLX version, on the CPU and the GPU, and records inputs and outputs into binary files that the Rust test suite replays — no Python needed to run the tests. Cases cover:
 
 - every operation over every dtype, with edge values (NaN, infinities, integer limits);
 - random layouts: transposes, negative strides, broadcasts and offsets;

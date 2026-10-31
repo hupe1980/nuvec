@@ -293,7 +293,7 @@ fn unpadded_headers_are_copied_once() {
 
 #[test]
 fn deeply_nested_json_is_an_error_not_a_stack_overflow() {
-    // On a thread with the default 2 MB stack: 100 000 levels used to overflow it.
+    // On a thread with the default 2 MB stack, which 100 000 recursive levels would overflow.
     let handle = std::thread::Builder::new()
         .stack_size(2 << 20)
         .spawn(|| {

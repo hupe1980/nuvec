@@ -35,7 +35,7 @@
         {
           "@type": "Question",
           "name": "How fast is nuvec compared to MLX?",
-          "acceptedAnswer": { "@type": "Answer", "text": "On an Apple M4 Pro (nuvec 0.5.0, 2026-10-27, 12 models), nuvec-lm decodes at 0.97–1.09× the speed of mlx-lm (geometric mean 1.01×) on dense, hybrid, mixture-of-experts, gpt-oss and Gemma 4 models, with the same time to first token (1.02× at 2,048 and 32,768 tokens). Concurrent serving is on par (1.00× at 4 and 8 requests), and models load 1.7× faster." }
+          "acceptedAnswer": { "@type": "Answer", "text": "On par. On an Apple M4 Pro (nuvec 0.5.0, mlx-lm 0.32.2, 2026-10-31, 12 models), nuvec-lm decodes at 0.98–1.10× mlx-lm's speed (geometric mean 1.01×), with time to first token 1.02× at 2,048 and 32,768 tokens. Concurrent serving is 1.00× at 4 and 8 requests, and warm loads are 1.8× faster." }
         },
         {
           "@type": "Question",
@@ -64,7 +64,7 @@
       <div class="install" aria-label="Install">
         <code><span class="c-prompt">$</span> cargo add nuvec</code>
       </div>
-      <p class="status-pill"><span class="dot" aria-hidden="true"></span>Pre-alpha · the API may still change</p>
+      <p class="status-pill"><span class="dot" aria-hidden="true"></span>Pre-alpha · the API may change</p>
     </div>
     <figure class="window" aria-label="Example program">
       <div class="window-bar" aria-hidden="true"><span></span><span></span><span></span><em>main.rs</em></div>
@@ -92,12 +92,12 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
 <section class="section">
   <div class="wrap">
     <h2 class="section-title">Everything MLX gives you, in idiomatic Rust</h2>
-    <p class="section-lead">The programming model that made MLX the fastest way to do machine learning on a Mac — rebuilt on Rust's ownership, typed errors and thread safety.</p>
+    <p class="section-lead">MLX's programming model, built on Rust's ownership, typed errors and thread safety.</p>
     <div class="cards">
       <article class="card">
         <div class="icon" aria-hidden="true">💤</div>
         <h3>Lazy arrays, unified memory</h3>
-        <p>Operations record a graph and return at once; reading a value evaluates exactly what it needs. CPU and GPU share memory, so nothing is ever copied between them.</p>
+        <p>Operations record a graph; reading a value evaluates exactly what it needs. CPU and GPU share memory, with no copies between them.</p>
       </article>
       <article class="card">
         <div class="icon" aria-hidden="true">🔁</div>
@@ -112,17 +112,17 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
       <article class="card">
         <div class="icon" aria-hidden="true">🤖</div>
         <h3>An LLM runtime included</h3>
-        <p>Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 — dense, hybrid Gated DeltaNet or mixture-of-experts — straight from mlx-community checkpoints, with samplers, speculative decoding and batched serving.</p>
+        <p>Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 — dense, hybrid Gated DeltaNet or mixture-of-experts — from mlx-community or Hugging Face checkpoints, with samplers, speculative decoding and batched serving.</p>
       </article>
       <article class="card">
         <div class="icon" aria-hidden="true">💾</div>
         <h3>Memory-mapped weights</h3>
-        <p>Aligned safetensors files are memory-mapped and wrapped as Metal buffers without a copy (mlx-community checkpoints are copied once at load), and stay resident through Metal residency sets while you generate.</p>
+        <p>Aligned safetensors files become Metal buffers without a copy; mlx-community checkpoints are copied once at load. Metal residency sets keep weights resident.</p>
       </article>
       <article class="card">
         <div class="icon" aria-hidden="true">🧪</div>
         <h3>Verified against MLX</h3>
-        <p>Nearly a thousand recorded MLX results — random strides, offsets and dtypes, gradients and batching — replay on every test run, next to tiny reference models from mlx-lm.</p>
+        <p>Over a thousand recorded MLX results — random strides, offsets and dtypes, gradients and batching — replay on every test run, plus tiny reference models from mlx-lm.</p>
       </article>
     </div>
   </div>
@@ -186,7 +186,7 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
   <div class="wrap two-col">
     <div>
       <h2 class="section-title">As fast as MLX. Measured, not claimed.</h2>
-      <p>Every number comes from one command, <code>just bench-parity</code>: nuvec-lm and mlx-lm on the same Mac, the same day, the same mlx-community checkpoints, timed the same way, medians of alternating runs, with the previous release in the same session to catch regressions.</p>
+      <p>Every number comes from <code>just bench-parity</code>: nuvec-lm and mlx-lm on the same Mac and checkpoints in one session, medians of alternating runs, with the previous release alongside to catch regressions.</p>
       <p class="muted small">Apple M4 Pro · nuvec 0.5.0 · mlx-lm 0.32.2 · 2026-10-31 · greedy · decode after a 961-token prompt.</p>
       <a class="link-arrow" href="{{ get_url(path='@/docs/benchmarks.md') }}">Full tables and method</a>
     </div>
@@ -223,7 +223,7 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
       <a class="crate" href="{{ get_url(path='@/docs/llm.md') }}"><strong>nuvec-lm</strong><span>Models, tokenizer, sampling, speculative decoding</span></a>
       <a class="crate" href="{{ get_url(path='@/docs/compile.md') }}"><strong>nuvec-compile</strong><span>Tracing, simplification, kernel fusion</span></a>
       <a class="crate" href="{{ get_url(path='@/docs/gpu.md') }}"><strong>nuvec-gpu</strong><span>Metal runtime, allocator, wired memory, profiler</span></a>
-      <a class="crate" href="{{ get_url(path='@/docs/io.md') }}"><strong>nuvec-io</strong><span>safetensors and npy, memory-mapped</span></a>
+      <a class="crate" href="{{ get_url(path='@/docs/io.md') }}"><strong>nuvec-io</strong><span>safetensors, npy and IDX, memory-mapped</span></a>
     </div>
   </div>
 </section>
@@ -232,7 +232,7 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
   <div class="wrap faq-short">
     <h2 class="section-title">Questions</h2>
     <details><summary>Is nuvec a binding to MLX?</summary><p>No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ library. It reaches Metal through Apple's system frameworks and compiles its own Metal kernels, several of them ported from MLX.</p></details>
-    <details><summary>How fast is it compared to MLX?</summary><p>On an Apple M4 Pro (nuvec 0.5.0, 2026-10-27, 12 models), nuvec-lm decodes at 0.97–1.09× the speed of mlx-lm (geometric mean 1.01×) on dense, hybrid, mixture-of-experts, gpt-oss and Gemma 4 models, with the same time to first token (1.02× at 2,048 and 32,768 tokens). Concurrent serving is on par (1.00× at 4 and 8 requests), and models load 1.7× faster. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
+    <details><summary>How fast is it compared to MLX?</summary><p>On par. On an Apple M4 Pro (nuvec 0.5.0, mlx-lm 0.32.2, 2026-10-31, 12 models), nuvec-lm decodes at 0.98–1.10× mlx-lm's speed (geometric mean 1.01×), with time to first token 1.02× at 2,048 and 32,768 tokens. Concurrent serving is 1.00× at 4 and 8 requests, and warm loads are 1.8× faster. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
     <details><summary>Which hardware does it support?</summary><p>Macs with Apple Silicon (M1 or later) on macOS 15 or newer. The core and CPU crates also build and run on Linux.</p></details>
     <a class="link-arrow" href="{{ get_url(path='@/docs/faq.md') }}">All questions</a>
   </div>

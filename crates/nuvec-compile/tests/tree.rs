@@ -151,7 +151,7 @@ fn the_cache_is_bounded() {
 }
 
 /// A tape that captures an outer tracer is correct (also on the CPU, where an equal
-/// evaluated scalar constant used to replace the tracer) and not cached.
+/// evaluated scalar constant must not replace the tracer) and not cached.
 #[test]
 fn tapes_that_capture_a_tracer_are_not_cached() {
     on_cpu();

@@ -1,6 +1,6 @@
 +++
 title = "Quantization"
-description = "MLX-compatible quantization in nuvec: affine 1–8-bit packing, the MXFP4, MXFP8 and NVFP4 floating-point formats, quantized matrix products with MLX's kernels, and mixture-of-experts gather products."
+description = "MLX-compatible quantization in nuvec: affine packing of 1 to 6 or 8 bits, the MXFP4, MXFP8 and NVFP4 floating-point formats, quantized matrix products with MLX's kernels, and mixture-of-experts gather products."
 weight = 70
 [extra]
 group = "GPU"
@@ -10,13 +10,13 @@ nuvec implements MLX's quantization modes bit for bit — **affine** and the flo
 
 ## Affine
 
-Weights are split into groups of `group_size` values along each row (32, 64 or 128). Each group stores a scale and a bias, and each value becomes an integer code of `bits` bits (1 to 8), packed into `uint32` words:
+Weights are split into groups of `group_size` values along each row (32, 64 or 128). Each group stores a scale and a bias, and each value becomes an integer code of `bits` bits (1, 2, 3, 4, 5, 6 or 8), packed into `uint32` words:
 
 ```text
 w ≈ scale · code + bias
 ```
 
-4-bit weights with groups of 64 take about 4.5 bits per weight including scales and biases — a quarter of `bfloat16`'s memory and bandwidth, which is what decode speed depends on.
+4-bit weights with groups of 64 take about 4.5 bits per weight including scales and biases: about a quarter of `bfloat16`'s memory and bandwidth.
 
 ```rust
 # use nuvec::prelude::*;
@@ -78,7 +78,7 @@ let y = x.gather_qmm(&q, None, Some(&experts), GatherQmm::default().sorted_indic
 # assert_eq!(y.shape(), [4, 1, 128]);
 ```
 
-With rows sorted by expert (`sorted_indices`), more than 64 of them and at least four per expert on average, a grouped kernel reads each expert's weights once; otherwise each row gets its own product. NVFP4 experts can carry one float32 global scale each (`GatherQmm::global_scale`), as mlx-lm's `quantize_model(..., global_scale=True)` writes them. `gather_mm` is the same for full-precision weights.
+With rows sorted by expert (`sorted_indices`), at least 16 of them (more than 64 under `with_row_exact`) and at least four per expert on average, a grouped kernel reads each expert's weights once; otherwise each row gets its own product. NVFP4 experts can carry one float32 global scale each (`GatherQmm::global_scale`), as mlx-lm's `quantize_model(..., global_scale=True)` writes them. `gather_mm` is the same for full-precision weights.
 
 ## Training through quantized weights
 

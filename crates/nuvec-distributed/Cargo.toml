@@ -1,6 +1,6 @@
 [package]
 name = "nuvec-distributed"
-description = "Distributed backends for nuvec: MLX's TCP ring for collectives across processes and Macs"
+description = "MLX's TCP ring for nuvec's distributed collectives across processes and Macs"
 exclude.workspace = true
 version.workspace = true
 edition.workspace = true

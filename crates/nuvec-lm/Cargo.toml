@@ -1,6 +1,6 @@
 [package]
 name = "nuvec-lm"
-description = "LLM runtime for nuvec: Llama, Mistral, Qwen, gpt-oss and Gemma 4 models from MLX and Hugging Face checkpoints, sampling, speculative decoding, batched serving and LoRA"
+description = "LLM runtime for nuvec: Llama, Mistral, Qwen, gpt-oss and Gemma 4 from mlx-community and Hugging Face checkpoints, with sampling, speculative decoding, batched serving and LoRA"
 exclude.workspace = true
 version.workspace = true
 edition.workspace = true

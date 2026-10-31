@@ -12,8 +12,8 @@
 //! - template arguments become `constexpr` values and `typedef`s at the top of the body.
 //!
 //! The kernel runs on the GPU only, with one thread per grid position (`dispatchThreads`).
-//! It has no derivative or batching rule; wrap it in [`crate::custom_function`] (or [`crate::custom_function_flat`]) to give it
-//! one.
+//! It has no derivative or batching rule; wrap it in [`crate::custom_function`] (or
+//! [`crate::custom_function_flat`]) to give it one.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -57,7 +57,8 @@ pub(crate) struct KernelSpec {
 ///   MLX's type names (`bfloat16_t`, `float16_t`) and `elem_to_loc` are defined.
 ///
 /// It runs on the GPU only, one thread per grid position (`dispatchThreads`), and has no
-/// derivative or batching rule; wrap it in [`crate::custom_function`] (or [`crate::custom_function_flat`]) to give it one.
+/// derivative or batching rule; wrap it in [`crate::custom_function`] (or
+/// [`crate::custom_function_flat`]) to give it one.
 ///
 /// The source is trusted code, run as written: nuvec checks the inputs, outputs and
 /// launch configuration, but not what the body does with them. A body that reads or

@@ -1,6 +1,6 @@
 [package]
 name = "nuvec-cpu"
-description = "Pure-Rust CPU backend for nuvec"
+description = "Pure-Rust CPU kernels for nuvec"
 exclude.workspace = true
 version.workspace = true
 edition.workspace = true

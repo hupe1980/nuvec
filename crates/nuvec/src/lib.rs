@@ -111,8 +111,8 @@
 //!   [`with_row_exact`] (every bit width and group size, sorted or unsorted indices, up to
 //!   `ROW_INDEPENDENT_ROWS` tokens of up to 8 experts each). Outside it, quantized and
 //!   gathered products route as MLX's do: from 2 rows, multi-vector kernels that read the
-//!   weights once give a row other low bits than its one-row product. So are the row-wise
-//!   operations of a decode step, always: `rms_norm`, `add_rms_norm`, `rope` and
+//!   weights once give a row other low bits than its one-row product. The row-wise
+//!   operations of a decode step are row-independent always: `rms_norm`, `add_rms_norm`, `rope` and
 //!   `norm_rope` with per-row offsets, element-wise operations, vector attention over equal
 //!   key lengths, `gated_delta` and `gated_delta_slots`.
 //! - **Batch items of quantized products:** under [`with_row_exact`], a quantized product
@@ -143,8 +143,8 @@
 //!
 //! - `scatter_add_along_axis` (and `at(..).add`) on floating-point values with repeated
 //!   indices, and derivatives built on it (the reverse mode of gathers, `take`,
-//!   `take_along_axis` and indexing with repeated indices): float atomics (`indexing.metal`). With unique
-//!   indices the result is exact.
+//!   `take_along_axis` and indexing with repeated indices): float atomics
+//!   (`indexing.metal`). With unique indices the result is exact.
 //! - `put_along_axis` with repeated indices *and* differing values (one of the writes wins).
 //!   Unique indices, or one fill value, are deterministic (as a top-k sampler's
 //!   `argpartition` indices and fill).

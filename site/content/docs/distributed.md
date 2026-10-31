@@ -71,8 +71,8 @@ assert_eq!(y.shape(), [1, 4]);
 
 ## Failures
 
-A peer that never starts, or exits during a collective, fails every pending operation with an error naming its rank within the timeout (`NUVEC_DISTRIBUTED_TIMEOUT`, in seconds, default 30). Nothing hangs without bound, and nothing panics.
+A peer that never starts, or exits during a collective, fails every pending operation with an error naming its rank within the timeout (`NUVEC_DISTRIBUTED_TIMEOUT`, in seconds, default 30). Nothing hangs or panics.
 
 ## Performance
 
-`just bench-distributed` times `all_sum` against MLX's ring backend on the same Mac. On an M4 Pro over loopback nuvec takes 0.36–0.78× MLX's time with 2 ranks and 0.17–0.66× with 4, from 4 KB to 256 MB. RDMA over Thunderbolt 5 (MLX's JACCL) is planned behind the same API.
+`just bench-distributed` times `all_sum` against MLX's ring backend on the same Mac. On an M4 Pro over loopback nuvec takes 0.36–0.78× MLX's time with 2 ranks and 0.17–0.66× with 4, from 4 KB to 256 MB. RDMA over Thunderbolt 5 (MLX's JACCL backend) is not supported.

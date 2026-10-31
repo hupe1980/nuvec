@@ -2,9 +2,9 @@
 //!
 //! - **Models:** Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE, Qwen 3.5 (hybrid Gated
 //!   DeltaNet and attention, dense or mixture-of-experts), gpt-oss and Gemma 4 (text), from
-//!   Hugging Face or MLX
-//!   checkpoints, including MLX's quantized ones. Aligned files are memory-mapped without a
-//!   copy; mlx-community checkpoints (unpadded headers) are read once at load, in parallel.
+//!   Hugging Face or MLX checkpoints, including MLX's quantized ones. Aligned files are
+//!   memory-mapped without a copy; mlx-community checkpoints (unpadded headers) are read
+//!   once at load, in parallel.
 //! - **Tokenizer:** BPE read from `tokenizer.json`: byte-level (GPT-2, Llama 3, Qwen 2/3/3.5,
 //!   gpt-oss's o200k and others with their split patterns) and SentencePiece-style with
 //!   byte fallback (Gemma, Llama 2, Mistral v0.1–v0.3). Other split patterns (Mistral's
@@ -12,9 +12,9 @@
 //!   their weights.
 //! - **Generation:** chunked prefill, a pipelined decode loop with the KV cache updated in
 //!   place, stopping at the model's end-of-sequence tokens (`config.json` and
-//!   `generation_config.json`), mlx-lm's samplers (temperature, top-p, min-p, top-k), and [speculative
-//!   decoding](speculative) with pluggable drafters; memory is wired while generating
-//!   ([`WiredLimit`]).
+//!   `generation_config.json`), mlx-lm's samplers (temperature, top-p, min-p, top-k), and
+//!   [speculative decoding](speculative) with pluggable drafters; memory is wired while
+//!   generating ([`WiredLimit`]).
 //! - **Serving:** batched decoding over a [paged KV cache](paged) and a [`Batcher`] that
 //!   serves many requests at once.
 //! - **Fine-tuning:** a [`Model`] is a `nuvec_nn::Module` (Hugging Face's parameter names);
