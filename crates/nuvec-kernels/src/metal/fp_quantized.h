@@ -928,8 +928,15 @@ METAL_FUNC void fp_qvm_impl(
       scale = dequantize_scale<U, group_size>(*scales);
       w_local = *((device vec_w*)ws);
     } else {
+      // The weights too (MLX keeps them): with fewer rows than a block they are never
+      // loaded, and stale register bytes can decode to an E4M3 NaN, which `0 · 0 · w`
+      // keeps.
       x_local = 0;
       scale = 0;
+#pragma clang loop unroll(full)
+      for (int j = 0; j < tn * bytes_per_pack; j++) {
+        w_local.wi[j] = 0;
+      }
     }
     qouter<U, tn * pack_factor, bits>(
         (thread uint8_t*)&w_local, x_local, scale, result);
