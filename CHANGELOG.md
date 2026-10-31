@@ -6,7 +6,7 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-10-25
+## [0.5.0] - 2026-10-31
 
 ### Added
 

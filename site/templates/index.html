@@ -187,14 +187,14 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
     <div>
       <h2 class="section-title">As fast as MLX. Measured, not claimed.</h2>
       <p>Every number comes from one command, <code>just bench-parity</code>: nuvec-lm and mlx-lm on the same Mac, the same day, the same mlx-community checkpoints, timed the same way, medians of alternating runs, with the previous release in the same session to catch regressions.</p>
-      <p class="muted small">Apple M4 Pro · nuvec 0.5.0 · mlx-lm 0.32.2 · 2026-10-25 · greedy · decode after a 961-token prompt.</p>
+      <p class="muted small">Apple M4 Pro · nuvec 0.5.0 · mlx-lm 0.32.2 · 2026-10-31 · greedy · decode after a 961-token prompt.</p>
       <a class="link-arrow" href="{{ get_url(path='@/docs/benchmarks.md') }}">Full tables and method</a>
     </div>
     <div class="bars" role="table" aria-label="Decode speed relative to mlx-lm">
       <div class="bar-row" role="row"><span role="cell">Qwen3-8B</span><span class="bar" role="cell" style="--v:1.01"><b>1.01×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3.5-9B</span><span class="bar" role="cell" style="--v:0.99"><b>0.99×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3-30B-A3B</span><span class="bar" role="cell" style="--v:1.08"><b>1.08×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">gpt-oss-20b</span><span class="bar" role="cell" style="--v:0.98"><b>0.98×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3.5-9B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3-30B-A3B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">gpt-oss-20b</span><span class="bar" role="cell" style="--v:0.99"><b>0.99×</b></span></div>
       <div class="bar-axis" aria-hidden="true"><span>mlx-lm = 1.00×</span></div>
     </div>
   </div>
