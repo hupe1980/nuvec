@@ -1654,14 +1654,18 @@ fn fp_derivatives_and_vmap() {
                 );
             }
             if mode == QuantMode::Nvfp4 {
-                let f = |xs: &[Array]| {
-                    let options = GatherQmm::default().global_scale(&xs[0]);
-                    Ok(vec![x.gather_qmm(&q, None, Some(&rhs), options)])
-                };
-                assert!(
-                    vjp_flat(f, std::slice::from_ref(&gscale), std::slice::from_ref(&g)).is_err(),
-                    "global scale"
-                );
+                // On the GPU and on the CPU (where the product runs its fallback graph).
+                for device in [default_device(), Device::cpu()] {
+                    let f = |xs: &[Array]| {
+                        let options = GatherQmm::default().global_scale(&xs[0]);
+                        Ok(vec![x.gather_qmm(&q, None, Some(&rhs), options)])
+                    };
+                    let refused = with_stream(device, || {
+                        vjp_flat(f, std::slice::from_ref(&gscale), std::slice::from_ref(&g))
+                    })
+                    .is_err();
+                    assert!(refused, "global scale on {device:?}");
+                }
             }
         }
     }

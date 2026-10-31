@@ -70,28 +70,45 @@ fn mlx_gpu_fixtures_bit_for_bit() {
         devices.push(Device::gpu(0));
     }
     devices.push(Device::cpu());
+    // The GPU the fixtures were recorded on: other GPU generations' `pow` and `exp` may
+    // round differently (by one unit in the last place, in MLX as in nuvec).
+    let architecture = nuvec_gpu::Device::shared().map(|d| d.info().architecture.clone());
+    let recorded_gpu = architecture.as_deref() == Some(RECORDED_ON);
     for device in devices {
         // Products, affine dequantize, the blocked head-512 attention and `pow` are
         // bit-exact on the GPU (MLX's kernels and dispatch); the CPU follows MLX's CPU
         // (another accumulation order, two roundings per dequantized element, the C
-        // library's `pow`) and meets FR-008's bound instead.
+        // library's `pow`) and meets FR-008's bound instead, as do `pow` and attention on
+        // another GPU generation.
+        let cpu = device == Device::cpu();
         let failures: Vec<String> = cases
             .iter()
             .filter_map(|c| {
-                with_stream(device, || match (device == Device::cpu(), cpu_differs(c)) {
-                    (true, true) => check_within(c),
-                    _ => check_exact(c),
+                with_stream(device, || {
+                    if (cpu && cpu_differs(c)) || (!cpu && !recorded_gpu && transcendental(c)) {
+                        check_within(c)
+                    } else {
+                        check_exact(c)
+                    }
                 })
             })
             .collect();
         assert!(
             failures.is_empty(),
-            "{device:?}: {} of {} MLX GPU fixture cases differ:\n{}",
+            "{device:?} ({architecture:?}): {} of {} MLX GPU fixture cases differ:\n{}",
             failures.len(),
             cases.len(),
             failures.join("\n")
         );
     }
+}
+
+/// The GPU architecture `mlx_gpu.bin` was recorded on (an M4 Pro).
+const RECORDED_ON: &str = "applegpu_g16s";
+
+/// Cases whose GPU results depend on the GPU's `pow` or `exp`.
+fn transcendental(case: &Case) -> bool {
+    case.name.starts_with("sdpa-d512-") || case.name.starts_with("power-gpu-")
 }
 
 fn cpu_differs(case: &Case) -> bool {

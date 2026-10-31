@@ -594,7 +594,10 @@ pub(crate) fn gather_qmm(
     // Affine gathers have kernels for transposed weights only.
     let kernel = (options.transpose || quant.mode != QuantMode::Affine)
         && crate::fast::imp::on_gpu(dtype, x.size());
-    let out = if kernel {
+    // With a global scale the primitive runs on the CPU too (its fallback): it refuses the
+    // global scale's derivative, as MLX's `GatherQMM`, where the graph would differentiate
+    // through it.
+    let out = if kernel || options.global_scale.is_some() {
         Array::from_op(Primitive::Fast(op), inputs)?.swap_remove(0)
     } else {
         op.fallback(&inputs)?.swap_remove(0)
