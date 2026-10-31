@@ -271,7 +271,8 @@ fn cpu_access_waits_for_the_gpu() {
     let mut out = device.new_buffer(n as usize * 4).unwrap();
     let mut cmd = device.command_buffer().unwrap();
     add(&mut cmd, &device, &a, &a, &mut out, n);
-    let submitted = cmd.commit();
+    // From encoding on (checked before the commit: committed work may finish before any
+    // check, as on CI's runners).
     assert!(out.in_use());
     assert_eq!(out.contents().unwrap_err(), GpuError::BufferInUse);
     assert!(a.in_use());
@@ -280,7 +281,7 @@ fn cpu_access_waits_for_the_gpu() {
         GpuError::BufferInUse,
         "inputs refuse CPU writes while the GPU reads them"
     );
-    drop(submitted); // waits
+    drop(cmd.commit()); // waits
     assert!(!out.in_use());
     assert_eq!(read_f32(&out)[0], 2.0);
 }
