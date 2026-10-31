@@ -6003,7 +6003,11 @@ mod metal {
                 producer = crate::ops::imp::exp(&(&producer * 0.5f32)).unwrap();
             }
             fault::fail_next_commit();
-            crate::async_eval(std::slice::from_ref(&producer)).unwrap();
+            // The chain spans several command buffers: when the failed first one completes
+            // before the last is committed, `async_eval` already reports it.
+            if let Err(e) = crate::async_eval(std::slice::from_ref(&producer)) {
+                assert!(e.to_string().contains("injected"), "{e}");
+            }
             // Encoded while the producer is (usually) still in flight.
             let consumer = &producer + 1.0f32;
             assert!(consumer.eval().is_err());
