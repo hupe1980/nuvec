@@ -12,6 +12,12 @@
 //!
 //! `NUVEC_REQUIRE_METALLIB=1` turns every fallback into a build error (used by CI). Any
 //! `NUVEC_METALLIB` value other than `off` is ignored with a warning.
+//!
+//! The Neural Accelerator kernels (`src/metal/nax/`) need Metal 4.0 and macOS 26.2, so they
+//! build into a second library, `nuvec_nax.metallib`, and the baseline keeps macOS 15. They
+//! are reported as `cfg(nuvec_nax_metallib)`: `precompiled`, `source` (the baseline is
+//! compiled at runtime, so are they), or `absent` (an SDK older than 26.2, or no Metal
+//! Performance Primitives headers: one warning; `NUVEC_REQUIRE_NAX=1` makes it an error).
 
 use std::env;
 use std::fmt::Write as _;
@@ -27,6 +33,10 @@ const INSTALL_HINT: &str = "install it with `xcodebuild -downloadComponent Metal
 /// Deployment floor: macOS 15 (Metal 3.2).
 const METAL_STD: &str = "-std=metal3.2";
 const MACOS_MIN: &str = "-mmacosx-version-min=15.0";
+/// The Neural Accelerator library: Metal 4.0 and macOS 26.2 (TensorOps).
+const NAX_STD: &str = "-std=metal4.0";
+const NAX_MIN: &str = "-mmacosx-version-min=26.2";
+const REQUIRE_NAX: &str = "NUVEC_REQUIRE_NAX";
 /// IEEE-conformant math, as MLX compiles its kernels.
 const PRECISE: &str = "-fno-fast-math";
 /// No implicit fused multiply-add: element-wise results round like the CPU backend.
@@ -38,6 +48,10 @@ fn main() {
     println!(
         "cargo::rustc-check-cfg=cfg(nuvec_metallib, values(\"precompiled\", \"source\", \"unavailable\"))"
     );
+    println!(
+        "cargo::rustc-check-cfg=cfg(nuvec_nax_metallib, values(\"precompiled\", \"source\", \"absent\"))"
+    );
+    println!("cargo::rerun-if-env-changed={REQUIRE_NAX}");
     // A directory is rescanned recursively, so header edits trigger a rebuild too.
     println!("cargo::rerun-if-changed=src/metal");
     println!("cargo::rerun-if-changed=src/contracted.rs");
@@ -53,10 +67,14 @@ fn main() {
     // docs.rs has no Metal toolchain (and its sandbox has no `xcrun`).
     if env::var_os("DOCS_RS").is_some() {
         println!("cargo::rustc-cfg=nuvec_metallib=\"source\"");
+        println!("cargo::rustc-cfg=nuvec_nax_metallib=\"absent\"");
         write_sources(&out_dir, &src_dir, &[]);
+        write_named(&out_dir, &src_dir, &[], "nax_sources.rs");
         return;
     }
-    let files = shader_files(&src_dir);
+    let (nax_files, files): (Vec<PathBuf>, Vec<PathBuf>) = shader_files(&src_dir)
+        .into_iter()
+        .partition(|f| f.strip_prefix(&src_dir).is_ok_and(|r| r.starts_with("nax")));
     let require = env::var(REQUIRE).is_ok_and(|v| v == "1");
 
     let mut embedded: &[PathBuf] = &[];
@@ -73,6 +91,55 @@ fn main() {
 
     println!("cargo::rustc-cfg=nuvec_metallib=\"{mode}\"");
     write_sources(&out_dir, &src_dir, embedded);
+    let nax = match mode {
+        "precompiled" => match nax_unavailable() {
+            None => {
+                compile_library(
+                    &nax_files,
+                    &out_dir,
+                    &[NAX_STD, NAX_MIN],
+                    "nuvec_nax.metallib",
+                );
+                "precompiled"
+            }
+            Some(reason) => nax_fallback(&reason),
+        },
+        // Runtime compilation needs the OS's Metal 4 compiler, checked when loaded.
+        "source" => "source",
+        _ => "absent",
+    };
+    println!("cargo::rustc-cfg=nuvec_nax_metallib=\"{nax}\"");
+    let embedded_nax: &[PathBuf] = if nax == "source" { &nax_files } else { &[] };
+    write_named(&out_dir, &src_dir, embedded_nax, "nax_sources.rs");
+}
+
+/// Why the NAX library cannot be built here, if it cannot: an SDK older than 26.2, or no
+/// Metal Performance Primitives headers.
+fn nax_unavailable() -> Option<String> {
+    let sdk = xcrun(&["--show-sdk-version"]).ok()?;
+    let version = String::from_utf8_lossy(&sdk.stdout).trim().to_owned();
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    if (major, minor) < (26, 2) {
+        return Some(format!("the macOS SDK is {version} (26.2 or later needed)"));
+    }
+    let path = xcrun(&["--show-sdk-path"]).ok()?;
+    let headers = PathBuf::from(String::from_utf8_lossy(&path.stdout).trim()).join(
+        "System/Library/Frameworks/MetalPerformancePrimitives.framework/Headers/MetalPerformancePrimitives.h",
+    );
+    if !headers.is_file() {
+        return Some("the SDK has no Metal Performance Primitives headers".into());
+    }
+    None
+}
+
+/// `absent`, after one warning (an error under `NUVEC_REQUIRE_NAX=1`).
+fn nax_fallback(reason: &str) -> &'static str {
+    if env::var(REQUIRE_NAX).is_ok_and(|v| v == "1") {
+        panic!("{REQUIRE_NAX}=1 but {reason}");
+    }
+    println!("cargo::warning={reason}; the Neural Accelerator (NAX) kernels are not built");
+    "absent"
 }
 
 /// Why precompilation cannot run, or `None` if it can. Panics if `require` forbids a fallback.
@@ -118,12 +185,19 @@ fn xcrun(args: &[&str]) -> std::io::Result<Output> {
 
 /// Compiles every `.metal` file to AIR, in parallel, and links `nuvec.metallib`.
 fn precompile(files: &[PathBuf], out_dir: &Path) {
+    compile_library(files, out_dir, &[METAL_STD, MACOS_MIN], "nuvec.metallib");
+}
+
+/// Compiles every `.metal` file of `files` with `target` (language and deployment flags)
+/// to AIR, in parallel, and links them into `out_dir/name`.
+fn compile_library(files: &[PathBuf], out_dir: &Path, target: &[&str], name: &str) {
     let debug = env::var("PROFILE").as_deref() == Ok("debug");
     let compile = |src: &PathBuf| -> PathBuf {
-        let air = out_dir
-            .join(src.file_stem().expect("shader file has a name"))
-            .with_extension("air");
-        let mut args = vec![METAL_STD, MACOS_MIN, PRECISE];
+        // Per library, so `nax/gemm.metal` and `gemm.metal` do not collide.
+        let stem = src.file_stem().expect("shader file has a name");
+        let air = out_dir.join(format!("{name}-{}.air", stem.to_string_lossy()));
+        let mut args: Vec<&str> = target.to_vec();
+        args.push(PRECISE);
         if !CONTRACTED.iter().any(|f| src.ends_with(f)) {
             args.push(NO_CONTRACT);
         }
@@ -148,7 +222,7 @@ fn precompile(files: &[PathBuf], out_dir: &Path) {
             .collect()
     });
 
-    let lib = out_dir.join("nuvec.metallib");
+    let lib = out_dir.join(name);
     let mut args: Vec<&str> = airs.iter().map(|p| path_str(p)).collect();
     args.extend(["-o", path_str(&lib)]);
     run("metallib", &args);
@@ -186,6 +260,10 @@ fn shader_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn write_sources(out_dir: &Path, src_dir: &Path, files: &[PathBuf]) {
+    write_named(out_dir, src_dir, files, "sources.rs");
+}
+
+fn write_named(out_dir: &Path, src_dir: &Path, files: &[PathBuf], name: &str) {
     let mut code = String::from("&[");
     for file in files {
         let rel = file.strip_prefix(src_dir).expect("file is under src/metal");
@@ -198,7 +276,7 @@ fn write_sources(out_dir: &Path, src_dir: &Path, files: &[PathBuf]) {
         .expect("writing to a String");
     }
     code.push(']');
-    fs::write(out_dir.join("sources.rs"), code).expect("writing sources.rs");
+    fs::write(out_dir.join(name), code).unwrap_or_else(|e| panic!("writing {name}: {e}"));
 }
 
 fn path_str(path: &Path) -> &str {

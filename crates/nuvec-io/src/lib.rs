@@ -22,7 +22,8 @@ pub use idx::{parse_idx, read_idx};
 pub use npy::{load_npy, save_npy};
 pub use safetensors::{
     Footprint, SafeTensors, SaveHandle, load_safetensors, load_safetensors_filtered,
-    safetensors_footprint, save_safetensors, save_safetensors_async,
+    safetensors_footprint, safetensors_footprint_filtered, save_safetensors,
+    save_safetensors_async,
 };
 pub use tree::{load_into, save};
 

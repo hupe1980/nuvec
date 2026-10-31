@@ -182,8 +182,25 @@ impl CustomFunctionFlat {
 pub fn checkpoint_flat(
     f: impl Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync + 'static,
 ) -> impl Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync {
-    let function = custom_function_flat(f);
-    move |inputs| function.call(inputs)
+    let f = Arc::new(f);
+    move |inputs| {
+        // The recomputation draws the same random numbers as the forward pass (as
+        // `checkpoint`): the thread's key at this call is restored around every later run.
+        let key = crate::random::sequence_key();
+        let first = AtomicBool::new(true);
+        let f = f.clone();
+        let function = custom_function_flat(move |xs: &[Array]| {
+            let current = crate::random::sequence_key();
+            crate::random::set_sequence_key(key.clone());
+            let restore = (!first.swap(false, Ordering::AcqRel)).then_some(current);
+            let out = f(xs);
+            if let Some(current) = restore {
+                crate::random::set_sequence_key(current);
+            }
+            out
+        });
+        function.call(inputs)
+    }
 }
 
 // ── Over trees ──────────────────────────────────────────────────────────────

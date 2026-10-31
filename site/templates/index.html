@@ -35,7 +35,7 @@
         {
           "@type": "Question",
           "name": "How fast is nuvec compared to MLX?",
-          "acceptedAnswer": { "@type": "Answer", "text": "On an Apple M4 Pro (nuvec 0.4.0, 2026-10-23), nuvec-lm decodes at 0.99–1.10× the speed of mlx-lm across eight models from 0.6B to 35B parameters (geometric mean 1.02×), with the same time to first token (1.01× at 2,048 tokens). Concurrent serving is on par, and models load 1.6× faster." }
+          "acceptedAnswer": { "@type": "Answer", "text": "On an Apple M4 Pro (nuvec 0.5.0, 2026-10-27, 12 models), nuvec-lm decodes at 0.97–1.09× the speed of mlx-lm (geometric mean 1.01×) on dense, hybrid, mixture-of-experts, gpt-oss and Gemma 4 models, with the same time to first token (1.02× at 2,048 and 32,768 tokens). Concurrent serving is on par (1.00× at 4 and 8 requests), and models load 1.7× faster." }
         },
         {
           "@type": "Question",
@@ -82,9 +82,9 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
 
 <section class="stats" aria-label="Key numbers">
   <div class="wrap stats-grid">
-    <div><strong>1.02×</strong><span>mlx-lm decode speed<br>(geometric mean, 8 models)</span></div>
+    <div><strong>1.01×</strong><span>mlx-lm decode speed<br>(geometric mean, 12 models)</span></div>
     <div><strong>256K</strong><span>prompt tokens prefilled on 48 GB<br>(Qwen3.6-35B-A3B)</span></div>
-    <div><strong>2.2×</strong><span>decode with speculative<br>drafts on repetitive text</span></div>
+    <div><strong>1.66×</strong><span>decode with MTP drafts, same<br>output (Qwen3.8-27B)</span></div>
     <div><strong>0</strong><span>C/C++ dependencies<br>or MLX bindings</span></div>
   </div>
 </section>
@@ -107,12 +107,12 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
       <article class="card">
         <div class="icon" aria-hidden="true">🔥</div>
         <h3>MLX's Metal kernels</h3>
-        <p>Tiled GEMM with split-K, GEMV, 1- to 6-bit and 8-bit quantized products, flash-style attention, RMSNorm, RoPE, sort, scan and mixture-of-experts gather kernels — or your own kernel from source.</p>
+        <p>Tiled GEMM with split-K, GEMV, 1- to 6-bit and 8-bit affine and MXFP4, MXFP8 and NVFP4 quantized products, flash-style attention, RMSNorm, RoPE, sort, scan and mixture-of-experts gather kernels — or your own kernel from source.</p>
       </article>
       <article class="card">
         <div class="icon" aria-hidden="true">🤖</div>
         <h3>An LLM runtime included</h3>
-        <p>Llama, Mistral and Qwen 2/3/3.5 — dense, hybrid Gated DeltaNet or mixture-of-experts — straight from mlx-community checkpoints, with samplers, speculative decoding and batched serving.</p>
+        <p>Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 — dense, hybrid Gated DeltaNet or mixture-of-experts — straight from mlx-community checkpoints, with samplers, speculative decoding and batched serving.</p>
       </article>
       <article class="card">
         <div class="icon" aria-hidden="true">💾</div>
@@ -186,19 +186,15 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
   <div class="wrap two-col">
     <div>
       <h2 class="section-title">As fast as MLX. Measured, not claimed.</h2>
-      <p>Every number comes from one command, <code>just bench-parity</code>: nuvec-lm and mlx-lm on the same Mac, the same day, the same mlx-community checkpoints, timed the same way, medians of alternating runs.</p>
-      <p class="muted small">Apple M4 Pro · nuvec 0.4.0 · mlx-lm 0.32.2 · 2026-10-23 · greedy · decode after a 961-token prompt.</p>
+      <p>Every number comes from one command, <code>just bench-parity</code>: nuvec-lm and mlx-lm on the same Mac, the same day, the same mlx-community checkpoints, timed the same way, medians of alternating runs, with the previous release in the same session to catch regressions.</p>
+      <p class="muted small">Apple M4 Pro · nuvec 0.5.0 · mlx-lm 0.32.2 · 2026-10-25 · greedy · decode after a 961-token prompt.</p>
       <a class="link-arrow" href="{{ get_url(path='@/docs/benchmarks.md') }}">Full tables and method</a>
     </div>
     <div class="bars" role="table" aria-label="Decode speed relative to mlx-lm">
-      <div class="bar-row" role="row"><span role="cell">Qwen3-0.6B</span><span class="bar" role="cell" style="--v:1.09"><b>1.09×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Llama-3.2-3B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Llama-3.1-8B</span><span class="bar" role="cell" style="--v:1.01"><b>1.01×</b></span></div>
       <div class="bar-row" role="row"><span role="cell">Qwen3-8B</span><span class="bar" role="cell" style="--v:1.01"><b>1.01×</b></span></div>
       <div class="bar-row" role="row"><span role="cell">Qwen3.5-9B</span><span class="bar" role="cell" style="--v:0.99"><b>0.99×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3.8-27B</span><span class="bar" role="cell" style="--v:1.01"><b>1.01×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3-30B-A3B</span><span class="bar" role="cell" style="--v:1.03"><b>1.03×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3.6-35B-A3B</span><span class="bar" role="cell" style="--v:1.01"><b>1.01×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3-30B-A3B</span><span class="bar" role="cell" style="--v:1.08"><b>1.08×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">gpt-oss-20b</span><span class="bar" role="cell" style="--v:0.98"><b>0.98×</b></span></div>
       <div class="bar-axis" aria-hidden="true"><span>mlx-lm = 1.00×</span></div>
     </div>
   </div>
@@ -236,7 +232,7 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
   <div class="wrap faq-short">
     <h2 class="section-title">Questions</h2>
     <details><summary>Is nuvec a binding to MLX?</summary><p>No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ library. It reaches Metal through Apple's system frameworks and compiles its own Metal kernels, several of them ported from MLX.</p></details>
-    <details><summary>How fast is it compared to MLX?</summary><p>On an Apple M4 Pro (nuvec 0.4.0, 2026-10-23), nuvec-lm decodes at 0.99–1.10× the speed of mlx-lm across eight models from 0.6B to 35B parameters (geometric mean 1.02×), with the same time to first token (1.01× at 2,048 tokens). Concurrent serving is on par, and models load 1.6× faster. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
+    <details><summary>How fast is it compared to MLX?</summary><p>On an Apple M4 Pro (nuvec 0.5.0, 2026-10-27, 12 models), nuvec-lm decodes at 0.97–1.09× the speed of mlx-lm (geometric mean 1.01×) on dense, hybrid, mixture-of-experts, gpt-oss and Gemma 4 models, with the same time to first token (1.02× at 2,048 and 32,768 tokens). Concurrent serving is on par (1.00× at 4 and 8 requests), and models load 1.7× faster. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
     <details><summary>Which hardware does it support?</summary><p>Macs with Apple Silicon (M1 or later) on macOS 15 or newer. The core and CPU crates also build and run on Linux.</p></details>
     <a class="link-arrow" href="{{ get_url(path='@/docs/faq.md') }}">All questions</a>
   </div>

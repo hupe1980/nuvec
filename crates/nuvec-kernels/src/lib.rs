@@ -10,13 +10,16 @@
 //! - element-wise operations, casts, copies, gather and scatter along an axis;
 //! - MLX's reductions, sort (block and multi-block merge) and scans;
 //! - MLX's GEMM (steel tiles, split-K, fused `addmm`), GEMV and gather GEMM (`gather_mm`);
-//! - MLX's affine quantization: quantize, dequantize and the quantized products, including
-//!   the mixture-of-experts gather kernels;
+//! - MLX's quantization, affine and floating-point (MXFP4, MXFP8, NVFP4): quantize,
+//!   dequantize and the quantized products, including the mixture-of-experts gather
+//!   kernels, and E4M3 conversions;
 //! - MLX's fused kernels: softmax, log-sum-exp, RMS and layer normalisation, RoPE, cross
 //!   entropy, scaled dot-product attention (vector, two-pass and tiled);
 //! - mlx-lm's Gated DeltaNet kernels;
-//! - nuvec's own: residual add + RMS norm, norm + RoPE + cache write, few-row 4-bit
-//!   products, depthwise 1-D convolution and random bits.
+//! - nuvec's own: residual add + RMS norm, norm + RoPE + cache write, few-row quantized
+//!   products, depthwise 1-D convolution and random bits;
+//! - in a second library for macOS 26.2 and later ([`NAX_MODE`]), GEMM on the GPU's matrix
+//!   units through Metal 4 TensorOps (the Neural Accelerators of M5-class GPUs).
 //!
 //! **Stability:** no promise when this crate is depended on directly; depend on `nuvec`,
 //! whose re-exports are semver-tracked.
@@ -50,6 +53,47 @@ const METALLIB: Option<&[u8]> = Some(include_bytes!(concat!(env!("OUT_DIR"), "/n
 const METALLIB: Option<&[u8]> = None;
 
 const SOURCES: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/sources.rs"));
+const NAX_SOURCES: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/nax_sources.rs"));
+
+#[cfg(nuvec_nax_metallib = "precompiled")]
+const NAX_METALLIB: Option<&[u8]> = Some(include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/nuvec_nax.metallib"
+)));
+#[cfg(not(nuvec_nax_metallib = "precompiled"))]
+const NAX_METALLIB: Option<&[u8]> = None;
+
+/// How the Neural Accelerator (NAX) kernel library is provided: Metal 4.0 kernels for
+/// macOS 26.2 and later, in a library of their own so the baseline keeps macOS 15.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NaxMode {
+    /// Compiled to `nuvec_nax.metallib` at build time.
+    Precompiled,
+    /// Sources embedded for compilation at runtime (with the baseline's runtime mode).
+    RuntimeSource,
+    /// Not built: an SDK older than 26.2, no Metal Performance Primitives, or no Metal.
+    Absent,
+}
+
+/// The NAX library's mode in this build.
+pub const NAX_MODE: NaxMode = if cfg!(nuvec_nax_metallib = "precompiled") {
+    NaxMode::Precompiled
+} else if cfg!(nuvec_nax_metallib = "source") {
+    NaxMode::RuntimeSource
+} else {
+    NaxMode::Absent
+};
+
+/// The precompiled NAX library bytes, if [`NAX_MODE`] is [`NaxMode::Precompiled`].
+pub fn nax_metallib() -> Option<&'static [u8]> {
+    NAX_METALLIB
+}
+
+/// The embedded NAX shader sources, if [`NAX_MODE`] is [`NaxMode::RuntimeSource`].
+pub fn nax_sources() -> &'static [(&'static str, &'static str)] {
+    NAX_SOURCES
+}
 
 include!("contracted.rs");
 
@@ -103,6 +147,21 @@ mod tests {
         let paths: Vec<_> = sources().iter().map(|(p, _)| *p).collect();
         assert!(paths.contains(&"elementwise.metal"));
         assert!(paths.contains(&"common.h"));
+    }
+
+    #[test]
+    fn nax_accessors_match_mode() {
+        assert_eq!(NAX_MODE == NaxMode::Precompiled, nax_metallib().is_some());
+        assert_eq!(
+            NAX_MODE == NaxMode::RuntimeSource,
+            !nax_sources().is_empty()
+        );
+        if option_env!("NUVEC_REQUIRE_NAX") == Some("1") {
+            assert_eq!(NAX_MODE, NaxMode::Precompiled);
+        }
+        if let Some(lib) = nax_metallib() {
+            assert!(lib.starts_with(b"MTLB"), "not a metallib");
+        }
     }
 
     #[test]

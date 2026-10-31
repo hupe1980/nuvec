@@ -201,6 +201,32 @@ for seed in (0, 1):
         mx.random.seed(seed)
         put("dropout", **{f"s{seed}_p{int(prob * 10)}": nn.Dropout(prob)(xd)})
 
+# ── Floating-point quantized layers (MLX's GPU, the modes' reference) ──────
+
+# Their own generator, so the cases above and below keep their draws.
+fp_rng = np.random.default_rng(20261024)
+
+
+def fp_rand(*shape: int) -> mx.array:
+    return mx.array(fp_rng.normal(size=shape).astype(np.float32))
+
+
+for mode in ("mxfp4", "mxfp8", "nvfp4"):
+    with mx.stream(mx.gpu):
+        lin = nn.Linear(64, 16)
+        lin.weight = fp_rand(16, 64)
+        ql = nn.QuantizedLinear.from_linear(lin, mode=mode)
+        x1 = fp_rand(1, 64)
+        emb = nn.Embedding(10, 64)
+        emb.weight = fp_rand(10, 64)
+        qe = nn.QuantizedEmbedding.from_embedding(emb, mode=mode)
+        ids = mx.array([3, 0, 7])
+        put(f"qlinear_{mode}", weight=lin.weight, bias=lin.bias, x=x1, qweight=ql.weight,
+            scales=ql.scales, y=ql(x1))
+        put(f"qembed_{mode}", weight=emb.weight, qweight=qe.weight, scales=qe.scales, ids=ids,
+            rows=qe(ids), linear=qe.as_linear(x1))
+        mx.eval(out)
+
 mx.eval(out)
 OUT.parent.mkdir(parents=True, exist_ok=True)
 mx.save_safetensors(str(OUT), out)
@@ -250,6 +276,8 @@ NAMES = {
     "QuantizedLinear_trainable_after_unfreeze": [k for k, _ in tree_flatten(ql.trainable_parameters())],
     "Embedding": names(nn.Embedding(10, 4)),
     "QuantizedEmbedding": names(nn.QuantizedEmbedding.from_embedding(nn.Embedding(10, 64))),
+    "QuantizedLinear_mxfp4": names(nn.QuantizedLinear.from_linear(nn.Linear(64, 8), mode="mxfp4")),
+    "QuantizedEmbedding_nvfp4": names(nn.QuantizedEmbedding.from_embedding(nn.Embedding(10, 64), mode="nvfp4")),
     "RMSNorm": names(nn.RMSNorm(8)),
     "LayerNorm": names(nn.LayerNorm(8)),
     "LayerNorm_no_bias": names(nn.LayerNorm(8, bias=False)),

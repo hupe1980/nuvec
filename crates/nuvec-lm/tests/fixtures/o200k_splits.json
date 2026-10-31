@@ -1,0 +1,112 @@
+{
+ "pattern": "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+ "cases": [
+  {
+   "text": "Hello  world's 123456!? don't I'LL HTTPRequest iPhone McDonald's",
+   "pieces": [
+    "Hello",
+    " ",
+    " world's",
+    " ",
+    "123",
+    "456",
+    "!?",
+    " don't",
+    " I'LL",
+    " HTTPRequest",
+    " i",
+    "Phone",
+    " Mc",
+    "Donald's"
+   ]
+  },
+  {
+   "text": "ÜBER über Ärger naïve café ﬁne ǅemo ʰello",
+   "pieces": [
+    "ÜBER",
+    " über",
+    " Ärger",
+    " naïve",
+    " café",
+    " ﬁne",
+    " ǅemo",
+    " ʰello"
+   ]
+  },
+  {
+   "text": "áb ́x 日本語のテキスト 한국어 mixed中文Text",
+   "pieces": [
+    "áb",
+    " ́x",
+    " 日本語のテキスト",
+    " 한국어",
+    " mixed中文",
+    "Text"
+   ]
+  },
+  {
+   "text": "path/to/file ,,, ...\n\n  \n\tx  y\r\n\r\nz   ",
+   "pieces": [
+    "path",
+    "/to",
+    "/file",
+    " ,,,",
+    " ...\n\n",
+    "  \n",
+    "\tx",
+    " ",
+    " y",
+    "\r\n\r\n",
+    "z",
+    "   "
+   ]
+  },
+  {
+   "text": "x'S y'Ve 'll 1 22 333 4444 ٣٤٥ Ⅷ ½",
+   "pieces": [
+    "x'S",
+    " y'Ve",
+    " '",
+    "ll",
+    " ",
+    "1",
+    " ",
+    "22",
+    " ",
+    "333",
+    " ",
+    "444",
+    "4",
+    " ",
+    "٣٤٥",
+    " ",
+    "Ⅷ",
+    " ",
+    "½"
+   ]
+  },
+  {
+   "text": "!!!/\n// hi/there\n  \n",
+   "pieces": [
+    "!!!/\n//",
+    " hi",
+    "/there",
+    "\n  \n"
+   ]
+  },
+  {
+   "text": "CamelCaseWord ALLCAPS's lower's MiXeD ABCdef",
+   "pieces": [
+    "Camel",
+    "Case",
+    "Word",
+    " ALLCAPS's",
+    " lower's",
+    " Mi",
+    "Xe",
+    "D",
+    " ABCdef"
+   ]
+  }
+ ]
+}

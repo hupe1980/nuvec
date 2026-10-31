@@ -133,19 +133,90 @@ fn unary_gradients() {
     );
 }
 
+/// Attention (unmasked, causal, windowed, windowed with sinks, grouped queries) against
+/// finite differences in float64: the derivatives run the composition, in float64.
+#[test]
+#[cfg_attr(miri, ignore = "hundreds of evaluations: too slow under Miri")]
+fn attention_gradients_equal_finite_differences() {
+    check(
+        "causal-attention",
+        |x| {
+            fast::scaled_dot_product_attention(
+                &x[0],
+                &x[1],
+                &x[2],
+                0.5,
+                &fast::AttentionOptions::causal(),
+            )
+        },
+        &[&[1, 2, 4, 4], &[1, 1, 7, 4], &[1, 1, 7, 4]],
+        -1.0,
+        1.0,
+    );
+    check(
+        "plain-attention",
+        |x| {
+            fast::scaled_dot_product_attention(
+                &x[0],
+                &x[1],
+                &x[2],
+                0.5,
+                &fast::AttentionOptions::default(),
+            )
+        },
+        &[&[1, 2, 4, 4], &[1, 1, 7, 4], &[1, 1, 7, 4]],
+        -1.0,
+        1.0,
+    );
+    let causal_window = |x: &[Array]| {
+        fast::scaled_dot_product_attention(
+            &x[0],
+            &x[1],
+            &x[2],
+            0.5,
+            &fast::AttentionOptions::causal().window(3),
+        )
+    };
+    check(
+        "windowed-attention",
+        causal_window,
+        &[&[1, 2, 4, 4], &[1, 1, 7, 4], &[1, 1, 7, 4]],
+        -1.0,
+        1.0,
+    );
+    check(
+        "windowed-attention-sinks",
+        |x| {
+            fast::scaled_dot_product_attention(
+                &x[0],
+                &x[1],
+                &x[2],
+                0.5,
+                &fast::AttentionOptions::causal()
+                    .window(3)
+                    .sinks(Some(&x[3])),
+            )
+        },
+        &[&[1, 2, 4, 4], &[1, 1, 7, 4], &[1, 1, 7, 4], &[2]],
+        -1.0,
+        1.0,
+    );
+}
+
 #[test]
 #[cfg_attr(
     miri,
     ignore = "hundreds of evaluations: too slow under Miri, and covered natively"
 )]
 fn binary_gradients_with_broadcasting() {
-    let cases: [(&str, F); 6] = [
+    let cases: [(&str, F); 7] = [
         ("add", |x| x[0].add(&x[1])),
         ("subtract", |x| x[0].subtract(&x[1])),
         ("multiply", |x| x[0].multiply(&x[1])),
         ("divide", |x| x[0].divide(&x[1])),
         ("maximum", |x| x[0].maximum(&x[1])),
         ("minimum", |x| x[0].minimum(&x[1])),
+        ("power", |x| x[0].power(&x[1])),
     ];
     for (name, f) in cases {
         check(name, f, &[&[2, 3], &[3]], 0.5, 2.0);

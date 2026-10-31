@@ -51,10 +51,21 @@ pub(crate) fn slice_update(
     update: Operand<'_>,
     slices: &[DimSlice],
 ) -> Result<Buffer> {
-    fn run<T: Pod>(base: Operand<'_>, update: Operand<'_>, slices: &[DimSlice]) -> Result<Buffer> {
-        let mut out = contiguous(base.0, base.1)?;
-        let (strides, offset) =
-            view::slice_geometry(&shape::row_contiguous_strides(&base.0.shape), slices);
+    let mut out = contiguous(base.0, base.1)?;
+    slice_update_into(&mut out, &base.0.shape, update, slices);
+    Ok(out)
+}
+
+/// Writes `update` into the region `slices` of `out`, a row-major array of `shape` (the
+/// in-place half of [`slice_update`], also run on a donated base).
+pub(crate) fn slice_update_into(
+    out: &mut Buffer,
+    shape: &[usize],
+    update: Operand<'_>,
+    slices: &[DimSlice],
+) {
+    fn run<T: Pod>(out: &mut Buffer, base: &[usize], update: Operand<'_>, slices: &[DimSlice]) {
+        let (strides, offset) = view::slice_geometry(&shape::row_contiguous_strides(base), slices);
         let shape = &update.0.shape;
         let dst = out.typed_mut::<T>();
         // The update read in place through its own strides (no temporary copy), in row-major
@@ -77,13 +88,12 @@ pub(crate) fn slice_update(
                 index[d] = 0;
             }
         }
-        Ok(out)
     }
-    match base.0.dtype.size() {
-        1 => run::<u8>(base, update, slices),
-        2 => run::<u16>(base, update, slices),
-        4 => run::<u32>(base, update, slices),
-        _ => run::<u64>(base, update, slices),
+    match update.0.dtype.size() {
+        1 => run::<u8>(out, shape, update, slices),
+        2 => run::<u16>(out, shape, update, slices),
+        4 => run::<u32>(out, shape, update, slices),
+        _ => run::<u64>(out, shape, update, slices),
     }
 }
 
@@ -530,6 +540,8 @@ pub(crate) fn binary(op: BinaryOp, a: Operand<'_>, b: Operand<'_>) -> Result<Buf
                 BinaryOp::Divide => go!(T::div_),
                 BinaryOp::Maximum => go!(T::max_),
                 BinaryOp::LogAddExp => go!(T::logaddexp_),
+                BinaryOp::FloorDivide => go!(T::floordiv_),
+                BinaryOp::Power => go!(T::pow_),
                 _ => go!(T::min_),
             }
             Ok(out)
@@ -840,6 +852,145 @@ pub(crate) fn dequantize(
     })
 }
 
+/// MLX's `to_fp8`: each float (through float32) as an E4M3 byte. Widening float16 makes a
+/// NaN positive, as the GPU's conversion does.
+pub(crate) fn to_fp8(a: Operand<'_>) -> Result<Buffer> {
+    let values = cast(a, DType::F32)?;
+    let half = a.0.dtype == DType::F16;
+    let mut out = output::<u8>(a.0.size)?;
+    for (o, &v) in out.bytes_mut().iter_mut().zip(values.typed::<f32>()) {
+        *o = crate::fp8::e4m3_from_f32(if half { crate::fp8::canonical(v) } else { v });
+    }
+    Ok(out)
+}
+
+/// MLX's `gather_mm_offsets` per row of the last axis: for each group `g`, the first
+/// index whose value is not below `g` (binary search, as the Metal kernel).
+pub(crate) fn sorted_offsets(a: Operand<'_>, groups: usize) -> Result<Buffer> {
+    let indices = contiguous(a.0, a.1)?;
+    let indices = indices.typed::<u32>();
+    let (rows, m) = a.0.shape.split_at(a.0.shape.len() - 1);
+    let (rows, m) = (rows.iter().product::<usize>(), m[0]);
+    let mut out = output::<i32>(rows * groups)?;
+    for (r, offsets) in out
+        .typed_mut::<i32>()
+        .chunks_exact_mut(groups.max(1))
+        .enumerate()
+    {
+        let row = &indices[r * m..(r + 1) * m];
+        for (g, o) in offsets.iter_mut().enumerate() {
+            *o = row.partition_point(|&i| (i as usize) < g) as i32;
+        }
+    }
+    Ok(out)
+}
+
+/// MLX's `from_fp8`: each E4M3 byte as `dtype`.
+pub(crate) fn from_fp8(a: Operand<'_>, dtype: DType) -> Result<Buffer> {
+    let codes = contiguous(a.0, a.1)?;
+    with_type!(dtype, T => {
+        let mut out = output::<T>(a.0.size)?;
+        for (o, &c) in out.typed_mut::<T>().iter_mut().zip(codes.bytes()) {
+            *o = round_to::<T>(f64::from(crate::fp8::e4m3_to_f32(c)));
+        }
+        Ok(out)
+    })
+}
+
+/// MLX's floating-point quantization (`fp_quantize`, Metal): per group, the scale
+/// `amax / max_element` (6 for E2M1, 448 for E4M3), rounded up to a power of two (mx modes,
+/// E8M0) or encoded as E4M3 (nvfp4); the values are encoded as `w · (1 / scale)` (0 for a
+/// zero scale), two E2M1 codes per byte (low nibble first) or one E4M3 code per byte. The
+/// operations and their order are the Metal kernel's, with float32 subnormals flushed to
+/// zero as the GPU does ([`fp8::ftz`]), so the bytes are MLX's GPU bytes.
+/// Returns the packed codes and the uint8 scales.
+pub(crate) fn fp_quantize(
+    w: Operand<'_>,
+    group_size: usize,
+    bits: usize,
+) -> Result<(Buffer, Buffer)> {
+    use crate::fp8;
+    let values = cast(w, DType::F32)?;
+    let values = values.typed::<f32>();
+    let mx = group_size == 32;
+    let max_element = if bits == 4 {
+        fp8::E2M1_MAX
+    } else {
+        fp8::E4M3_MAX
+    };
+    let mut packed = output::<u32>(values.len() * bits / 32)?;
+    let bytes = packed.bytes_mut();
+    let mut scales = output::<u8>(values.len() / group_size)?;
+    let scale_codes = scales.bytes_mut();
+    for (g, group) in values.chunks_exact(group_size).enumerate() {
+        let amax = group.iter().fold(0f32, |m, &v| m.max(fp8::ftz(v).abs()));
+        let scale = fp8::ftz(amax / max_element);
+        let (code, decoded) = if mx {
+            let rounded = fp8::mx_scale_round_up(scale);
+            let code = fp8::e8m0_from_f32(rounded);
+            (code, fp8::e8m0_to_f32(code))
+        } else {
+            let code = fp8::e4m3_from_f32(scale);
+            (code, fp8::e4m3_to_f32(code))
+        };
+        scale_codes[g] = code;
+        let decoded = fp8::ftz(decoded);
+        let inverse = if decoded == 0.0 {
+            0.0
+        } else {
+            fp8::ftz(1.0 / decoded)
+        };
+        for (j, &v) in group.iter().enumerate() {
+            let i = g * group_size + j;
+            let scaled = fp8::canonical(fp8::ftz(fp8::ftz(v) * inverse));
+            if bits == 8 {
+                bytes[i] = fp8::e4m3_from_f32(scaled);
+            } else {
+                let nibble = fp8::e2m1_from_f32(scaled);
+                if i.is_multiple_of(2) {
+                    bytes[i / 2] = nibble;
+                } else {
+                    bytes[i / 2] |= nibble << 4;
+                }
+            }
+        }
+    }
+    Ok((packed, scales))
+}
+
+/// MLX's floating-point dequantization (`fp_dequantize`, Metal): each value is
+/// `float(scale) · float(code)` in float32 (subnormals flushed, as the GPU), rounded once to
+/// `dtype`.
+pub(crate) fn fp_dequantize(
+    w: Operand<'_>,
+    scales: Operand<'_>,
+    group_size: usize,
+    bits: usize,
+    dtype: DType,
+) -> Result<Buffer> {
+    use crate::fp8;
+    let codes = contiguous(w.0, w.1)?;
+    let codes = codes.bytes();
+    let s = contiguous(scales.0, scales.1)?;
+    let s = s.bytes();
+    let mx = group_size == 32;
+    let n = w.0.size * 32 / bits;
+    with_type!(dtype, T => {
+        let mut out = output::<T>(n)?;
+        for (i, o) in out.typed_mut::<T>().iter_mut().enumerate() {
+            let code = s[i / group_size];
+            let scale = if mx { fp8::e8m0_to_f32(code) } else { fp8::e4m3_to_f32(code) };
+            let value = if bits == 8 {
+                fp8::e4m3_to_f32(codes[i])
+            } else {
+                fp8::e2m1_to_f32((codes[i / 2] >> (4 * (i % 2))) & 0xF)
+            };
+            *o = round_to::<T>(f64::from(fp8::canonical(fp8::ftz(fp8::ftz(scale) * value))));
+        }
+        Ok(out)
+    })
+}
+
 /// Metadata for a matrix operand with explicit strides.
 pub(crate) fn strided(dtype: DType, shape: &[usize], strides: &[isize]) -> Output {
     Output {
@@ -855,15 +1006,23 @@ pub(crate) fn strided(dtype: DType, shape: &[usize], strides: &[isize]) -> Outpu
 }
 
 /// `x · dequantize(w)ᵀ` (`transpose`) or `x · dequantize(w)`: the weights are dequantized,
-/// then multiplied with the GEMM (accumulating in f32 for half types).
+/// then multiplied with the GEMM (accumulating in f32 for half types). The floating-point
+/// modes decode, multiply and accumulate in f32 (as MLX's kernels) and round once to `x`'s
+/// dtype.
 pub(crate) fn quantized_matmul(
     operands: &[Operand<'_>],
+    quant: crate::Quant,
     group_size: usize,
     bits: usize,
     transpose: bool,
 ) -> Result<Buffer> {
     let (x, w) = (operands[0], operands[1]);
-    let dense = Data::new(dequantize(w, operands[2], operands[3], group_size, bits)?);
+    let fp = quant.mode != crate::QuantMode::Affine;
+    let dense = match fp {
+        false => dequantize(w, operands[2], operands[3], group_size, bits)?,
+        true => fp_dequantize(w, operands[2], group_size, bits, DType::F32)?,
+    };
+    let dense = Data::new(dense);
     let (xn, wn) = (x.0.shape.len(), w.0.shape.len());
     let rows = w.0.shape[wn - 2];
     let cols = w.0.shape[wn - 1] * 32 / bits;
@@ -883,8 +1042,20 @@ pub(crate) fn quantized_matmul(
     };
     shape.extend([k, n]);
     strides.extend([sk, sn]);
-    let meta = strided(x.0.dtype, &shape, &strides);
-    matmul(x, (&meta, &dense))
+    if !fp {
+        let meta = strided(x.0.dtype, &shape, &strides);
+        return matmul(x, (&meta, &dense));
+    }
+    let row_major =
+        |shape: &[usize]| strided(DType::F32, shape, &shape::row_contiguous_strides(shape));
+    let x32 = Data::new(cast(x, DType::F32)?);
+    let product = matmul(
+        (&row_major(&x.0.shape), &x32),
+        (&strided(DType::F32, &shape, &strides), &dense),
+    )?;
+    let mut out_shape = x.0.shape.to_vec();
+    out_shape[xn - 1] = n;
+    cast((&row_major(&out_shape), &Data::new(product)), x.0.dtype)
 }
 
 /// `T` is the storage type, `G` the GEMM element type with the same layout.
@@ -961,6 +1132,12 @@ trait Num: Scalar {
     fn logaddexp_(self, _: Self) -> Self {
         unreachable!("logaddexp of a non-float type: {REJECTED}")
     }
+    fn floordiv_(self, _: Self) -> Self {
+        unreachable!("floor division of bool or complex: {REJECTED}")
+    }
+    fn pow_(self, _: Self) -> Self {
+        unreachable!("power of bool or complex: {REJECTED}")
+    }
 }
 
 const REJECTED: &str = "rejected by the ops layer";
@@ -1019,6 +1196,30 @@ macro_rules! int_num {
             fn neg_(self) -> Self { self.wrapping_neg() }
             fn abs_(self) -> Self { let f: fn($t) -> $t = $abs; f(self) }
             fn float_(self, _: UnaryOp) -> Self { unreachable!("integer transcendental: {REJECTED}") }
+            fn pow_(self, o: Self) -> Self {
+                // Repeated squaring (MLX's Power), wrapping; 0 for a negative exponent.
+                #[allow(unused_comparisons)]
+                if o < 0 {
+                    return 0;
+                }
+                let (mut r, mut x, mut e) = (1 as Self, self, o);
+                while e != 0 {
+                    if e & 1 == 1 {
+                        r = r.wrapping_mul(x);
+                    }
+                    e >>= 1;
+                    x = x.wrapping_mul(x);
+                }
+                r
+            }
+            fn floordiv_(self, o: Self) -> Self {
+                if o == 0 {
+                    return 0;
+                }
+                let q = self.wrapping_div(o);
+                let negative = |v: Self| (v as i128) < 0;
+                if self.wrapping_rem(o) != 0 && negative(self) != negative(o) { q - 1 } else { q }
+            }
         }
     )*};
 }
@@ -1040,6 +1241,8 @@ macro_rules! float_num {
             fn neg_(self) -> Self { -self }
             fn abs_(self) -> Self { self.abs() }
             fn is_nan_(self) -> bool { self.is_nan() }
+            fn floordiv_(self, o: Self) -> Self { (self / o).floor() }
+            fn pow_(self, o: Self) -> Self { self.powf(o) }
             fn logaddexp_(self, o: Self) -> Self {
                 if self.is_nan() || o.is_nan() {
                     return <$t>::NAN;
@@ -1164,6 +1367,9 @@ macro_rules! half_num {
             fn is_nan_(self) -> bool { self.is_nan() }
             fn float_(self, op: UnaryOp) -> Self { <$t>::from_f32(self.to_f32().float_(op)) }
             fn logaddexp_(self, o: Self) -> Self { <$t>::from_f32(self.to_f32().logaddexp_(o.to_f32())) }
+            // The floor of the rounded quotient (MLX's kernel: `floor(x / y)` in the type).
+            fn floordiv_(self, o: Self) -> Self { <$t>::from_f32(self.div_(o).to_f32().floor()) }
+            fn pow_(self, o: Self) -> Self { <$t>::from_f32(self.to_f32().powf(o.to_f32())) }
         }
     )*};
 }

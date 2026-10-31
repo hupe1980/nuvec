@@ -22,13 +22,30 @@ Sections (`--sections`, default all):
   cold (after `sudo -n purge`, when available without a password).
 - `concurrency`: aggregate tokens per second of 1, 4 and 8 requests served together
   (nuvec `Batcher` vs mlx-lm `BatchGenerator`), and whether nuvec's batched tokens equal
-  each request generated alone.
+  each request generated alone (information: with MLX's routing they may differ in their
+  low bits, as mlx-lm's do).
+
+Tiers (`--tier`):
+
+- `quick` (default, about 45 minutes): one model per architecture (`QUICK_MODELS`), decode,
+  time to first token at 2,048 tokens, memory, warm load and 4 concurrent requests. The
+  release gate.
+- `full`: every roster model, 32K tokens and each model's longer extras, cold loads and 1, 4
+  and 8 requests: hours; run it in pieces with `--budget` and `--resume`.
+
+Regressions: unless `--no-baseline`, the previous release (`--baseline REF`, default the
+latest `v*` tag) runs as a third engine, alternating with the others, and every cell also
+records HEAD against it (`vs_baseline`, best sample against best sample: interference
+only slows runs down). A cell below 0.97 is measured once more (every
+engine, a fresh pass); if it stays below, it is listed in `summary.regressions` and the run
+exits 4. Models the baseline cannot run have no comparison.
 
 Ratios are oriented so that above 1.00 favours nuvec (speeds nuvec / mlx-lm, times and
 memory mlx-lm / nuvec). Speed and time cells are marked against the gate (0.98) and the
 goal (1.0).
 
-Usage: `just bench-parity [models…] [--sections decode,ttft] [--out PATH] [--release]
+Usage: `just bench-parity [models…] [--tier quick|full] [--baseline REF | --no-baseline]
+[--sections decode,ttft] [--out PATH] [--release]
 [--resume] [--budget SECONDS] [--nuvec-ref REF] [--no-cold] [--no-max-context]
 [--prompt-tokens 2048,32768] [--concurrency 1,4,8]`.
 
@@ -67,6 +84,10 @@ ROSTER = [
     ("mlx-community/Qwen3.8-27B-4bit", "hybrid", []),
     ("mlx-community/Qwen3-30B-A3B-4bit", "moe", []),
     ("mlx-community/Qwen3.6-35B-A3B-4bit", "hybrid-moe", [32768, 65536, 261952]),
+    ("mlx-community/gpt-oss-20b-MXFP4-Q8", "moe", []),
+    ("lmstudio-community/gpt-oss-20b-MLX-8bit", "moe", []),
+    ("mlx-community/gemma-4-e4b-it-4bit", "dense", []),
+    ("mlx-community/gemma-4-26b-a4b-it-4bit", "moe", []),
 ]
 MAX_CONTEXT = 261952
 TEXT = ("The lighthouse keeper climbed the spiral stairs every evening, counting the steps "
@@ -81,6 +102,15 @@ MIN_DECODE_TOKENS, MIN_DECODE_S = 8, 0.010
 CONC_PROMPT, CONC_TOKENS = 512, 128
 LOAD_SAMPLES = 3
 SECTIONS = ["decode", "ttft", "memory", "load", "concurrency"]
+# The quick tier (the default): one model per architecture and the cells that move with
+# kernel and scheduler changes, in about 45 minutes with the baseline. The full tier adds
+# the long contexts, cold loads and the whole roster.
+QUICK_MODELS = ["mlx-community/Qwen3-8B-4bit", "mlx-community/Qwen3.5-9B-4bit",
+                "mlx-community/Qwen3-30B-A3B-4bit", "mlx-community/gpt-oss-20b-MXFP4-Q8"]
+TIERS = {"quick": {"prompt_tokens": "2048", "concurrency": "4"},
+         "full": {"prompt_tokens": "2048,32768", "concurrency": "1,4,8"}}
+# A cell below this ratio to the baseline release is measured once more, then reported.
+REGRESSION = 0.97
 GIB = 1 << 30
 
 
@@ -316,10 +346,14 @@ def mlx_worker(mode: str, snap: str, rest: list[str]) -> None:
 # ── Children and the job cache ───────────────────────────────────────────────────────────
 
 class Runner:
-    def __init__(self, args, bench: Path, ref_tag: str):
+    def __init__(self, args, bench: Path, ref_tag: str, base: Path | None = None,
+                 base_tag: str = ""):
         self.args = args
         self.bench = bench
         self.ref_tag = ref_tag  # "" for the working tree, "@<sha>" for --nuvec-ref
+        self.base = base  # the baseline release's bench binary (`--baseline`)
+        self.base_tag = base_tag
+        self.extra = 0  # extra samples per cell while re-measuring suspected regressions
         self.deadline = time.monotonic() + args.budget if args.budget else None
 
     def child(self, cmd: list[str]) -> tuple[list[dict], int, str | None]:
@@ -338,18 +372,36 @@ class Runner:
             return lines(stdout), usage.ru_maxrss, f"exit {proc.returncode}: {tail[0][:300]}"
         return lines(stdout), usage.ru_maxrss, None
 
-    def job(self, model: str, key: str, engine: str, cmd: list[str]) -> dict:
-        """A cached child run: {"lines", "maxrss", "error"}."""
-        tag = self.ref_tag if engine == "nuvec" else ""
-        path = WORK / slug(model) / "jobs" / f"{engine}{tag}-{key}.json"
-        if self.args.resume and path.exists():
+    def path(self, model: str, key: str, engine: str) -> Path:
+        tag = {"nuvec": self.ref_tag, "base": self.base_tag}.get(engine, "")
+        name = "nuvec" if engine == "base" else engine
+        return WORK / slug(model) / "jobs" / f"{name}{tag}-{key}.json"
+
+    def engines(self) -> list[str]:
+        """The engines of one comparison, in the order they alternate."""
+        return ["nuvec", *(["base"] if self.base else []), "mlx"]
+
+    def cached(self, model: str, key: str) -> bool:
+        """Whether `--resume` may reuse a comparison: every engine's run of it is cached, so
+        all of them come from the same session (a partial set is measured again whole)."""
+        return self.args.resume and all(self.path(model, key, e).exists()
+                                        for e in self.engines())
+
+    def job(self, model: str, key: str, engine: str, cmd: list[str],
+            fresh: bool = False) -> dict:
+        """A cached child run: {"lines", "maxrss", "error"}; `fresh` ignores the cache."""
+        tag = {"nuvec": self.ref_tag, "base": self.base_tag}.get(engine, "")
+        name = "nuvec" if engine == "base" else engine
+        path = self.path(model, key, engine)
+        if self.args.resume and not fresh and path.exists():
             return json.loads(path.read_text())
         if self.deadline and time.monotonic() > self.deadline:
             raise OutOfBudget
         if not self.args.quiet:
-            print(f"  {slug(model)}: {engine}{tag} {key}", file=sys.stderr, flush=True)
-        if engine == "nuvec":
-            out, maxrss, error = self.child([str(self.bench), *cmd])
+            print(f"  {slug(model)}: {name}{tag} {key}", file=sys.stderr, flush=True)
+        if engine in ("nuvec", "base"):
+            binary = self.bench if engine == "nuvec" else self.base
+            out, maxrss, error = self.child([str(binary), *cmd])
         else:
             out, maxrss, error = self.child([sys.executable, __file__, "--mlx-worker", *cmd])
         result = {"lines": out, "maxrss": maxrss, "error": error}
@@ -381,6 +433,25 @@ def pair(ours: list[float] | None, theirs: list[float] | None, unit: str,
         p["gate_pass"] = ratio >= GATE
         p["goal_pass"] = ratio >= GOAL
     return p
+
+
+def attach(p: dict, base: list[float] | None, higher_is_better: bool) -> None:
+    """Adds the baseline release's samples to a pair, and HEAD's ratio to them (above 1
+    favours HEAD; `None` when either side is missing, e.g. a model the baseline lacks).
+
+    The ratio compares each engine's best sample (the highest speed, the lowest time or
+    memory): other work on the machine only ever slows a run down, so the best sample is
+    the stable estimate when some passes are disturbed. Medians stay in the record."""
+    n = p.get("nuvec")
+    m = metric(base or [], n["unit"]) if n else None
+    p["baseline"] = m
+    p["vs_baseline"] = None
+    if m and n:
+        best = max if higher_is_better else min
+        ours, theirs = best(n["samples"]), best(m["samples"])
+        if ours > 0 and theirs > 0:
+            r = ours / theirs if higher_is_better else theirs / ours
+            p["vs_baseline"] = round(r, 4)
 
 
 def decode_check(row: dict) -> str | None:
@@ -422,12 +493,21 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
     if ids["error"]:
         entry.update(status="failed", reason=f"prompt ids: {ids['error']}")
         return entry
-    passes = range(r.args.passes)
+    passes = range(r.args.passes + r.extra)
     text = ["--model", s, "--text", TEXT]
+    # The baseline's results per job key (its failures are not problems of this record).
+    base: dict[str, list[dict]] = {}
+
+    def base_lines(key: str) -> list[dict]:
+        return [x for res in base.get(key, []) if not res["error"] for x in res["lines"]]
 
     def both(key: str, nuvec_cmd: list[str], mlx_cmd: list[str], p: int):
-        a = r.job(model, f"{key}-p{p}", "nuvec", nuvec_cmd)
-        b = r.job(model, f"{key}-p{p}", "mlx", mlx_cmd)
+        fresh = not r.cached(model, f"{key}-p{p}")
+        a = r.job(model, f"{key}-p{p}", "nuvec", nuvec_cmd, fresh)
+        if r.base:
+            base.setdefault(key, []).append(r.job(model, f"{key}-p{p}", "base", nuvec_cmd,
+                                                  fresh))
+        b = r.job(model, f"{key}-p{p}", "mlx", mlx_cmd, fresh)
         for e, res in (("nuvec", a), ("mlx-lm", b)):
             if res["error"]:
                 problems.append(f"{key} {e}: {res['error']}")
@@ -455,6 +535,10 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
             legacy.append({"repeats": rep, "prompt_tokens": tokens,
                            "prefill_tok_s": pair(side(o, "prefill")[0], side(t, "prefill")[0],
                                                  "tok/s", True)})
+            if r.base:
+                bl = [x for x in base_lines("decode") if x.get("repeats") == rep]
+                attach(decode[-1]["tok_s"], side(bl, "decode", decode_check)[0], True)
+                attach(legacy[-1]["prefill_tok_s"], side(bl, "prefill")[0], True)
         entry["decode"] = decode
         entry.setdefault("ttft", {})["legacy"] = legacy
 
@@ -491,6 +575,10 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
                                          False, reason=why),
                           "prefill_tok_s": pair(side(o, "prefill")[0], side(t, "prefill")[0],
                                                 "tok/s", True, reason=why)})
+            if r.base:
+                bl = base_lines(f"ttft-{n}")
+                attach(cells[-1]["ttft_s"], side(bl, "ttft_s")[0], False)
+                attach(cells[-1]["prefill_tok_s"], side(bl, "prefill")[0], True)
         entry.setdefault("ttft", {})["lengths"] = cells
 
     if "memory" in sections:
@@ -516,6 +604,10 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
                                           [x["maxrss"] for x in t if not x["error"]],
                                           "bytes", False, False),
             }
+            if r.base:
+                bl = [res["lines"][0] for res in base.get(f"mem-{name}", [])
+                      if res["lines"] and not res["error"]]
+                attach(cell["peak_bytes"], [x["peak_with_mapped_bytes"] for x in bl], False)
             if ol:
                 last = ol[-1]
                 cell["nuvec_raw"] = {"peak_bytes": last["peak_bytes"],
@@ -569,14 +661,23 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
         f = prompts / "concurrency.txt"
         rows = []
         for n in levels:
-            a = r.job(model, f"conc-{n}", "nuvec", [*text, "--batch", str(n), "--ids-file",
-                                                    str(f), "--max-tokens", str(CONC_TOKENS)])
-            b = r.job(model, f"conc-{n}", "mlx", ["concurrency", s, str(f), str(n)])
-            for e, res_ in (("nuvec", a), ("mlx-lm", b)):
-                if res_["error"]:
-                    problems.append(f"concurrency {n} {e}: {res_['error']}")
-            o = a["lines"][:1] if not a["error"] else []
-            t = b["lines"][:1] if not b["error"] else []
+            cmd = [*text, "--batch", str(n), "--ids-file", str(f), "--max-tokens",
+                   str(CONC_TOKENS)]
+            o, t, bl = [], [], []
+            # One sample per engine, and one more per re-measurement.
+            for i in range(1 + r.extra):
+                key = f"conc-{n}" + (f"-r{i}" if i else "")
+                fresh = not r.cached(model, key)
+                a = r.job(model, key, "nuvec", cmd, fresh)
+                if r.base:
+                    c = r.job(model, key, "base", cmd, fresh)
+                    bl += c["lines"][:1] if not c["error"] else []
+                b = r.job(model, key, "mlx", ["concurrency", s, str(f), str(n)], fresh)
+                for e, res_ in (("nuvec", a), ("mlx-lm", b)):
+                    if res_["error"]:
+                        problems.append(f"concurrency {n} {e}: {res_['error']}")
+                o += a["lines"][:1] if not a["error"] else []
+                t += b["lines"][:1] if not b["error"] else []
             rows.append({
                 "level": n,
                 "total_tokens": n * CONC_TOKENS,
@@ -587,8 +688,11 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
                 "decode_aggregate_tok_s": pair(
                     [x["decode_tokens"] / x["decode_wall_s"] for x in o],
                     [x["decode_tokens"] / x["decode_wall_s"] for x in t], "tok/s", True),
-                "nuvec_matches_solo": o[0]["matches_solo"] if o else None,
+                "nuvec_matches_solo": all(x["matches_solo"] for x in o) if o else None,
             })
+            if r.base:
+                attach(rows[-1]["aggregate_tok_s"],
+                       [x["total_tokens"] / x["wall_s"] for x in bl], True)
         entry["concurrency"] = rows
 
     if problems:
@@ -616,12 +720,30 @@ def pairs_of(entry: dict):
         yield f"concurrency_{row['level']}", row["aggregate_tok_s"]
 
 
+def baseline_cells(entry: dict):
+    """(section, cell, Pair) for every cell compared with the baseline release."""
+    for row in entry.get("decode", []):
+        yield "decode", f"decode after {row['repeats']}x", row["tok_s"]
+    for row in entry.get("ttft", {}).get("lengths", []):
+        yield "ttft", f"ttft {row['prompt_tokens']}", row["ttft_s"]
+    for name, cell in entry.get("memory", {}).items():
+        yield "memory", f"memory {name}", cell["peak_bytes"]
+    for row in entry.get("concurrency", []):
+        yield "concurrency", f"concurrency {row['level']}", row["aggregate_tok_s"]
+
+
+def suspects(entry: dict, threshold: float) -> set[str]:
+    """The sections with a cell below the regression threshold."""
+    return {sec for sec, _, p in baseline_cells(entry)
+            if p.get("vs_baseline") is not None and p["vs_baseline"] < threshold}
+
+
 def geomean(values: list[float]) -> dict | None:
     return {"value": round(statistics.geometric_mean(values), 4), "n": len(values)} \
         if values else None
 
 
-def summary(models: list[dict]) -> dict:
+def summary(models: list[dict], threshold: float = REGRESSION) -> dict:
     groups: dict[str, list[float]] = {}
     below_gate: dict[str, list] = {}
     below_goal: dict[str, list] = {}
@@ -640,11 +762,17 @@ def summary(models: list[dict]) -> dict:
                 if not p["goal_pass"]:
                     below_goal.setdefault(key, []).append({"model": entry["id"],
                                                            "ratio": p["ratio"]})
-        for row in entry.get("concurrency", []):
-            if row["nuvec_matches_solo"] is False:
-                flags.append({"model": entry["id"], "level": row["level"],
-                              "check": "matches_solo"})
+        # Batched tokens may differ in their low bits from each request run alone, as
+        # mlx-lm's (D-103: products route as MLX's; `Batcher::batch_invariant` is tested in
+        # CI): recorded, not flagged.
     out: dict = {"below_gate": below_gate, "below_goal": below_goal, "correctness_flags": flags}
+    vs = [(e["id"], cell, p["vs_baseline"]) for e in models if e["status"] not in
+          ("skipped", "failed") for _, cell, p in baseline_cells(e)
+          if p.get("vs_baseline") is not None]
+    if vs:
+        out["baseline_geomean"] = geomean([v for _, _, v in vs])
+        out["regressions"] = [{"model": m, "cell": c, "vs_baseline": v} for m, c, v in vs
+                              if v < threshold]
     for name, keys in (("decode_geomean", ["decode"]), ("memory_geomean", ["memory"]),
                        ("load_warm_geomean", ["load_warm"]),
                        ("load_cold_geomean", ["load_cold"])):
@@ -744,10 +872,29 @@ def markdown(record: dict) -> str:
         out.append("")
     s = record["summary"]
     parts = [f"{k}: {v['value']:.2f}× (n={v['n']})" for k, v in s.items()
-             if isinstance(v, dict) and "value" in v]
+             if isinstance(v, dict) and "value" in v and k != "baseline_geomean"]
     for k in ("ttft_geomean", "concurrency_geomean"):
         parts += [f"{k} {n}: {v['value']:.2f}×" for n, v in s.get(k, {}).items() if v]
     out.append("Geometric means: " + "; ".join(parts))
+    if base := record["settings"].get("regression_baseline"):
+        cells = [(m, c, p) for m in record["models"] for _, c, p in baseline_cells(m)
+                 if p.get("vs_baseline") is not None]
+        if cells:
+            out += ["", f"| model | cell | nuvec HEAD / {base['ref']} | ratio |",
+                    "|---|---|---:|---:|"]
+            for m, c, p in cells:
+                g = (lambda k: f"{p[k]['median'] / 1e9:.2f} GB" if p.get(k) else "—") \
+                    if p["nuvec"]["unit"] == "bytes" else (lambda k: med(p, k, 2))
+                out.append(f"| {slug(m['id'])} | {c} | {g('nuvec')} / "
+                           f"{g('baseline')} | {p['vs_baseline']:.2f}×"
+                           f"{' ⚠' if p['vs_baseline'] < base['threshold'] else ''} |")
+            out.append("")
+        out.append(f"Against {base['ref']}: {s['baseline_geomean']['value']:.2f}× "
+                   f"(n={s['baseline_geomean']['n']})" if s.get("baseline_geomean") else
+                   f"Against {base['ref']}: no comparable cells")
+        for x in s.get("regressions", []):
+            out.append(f"- REGRESSION {slug(x['model'])} {x['cell']}: "
+                       f"{x['vs_baseline']:.2f}× {base['ref']}")
     for m in record["models"]:
         if m["status"] != "ok":
             out.append(f"- {m['id']}: {m['status']} ({m.get('reason', '')[:300]})")
@@ -800,9 +947,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("models", nargs="*")
     ap.add_argument("--sections", default=",".join(SECTIONS))
-    ap.add_argument("--prompt-tokens", default="2048,32768")
+    ap.add_argument("--tier", choices=sorted(TIERS), default="quick")
+    ap.add_argument("--baseline", help="release to compare against (default: the latest "
+                    "v* tag before HEAD)")
+    ap.add_argument("--no-baseline", action="store_true")
+    ap.add_argument("--regression-threshold", type=float, default=REGRESSION)
+    ap.add_argument("--prompt-tokens")
     ap.add_argument("--no-max-context", action="store_true")
-    ap.add_argument("--concurrency", default="1,4,8")
+    ap.add_argument("--concurrency")
     ap.add_argument("--out", type=Path, default=WORK / "record.json")
     ap.add_argument("--release", action="store_true")
     ap.add_argument("--allow-dirty", action="store_true",
@@ -824,24 +976,52 @@ def main() -> int:
         sections = [s for s in sections if s == "decode"]
     if args.release and not args.allow_dirty and git("status", "--porcelain"):
         ap.error("--release needs a clean working tree (or --allow-dirty)")
+    quick = args.tier == "quick"
+    if quick:
+        args.no_cold = True
     bench, tag = build(args.nuvec_ref, args.no_build)
-    runner = Runner(args, bench, tag)
+    baseline = None
+    if not (args.no_baseline or args.nuvec_ref):
+        baseline = args.baseline or git("describe", "--tags", "--abbrev=0", "--match", "v*",
+                                        "HEAD")
+        if not baseline:
+            ap.error("no release tag to compare against: pass --baseline REF or --no-baseline")
+    base, base_tag = build(baseline) if baseline else (None, "")
+    runner = Runner(args, bench, tag, base, base_tag)
     env = environment(args.nuvec_ref)
     roster = {m: (k, e) for m, k, e in ROSTER}
-    models = args.models or [m for m, _, _ in ROSTER]
-    prompt_tokens = [int(n) for n in args.prompt_tokens.split(",") if n]
-    levels = [int(n) for n in args.concurrency.split(",") if n]
+    models = args.models or (QUICK_MODELS if quick else [m for m, _, _ in ROSTER])
+    tier = TIERS[args.tier]
+    prompt_tokens = [int(n) for n in (args.prompt_tokens or tier["prompt_tokens"]).split(",")
+                     if n]
+    levels = [int(n) for n in (args.concurrency or tier["concurrency"]).split(",") if n]
     results = []
     try:
         for model in models:
             kind, extras = roster.get(model, ("dense", []))
-            results.append(run_model(runner, model, kind, extras, sections, prompt_tokens,
-                                     levels))
+            extras = [] if quick else extras
+            entry = run_model(runner, model, kind, extras, sections, prompt_tokens, levels)
+            # A suspected regression is measured once more (every engine, a fresh pass)
+            # before it counts: one disturbed pass must not fail the run.
+            if again := suspects(entry, args.regression_threshold):
+                print(f"  {slug(model)}: re-measuring {', '.join(sorted(again))}",
+                      file=sys.stderr, flush=True)
+                runner.extra = 1
+                redo = run_model(runner, model, kind, extras, [x for x in sections
+                                 if x in again], prompt_tokens, levels)
+                runner.extra = 0
+                for key in ("decode", "memory", "concurrency"):
+                    if key in redo:
+                        entry[key] = redo[key]
+                for key, value in redo.get("ttft", {}).items():
+                    entry.setdefault("ttft", {})[key] = value
+            results.append(entry)
     except OutOfBudget:
         print(f"budget spent after {len(results)} of {len(models)} models; run again with "
               "--resume", file=sys.stderr)
         return 3
     settings = {
+        "tier": args.tier,
         "passes": args.passes, "runs_per_pass": args.runs, "max_tokens": MAX_TOKENS,
         "prompt_tokens": prompt_tokens, "legacy_repeats": REPEATS,
         "extra_prompt_tokens": {m: e for m, _, e in ROSTER if e and m in models},
@@ -856,11 +1036,14 @@ def main() -> int:
     }
     if args.nuvec_ref:
         settings["baseline"] = {"ref": args.nuvec_ref, "commit": env["nuvec"]["commit"]}
+    if baseline:
+        settings["regression_baseline"] = {"ref": baseline, "commit": git("rev-parse", baseline),
+                                           "threshold": args.regression_threshold}
     record = {
         "schema": "nuvec-parity-record", "schema_version": 1,
         "created": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "environment": env, "settings": settings, "sections": sections,
-        "models": results, "summary": summary(results),
+        "models": results, "summary": summary(results, args.regression_threshold),
     }
     validate(record, "parity-record-v1.schema.json")
     out = args.out
@@ -869,14 +1052,16 @@ def main() -> int:
                            if "site/static/benchmarks/" not in line]) and not args.allow_dirty:
             print(f"unexpected changes during the run: {unexpected}", file=sys.stderr)
             return 1
-        out = BENCH_DIR / env["nuvec"]["version"] / f"{machine_slug(env)}.json"
+        suffix = "" if args.tier == "full" else f"-{args.tier}"
+        out = BENCH_DIR / env["nuvec"]["version"] / f"{machine_slug(env)}{suffix}.json"
     write_atomic(out, record)
     if args.release:
         add_to_index(env["nuvec"]["version"], machine_slug(env),
-                     str(out.relative_to(BENCH_DIR)), "parity")
+                     str(out.relative_to(BENCH_DIR)),
+                     "parity" if args.tier == "full" else f"parity-{args.tier}")
     print(markdown(record))
     print(f"\nrecord: {out}")
-    return 0
+    return 4 if record["summary"].get("regressions") else 0
 
 
 if __name__ == "__main__":

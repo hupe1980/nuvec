@@ -41,6 +41,12 @@ fn front_full(a: &Array, axis: Option<usize>, b: usize) -> Result<Array> {
     broadcast_to(&x, &shape)
 }
 
+/// The batch axis of a gathered input that `vmap` moved last (a batched vector gathers
+/// as one row per rank, its batch on the second axis).
+fn moved_last(ndim: usize) -> usize {
+    ndim.max(2) - 1
+}
+
 /// Prepends a batch dimension to slice parameters.
 fn prepend<T: Copy>(first: T, rest: &[T]) -> Vec<T> {
     std::iter::once(first).chain(rest.iter().copied()).collect()
@@ -72,13 +78,42 @@ impl Primitive {
                 all.extend_from_slice(&inputs[1..]);
                 Ok((record(self.clone(), all)?, axis))
             }
+            // MLX's rules: the reductions and sends keep the batch axis; a gather joins the
+            // ranks along the first axis, so the batch goes last.
+            Self::Collective { op, .. } => match op {
+                crate::distributed::CollectiveOp::Gather => {
+                    let axis = axes[0].expect("the one input is batched");
+                    let last = x.ndim() - 1;
+                    let moved = if x.ndim() == 1 {
+                        crate::ops::imp::expand_dims(x, 0)?
+                    } else {
+                        move_axis(x, axis, last)?
+                    };
+                    Ok((record(self.clone(), vec![moved])?, moved_last(x.ndim())))
+                }
+                crate::distributed::CollectiveOp::Recv { .. } => {
+                    unreachable!("recv has no inputs to batch")
+                }
+                _ => Ok((record(self.clone(), vec![x.clone()])?, axes[0].unwrap_or(0))),
+            },
             Self::Unary(_) | Self::AsType(_) | Self::StopGradient | Self::Copy => {
                 Ok((record(self.clone(), vec![x.clone()])?, axes[0].unwrap_or(0)))
             }
+            Self::ToFp8 | Self::FromFp8(_) => {
+                Ok((record(self.clone(), vec![x.clone()])?, axes[0].unwrap_or(0)))
+            }
+            // Per row of the last axis: the batch goes first.
+            Self::SortedOffsets { .. } => Ok((record(self.clone(), vec![front(x, axes[0])?])?, 0)),
+            // The last axis is reinterpreted: the batch goes first.
+            Self::View(_) => Ok((record(self.clone(), vec![front(x, axes[0])?])?, 0)),
             Self::Binary(_) | Self::Select => self.elementwise(inputs, axes),
             Self::Reshape(shape) => {
                 let shape: Vec<isize> = prepend(b, shape).iter().map(|&n| n as isize).collect();
                 Ok((vec![reshape(&front(x, axes[0])?, &shape)?], 0))
+            }
+            Self::Squeeze(unit) => at_front(Self::Squeeze(unit.iter().map(|a| a + 1).collect())),
+            Self::ExpandDims(unit) => {
+                at_front(Self::ExpandDims(unit.iter().map(|a| a + 1).collect()))
             }
             Self::Transpose(perm) => {
                 let perm: Vec<usize> = prepend(0, &perm.iter().map(|a| a + 1).collect::<Vec<_>>());
@@ -179,29 +214,28 @@ impl Primitive {
             Self::Fast(op) => op.vmap(inputs, axes),
             Self::MetalKernel(_) => Err(crate::Error::InvalidArgument("metal_kernel: no derivative or batching rule (wrap the kernel in `custom_function`)".into())),
             Self::Compiled(fused) => fused.vmap(inputs, axes),
-            Self::Quantize { group_size, bits } => {
-                let (wq, scales, biases) =
-                    quantize(&front(x, axes[0])?, *group_size, u32::from(*bits))?;
-                Ok((vec![wq, scales, biases], 0))
+            Self::Quantize { quant } => {
+                let (wq, scales, biases) = quantize(&front(x, axes[0])?, *quant)?;
+                let mut out = vec![wq, scales];
+                out.extend(biases);
+                Ok((out, 0))
             }
             // Packed weights, scales and biases share their batch dimensions.
-            Self::Dequantize { group_size, bits } => {
-                let [w, s, bias] = [0, 1, 2].map(|i| front_full(&inputs[i], axes[i], b));
+            Self::Dequantize { quant, dtype } => {
+                let parts = (0..inputs.len())
+                    .map(|i| front_full(&inputs[i], axes[i], b))
+                    .collect::<Result<Vec<_>>>()?;
                 Ok((
-                    vec![dequantize(&w?, &s?, &bias?, *group_size, u32::from(*bits))?],
+                    vec![dequantize(&parts[0], &parts[1], parts.get(2), *quant, Some(*dtype))?],
                     0,
                 ))
             }
             // MLX has no rule. With unbatched weights, the batch joins `x`'s leading
             // dimensions; otherwise every operand gets the batch axis first, and 2-D weights
             // get size-1 axes for `x`'s other batch dimensions.
-            Self::QuantizedMatmul {
-                group_size,
-                bits,
-                transpose,
-            } => {
+            Self::QuantizedMatmul { quant, transpose } => {
                 let x = front(x, axes[0])?;
-                let mut weights = [inputs[1].clone(), inputs[2].clone(), inputs[3].clone()];
+                let mut weights: Vec<Array> = inputs[1..].to_vec();
                 if axes[1..].iter().any(Option::is_some) {
                     for (i, a) in weights.iter_mut().enumerate() {
                         *a = front_full(a, axes[i + 1], b)?;
@@ -214,10 +248,9 @@ impl Primitive {
                     &x,
                     &weights[0],
                     &weights[1],
-                    &weights[2],
+                    weights.get(2),
                     *transpose,
-                    *group_size,
-                    u32::from(*bits),
+                    *quant,
                 )?;
                 Ok((vec![out], 0))
             }

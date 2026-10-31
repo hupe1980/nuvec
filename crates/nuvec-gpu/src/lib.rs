@@ -42,7 +42,7 @@ mod info;
 mod memory;
 
 pub use error::{GpuError, Result};
-pub use info::DeviceInfo;
+pub use info::{DeviceInfo, NaxReason, NaxStatus};
 pub use memory::{MemoryStats, allocation_size, mapping_size};
 
 #[cfg(target_os = "macos")]

@@ -35,6 +35,8 @@ pub(crate) fn binary(op: BinaryOp, a: &Array, b: &Array) -> Result<Array> {
         BinaryOp::Maximum
             | BinaryOp::Minimum
             | BinaryOp::LogAddExp
+            | BinaryOp::FloorDivide
+            | BinaryOp::Power
             | BinaryOp::Less
             | BinaryOp::LessEqual
             | BinaryOp::Greater
@@ -165,12 +167,18 @@ unary_fn! {
     erfinv => ErfInv;
 }
 
+/// Whether the row kernels (softmax, log-sum-exp) take `a` over its last axis.
+fn rows_on_gpu(a: &Array) -> bool {
+    let axis = a.dims().last().copied().unwrap_or(1);
+    crate::fast::imp::rows_on_gpu(a.dtype(), a.size(), axis)
+}
+
 /// `log(sum(exp(a)))` over `axes` (all axes if empty), computed stably as MLX does: the
 /// maximum is subtracted first (without gradient), and rows whose maximum is infinite
 /// return that maximum.
 pub(crate) fn logsumexp(a: &Array, axes: &[isize], keepdims: bool) -> Result<Array> {
     let a = astype(a, at_least_float(a.dtype()))?;
-    if last_axis_only(&a, axes) && crate::fast::imp::on_gpu(a.dtype(), a.size()) {
+    if last_axis_only(&a, axes) && rows_on_gpu(&a) {
         let out = Array::from_op(
             Primitive::Fast(crate::fast::imp::FastOp::LogSumExp),
             vec![a],
@@ -197,12 +205,17 @@ pub(crate) fn logsumexp(a: &Array, axes: &[isize], keepdims: bool) -> Result<Arr
 /// first (without gradient), as MLX does.
 pub(crate) fn softmax(a: &Array, axes: &[isize]) -> Result<Array> {
     let a = astype(a, at_least_float(a.dtype()))?;
-    if last_axis_only(&a, axes) && crate::fast::imp::on_gpu(a.dtype(), a.size()) {
+    if last_axis_only(&a, axes) && rows_on_gpu(&a) {
         return single(Primitive::Fast(crate::fast::imp::FastOp::Softmax), vec![a]);
     }
-    let maxval = stop_gradient(&max(&a, axes, true)?)?;
-    let ex = exp(&subtract(&a, &maxval)?)?;
-    divide(&ex, sum(&ex, axes, true)?)
+    // Half precision in float32, rounded once, as the kernel (MLX's `precise=True`).
+    let wide = match a.dtype() {
+        DType::F16 | DType::BF16 => astype(&a, DType::F32)?,
+        _ => a.clone(),
+    };
+    let maxval = stop_gradient(&max(&wide, axes, true)?)?;
+    let ex = exp(&subtract(&wide, &maxval)?)?;
+    astype(&divide(&ex, sum(&ex, axes, true)?)?, a.dtype())
 }
 
 /// Whether `axes` (all if empty) reduce the last axis and otherwise only axes of size 1:
@@ -333,9 +346,15 @@ pub(crate) fn broadcast_to(a: &Array, shape: &[usize]) -> Result<Array> {
 /// Shares the data.
 pub(crate) fn expand_dims(a: &Array, axis: isize) -> Result<Array> {
     let axis = view::normalize_axis(axis, a.ndim() + 1)?;
-    let mut shape: Shape = a.dims().into();
-    shape.insert(axis, 1);
-    reshape_to(a, shape)
+    single(Primitive::ExpandDims(vec![axis]), vec![a.clone()])
+}
+
+/// Inserts dimensions of size 1 at the result's sorted, unique `axes`. Shares the data.
+pub(crate) fn expand_dims_at(a: &Array, axes: Vec<usize>) -> Result<Array> {
+    if axes.is_empty() {
+        return Ok(a.clone());
+    }
+    single(Primitive::ExpandDims(axes), vec![a.clone()])
 }
 
 /// Removes dimensions of size 1: the given `axes`, or all of them if `axes` is empty.
@@ -353,14 +372,13 @@ pub(crate) fn squeeze(a: &Array, axes: &[isize]) -> Result<Array> {
         }
         remove[i] = true;
     }
-    let shape = a
-        .dims()
-        .iter()
-        .zip(&remove)
-        .filter(|&(&d, &r)| !(r && d == 1))
-        .map(|(&d, _)| d)
+    let axes: Vec<usize> = (0..a.ndim())
+        .filter(|&i| remove[i] && a.dims()[i] == 1)
         .collect();
-    reshape_to(a, shape)
+    if axes.is_empty() {
+        return Ok(a.clone());
+    }
+    single(Primitive::Squeeze(axes), vec![a.clone()])
 }
 
 // ── Reductions ──────────────────────────────────────────────────────────────
@@ -383,17 +401,13 @@ fn normalize_axes(a: &Array, axes: &[isize]) -> Result<Vec<usize>> {
 
 /// `out` with the (size-1) `axes` removed, unless `keepdims`.
 fn finish_reduction(out: Array, axes: &[usize], keepdims: bool) -> Result<Array> {
-    if keepdims {
+    if keepdims || axes.is_empty() {
         return Ok(out);
     }
-    let shape = out
-        .dims()
-        .iter()
-        .enumerate()
-        .filter(|(d, _)| !axes.contains(d))
-        .map(|(_, &n)| n)
-        .collect();
-    reshape_to(&out, shape)
+    let mut axes = axes.to_vec();
+    axes.sort_unstable();
+    axes.dedup();
+    single(Primitive::Squeeze(axes), vec![out])
 }
 
 fn reduction(

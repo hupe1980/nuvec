@@ -613,3 +613,32 @@ impl GpuEval {
         )
     }
 }
+
+impl GpuEval {
+    /// MLX's sum of split-K partials (`qvm_split_k`'s `strided_reduce_general_dispatch`):
+    /// row-major `[..., split, M, N]` partials in `dtype`, summed over the split axis in
+    /// `dtype` as MLX accumulates (half precision too), into `[..., M, N]`.
+    pub(super) fn split_k_sum(
+        &mut self,
+        dtype: DType,
+        shape: &[usize],
+        partial: &Buffer,
+        out: &mut nuvec_gpu::Buffer,
+    ) -> Result<()> {
+        let strides = crate::shape::row_contiguous_strides(shape);
+        let meta = crate::kernels::strided(dtype, shape, &strides);
+        let axis = shape.len() - 3;
+        let p = Plan {
+            kind: PlanType::ContiguousStrided,
+            shape: vec![shape[axis]],
+            strides: vec![strides[axis]],
+        };
+        let tag = match dtype {
+            DType::F32 => "sum_float32".to_owned(),
+            _ => format!("sum_in_{}", dtype.name()),
+        };
+        let input = (partial.metal().expect("device storage"), 0);
+        let size = meta.size / shape[axis];
+        self.col_reduce((&tag, &tag, dtype), &meta, &[axis], &p, input, size, out)
+    }
+}

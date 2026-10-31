@@ -33,8 +33,32 @@ fn adam(xs: &[Array]) -> Result<Vec<Array>> {
     Ok(vec![p.subtract(step.multiply(1e-3)), m, v])
 }
 
+/// Gemma's GeGLU: `gelu_approx(g) · u`, the cube as one power (MLX's `x**3`).
+fn geglu(xs: &[Array]) -> Result<Vec<Array>> {
+    let (g, u) = (&xs[0], &xs[1]);
+    let inner = g.add(g.power(3.0).multiply(0.044715)).multiply(0.797_884_6);
+    Ok(vec![
+        g.multiply(0.5).multiply(inner.tanh().add(1.0)).multiply(u),
+    ])
+}
+
+/// gpt-oss's clamped SwiGLU: `(clip(u, −7, 7) + 1) · g · sigmoid(1.702 g)`, `g = min(g, 7)`.
+fn swiglu_oai(xs: &[Array]) -> Result<Vec<Array>> {
+    let g = xs[0].minimum(7.0);
+    let u = xs[1].maximum(-7.0).minimum(7.0);
+    Ok(vec![
+        u.add(1.0).multiply(g.multiply(g.multiply(1.702).sigmoid())),
+    ])
+}
+
 type Case = (&'static str, usize, fn(&[Array]) -> Result<Vec<Array>>);
-const CASES: &[Case] = &[("gelu", 1, gelu), ("swiglu", 2, swiglu), ("adam", 4, adam)];
+const CASES: &[Case] = &[
+    ("gelu", 1, gelu),
+    ("swiglu", 2, swiglu),
+    ("geglu", 2, geglu),
+    ("swiglu-oai", 2, swiglu_oai),
+    ("adam", 4, adam),
+];
 
 fn main() -> Result<()> {
     // `cargo test --all-targets` runs bench binaries too: measure only under `cargo bench`.

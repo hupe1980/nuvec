@@ -12,7 +12,7 @@ group = "Core"
 - equal scalar constants are merged;
 - equal operations on equal inputs are computed once (common-subexpression elimination).
 
-On the GPU, chains of element-wise operations are then **fused** into one generated Metal kernel, with several outputs when needed. Later calls with the same signature replay the simplified graph without running your function again.
+On the GPU, chains of element-wise operations are then **fused** into one generated Metal kernel, with several outputs when needed. Fused kernels are built as `mx.compile` builds its: constant scalars are literals in the kernel, and Metal's default math functions apply, which only `power` uses. Results equal the uncompiled function's bit for bit except where `power` is fused, which can differ in the low bits, as in MLX. Later calls with the same signature replay the simplified graph without running your function again.
 
 ```rust
 use nuvec::prelude::*;
@@ -60,6 +60,28 @@ With nuvec-nn, the step over `(model, optimizer)` is the whole training step (se
 
 A tree's structure includes its static fields: `#[tree(skip)]` fields of a `Static` type (a layer's `eps`, an optimizer's betas), the train/eval mode, frozen flags and the active enum variants. Changing any of them retraces once, instead of replaying a stale constant. A step that changes its state's structure on every call (a host counter in a `#[tree(skip)]` field) is an error; make such values arrays, or mark the field `#[tree(skip, static_unchecked)]`, whose value is then baked into the trace.
 
+## Shapeless compile
+
+`compile::Options::default().shapeless(true)` (MLX's `shapeless=True`) traces once per input structure, dtypes and ranks, and replays for any shapes of those ranks: an activation compiled this way traces once for every prefill chunk length. Each replay infers the shapes again, and element-wise operations broadcast their operands as the uncompiled ones do, so results equal the shaped compile's bit for bit. `compile::compile_flat_with` takes the same options; `compile_mut` keys its state exactly and its inputs shapelessly.
+
+```rust
+use nuvec::prelude::*;
+use nuvec::compile::Options;
+
+# fn main() -> Result<()> {
+let swiglu = Options::default()
+    .shapeless(true)
+    .compile(|(g, u): &(Array, Array)| g.multiply(g.sigmoid()).multiply(u));
+for rows in [7, 512, 2048] {
+    let g = nuvec::ops::ones([rows, 64], DType::F32);
+    swiglu(&(g.clone(), g))?.eval()?;
+}
+# Ok(())
+# }
+```
+
+Operations whose parameters hold traced sizes fail the trace with an error naming them: reshapes, slices, broadcasts to a literal shape, random draws, custom Metal kernels and attention. Compile those without the option. As in MLX, Rust code that reads a shape while tracing bakes the first call's value in.
+
 ## When it helps
 
 Element-wise chains are bandwidth-bound: unfused, each step reads and writes the whole array. Fused, the chain reads its inputs once and writes its outputs once. Activations (`silu(gate) * up`, GELU), normalization epilogues and optimizer updates are typical wins. nuvec-lm compiles exactly the functions mlx-lm compiles, such as SwiGLU and the Gated DeltaNet gates.
@@ -67,6 +89,6 @@ Element-wise chains are bandwidth-bound: unfused, each step reads and writes the
 ## Limits
 
 - The function must not evaluate arrays while it is traced.
-- A new input signature means a new trace (and new kernels); keep shapes stable in hot loops. Each compiled function keeps its 64 most recently used traces (`compile::Options::default().cache_capacity(n)` changes that).
+- A new input signature means a new trace (and new kernels); keep shapes stable in hot loops, or compile shapelessly. Each compiled function keeps its 64 most recently used traces (`compile::Options::default().cache_capacity(n)` changes that).
 - Arrays a pure `compile`d function captures, and random numbers drawn inside it, are constants frozen at the trace; `compile_mut` threads the random key instead.
 - Products, reductions and attention are not fused; they run as their own kernels.

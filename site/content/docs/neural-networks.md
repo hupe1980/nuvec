@@ -79,7 +79,7 @@ struct Attention {
 
 Constructors take no `bool` and return no `Result`; initialisation draws MLX's values for a seed.
 
-- `Linear::new(i, o)` (`.without_bias()`), `QuantizedLinear::from_linear(&l)` (MLX's affine quantization; `from_linear_with(&l, group_size, bits)`), `Embedding::new(n, d)`, `QuantizedEmbedding::from_embedding(&e)`;
+- `Linear::new(i, o)` (`.without_bias()`), `QuantizedLinear::from_linear(&l)` (MLX's affine 64/4; `from_linear_with(&l, Quant::affine(32, 8))` or `QuantMode::Mxfp4`), `Embedding::new(n, d)`, `QuantizedEmbedding::from_embedding(&e)`;
 - `RmsNorm::new(d).eps(e)`, `LayerNorm::new(d).eps(e).affine(false)` / `.without_bias()` and `Rope::new(d).traditional().base(b).scale(s)` on the fused kernels;
 - `LoraLinear::from_base(base, rank)` over a full-precision or quantized base layer (LoRA and QLoRA), with `.scale(s)`, `.dropout(p)` and `.rslora()`;
 - `Dropout::new(p)`, as MLX's `nn.Dropout`;

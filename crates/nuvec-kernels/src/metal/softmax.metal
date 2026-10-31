@@ -18,11 +18,15 @@ inline T softmax_exp(T x) {
   return fast::exp(x);
 }
 
-template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
+// nuvec: with CAUSAL, row `r` (of `tile_rows` per block, the last query of each block
+// seeing the last column) reads columns past `r % tile_rows + axis_size - tile_rows` as T's
+// lowest finite value: the masked composition's scores, without the separate mask pass.
+template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS, bool CAUSAL = false>
 [[kernel]] void softmax_single_row(
     const device T* in,
     device T* out,
     constant int& axis_size,
+    constant int& tile_rows [[buffer(3)]],
     uint gid [[threadgroup_position_in_grid]],
     uint _lid [[thread_position_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
@@ -45,6 +49,15 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
     for (int i = 0; i < N_READS; i++) {
       ld[i] =
           ((lid * N_READS + i) < axis_size) ? AccT(in[i]) : Limits<AccT>::min;
+    }
+  }
+  if (CAUSAL) {
+    int last = int(gid % uint(tile_rows)) + axis_size - tile_rows;
+    for (int i = 0; i < N_READS; i++) {
+      int col = lid * N_READS + i;
+      if (col > last && col < axis_size) {
+        ld[i] = AccT(Limits<T>::finite_min);
+      }
     }
   }
   if (simd_group_id == 0) {
@@ -108,17 +121,23 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
   }
 }
 
-template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
+template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS, bool CAUSAL = false>
 [[kernel]] void softmax_looped(
     const device T* in,
     device T* out,
     constant int& axis_size,
+    constant int& tile_rows [[buffer(3)]],
     uint gid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint lsize [[threads_per_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
   in += gid * size_t(axis_size);
+  // (CAUSAL: columns past `last` read as T's lowest finite value.)
+  int last = CAUSAL ? int(gid % uint(tile_rows)) + axis_size - tile_rows : axis_size;
+  auto read = [&](int col) {
+    return (CAUSAL && col > last) ? AccT(Limits<T>::finite_min) : AccT(in[col]);
+  };
 
   constexpr int SIMD_SIZE = 32;
 
@@ -135,12 +154,12 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
     AccT vals[N_READS];
     if (offset + N_READS <= axis_size) {
       for (int i = 0; i < N_READS; i++) {
-        vals[i] = AccT(in[offset + i]);
+        vals[i] = read(offset + i);
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
         vals[i] =
-            (offset + i < axis_size) ? AccT(in[offset + i]) : Limits<AccT>::min;
+            (offset + i < axis_size) ? read(offset + i) : Limits<AccT>::min;
       }
     }
     prevmax = maxval;
@@ -187,13 +206,13 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
     int offset = r * lsize * N_READS + lid * N_READS;
     if (offset + N_READS <= axis_size) {
       for (int i = 0; i < N_READS; i++) {
-        out[offset + i] = T(softmax_exp(in[offset + i] - maxval) * normalizer);
+        out[offset + i] = T(softmax_exp(read(offset + i) - maxval) * normalizer);
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
         if (offset + i < axis_size) {
           out[offset + i] =
-              T(softmax_exp(in[offset + i] - maxval) * normalizer);
+              T(softmax_exp(read(offset + i) - maxval) * normalizer);
         }
       }
     }
@@ -209,3 +228,9 @@ template [[host_name("nuvec_softmax_block_float16")]] [[kernel]] decltype(mlx::s
 template [[host_name("nuvec_softmax_looped_float16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<half, float>) mlx::softmax::softmax_looped<half, float>;
 template [[host_name("nuvec_softmax_block_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<bfloat16_t, float>) mlx::softmax::softmax_single_row<bfloat16_t, float>;
 template [[host_name("nuvec_softmax_looped_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<bfloat16_t, float>) mlx::softmax::softmax_looped<bfloat16_t, float>;
+template [[host_name("nuvec_causal_softmax_block_float32")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<float, float, SOFTMAX_N_READS, true>) mlx::softmax::softmax_single_row<float, float, SOFTMAX_N_READS, true>;
+template [[host_name("nuvec_causal_softmax_looped_float32")]] [[kernel]] decltype(mlx::softmax::softmax_looped<float, float, SOFTMAX_N_READS, true>) mlx::softmax::softmax_looped<float, float, SOFTMAX_N_READS, true>;
+template [[host_name("nuvec_causal_softmax_block_float16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<half, float, SOFTMAX_N_READS, true>) mlx::softmax::softmax_single_row<half, float, SOFTMAX_N_READS, true>;
+template [[host_name("nuvec_causal_softmax_looped_float16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<half, float, SOFTMAX_N_READS, true>) mlx::softmax::softmax_looped<half, float, SOFTMAX_N_READS, true>;
+template [[host_name("nuvec_causal_softmax_block_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<bfloat16_t, float, SOFTMAX_N_READS, true>) mlx::softmax::softmax_single_row<bfloat16_t, float, SOFTMAX_N_READS, true>;
+template [[host_name("nuvec_causal_softmax_looped_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<bfloat16_t, float, SOFTMAX_N_READS, true>) mlx::softmax::softmax_looped<bfloat16_t, float, SOFTMAX_N_READS, true>;

@@ -22,10 +22,10 @@ The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each 
 | `gated_delta(q, k, v, g, beta, state)` | The Gated DeltaNet recurrence (Qwen 3.5's linear attention), returning the outputs and the new state |
 | `gated_delta_steps(q, k, v, g, beta, state)` | The same, returning the state after every step (to roll the recurrence back) |
 | `gated_delta_slots(q, k, v, g, beta, pool, slots)` | The same for a batch whose states live at slots of a pool, updated in place |
-| `paged_attention(q, k_cache, v_cache, block_tables, lengths, scale)` | Attention for a batch of sequences of different lengths over a KV cache stored in fixed-size blocks |
+| `paged_attention(q, k_cache, v_cache, block_tables, lengths, scale, &options)` | Attention for a batch of sequences of different lengths over a KV cache stored in fixed-size blocks, with the same window and sinks |
 | `paged_write(cache, new, slots)` | Writes new keys or values into their blocks, in place when the cache is owned |
 
-Attention picks MLX's kernel for the shape: vector kernels for short queries (decode), a two-pass split-K kernel for long contexts, and the tiled flash-style kernel or the composition for prefill. `plan_attention` reports the choice, and the scratch memory it holds, from the shapes alone; `max_score_bytes` bounds every score-sized intermediate (the tiled kernel, or the composition in blocks of queries). With 2 to 8 causal queries (speculative verification), each row gives the bits of the same row decoded alone. `softmax` and `logsumexp` over the last axis use fused kernels too.
+Attention picks MLX's kernel for the shape: vector kernels for short queries (decode), a two-pass split-K kernel for long contexts, and the tiled flash-style kernel or the composition for prefill; at head size 512, long causal prefill in half precision runs MLX's blocked path (256 queries at a time over only the keys they see). A sliding window skips the keys outside it in every kernel. `plan_attention` reports the choice, and the scratch memory it holds, from the shapes alone; `max_score_bytes` bounds every score-sized intermediate (the tiled kernel, or the composition in blocks of queries). With 2 to 8 causal queries (speculative verification), each row gives the bits of the same row decoded alone. `softmax` and `logsumexp` over the last axis use fused kernels too.
 
 ```rust
 use nuvec::fast::{AttentionOptions, plan_attention};

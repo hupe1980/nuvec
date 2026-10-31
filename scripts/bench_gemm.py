@@ -34,6 +34,11 @@ SHAPES = [
     ("tallk", 1, 256, 8192, 256, False),
     ("wide", 1, 4096, 512, 4096, False),
     ("batch8", 8, 512, 512, 512, False),
+    # Prefill projections (Qwen3-8B, 2,048 and 8,192 tokens): the NAX report's shapes.
+    ("pf2048-qkv", 1, 2048, 4096, 4096, True),
+    ("pf2048-up", 1, 2048, 12288, 4096, True),
+    ("pf2048-down", 1, 2048, 4096, 12288, True),
+    ("pf8192-qkv", 1, 8192, 4096, 4096, True),
     ("mnist", 1, 256, 784, 32, True),
     ("vec4096", 1, 1, 4096, 4096, True),
     ("vecup", 1, 1, 4096, 11008, True),

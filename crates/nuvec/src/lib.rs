@@ -105,24 +105,34 @@
 //! - **Build modes:** precompiled kernels and runtime-compiled ones (`NUVEC_METALLIB=off`)
 //!   give the same bits.
 //! - **Row independence:** a product with at most [`ROW_INDEPENDENT_ROWS`] rows gives each
-//!   row the bits of the same row's one-row product, by default and with no mode: dense
-//!   matrix products (float32, float16, bfloat16; a multi-row matrix-vector kernel that
-//!   reads the weights once), quantized products (every bit width and group size;
-//!   untransposed weights run one product per row), and gathered (mixture-of-experts)
-//!   products, quantized or not, with sorted or unsorted indices (up to
-//!   `ROW_INDEPENDENT_ROWS` tokens of up to 8 experts each). So are the row-wise operations
-//!   of a decode step: `rms_norm`, `add_rms_norm`, `rope` and `norm_rope` with per-row
-//!   offsets, element-wise operations, vector attention over equal key lengths,
-//!   `gated_delta` and `gated_delta_slots`.
-//! - **Batch items of quantized products:** a quantized product over `[B, L, K]` (tiled,
-//!   `L` above the matrix-vector limit) gives each item the bits of its product alone
-//!   (`[1, L, K]`): the split-K partitions are counted per item, so prompts of the same
-//!   length prefilled together get their solo bits.
+//!   row the bits of the same row's one-row product: dense matrix products (float32,
+//!   float16, bfloat16; a multi-row matrix-vector kernel that reads the weights once)
+//!   always, and quantized and gathered (mixture-of-experts) products under
+//!   [`with_row_exact`] (every bit width and group size, sorted or unsorted indices, up to
+//!   `ROW_INDEPENDENT_ROWS` tokens of up to 8 experts each). Outside it, quantized and
+//!   gathered products route as MLX's do: from 2 rows, multi-vector kernels that read the
+//!   weights once give a row other low bits than its one-row product. So are the row-wise
+//!   operations of a decode step, always: `rms_norm`, `add_rms_norm`, `rope` and
+//!   `norm_rope` with per-row offsets, element-wise operations, vector attention over equal
+//!   key lengths, `gated_delta` and `gated_delta_slots`.
+//! - **Batch items of quantized products:** under [`with_row_exact`], a quantized product
+//!   over `[B, L, K]` (tiled, `L` above the matrix-vector limit) gives each item the bits of
+//!   its product alone (`[1, L, K]`): the split-K partitions are counted per item, so
+//!   prompts of the same length prefilled together get their solo bits. Outside it, as in
+//!   MLX, K is split only for one item.
 //! - **Speculative verification (the serial rule):** attention with 2 to 8 causal query
 //!   rows gives each row the bits of the one-query call over its causal key prefix
-//!   ([`fast::scaled_dot_product_attention`]).
-//! - **Routing is pure:** which kernel runs depends only on shapes, dtypes, options and the
-//!   GPU generation, never on memory state ([`fast::plan_attention`] reports it).
+//!   ([`fast::scaled_dot_product_attention`]); in float32 at head sizes 192 and 256, for at
+//!   most `32 / gqa` rows (more compose). With [`speculative::accept_greedy`] and
+//!   [`fast::gated_delta_steps_with`], run under [`with_row_exact`], a verification step
+//!   decodes exactly the tokens serial decoding would.
+//! - **Sliding windows:** a vector-kernel attention row with a window gives the bits of
+//!   the unmasked one-query call over exactly its window's keys, so a compacted contiguous
+//!   cache and the paged cache give the same bits (a batch-invariant `Batcher` serves
+//!   window models' requests their solo tokens).
+//! - **Routing is pure:** which kernel runs depends only on shapes, dtypes, options, the
+//!   row-exact mode and the GPU generation, never on memory state
+//!   ([`fast::plan_attention`] reports it).
 //! - **Chunk plans:** the same chunk plan gives the same bits, and resuming at a chunk
 //!   boundary from a [`ops::copy`] snapshot equals the uninterrupted run.
 //!
@@ -160,16 +170,26 @@ pub use nuvec_core::tree::{
 };
 pub use nuvec_core::{
     Array, ArrayIndex, At, Axes, Axis, Category, Complex64, CustomFunction, CustomFunctionFlat,
-    DType, Device, DeviceKind, Element, Ellipsis, Error, GradOutput, InAxes, InAxis, IntoResult,
-    IntoShape, NewAxis, OpErrorKind, OutAxes, Result, Scalar, ScalarOperand, ScalarOrArray,
-    ScanOptions, Scheduled, Step, Stepped, Stream, VarOptions, Vmap, array, async_eval,
-    at_least_float, bf16, checkpoint, checkpoint_flat, custom_function, custom_function_flat,
-    default_device, default_stream, eval, f16, grad, grad_flat, jvp, jvp_flat, promote_types,
-    schedule, set_default_stream, value_and_grad, value_and_grad_flat, vjp, vjp_flat, vmap,
-    vmap_flat, with_stream,
+    DType, Device, DeviceKind, Element, Ellipsis, Error, GatherQmm, GradOutput, InAxes, InAxis,
+    IntoResult, IntoShape, NewAxis, OpErrorKind, OutAxes, Quant, QuantMode, Quantized, Result,
+    Scalar, ScalarOperand, ScalarOrArray, ScanOptions, Scheduled, Step, Stepped, Stream,
+    VarOptions, Vmap, array, async_eval, at_least_float, bf16, checkpoint, checkpoint_flat,
+    custom_function, custom_function_flat, default_device, default_stream, eval, f16, grad,
+    grad_flat, jvp, jvp_flat, promote_types, schedule, set_default_stream, value_and_grad,
+    value_and_grad_flat, vjp, vjp_flat, vmap, vmap_flat, with_stream,
 };
-pub use nuvec_core::{ROW_INDEPENDENT_ROWS, fast, graph, ops, random, tree};
+pub use nuvec_core::{
+    ROW_INDEPENDENT_ROWS, fast, graph, ops, random, row_exact, speculative, tree, with_row_exact,
+};
 pub use nuvec_io::{load_into, save};
+
+/// Distributed groups and collectives (MLX's `mx.distributed`): `all_sum`, `all_gather`,
+/// `send`, … over a [`Group`](distributed::Group), and MLX's TCP ring ([`init`](distributed::init)
+/// reads `MLX_HOSTFILE` and `MLX_RANK`).
+pub mod distributed {
+    pub use nuvec_core::distributed::*;
+    pub use nuvec_distributed::{Options, init, init_with};
+}
 pub use nuvec_macros::{Static, Tree};
 
 /// What the derive macros generate code against. Not a public API.

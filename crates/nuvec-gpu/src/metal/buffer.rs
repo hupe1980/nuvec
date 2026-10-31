@@ -1,7 +1,7 @@
 //! Shared-memory buffers.
 
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use objc2::rc::{Retained, autoreleasepool};
@@ -294,6 +294,9 @@ impl Buffer {
 /// pending it stays with the memory, also when the memory is cached and reused.
 #[derive(Default)]
 pub(crate) struct Guard {
+    /// The sequence number ([`commit_sequence`]) of the latest command buffer committed with
+    /// a use.
+    last_commit: AtomicU64,
     users: AtomicUsize,
     writers: AtomicUsize,
     /// Uses encoded in command buffers not committed yet: their fences cannot order other
@@ -329,7 +332,26 @@ struct Fences {
     users: Vec<Fence>,
 }
 
+/// Command buffers committed so far (all devices and queues).
+static COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// The next command buffer's sequence number.
+pub(crate) fn commit_sequence() -> u64 {
+    COMMITS.fetch_add(1, Ordering::AcqRel) + 1
+}
+
 impl Guard {
+    /// A use's command buffer was committed as number `sequence`.
+    pub(crate) fn committed_as(&self, sequence: u64) {
+        self.last_commit.fetch_max(sequence, Ordering::AcqRel);
+    }
+
+    /// Whether a use is in the latest committed command buffer: work taking the memory then
+    /// waits for that command buffer, so the next one cannot overlap it.
+    pub(crate) fn in_latest_commit(&self) -> bool {
+        self.last_commit.load(Ordering::Acquire) >= COMMITS.load(Ordering::Acquire)
+    }
+
     /// The fences to wait for before using the buffer: the pending writer's for a read, and
     /// every pending user's for a write.
     pub(crate) fn pending_fences(&self, write: bool) -> Vec<Fence> {

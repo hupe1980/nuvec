@@ -1,0 +1,15 @@
+You are an assistant that answers by calling tools. Reply with exactly one JSON object per turn, of the form {"tool": "<name>", "arguments": {...}}. Available tools:
+- {"tool": "search_files", "arguments": {"pattern": "<glob>", "query": "<text>"}}
+- {"tool": "read_file", "arguments": {"path": "<path>", "start_line": <n>, "end_line": <n>}}
+- {"tool": "edit_file", "arguments": {"path": "<path>", "old": "<text>", "new": "<text>"}}
+- {"tool": "run_tests", "arguments": {"package": "<name>", "filter": "<name>"}}
+
+Task: the test `parses_empty_header` in package `httpkit` fails. Find the parser and fix it.
+---
+Tool result: {"matches": [{"path": "src/header.rs", "line": 42, "text": "pub fn parse_header(input: &str) -> Result<Header, Error> {"}, {"path": "tests/header.rs", "line": 10, "text": "fn parses_empty_header() {"}]}
+---
+Tool result: {"path": "src/header.rs", "lines": "42: pub fn parse_header(input: &str) -> Result<Header, Error> {\n43:     let (name, value) = input.split_once(':').ok_or(Error::Missing)?;\n44:     let value = value.trim();\n45:     if value.is_empty() {\n46:         return Err(Error::Empty);\n47:     }\n48:     Ok(Header { name: name.trim().to_string(), value: value.to_string() })\n49: }"}
+---
+Tool result: {"path": "src/header.rs", "edited": true}
+---
+Tool result: {"package": "httpkit", "filter": "parses_empty_header", "passed": 1, "failed": 0}. Now run the whole test suite of the package.

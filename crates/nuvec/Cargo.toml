@@ -17,6 +17,7 @@ categories.workspace = true
 nuvec-core.workspace = true
 nuvec-compile.workspace = true
 nuvec-cpu.workspace = true
+nuvec-distributed.workspace = true
 nuvec-gpu.workspace = true
 nuvec-io.workspace = true
 nuvec-macros.workspace = true

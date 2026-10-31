@@ -29,13 +29,8 @@ test:
 test-stable:
     RUSTUP_TOOLCHAIN=stable RUSTFLAGS="-D warnings" cargo test --workspace --all-targets --all-features
 
-# Undefined-behaviour check of the graph logic, parsers and CPU kernels
-# (`rustup +nightly component add miri`). For nuvec-io and nuvec-cpu only the unit tests run
-# (the integration tests evaluate through `half`'s inline assembly, which Miri cannot run),
-# and file access is allowed for the parser tests.
-# Miri on the library unit tests (graph logic, CPU kernels, parsers): minutes, part of `ci`.
-# Thread-stress and GPU suites run natively in `test`; under Miri they take far longer
-# and the unsafe code they would reach (Metal FFI) cannot run there at all.
+# Thread-stress and GPU suites run natively in `test` (the Metal FFI cannot run under Miri).
+# Miri on the library unit tests (graph logic, CPU kernels, parsers; needs nightly's miri).
 miri:
     cargo +nightly miri test -p nuvec-core --lib
     MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test -p nuvec-io -p nuvec-cpu --lib
@@ -60,7 +55,7 @@ metal-check:
     MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu
     NUVEC_METALLIB=off MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu --test runtime
     # Runtime-compiled kernels give the precompiled results (MLX fixtures, bit-exact fused ops).
-    NUVEC_METALLIB=off cargo test -p nuvec-core --test gpu --test fast
+    NUVEC_METALLIB=off cargo test -p nuvec-core --test gpu --test fast --test mlx
     # Out-of-bounds GPU reads and writes do not panic: shader validation turns them into
     # errors (paged and indexing kernels, random primitives).
     MTL_SHADER_VALIDATION=1 cargo test -p nuvec-core --test fast --test primitive_fuzz
@@ -105,23 +100,60 @@ bench-mlx:
 bench-gemm:
     uv run scripts/bench_gemm.py
 
+# Metal 4 TensorOps run on every Apple GPU of macOS 26.2, so the NAX kernels can be forced on.
+# NAX kernels forced on: equal to the CPU and SIMD kernels, they are the ones that run, minos ≤ 15.
+nax-check:
+    NUVEC_NAX=on NUVEC_PROFILE=1 MTL_DEBUG_LAYER=1 cargo test -p nuvec-core --test nax
+    NUVEC_NAX=on NUVEC_METALLIB=off cargo test -p nuvec-core --test nax
+    # The NAX library leaves the deployment floor alone: binaries still load on macOS 15.
+    bin=$(cargo test -q -p nuvec-core --test nax --no-run --message-format=json | jq -r 'select(.executable != null) | .executable' | tail -1); \
+    minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/ {f=1} f && /minos/ {print $2; exit}'); \
+    echo "minos $minos"; [ "${minos%%.*}" -le 15 ]
+
+# On an M5-class Mac: the NAX report (correctness and speed vs SIMD and MLX) to attach to an issue.
+nax-report:
+    scripts/nax_report.sh
+
 # GPU quantized matrix products (4-bit decode and prefill shapes): nuvec vs MLX.
 bench-quant *filter:
     uv run scripts/bench_quant.py {{filter}}
 
 # GPU fused operations (norms, RoPE, softmax, log-sum-exp, cross entropy): nuvec vs MLX.
 bench-fast *filter:
-    uv run scripts/bench_fast.py {{filter}}
+    uv run scripts/bench_fast.py '{{filter}}'
+
+# Paged decode attention (window and sinks) against the same keys stored contiguously.
+bench-paged:
+    cargo bench -q -p nuvec-core --bench paged
 
 # GPU compiled element-wise functions (GELU, SwiGLU gating, Adam step): nuvec vs MLX.
 bench-compile:
     uv run scripts/bench_compile.py
 
+# all_sum over the TCP ring (2 and 4 ranks over loopback): nuvec vs MLX's ring backend.
+bench-distributed:
+    uv run scripts/bench_distributed.py
+
+# Speculative decoding (MTP, prompt lookup) vs mlx-lm plain and draft-model decoding.
+bench-spec:
+    uv run scripts/bench_spec.py
+
 # Text generation (prefill and decode) with a cached model: nuvec-lm vs mlx-lm.
 bench-lm model="mlx-community/Qwen3-8B-4bit" tokens="256":
     uv run scripts/bench_lm.py {{model}} {{tokens}}
 
-# Parity table over a model roster: nuvec-lm vs mlx-lm (cached models only).
+# Sampled speculative decoding against plain sampling: a chi-square test over 20,000 seeded
+# runs per drafter (greedy-continuation drafts and the MTP head; a few minutes).
+spec-chi-square:
+    cargo test --release -p nuvec-lm --test lm sampled_speculation_passes_a_chi_square_test -- --ignored --nocapture
+
+# Arrays of 2^32 elements and more on the GPU (element-wise, matrix products, softmax, the
+# attention composition over 8 GiB of scores; ~14 GB of GPU memory, run alone).
+test-large:
+    cargo test --release -p nuvec-core --test large -- --ignored --nocapture
+
+# Parity record: nuvec-lm vs mlx-lm and vs the previous release (quick tier, ~45 min; exit 4
+# on a confirmed regression). `--tier full` for every roster model and long contexts.
 bench-parity *args:
     uv run scripts/bench_parity.py {{args}}
 
@@ -188,13 +220,12 @@ internal-paths:
     fi
     echo "✓ no internal planning paths in tracked files"
 
-# Crate dependencies follow the layering: lower layers never depend on higher ones.
-
 # The crates CI builds on Linux (no Metal) compile without warnings there.
 portable-check:
     rustup target add x86_64-unknown-linux-gnu >/dev/null 2>&1 || true
     RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-gnu -p nuvec-core -p nuvec-cpu -p nuvec-io -p nuvec-kernels -p nuvec-gpu --all-targets
 
+# Crate dependencies follow the layering: lower layers never depend on higher ones.
 layering:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -203,12 +234,14 @@ layering:
     nuvec-core -> nuvec-gpu
     nuvec-compile -> nuvec-core
     nuvec-io -> nuvec-core
+    nuvec-distributed -> nuvec-core
     nuvec-gpu -> nuvec-kernels
     nuvec -> nuvec-core
     nuvec -> nuvec-compile
     nuvec -> nuvec-cpu
     nuvec -> nuvec-gpu
     nuvec -> nuvec-io
+    nuvec -> nuvec-distributed
     nuvec -> nuvec-macros
     nuvec-nn -> nuvec
     nuvec-lm -> nuvec
@@ -308,4 +341,4 @@ api-check:
 
 # GPU tests fail instead of skipping without a Metal device (`NUVEC_REQUIRE_GPU=1`).
 ci:
-    NUVEC_REQUIRE_GPU=1 just fmt-check lint test doc miri deny metallib-check metal-check internal-paths layering api-hygiene no-hand-visits notices docs-rs docs-claims portable-check
+    NUVEC_REQUIRE_GPU=1 just fmt-check lint test doc miri deny metallib-check metal-check nax-check internal-paths layering api-hygiene no-hand-visits notices docs-rs docs-claims portable-check

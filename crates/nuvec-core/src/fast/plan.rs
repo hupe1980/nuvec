@@ -82,6 +82,9 @@ pub(crate) enum Route {
     Tiled,
     /// The composition, in blocks of `rows` queries (`rows == lq`: one block).
     Composed { rows: usize },
+    /// MLX's blocked head-512 prefill: the composition in blocks of `rows` queries, each
+    /// over the keys its rows see (as `Composed`, chosen by MLX's rule).
+    Blocked { rows: usize },
 }
 
 /// A plan: the route and its memory.
@@ -149,6 +152,8 @@ fn one_row(key: &RouteKey, class: char, lk: usize) -> Option<GroupKind> {
     if !(vector_head(d, dv) && lk >= 1 && gqa <= 32 && d512) {
         return None;
     }
+    // A window bounds the keys a row reads; the partitions follow those, not the cache.
+    let lk = key.window.map_or(lk, |w| lk.min(w));
     if !vector_two_pass(class, lk, key.hkv < key.hq) {
         return Some(GroupKind::Vector {
             passes: 1,
@@ -160,6 +165,7 @@ fn one_row(key: &RouteKey, class: char, lk: usize) -> Option<GroupKind> {
     let blocks = vector_blocks(class, lk, gqa);
     let gqa_kernel = !array_mask
         && !key.sinks
+        && key.window.is_none()
         && d == dv
         && lk >= 8192
         && ((gqa == 8 && (d == 64 || d == 128)) || ((gqa == 12 || gqa == 16) && d == 128));
@@ -187,6 +193,7 @@ fn threads(key: &RouteKey, blocks: usize, causal_rows: bool) -> usize {
             bool_mask: array_mask && key.bool_mask,
             float_mask: array_mask && !key.bool_mask,
             sinks: key.sinks,
+            window: key.window.is_some(),
         },
         blocks,
     )
@@ -270,19 +277,63 @@ fn tiled_uncapped(key: &RouteKey) -> bool {
     // chunks, `just bench-attention-route`), the tiled kernel is faster for causal chunks
     // of 1,024 queries or more over up to 4,096 keys (2,048 over 4,096: 19.9 ms against
     // 23.5) and ties for 2,048 queries over 8,192 keys; the composition is faster beyond
-    // (1,024 over 8,192: 23.7 ms against 24.9) and for shorter chunks. The
-    // composition materialises the scores, so from 4 GiB of them (a 2,048-token chunk
-    // over ~64K keys and more) the tiled kernel runs anyway: re-measured at long-prefill chunks
-    // (16 query heads, half precision), the tiled kernel is 5–7% faster at exactly 4 GiB
-    // (1,024 queries over 131K keys), 1–6% slower below (342 queries over 8K–32K keys).
+    // (1,024 over 8,192: 23.7 ms against 24.9) and for shorter chunks, up to 8 GiB of
+    // scores (2,048 queries over 64K keys: 400 ms against 416; over 131K, 8 GiB: 813
+    // against 841, MLX 809). Beyond, the scores no longer fit beside a large model: MLX's
+    // composition swaps (Qwen3.6-35B-A3B over 262K tokens: 44 GB, 1,572 s on 48 GB) and
+    // nuvec's ran out of memory, so the tiled kernel runs (a fixed size, so results do not
+    // depend on the machine).
     let scores = key.b * key.hq * lq * lk * key.dtype.size();
-    let huge = scores >= 4 << 30;
+    let huge = scores > 8 << 30;
     let slow = match key.d {
         192 => !huge,
         256 => !(huge || (causal && lq >= 1024 && (lk <= 4096 || (lq >= 2048 && lk <= 8192)))),
         _ => false,
     };
     !slow
+}
+
+/// Whether a windowed call takes the tiled kernel where MLX's rule (for the equivalent
+/// array mask) composes: head sizes 192 and 256 with keys beyond the queries' windows,
+/// which the tiled kernel skips (a nuvec extension; the composition reads the window's
+/// keys only too, so the kernel wins where it avoids the scores' memory).
+fn windowed_tiled(key: &RouteKey) -> bool {
+    match key.window {
+        Some(w) => matches!(key.d, 192 | 256) && key.lk > w + key.lq,
+        None => false,
+    }
+}
+
+/// Query rows per block of MLX's blocked head-512 prefill.
+const BLOCKED_ROWS: usize = 256;
+
+/// MLX's `use_blocked_d512`: long causal self-attention at head size 512 in half
+/// precision, without an array mask or sinks (a window narrows each block's keys). MLX
+/// runs its split-D tiled kernel on NAX GPUs instead; nuvec blocks there too (F-019).
+fn blocked_d512(key: &RouteKey) -> bool {
+    matches!(key.dtype, DType::F16 | DType::BF16)
+        && key.d == 512
+        && key.dv == 512
+        && key.lq >= 1024
+        && key.lq <= key.lk
+        && key.mask == MaskKind::Causal
+        && !key.sinks
+}
+
+/// The blocked path's rows: 256, halved (down to 32) until a block's scores fit the cap;
+/// `None` when even 32 rows do not (the capped composition decides then).
+fn blocked_rows(key: &RouteKey) -> Option<usize> {
+    let mut rows = BLOCKED_ROWS;
+    while key
+        .cap
+        .is_some_and(|cap| block_intermediate(key, rows) > cap)
+    {
+        if rows == 32 {
+            return None;
+        }
+        rows /= 2;
+    }
+    Some(rows)
 }
 
 /// Bytes per element of the largest score-sized intermediate (float32 with sinks).
@@ -450,7 +501,6 @@ pub(crate) fn plan(key: &RouteKey) -> Result<Plan> {
     };
     if let Some(class) = class
         && key.lq <= 8
-        && key.window.is_none()
         && let Some(groups) = vector_schedule(key, class)
     {
         let scratch = vector_scratch(key, &groups);
@@ -461,8 +511,18 @@ pub(crate) fn plan(key: &RouteKey) -> Result<Plan> {
             capped: false,
         });
     }
+    if class.is_some()
+        && blocked_d512(key)
+        && let Some(rows) = blocked_rows(key)
+    {
+        return Ok(Plan {
+            route: Route::Blocked { rows },
+            scratch: blocked_scratch(key, rows),
+            max_intermediate: block_intermediate(key, rows),
+            capped: rows < BLOCKED_ROWS,
+        });
+    }
     let tiled_ok = class.is_some()
-        && key.window.is_none()
         && tiled_head(key.d, key.dv)
         && (key.mask != MaskKind::Causal || key.lq <= key.lk);
     let tiled = |capped: bool| Plan {
@@ -474,7 +534,7 @@ pub(crate) fn plan(key: &RouteKey) -> Result<Plan> {
     // (The benchmarking override `blocks` measures the composition under a cap even where
     // the tiled kernel would run uncapped.)
     let forced_blocks = key.cap.is_some() && capped_override() == Some(false);
-    if tiled_ok && key.lq > 8 && tiled_uncapped(key) && !forced_blocks {
+    if tiled_ok && key.lq > 8 && (tiled_uncapped(key) || windowed_tiled(key)) && !forced_blocks {
         return Ok(tiled(false));
     }
     let Some(cap) = key.cap else {

@@ -10,8 +10,12 @@
 //!   elimination).
 //!
 //! On the GPU, chains of element-wise operations are then fused into single generated
-//! kernels. Later calls replay the simplified graph on the new inputs without running the
-//! function again.
+//! kernels, compiled as MLX compiles its: scalar constants are literals in the source, and
+//! Metal's default (fast) math functions apply, which only `power` uses (the other
+//! functions are the precise ones, as in MLX). Fused results equal the uncompiled
+//! function's bit for bit, except where `power` is fused: there they can differ in the low
+//! bits, as `mx.compile`'s do. Later calls replay the simplified graph on the new inputs
+//! without running the function again.
 //!
 //! ```
 //! use nuvec_compile::compile;
@@ -25,6 +29,9 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! With [`Options::shapeless`] a function is traced once per input structure, dtypes and
+//! ranks, and replayed for any shapes (MLX's `shapeless=True`).
 //!
 //! [`compile_mut`] compiles a stateful step (MLX's `mx.compile(step, inputs=state,
 //! outputs=state)`): a training step over `(model, optimizer)` whose leaves are inputs and
@@ -62,18 +69,37 @@ const MAX_FUSED_STEPS: usize = 32;
 /// kernel; a fused kernel uses five more), as MLX's `max_compile_arrays`.
 const MAX_FUSED_ARRAYS: usize = 24;
 
-/// Options of [`compile`] and [`compile_mut`]: `Options::default().cache_capacity(8)`.
+thread_local! {
+    /// The traces made on this thread ([`__trace_count`]).
+    static TRACES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The number of traces compiled functions have made on this thread. A test diagnostic,
+/// not a stable API.
+#[doc(hidden)]
+pub fn __trace_count() -> usize {
+    TRACES.with(Cell::get)
+}
+
+/// Options of [`compile`], [`compile_mut`] and [`compile_flat_with`]:
+/// `Options::default().cache_capacity(8)`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Options {
     /// The most traced signatures a compiled function keeps (least recently used first
     /// out); 0 never caches. Default 64.
     pub cache_capacity: usize,
+    /// Trace once per input structure, dtypes and ranks, and replay for any shapes
+    /// ([`Options::shapeless`]). Default off.
+    pub shapeless: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { cache_capacity: 64 }
+        Self {
+            cache_capacity: 64,
+            shapeless: false,
+        }
     }
 }
 
@@ -81,6 +107,40 @@ impl Options {
     /// Sets the cache capacity.
     pub fn cache_capacity(mut self, n: usize) -> Self {
         self.cache_capacity = n;
+        self
+    }
+
+    /// Shapeless compilation (MLX's `shapeless=True`): the function is traced once per
+    /// input structure, dtypes and ranks, and replayed for any shapes of those ranks. Each
+    /// replay infers the shapes again, and element-wise operations broadcast their operands
+    /// as the uncompiled ones do, so the results are the shaped compile's bit for bit.
+    ///
+    /// ```
+    /// use nuvec_compile::Options;
+    /// use nuvec_core::{Array, DType, ops};
+    ///
+    /// # fn main() -> nuvec_core::Result<()> {
+    /// let swiglu = Options::default()
+    ///     .shapeless(true)
+    ///     .compile(|(g, u): &(Array, Array)| g.multiply(g.sigmoid()).multiply(u));
+    /// for rows in [7, 512, 2048] {
+    ///     let g = ops::ones([rows, 64], DType::F32);
+    ///     swiglu(&(g.clone(), g))?.eval()?; // traced once, for every row count
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// - Operations whose parameters hold traced sizes fail the trace with an error naming
+    ///   them: reshapes, slices and slice updates, broadcasts other than an element-wise
+    ///   operation's own, random draws, custom Metal kernels and attention (whose kernel
+    ///   choice depends on the lengths). Compile those without the option.
+    /// - As in MLX, Rust code that reads a shape while tracing (`x.shape()[0]`, a branch on
+    ///   a size) bakes the first call's value in, and constants built from a traced shape
+    ///   keep it: a replay on another shape then fails in the operation that uses them.
+    /// - [`compile_mut`] keys its state exactly and its inputs shapelessly.
+    pub fn shapeless(mut self, on: bool) -> Self {
+        self.shapeless = on;
         self
     }
 
@@ -100,7 +160,7 @@ impl Options {
                 // call carries to the outputs): no trace.
                 return f(inputs).into_result();
             }
-            let key = Key::new(vec![inputs.def()], &leaves);
+            let key = Key::new(vec![inputs.def()], &leaves, self.shapeless.then_some(0));
             let cached = lock(&cache).get(&key);
             let entry = match cached {
                 Some(entry) => entry,
@@ -112,7 +172,7 @@ impl Options {
                         out = Some(o.map(|_, a| light(a)));
                         Ok(leaves)
                     };
-                    let tape = Tape::trace(&mut body, &leaves, key.stream)?;
+                    let tape = Tape::trace(&mut body, &leaves, key.stream, self.shapeless)?;
                     let out =
                         out.ok_or_else(|| Error::InvalidArgument("compile: no output".into()))?;
                     let entry = Arc::new((tape, out));
@@ -155,12 +215,20 @@ impl Options {
             all.push(key0.clone());
             all.extend(state_leaves.iter().cloned());
             all.extend(input_leaves.iter().cloned());
-            let key = Key::new(vec![pre_def.clone(), inputs.def()], &all);
+            let shapeless = self.shapeless.then_some(1 + state_leaves.len());
+            let key = Key::new(vec![pre_def.clone(), inputs.def()], &all, shapeless);
             let cached = lock(&cache).get(&key);
             let entry = match cached {
                 Some(entry) => entry,
                 None => {
-                    let entry = Arc::new(MutTape::trace(&f, state, inputs, &all, key.stream)?);
+                    let entry = Arc::new(MutTape::trace(
+                        &f,
+                        state,
+                        inputs,
+                        &all,
+                        key.stream,
+                        self.shapeless,
+                    )?);
                     if !entry.tape.captures_tracer() {
                         lock(&cache).insert(key, entry.clone());
                     }
@@ -288,17 +356,30 @@ pub fn compile_flat<F>(f: F) -> impl Fn(&[Array]) -> Result<Vec<Array>>
 where
     F: Fn(&[Array]) -> Result<Vec<Array>>,
 {
-    let cache: Mutex<Cache<Tape>> = Mutex::new(Cache::new(Options::default().cache_capacity));
+    compile_flat_with(Options::default(), f)
+}
+
+/// [`compile_flat`] with options ([`Options::shapeless`], the cache capacity).
+pub fn compile_flat_with<F>(options: Options, f: F) -> impl Fn(&[Array]) -> Result<Vec<Array>>
+where
+    F: Fn(&[Array]) -> Result<Vec<Array>>,
+{
+    let cache: Mutex<Cache<Tape>> = Mutex::new(Cache::new(options.cache_capacity));
     move |inputs| {
         if inputs.iter().any(|a| graph::is_tracer(a) || a.is_failed()) {
             return f(inputs);
         }
-        let key = Key::new(Vec::new(), inputs);
+        let key = Key::new(Vec::new(), inputs, options.shapeless.then_some(0));
         let cached = lock(&cache).get(&key);
         let tape = match cached {
             Some(tape) => tape,
             None => {
-                let tape = Arc::new(Tape::trace(&mut |xs: &[Array]| f(xs), inputs, key.stream)?);
+                let tape = Arc::new(Tape::trace(
+                    &mut |xs: &[Array]| f(xs),
+                    inputs,
+                    key.stream,
+                    options.shapeless,
+                )?);
                 if !tape.captures_tracer() {
                     lock(&cache).insert(key, tape.clone());
                 }
@@ -337,6 +418,7 @@ impl<S: Tree, O: Tree> MutTape<S, O> {
         inputs: &I,
         all: &[Array],
         stream: Stream,
+        shapeless: bool,
     ) -> Result<Self> {
         let ns = state.len();
         let key0 = all[0].clone();
@@ -355,7 +437,7 @@ impl<S: Tree, O: Tree> MutTape<S, O> {
             traced = Some((out, s));
             Ok(leaves)
         };
-        let result = Tape::trace(&mut body, all, stream);
+        let result = Tape::trace(&mut body, all, stream, shapeless);
         random::set_sequence_key(key0.clone());
         let tape = result?;
         let (out, post) =
@@ -419,15 +501,27 @@ impl<T> Cache<T> {
 struct Key {
     stream: Stream,
     defs: Vec<TreeDef>,
-    inputs: Vec<(DType, Vec<usize>)>,
+    /// Dtype and shape per input (`Ok`), or dtype and rank for a shapeless input (`Err`).
+    inputs: Vec<(DType, std::result::Result<Vec<usize>, usize>)>,
 }
 
 impl Key {
-    fn new(defs: Vec<TreeDef>, inputs: &[Array]) -> Self {
+    /// The key of `inputs`; those from position `shapeless` on are keyed by dtype and rank.
+    fn new(defs: Vec<TreeDef>, inputs: &[Array], shapeless: Option<usize>) -> Self {
+        let from = shapeless.unwrap_or(inputs.len());
         Self {
             stream: default_stream(),
             defs,
-            inputs: inputs.iter().map(|a| (a.dtype(), dims(a))).collect(),
+            inputs: inputs
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    (
+                        a.dtype(),
+                        if i < from { Ok(dims(a)) } else { Err(a.ndim()) },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -457,7 +551,15 @@ struct Tape {
     consts: Vec<Array>,
     steps: Vec<Step>,
     outputs: Vec<Ref>,
+    /// Replayed on any shapes: element-wise steps broadcast their operands.
+    shapeless: bool,
+    /// Shapeless replays' broadcast views of constants, by constant and shape: the same on
+    /// every call of a shape, so made once (at most [`MAX_VIEWS`]).
+    views: Mutex<HashMap<(usize, Vec<usize>), Array>>,
 }
+
+/// The most broadcast constants a shapeless tape keeps (it starts over when full).
+const MAX_VIEWS: usize = 64;
 
 impl Tape {
     /// Traces `f` on placeholders like `inputs`, simplifies the graph and, on the GPU,
@@ -466,13 +568,18 @@ impl Tape {
         f: &mut dyn FnMut(&[Array]) -> Result<Vec<Array>>,
         inputs: &[Array],
         stream: Stream,
+        shapeless: bool,
     ) -> Result<Self> {
+        TRACES.with(|n| n.set(n.get() + 1));
         let placeholders = inputs
             .iter()
             .map(|a| graph::placeholder(a.dtype(), a.shape()))
             .collect::<Result<Vec<_>>>()?;
         let outputs = f(&placeholders)?;
         let mut tape = Builder::new(&placeholders).build(&outputs);
+        if shapeless {
+            tape.make_shapeless()?;
+        }
         if stream.device.kind == DeviceKind::Gpu {
             tape.fuse(inputs);
         }
@@ -493,10 +600,154 @@ impl Tape {
             Ref::Step(s, o) => values[s][o].clone(),
         };
         for step in &self.steps {
-            let args = step.inputs.iter().map(|r| get(r, &values)).collect();
+            let mut args: Vec<Array> = step.inputs.iter().map(|r| get(r, &values)).collect();
+            if self.shapeless && is_element_wise(&step.primitive) {
+                self.broadcast_operands(step, &mut args)?;
+            }
             values.push(graph::from_primitive(step.primitive.clone(), args)?);
         }
         Ok(self.outputs.iter().map(|r| get(r, &values)).collect())
+    }
+
+    /// Broadcasts an element-wise step's `args` to their common shape, as the binary
+    /// operations do; a constant's view of a shape is made once.
+    fn broadcast_operands(&self, step: &Step, args: &mut [Array]) -> Result<()> {
+        let shapes: Vec<Vec<usize>> = args.iter().map(dims).collect();
+        if shapes.windows(2).all(|w| w[0] == w[1]) {
+            return Ok(());
+        }
+        let mut shape = Vec::new();
+        for s in &shapes {
+            shape = graph::broadcast_shapes(step.primitive.name(), &shape, s)?;
+        }
+        let expand = |a: &Array| {
+            graph::from_primitive(Primitive::Broadcast(shape.clone()), vec![a.clone()])
+                .map(|mut v| v.remove(0))
+        };
+        for ((a, s), r) in args.iter_mut().zip(&shapes).zip(&step.inputs) {
+            if *s == shape {
+                continue;
+            }
+            *a = match *r {
+                Ref::Const(c) => {
+                    let mut views = lock(&self.views);
+                    if views.len() >= MAX_VIEWS {
+                        views.clear();
+                    }
+                    match views.entry((c, shape.clone())) {
+                        std::collections::hash_map::Entry::Occupied(v) => v.get().clone(),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(expand(a)?).clone()
+                        }
+                    }
+                }
+                _ => expand(a)?,
+            };
+        }
+        Ok(())
+    }
+
+    /// Makes a traced tape replayable on any shapes of the traced ranks. The operations
+    /// broadcast an element-wise operation's operands to the result's shape; a shapeless
+    /// replay re-derives that broadcast from the operands (as MLX's `Broadcast` does from
+    /// its partner inputs). So an element-wise step's broadcast operands are replaced by
+    /// their sources, and so are the broadcast views among the constants (scalar operands,
+    /// captured weights). Steps left without a use are dropped; a step whose parameters
+    /// still fix a shape fails the trace.
+    fn make_shapeless(&mut self) -> Result<()> {
+        self.shapeless = true;
+        // The constant each broadcast-view constant was expanded from.
+        let mut sources: HashMap<usize, usize> = HashMap::new();
+        for c in 0..self.consts.len() {
+            let a = &self.consts[c];
+            if graph::is_tracer(a) {
+                continue;
+            }
+            if let (Some(Primitive::Broadcast(_)), [x]) =
+                (graph::primitive(a), graph::inputs(a).as_slice())
+            {
+                let x = x.clone();
+                self.consts.push(x);
+                sources.insert(c, self.consts.len() - 1);
+            }
+        }
+        for k in 0..self.steps.len() {
+            if !is_element_wise(&self.steps[k].primitive) {
+                continue;
+            }
+            for i in 0..self.steps[k].inputs.len() {
+                let mut r = self.steps[k].inputs[i];
+                loop {
+                    r = match r {
+                        Ref::Step(j, 0)
+                            if matches!(self.steps[j].primitive, Primitive::Broadcast(_)) =>
+                        {
+                            self.steps[j].inputs[0]
+                        }
+                        Ref::Const(c) if sources.contains_key(&c) => Ref::Const(sources[&c]),
+                        _ => break,
+                    };
+                }
+                self.steps[k].inputs[i] = r;
+            }
+        }
+        self.drop_unused();
+        match self.steps.iter().find(|s| s.primitive.fixes_shape()) {
+            Some(s) => Err(Error::InvalidArgument(format!(
+                "compile (shapeless): `{}` fixes a traced shape; compile this function \
+                 without shapeless",
+                s.primitive.name()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Removes the steps no output depends on.
+    fn drop_unused(&mut self) {
+        let n = self.steps.len();
+        let step_of = |r: &Ref| match *r {
+            Ref::Step(j, _) => Some(j),
+            _ => None,
+        };
+        let mut live = vec![false; n];
+        let mut stack: Vec<usize> = self.outputs.iter().filter_map(step_of).collect();
+        while let Some(j) = stack.pop() {
+            if !std::mem::replace(&mut live[j], true) {
+                stack.extend(self.steps[j].inputs.iter().filter_map(step_of));
+            }
+        }
+        let mut index = vec![0; n];
+        let remap = |r: Ref, index: &[usize]| match r {
+            Ref::Step(j, o) => Ref::Step(index[j], o),
+            r => r,
+        };
+        let mut steps = Vec::with_capacity(n);
+        for (k, mut step) in std::mem::take(&mut self.steps).into_iter().enumerate() {
+            if live[k] {
+                step.inputs = step.inputs.iter().map(|&r| remap(r, &index)).collect();
+                index[k] = steps.len();
+                steps.push(step);
+            }
+        }
+        self.outputs = self.outputs.iter().map(|&r| remap(r, &index)).collect();
+        self.steps = steps;
+    }
+
+    /// A constant a fused kernel writes as a literal: a float scalar (or a broadcast one, as
+    /// the operations make for scalar operands) with a known value, not a tracer.
+    fn literal(&self, r: Ref) -> Option<(DType, u64)> {
+        let Ref::Const(c) = r else { return None };
+        let a = &self.consts[c];
+        if graph::is_tracer(a) || !matches!(a.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+            return None;
+        }
+        let value = scalar_bits(a).or_else(|| {
+            match (graph::primitive(a), graph::inputs(a).as_slice()) {
+                (Some(Primitive::Broadcast(_)), [x]) if x.dtype() == a.dtype() => scalar_bits(x),
+                _ => None,
+            }
+        })?;
+        Some((a.dtype(), value))
     }
 
     fn dtype(&self, r: Ref, inputs: &[Array]) -> DType {
@@ -565,9 +816,12 @@ impl Tape {
             let mut candidates: BinaryHeap<usize> = step_inputs(root).collect();
             let mut seen = HashSet::new();
             while let Some(j) = candidates.pop() {
+                // Shapeless: a fused kernel computes every member at the group's shape, and
+                // a member's own shape can be smaller, so the function's outputs stay out.
                 if !seen.insert(j)
                     || group[j].is_some()
                     || !fusable[j]
+                    || (self.shapeless && is_output[j])
                     || members.len() >= MAX_FUSED_STEPS
                     || !consumers[j].iter().all(|c| members.contains(c))
                 {
@@ -619,6 +873,22 @@ impl Tape {
                 (Some(_), Some((members, external))) => {
                     let position: HashMap<usize, usize> =
                         members.iter().enumerate().map(|(p, &m)| (m, p)).collect();
+                    // Scalar float constants go into the kernel as literals (MLX's compiled
+                    // kernels write theirs into the source); the rest are its inputs.
+                    let mut constants: Vec<(DType, u64)> = Vec::new();
+                    let mut literal: HashMap<Ref, usize> = HashMap::new();
+                    for &r in external {
+                        if let Some(value) = self.literal(r) {
+                            literal.insert(r, constants.len());
+                            constants.push(value);
+                        }
+                    }
+                    let external: Vec<Ref> = external
+                        .iter()
+                        .copied()
+                        .filter(|r| !literal.contains_key(r))
+                        .collect();
+                    let external = &external;
                     let graph = members
                         .iter()
                         .map(|&m| {
@@ -628,6 +898,9 @@ impl Tape {
                                 .map(|r| match *r {
                                     Ref::Step(j, _) if position.contains_key(&j) => {
                                         FusedRef::Step(position[&j])
+                                    }
+                                    r if literal.contains_key(&r) => {
+                                        FusedRef::Constant(literal[&r])
                                     }
                                     r => FusedRef::Input(
                                         external.iter().position(|&e| e == r).expect("external"),
@@ -650,7 +923,8 @@ impl Tape {
                     let dtypes: Vec<DType> =
                         external.iter().map(|&r| self.dtype(r, inputs)).collect();
                     let positions: Vec<usize> = outs.iter().map(|m| position[m]).collect();
-                    let Ok(f) = Fused::new(&dtypes, graph, &positions) else {
+                    let Ok(f) = Fused::with_constants(&dtypes, &constants, graph, &positions)
+                    else {
                         unreachable!("every member is fusable")
                     };
                     steps.push(Step {
@@ -738,6 +1012,8 @@ impl Builder {
             consts: self.consts,
             steps: self.steps,
             outputs,
+            shapeless: false,
+            views: Mutex::default(),
         }
     }
 
@@ -748,8 +1024,10 @@ impl Builder {
         let siblings = graph::siblings(a);
         let args: Vec<Ref> = inputs.iter().map(|i| self.refs[&Self::key(i)]).collect();
         let primitive = graph::primitive(a);
+        // A collective communicates on every call: never a constant.
+        let effect = |p: &Primitive| matches!(p, Primitive::Collective { .. });
         let Some(primitive) =
-            primitive.filter(|_| !args.iter().all(|r| matches!(r, Ref::Const(_))))
+            primitive.filter(|p| effect(p) || !args.iter().all(|r| matches!(r, Ref::Const(_))))
         else {
             for s in &siblings {
                 let c = self.constant(s);
@@ -761,8 +1039,14 @@ impl Builder {
             self.refs.insert(Self::key(a), args[0]);
             return;
         }
-        let k = match self.seen.get(&(primitive.clone(), args.clone())) {
-            Some(&k) => k,
+        // A collective is never merged with an identical one: each call communicates (two
+        // equal `recv`s receive two messages).
+        let merged = match effect(&primitive) {
+            true => None,
+            false => self.seen.get(&(primitive.clone(), args.clone())).copied(),
+        };
+        let k = match merged {
+            Some(k) => k,
             None => {
                 self.steps.push(Step {
                     primitive: primitive.clone(),
@@ -770,7 +1054,9 @@ impl Builder {
                     outputs: siblings.iter().map(|s| (s.dtype(), dims(s))).collect(),
                 });
                 let k = self.steps.len() - 1;
-                self.seen.insert((primitive, args), k);
+                if !effect(&primitive) {
+                    self.seen.insert((primitive, args), k);
+                }
                 k
             }
         };
@@ -807,11 +1093,21 @@ impl Builder {
     }
 }
 
+/// Whether `primitive` is element-wise over operands of one shape, which the operations
+/// broadcast to the result's shape.
+fn is_element_wise(primitive: &Primitive) -> bool {
+    matches!(
+        primitive,
+        Primitive::Binary(_) | Primitive::Select | Primitive::Compiled(_)
+    )
+}
+
 /// Whether `primitive` maps `input` to `output` unchanged.
 fn is_identity(primitive: &Primitive, input: &Array, output: &Array) -> bool {
     let same = input.shape() == output.shape() && graph::strides(input) == graph::strides(output);
     match primitive {
-        Primitive::Broadcast(_) | Primitive::Reshape(_) | Primitive::StopGradient => same,
+        // Not `StopGradient`: a replay under an outer transform must still stop gradients.
+        Primitive::Broadcast(_) | Primitive::Reshape(_) => same,
         Primitive::Transpose(axes) => axes.iter().enumerate().all(|(i, &a)| i == a),
         Primitive::AsType(d) => *d == input.dtype(),
         _ => false,
@@ -856,6 +1152,7 @@ mod tests {
             &mut |xs: &[Array]| f(xs),
             inputs,
             Stream::default_for(device),
+            false,
         )
         .unwrap()
     }

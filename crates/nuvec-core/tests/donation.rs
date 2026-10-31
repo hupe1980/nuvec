@@ -30,100 +30,47 @@ fn at_set_writes_in_place_when_it_owns_its_base() {
     let _serial = PEAK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    with_stream(Device::gpu(0), || {
-        let n = 4 << 20; // 16 MiB of float32
-        let mut x = ops::zeros([64, n / 64], DType::F32);
-        x.eval().unwrap();
-        gpu_peak_since_reset();
-        let resident = nuvec_gpu::Device::shared().map_or(0, |d| d.memory().active);
-        for i in 0..64 {
-            let v = ops::full([1, n / 64], i as f32);
-            // `at` takes `x` by value: the update owns its base and writes into it.
-            x = x.at((i..i + 1, ..)).set(&v);
-            x.eval().unwrap();
-        }
-        // Each step reused the buffer: a copy would have held two 16 MiB buffers at once.
-        let peak = gpu_peak_since_reset();
-        assert!(
-            peak < resident + n * 4 / 2,
-            "peak {peak}, before {resident}"
-        );
-        let v = x.to_vec::<f32>().unwrap();
-        assert!((0..64).all(|i| v[i * n / 64] == i as f32 && v[(i + 1) * n / 64 - 1] == i as f32));
-    });
-}
-
-/// `x.clone().at(..).set(..)` updates a copy: `x` keeps its values, on a held base and on a
-/// chain of updates.
-#[test]
-fn at_set_on_a_clone_leaves_the_original_unchanged() {
-    if crate::common::require_gpu().is_none() {
-        return;
-    }
-    with_stream(Device::gpu(0), || {
-        let x = ops::zeros([4, 8], DType::F32);
-        x.eval().unwrap();
-        let y = x.clone().at((.., 0..4)).set(1.0);
-        assert_eq!(x.to_vec::<f32>().unwrap(), [0.0; 32]);
-        let v = y.to_vec::<f32>().unwrap();
-        assert!((0..32).all(|i| v[i] == if i % 8 < 4 { 1.0 } else { 0.0 }));
-        // Unevaluated, and updated again through the clone: still unchanged.
-        let x = ops::arange(0, 32, 1).astype(DType::F32).reshape([4, 8]);
-        let mut y = x.clone();
-        for i in 0..4 {
-            y = y.at((i, ..)).set(-1.0);
-        }
-        assert_eq!(y.to_vec::<f32>().unwrap(), [-1.0; 32]);
-        let expected: Vec<f32> = (0..32).map(|i| i as f32).collect();
-        assert_eq!(x.to_vec::<f32>().unwrap(), expected);
-    });
-}
-
-/// The decode order (mlx-lm's): each step is submitted while the previous one is still in
-/// flight, and a small result of the previous step is read afterwards. The base is then
-/// in flight, held only by pending work, and is still written in place.
-#[test]
-fn slice_update_writes_in_place_into_bases_still_in_flight() {
-    if crate::common::require_gpu().is_none() {
-        return;
-    }
-    let _serial = PEAK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    with_stream(Device::gpu(0), || {
-        let n = 4 << 20; // 16 MiB of float32
-        let row = |i: usize| (i..i + 1, ..);
-        let mut a = ops::zeros([64, n / 64], DType::F32);
-        a.eval().unwrap();
-        // Work that keeps each step's command buffer running while the next is built,
-        // without allocating anything sizeable (a reduction of a resident 64 MiB array).
-        // (Computed on the GPU, so that it is resident in the GPU allocator when measured.)
-        let big = ops::zeros([16 << 20], DType::F32) + 1.0f32 / (16 << 20) as f32;
-        big.eval().unwrap();
-        gpu_peak_since_reset();
-        let resident = nuvec_gpu::Device::shared().map_or(0, |d| d.memory().active);
-        let mut token: Option<Array> = None;
-        for i in 0..64 {
-            let update = ops::full([1, n / 64], i as f32);
-            a = a.at(row(i)).set(&update);
-            // A small result of this step, read only after the next step is submitted.
-            let busy = big.sum(..);
-            let next = a.i(row(i)).sum(..) + busy;
-            async_eval(&[a.clone(), next.clone()]).unwrap();
-            if let Some(t) = token.replace(next) {
-                let want = (i - 1) as f32 * (n / 64) as f32 + 1.0;
-                assert!((t.item::<f32>().unwrap() - want).abs() < 1.0);
+    // No step copies its base, also when a step's donation coincides with the completion
+    // handler publishing it (publishing locks the in-flight cell before it reaches the node).
+    let attempt = || -> Option<String> {
+        with_stream(Device::gpu(0), || {
+            let n = 4 << 20; // 16 MiB of float32
+            let row = |i: usize| (i..i + 1, ..);
+            let mut a = ops::zeros([64, n / 64], DType::F32);
+            a.eval().unwrap();
+            // Work that keeps each step's command buffer running while the next is built,
+            // without allocating anything sizeable (a reduction of a resident 64 MiB
+            // array). (Computed on the GPU, so that it is resident in the GPU allocator
+            // when measured.)
+            let big = ops::zeros([16 << 20], DType::F32) + 1.0f32 / (16 << 20) as f32;
+            big.eval().unwrap();
+            gpu_peak_since_reset();
+            let resident = nuvec_gpu::Device::shared().map_or(0, |d| d.memory().active);
+            let mut token: Option<Array> = None;
+            for i in 0..64 {
+                let update = ops::full([1, n / 64], i as f32);
+                a = a.at(row(i)).set(&update);
+                // A small result of this step, read only after the next step is submitted.
+                let busy = big.sum(..);
+                let next = a.i(row(i)).sum(..) + busy;
+                async_eval(&[a.clone(), next.clone()]).unwrap();
+                if let Some(t) = token.replace(next) {
+                    let want = (i - 1) as f32 * (n / 64) as f32 + 1.0;
+                    assert!((t.item::<f32>().unwrap() - want).abs() < 1.0);
+                }
             }
-        }
-        // A copy per step would have held two 16 MiB buffers at once.
-        let peak = gpu_peak_since_reset();
-        assert!(
-            peak < resident + n * 4 / 2,
-            "peak {peak}, before {resident}"
-        );
-        let v = a.to_vec::<f32>().unwrap();
-        assert!((0..64).all(|i| v[i * n / 64] == i as f32 && v[(i + 1) * n / 64 - 1] == i as f32));
-    });
+            let v = a.to_vec::<f32>().unwrap();
+            assert!(
+                (0..64).all(|i| v[i * n / 64] == i as f32 && v[(i + 1) * n / 64 - 1] == i as f32)
+            );
+            // A copy would have held two 16 MiB buffers at once.
+            let peak = gpu_peak_since_reset();
+            (peak >= resident + n * 4 / 2).then(|| format!("peak {peak}, before {resident}"))
+        })
+    };
+    if let Some(failure) = attempt() {
+        panic!("{failure}");
+    }
 }
 
 #[test]
@@ -195,7 +142,7 @@ fn cpu_slice_update_reads_strided_updates_in_place() {
         let resident = nuvec_gpu::Device::shared().map_or(0, |d| d.memory().active);
         let out = base.slice_update(&update, (0..rows, ..));
         out.eval().unwrap();
-        // The result (a copy of the base: the CPU does not donate) and nothing else; a
+        // The result (a copy of the base, which `base` still holds) and nothing else; a
         // contiguous copy of the update would add another 512 KiB.
         let peak = gpu_peak_since_reset();
         let (base_bytes, update_bytes) = (64 * cols * 4, rows * cols * 4);
@@ -414,5 +361,59 @@ fn composed_attention_holds_one_score_matrix() {
             peak < resident + scores * 3 / 2,
             "peak {peak}, before {resident}, scores {scores}"
         );
+    });
+}
+
+/// The CPU writes an update into a base nothing else holds (MLX's CPU donation): a chain of
+/// updates keeps one buffer, whether each step is evaluated or the whole chain is; a held
+/// base keeps its values.
+#[test]
+fn cpu_slice_update_writes_in_place_when_it_owns_its_base() {
+    if crate::common::require_gpu().is_none() {
+        return;
+    }
+    let _serial = PEAK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_stream(Device::cpu(), || {
+        let n = 1 << 20; // 4 MiB of float32
+        for per_step in [true, false] {
+            let mut x = ops::zeros([64, n / 64], DType::F32) + 0.0;
+            x.eval().unwrap();
+            let id = x.buffer_id();
+            gpu_peak_since_reset();
+            let resident = nuvec_gpu::Device::shared().map_or(0, |d| d.memory().active);
+            for i in 0..64 {
+                x = x.at((i..i + 1, ..)).set(i as f32);
+                if per_step {
+                    x.eval().unwrap();
+                }
+            }
+            x.eval().unwrap();
+            let peak = gpu_peak_since_reset();
+            assert!(
+                peak < resident + n * 4 / 2,
+                "per step {per_step}: peak {peak}, before {resident}"
+            );
+            assert_eq!(x.buffer_id(), id, "per step {per_step}: the base's buffer");
+            let v = x.to_vec::<f32>().unwrap();
+            assert!(
+                (0..64).all(|i| v[i * n / 64] == i as f32 && v[(i + 1) * n / 64 - 1] == i as f32)
+            );
+        }
+        // Held: copied, the original unchanged.
+        let a = ops::zeros([8, 16], DType::F32) + 1.0;
+        a.eval().unwrap();
+        let b = a.clone().at((0, ..)).set(5.0);
+        b.eval().unwrap();
+        assert_ne!(a.buffer_id(), b.buffer_id());
+        assert!(a.to_vec::<f32>().unwrap().iter().all(|&x| x == 1.0));
+        assert_eq!(b.to_vec::<f32>().unwrap()[0], 5.0);
+        // A view of the base is a holder too.
+        let a = ops::zeros([8, 16], DType::F32) + 1.0;
+        let row = a.i(1);
+        let b = a.at((1, ..)).set(5.0);
+        eval(&[b.clone(), row.clone()]).unwrap();
+        assert!(row.to_vec::<f32>().unwrap().iter().all(|&x| x == 1.0));
     });
 }

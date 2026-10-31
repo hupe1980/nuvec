@@ -432,3 +432,26 @@ NUVEC_GATHER_MM(float32, float, true, t)
 
 } // namespace steel
 } // namespace mlx
+
+// MLX's `gather_mm_offsets` (kernels/gather_mm_offsets.metal): for rows sorted by weight
+// batch, where each batch's rows start (the lower bound of `g`), per row of the last axis
+// (`tid.y`; MLX has one).
+[[kernel]] void nuvec_sorted_offsets(
+    const device uint32_t* indices [[buffer(0)]],
+    device int32_t* offsets [[buffer(1)]],
+    const constant int& M [[buffer(2)]],
+    const constant int& groups [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]]) {
+  const device uint32_t* row = indices + size_t(tid.y) * M;
+  int lo = 0;
+  int hi = M;
+  while (lo < hi) {
+    const int mid = (lo + hi) / 2;
+    if (row[mid] < tid.x) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  offsets[size_t(tid.y) * groups + tid.x] = lo;
+}

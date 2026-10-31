@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 
-use nuvec::{Array, DType, OpErrorKind, Param, fast, ops, random};
+use nuvec::{Array, DType, OpErrorKind, Param, Quant, QuantMode, Quantized, fast, ops, random};
 
 use crate::Module;
 
@@ -82,7 +82,8 @@ impl Linear {
 }
 
 /// A [`Linear`] layer with its weight quantized (MLX's `nn.QuantizedLinear`): `x Wᵀ + b`
-/// computed by `quantized_matmul` from the packed weight, its scales and biases.
+/// computed by `quantized_matmul` from the packed weight and its scales (and, for affine,
+/// biases), in any [`QuantMode`].
 ///
 /// The packed weight, scales and biases are buffers (never trained, also after
 /// `unfreeze`); the bias is a trainable parameter.
@@ -91,63 +92,63 @@ pub struct QuantizedLinear {
     /// The packed weight (uint32), `[output_dims, input_dims · bits / 32]`.
     #[tree(buffer)]
     pub weight: Array,
-    /// One scale per group of input values, `[output_dims, input_dims / group_size]`.
+    /// One scale per group of input values, `[output_dims, input_dims / group_size]`
+    /// (uint8 codes for the floating-point modes).
     #[tree(buffer)]
     pub scales: Array,
-    /// One bias per group of input values, shaped like `scales`.
+    /// One bias per group of input values, shaped like `scales`: affine only.
     #[tree(buffer)]
-    pub biases: Array,
+    pub biases: Option<Array>,
     /// The layer's bias, `[output_dims]`.
     pub bias: Option<Param>,
-    /// Input values per scale and bias.
+    /// How the weight is quantized.
     #[tree(skip)]
-    pub group_size: i32,
-    /// Bits per weight.
-    #[tree(skip)]
-    pub bits: i32,
+    pub quant: Quant,
 }
 
 impl QuantizedLinear {
-    /// Quantizes `linear`'s weight with MLX's defaults (groups of 64 values, 4 bits); the
-    /// bias is kept.
+    /// Quantizes `linear`'s weight with MLX's defaults (affine, groups of 64 values, 4
+    /// bits); the bias is kept.
     #[track_caller]
     pub fn from_linear(linear: &Linear) -> Self {
-        Self::from_linear_with(linear, 64, 4)
+        Self::from_linear_with(linear, Quant::default())
     }
 
-    /// Quantizes `linear`'s weight in groups of `group_size` (32, 64 or 128) input values
-    /// with `bits` (1–6 or 8) bits each; the bias is kept.
+    /// Quantizes `linear`'s weight with `quant` (a mode such as `QuantMode::Mxfp4`, or
+    /// `Quant::affine(group_size, bits)`); the bias is kept.
     #[track_caller]
-    pub fn from_linear_with(linear: &Linear, group_size: i32, bits: i32) -> Self {
-        let (weight, scales, biases) = linear.weight.quantize(group_size, bits);
+    pub fn from_linear_with(linear: &Linear, quant: impl Into<Quant>) -> Self {
+        let q = linear.weight.quantize(quant);
         Self {
-            weight,
-            scales,
-            biases,
+            weight: q.weight,
+            scales: q.scales,
+            biases: q.biases,
             bias: linear.bias.clone(),
-            group_size,
-            bits,
+            quant: q.quant,
         }
     }
 
-    /// The dequantized weight, `[output_dims, input_dims]`.
+    /// The quantized weight.
+    pub fn quantized(&self) -> Quantized {
+        Quantized::new(
+            self.weight.clone(),
+            self.scales.clone(),
+            self.biases.clone(),
+            self.quant,
+        )
+    }
+
+    /// The dequantized weight, `[output_dims, input_dims]`, in `dtype` (default: the
+    /// scales' dtype for affine, bfloat16 for the floating-point modes).
     #[track_caller]
-    pub fn dequantized_weight(&self) -> Array {
-        self.weight
-            .dequantize(&self.scales, &self.biases, self.group_size, self.bits)
+    pub fn dequantized_weight(&self, dtype: impl Into<Option<DType>>) -> Array {
+        self.quantized().dequantize(dtype)
     }
 
     /// `x Wᵀ + b` over the last axis of `x`.
     #[track_caller]
     pub fn forward(&self, x: &Array) -> Array {
-        let y = x.quantized_matmul(
-            &self.weight,
-            &self.scales,
-            &self.biases,
-            true,
-            self.group_size,
-            self.bits,
-        );
+        let y = x.quantized_matmul(&self.quantized(), true);
         match &self.bias {
             Some(b) => y.add(b),
             None => y,
@@ -188,7 +189,8 @@ impl Embedding {
 }
 
 /// An [`Embedding`] with its table quantized (MLX's `nn.QuantizedEmbedding`): rows are
-/// gathered packed and dequantized; the packed table, scales and biases are buffers.
+/// gathered packed and dequantized; the packed table, scales and biases are buffers. In the
+/// floating-point modes the rows come out in bfloat16, as MLX's.
 #[derive(Debug, Clone, Module)]
 pub struct QuantizedEmbedding {
     /// The packed table (uint32), `[num_embeddings, dims · bits / 32]`.
@@ -197,59 +199,59 @@ pub struct QuantizedEmbedding {
     /// One scale per group of values, `[num_embeddings, dims / group_size]`.
     #[tree(buffer)]
     pub scales: Array,
-    /// One bias per group of values, shaped like `scales`.
+    /// One bias per group of values, shaped like `scales`: affine only.
     #[tree(buffer)]
-    pub biases: Array,
-    /// Values per scale and bias.
+    pub biases: Option<Array>,
+    /// How the table is quantized.
     #[tree(skip)]
-    pub group_size: i32,
-    /// Bits per value.
-    #[tree(skip)]
-    pub bits: i32,
+    pub quant: Quant,
 }
 
 impl QuantizedEmbedding {
-    /// Quantizes `embedding`'s table with MLX's defaults (groups of 64, 4 bits).
+    /// Quantizes `embedding`'s table with MLX's defaults (affine, groups of 64, 4 bits).
     #[track_caller]
     pub fn from_embedding(embedding: &Embedding) -> Self {
-        Self::from_embedding_with(embedding, 64, 4)
+        Self::from_embedding_with(embedding, Quant::default())
     }
 
-    /// Quantizes `embedding`'s table in groups of `group_size` values with `bits` bits.
+    /// Quantizes `embedding`'s table with `quant`.
     #[track_caller]
-    pub fn from_embedding_with(embedding: &Embedding, group_size: i32, bits: i32) -> Self {
-        let (weight, scales, biases) = embedding.weight.quantize(group_size, bits);
+    pub fn from_embedding_with(embedding: &Embedding, quant: impl Into<Quant>) -> Self {
+        let q = embedding.weight.quantize(quant);
         Self {
-            weight,
-            scales,
-            biases,
-            group_size,
-            bits,
+            weight: q.weight,
+            scales: q.scales,
+            biases: q.biases,
+            quant: q.quant,
         }
+    }
+
+    /// The quantized table.
+    pub fn quantized(&self) -> Quantized {
+        Quantized::new(
+            self.weight.clone(),
+            self.scales.clone(),
+            self.biases.clone(),
+            self.quant,
+        )
     }
 
     /// The rows for the ids in `x`, dequantized: shape `x.shape + [dims]`.
     #[track_caller]
     pub fn forward(&self, x: &Array) -> Array {
-        self.weight.take(x, 0).dequantize(
-            &self.scales.take(x, 0),
-            &self.biases.take(x, 0),
-            self.group_size,
-            self.bits,
-        )
+        let rows = Quantized::new(
+            self.weight.take(x, 0),
+            self.scales.take(x, 0),
+            self.biases.as_ref().map(|b| b.take(x, 0)),
+            self.quant,
+        );
+        rows.dequantize(None)
     }
 
     /// `x Wᵀ` with the quantized table (tied embeddings).
     #[track_caller]
     pub fn as_linear(&self, x: &Array) -> Array {
-        x.quantized_matmul(
-            &self.weight,
-            &self.scales,
-            &self.biases,
-            true,
-            self.group_size,
-            self.bits,
-        )
+        x.quantized_matmul(&self.quantized(), true)
     }
 }
 
@@ -345,7 +347,9 @@ impl LayerNorm {
 }
 
 /// Rotary position embedding of the first `dims` features (MLX's `nn.RoPE`, the fused
-/// `fast::rope`). No parameters.
+/// `fast::rope`), optionally with a frequency scaling ([`Rope::scaled`]: mlx-lm's
+/// `Llama3RoPE`, `YarnRoPE`, `SuScaledRoPE`, `ProportionalRoPE`). No parameters: the
+/// frequencies are computed from the settings, never loaded or saved.
 #[derive(Debug, Clone, Module)]
 pub struct Rope {
     /// Rotated features.
@@ -360,6 +364,12 @@ pub struct Rope {
     /// Scale applied to positions.
     #[tree(skip)]
     pub scale: f32,
+    /// The frequency scaling.
+    #[tree(skip)]
+    scaling: crate::RopeScaling,
+    /// The scaling's per-pair frequencies (mlx-lm's `_freqs`), if it has them.
+    #[tree(skip)]
+    freqs: Option<Array>,
 }
 
 impl Rope {
@@ -370,6 +380,53 @@ impl Rope {
             traditional: false,
             base: 10000.0,
             scale: 1.0,
+            scaling: crate::RopeScaling::None,
+            freqs: None,
+        }
+    }
+
+    /// RoPE over `dims` features with `base` and a frequency `scaling`, as mlx-lm's scaled
+    /// RoPE layers (for [`RopeScaling::Proportional`](crate::RopeScaling::Proportional)
+    /// `dims` is the whole head's).
+    ///
+    /// ```
+    /// use nuvec_nn::{Rope, RopeScaling, Yarn};
+    ///
+    /// // gpt-oss: YaRN over 64 features, base 150000, factor 32 over 4096 positions.
+    /// let yarn = Yarn { factor: 32.0, original_max_position_embeddings: 4096.0, ..Yarn::default() };
+    /// let rope = Rope::scaled(64, 150_000.0, &RopeScaling::Yarn(yarn));
+    /// assert!((rope.mscale() - 1.3466).abs() < 1e-4);
+    /// ```
+    pub fn scaled(dims: i32, base: f32, scaling: &crate::RopeScaling) -> Self {
+        Self {
+            dims,
+            traditional: false,
+            base,
+            scale: scaling.position_scale(),
+            scaling: scaling.clone(),
+            freqs: scaling.frequencies(dims, base),
+        }
+    }
+
+    /// The input scale the scaling applies to the rotated features (YaRN, LongRoPE; else
+    /// 1). Callers that rotate queries and keys with [`Rope::rotation`] (one fused kernel
+    /// each) instead multiply the attention scale by `mscale()²`, which is the same up to
+    /// rounding when the rotated features are the whole head. In half precision mlx-lm
+    /// multiplies q and k by the mscale rounded to their dtype, which the fold does not
+    /// reproduce: nuvec-lm multiplies explicitly there and folds only in float32.
+    pub fn mscale(&self) -> f32 {
+        self.scaling.mscale()
+    }
+
+    /// The rotation for the fused ops (`fast::rope`, `fast::norm_rope`), without the input
+    /// scale ([`Rope::mscale`]).
+    pub fn rotation(&self) -> fast::Rotation<'_> {
+        fast::Rotation {
+            dims: self.dims,
+            traditional: self.traditional,
+            base: self.freqs.is_none().then_some(self.base),
+            scale: self.scale,
+            freqs: self.freqs.as_ref(),
         }
     }
 
@@ -379,9 +436,10 @@ impl Rope {
         self
     }
 
-    /// Sets the frequency base.
+    /// Sets the frequency base (recomputing a scaling's frequencies).
     pub fn base(mut self, base: f32) -> Self {
         self.base = base;
+        self.freqs = self.scaling.frequencies(self.dims, base);
         self
     }
 
@@ -391,17 +449,28 @@ impl Rope {
         self
     }
 
-    /// `x` (`[..., sequence, features]`) rotated for positions `offset`, `offset + 1`, ….
+    /// `x` (`[..., sequence, features]`) rotated for positions `offset`, `offset + 1`, …,
+    /// its rotated features first multiplied by [`Rope::mscale`] (as mlx-lm).
     #[track_caller]
     pub fn forward(&self, x: &Array, offset: i32) -> Array {
+        let m = self.mscale();
+        let x = if m == 1.0 {
+            x.clone()
+        } else if x.shape().last() == Some(&self.dims) {
+            x.multiply(m)
+        } else {
+            let head = (.., ..self.dims);
+            x.clone().at(head).set(x.i(head).multiply(m))
+        };
+        let r = self.rotation();
         fast::rope(
-            x,
-            self.dims,
-            self.traditional,
-            Some(self.base),
-            self.scale,
+            &x,
+            r.dims,
+            r.traditional,
+            r.base,
+            r.scale,
             &Array::from(offset),
-            None,
+            r.freqs,
         )
     }
 }
@@ -489,7 +558,10 @@ impl LoraBase {
             Self::Quantized(q) => {
                 let s = q.weight.shape();
                 let packed = s.get(1).copied().unwrap_or(0);
-                (s.first().copied().unwrap_or(0), packed * 32 / q.bits.max(1))
+                (
+                    s.first().copied().unwrap_or(0),
+                    packed * 32 / q.quant.bits.max(1),
+                )
             }
         }
     }
@@ -581,12 +653,16 @@ impl LoraLinear {
     }
 
     /// The base layer with the update merged into its weight (mlx-lm's `fuse` with
-    /// `dequantize`): `W + scale · Bᵀ Aᵀ`.
+    /// `dequantize`): `W + scale · Bᵀ Aᵀ`. A floating-point quantized base is dequantized to
+    /// the adapter's dtype (not MLX's bfloat16 default), an affine one to its scales' dtype.
     #[track_caller]
     pub fn fuse(&self) -> Linear {
         let (weight, bias) = match &self.base {
             LoraBase::Linear(l) => (l.weight.value().clone(), l.bias.clone()),
-            LoraBase::Quantized(q) => (q.dequantized_weight(), q.bias.clone()),
+            LoraBase::Quantized(q) => {
+                let dtype = (q.quant.mode != QuantMode::Affine).then(|| self.lora_a.dtype());
+                (q.dequantized_weight(dtype), q.bias.clone())
+            }
         };
         let delta = self
             .lora_b

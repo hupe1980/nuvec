@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "tree"
 harness = false
+
+[[bench]]
+name = "shapeless"
+harness = false

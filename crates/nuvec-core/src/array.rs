@@ -58,7 +58,9 @@ pub(crate) struct Output {
     pub(crate) slot: OnceLock<Result<Data>>,
     /// GPU data whose command buffer is committed on the device timeline but may not have
     /// completed: later GPU work (ordered after it on the device) may read it before `slot` is set.
-    pub(crate) inflight: InFlight,
+    /// Shared with the committed work that publishes it, which locks it before it reaches
+    /// the node (so a consumer holding the lock sees the node's real handles).
+    pub(crate) inflight: Arc<InFlight>,
 }
 
 /// An output's in-flight data (see [`Output::inflight`]). It is published to the slot from
@@ -117,14 +119,6 @@ impl InFlight {
         match &*self.lock() {
             InFlightState::Set(data) => Some(data.clone()),
             _ => None,
-        }
-    }
-
-    /// Drops the data (the slot holds it now), unless donated.
-    pub(crate) fn clear(&mut self) {
-        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        if matches!(state, InFlightState::Set(_)) {
-            *state = InFlightState::Unset;
         }
     }
 }
@@ -293,7 +287,7 @@ impl Output {
             flags,
             size,
             slot,
-            inflight: InFlight::default(),
+            inflight: Arc::default(),
         })
     }
 }
@@ -706,6 +700,28 @@ impl Array {
             return Err(Error::dtype_mismatch("item", self.dtype(), T::DTYPE));
         }
         Ok(self.to_vec::<T>()?[0])
+    }
+
+    /// The identity of the memory the evaluated array reads, or `None` before evaluation
+    /// (and for a failed array). Arrays with equal ids share storage (views of one array, or
+    /// tensors of one mapped or read checkpoint file); an array's id stays the same while it
+    /// is alive. The analogue of comparing MLX's data pointers for aliasing; it is not an
+    /// address to read from.
+    ///
+    /// ```
+    /// use nuvec_core::{array, Array};
+    ///
+    /// let a = array![[1, 2], [3, 4]].add(1);
+    /// let row = a.i(1);
+    /// assert_eq!(a.buffer_id(), None); // not evaluated yet
+    /// a.eval().unwrap();
+    /// row.eval().unwrap();
+    /// assert!(a.buffer_id().is_some());
+    /// assert_eq!(row.buffer_id(), a.buffer_id()); // a view shares the storage
+    /// assert_ne!(Array::from(1).buffer_id(), a.buffer_id());
+    /// ```
+    pub fn buffer_id(&self) -> Option<usize> {
+        self.data().map(|d| Arc::as_ptr(&d.buffer) as usize)
     }
 
     /// The evaluated data, if evaluation succeeded.

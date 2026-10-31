@@ -188,4 +188,32 @@ impl Sampler {
         }
         categorical_with(&lp, self.temperature, key)
     }
+
+    /// The distribution [`Sampler::sample`] draws from, `[..., vocab]` float32: the
+    /// filters (top-p, min-p, top-k, in mlx-lm's order), then the softmax at the
+    /// temperature (a one-hot argmax at temperature 0). Speculative decoding verifies
+    /// against it.
+    pub fn probabilities(&self, logprobs: &Array) -> Result<Array> {
+        self.validate()?;
+        let vocab = logprobs.shape().last().copied().unwrap_or(0);
+        if self.temperature == 0.0 {
+            let best = logprobs.argmax_keepdims(-1);
+            return nuvec::ops::arange(0, vocab, 1)
+                .equal(&best)
+                .astype(DType::F32)
+                .check();
+        }
+        let mut lp = logprobs.clone();
+        if 0.0 < self.top_p && self.top_p < 1.0 {
+            lp = apply_top_p(&lp, self.top_p)?;
+        }
+        if self.min_p != 0.0 {
+            lp = apply_min_p(&lp, self.min_p, self.min_tokens_to_keep)?;
+        }
+        if self.top_k > 0 && self.top_k < vocab as usize {
+            lp = apply_top_k(&lp, self.top_k)?;
+        }
+        let inverse = (1.0 / f64::from(self.temperature)) as f32;
+        nuvec::ops::softmax(&lp.astype(DType::F32).multiply(inverse), -1).check()
+    }
 }

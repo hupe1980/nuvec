@@ -106,8 +106,8 @@ assert_eq!(x.to_vec::<i32>().unwrap(), [0, 2, 3, 10, 15, 16]);
 
 ## Computation
 
-- Element-wise: arithmetic, comparisons, `select` (`ops::where_`), `exp`, `log`, `sin`, `tanh`, `sigmoid`, `logaddexp`, `erfinv`, …
-- Reductions over any axes: `sum`, `prod`, `max`, `min`, `mean`, `argmax`, `argmin`, `all`, `any`, `logsumexp`, `softmax`. Axes are an index (`-1`), a list (`[0, 2]`) or `..` for all of them; `sum_keepdims` and the other `*_keepdims` twins keep the reduced axes.
+- Element-wise: arithmetic, comparisons, `select` (`ops::where_`), `exp`, `log`, `sin`, `tanh`, `sigmoid`, `logaddexp`, `floor_divide`, `erfinv`, …
+- Reductions over any axes: `sum`, `prod`, `max`, `min`, `mean`, `argmax`, `argmin`, `all`, `any`, `logsumexp`, `softmax` (half precision computed in float32, MLX's `precise=True`). Axes are an index (`-1`), a list (`[0, 2]`) or `..` for all of them; `sum_keepdims` and the other `*_keepdims` twins keep the reduced axes.
 - Sorting and scans with MLX's kernels: `sort`, `argsort`, `partition`, `argpartition`, `topk`, `cumsum`, `cumprod`, `cummax`, `cummin`, `logcumsumexp`.
 - Linear algebra: `matmul` (batched, broadcasting), `addmm`, `gather_mm`, `conv1d`.
 - Random numbers (`nuvec::random`): `uniform`, `normal`, `gumbel`, `categorical`, `randint`, `bernoulli`, bit-identical to MLX for the same key.

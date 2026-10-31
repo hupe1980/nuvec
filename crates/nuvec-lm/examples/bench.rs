@@ -11,8 +11,13 @@
 //! token or after `--max-tokens` (`--ignore-eos` always runs to `--max-tokens`). With
 //! `NUVEC_PROFILE=1`, the GPU time per kernel of each prompt length's last run goes to
 //! stderr (every dispatch then runs alone, so throughput drops; `--max-tokens 1` profiles
-//! prefill). `--draft N` decodes speculatively with prompt-lookup drafts of up to `N`
-//! tokens and adds the draft counts.
+//! prefill). `--draft N` decodes speculatively with drafts of up to `N` tokens and adds
+//! the draft counts: `--drafter lookup` (default), `mtp` (with `--mtp-weights FILE` from
+//! `scripts/extract_mtp.py` unless the checkpoint has its `mtp.*` weights) or `suffix`;
+//! `--policy auto` (default: the drafter's measured length and kill switch; `--draft`
+//! then only switches speculation on), `adaptive` (pause after rejected drafts) or
+//! `fixed`. `--text-file F`
+//! reads the prompt text from a file.
 //!
 //! Token-id prompts (files with one prompt per line, comma-separated ids):
 //!
@@ -21,12 +26,20 @@
 //!   process, then the peak memory (allocator plus mapped files) and its parts.
 //! - `--phase load --first-token-ids F`: seconds to a loaded model and to the first token.
 //! - `--batch N --ids-file F`: the first `N` lines served together by a `Batcher`
-//!   (128 tokens each, end-of-sequence ignored), compared with each prompt alone.
+//!   (128 tokens each, end-of-sequence ignored), compared with each prompt alone;
+//!   `--batch-invariant` serves them row-exact (`Batcher::batch_invariant`).
+//!
+//! `--trace FILE` replays a multi-turn trace (turns separated by `---` lines; each turn's
+//! prompt is the history so far, earlier outputs included, plus the turn) with plain
+//! decoding, prompt lookup and SuffixDecoding (whose store remembers each finished turn),
+//! and prints one JSON object per drafter: decode tokens/s over the trace, drafts, and
+//! whether every turn's tokens equal plain decoding's.
 
 use std::time::Instant;
 
 use nuvec_lm::{
-    Batcher, Event, GenerateOptions, PromptLookup, WiredLimit, generate, load, speculative_generate,
+    Batcher, DraftPolicy, Drafter, Event, GenerateOptions, MtpDrafter, PromptLookup,
+    SuffixDecoding, WiredLimit, generate, load, speculative_generate,
 };
 
 /// The prompts of an ids file: one per line, comma-separated token ids.
@@ -69,7 +82,12 @@ fn main() -> nuvec::Result<()> {
         fail("no Metal device");
     };
     let model_id = value("--model").unwrap_or_else(|| "mlx-community/Qwen3-8B-4bit".into());
-    let text = value("--text").unwrap_or_else(|| "Hello. ".into());
+    let text = match value("--text-file") {
+        Some(f) => std::fs::read_to_string(&f).unwrap_or_else(|e| fail(&format!("{f}: {e}"))),
+        None => value("--text").unwrap_or_else(|| "Hello. ".into()),
+    };
+    let drafter = value("--drafter").unwrap_or_else(|| "lookup".into());
+    let policy = value("--policy").unwrap_or_else(|| "auto".into());
     let repeats: Vec<usize> = value("--repeats").map_or_else(Vec::new, |v| {
         v.split(',')
             .map(|r| {
@@ -89,6 +107,9 @@ fn main() -> nuvec::Result<()> {
 
     let load_start = Instant::now();
     let (mut model, tokenizer) = load(&model_id)?;
+    if let Some(path) = value("--mtp-weights") {
+        model.attach_mtp(&path)?;
+    }
     let model_ready = load_start.elapsed().as_secs_f64();
     if ignore_eos || value("--batch").is_some() || phase.is_some() {
         model.config.eos_token_ids.clear();
@@ -103,7 +124,19 @@ fn main() -> nuvec::Result<()> {
         let mut speculative = None;
         let mut plain = None;
         let generation: &mut dyn Iterator<Item = nuvec::Result<u32>> = if draft > 0 {
-            let g = speculative_generate(&model, ids, options, PromptLookup::default(), draft)?;
+            let d: Box<dyn Drafter> = match drafter.as_str() {
+                "lookup" => Box::new(PromptLookup::default()),
+                "mtp" => Box::new(MtpDrafter::new(&model)?),
+                "suffix" => Box::new(SuffixDecoding::default()),
+                d => fail(&format!("--drafter {d}: lookup, mtp or suffix")),
+            };
+            let policy = match policy.as_str() {
+                "auto" => DraftPolicy::Auto,
+                "adaptive" => DraftPolicy::Adaptive(draft),
+                "fixed" => DraftPolicy::Fixed(draft),
+                p => fail(&format!("--policy {p}: adaptive or fixed")),
+            };
+            let g = speculative_generate(&model, ids, options, d, policy)?;
             speculative.insert(g)
         } else {
             plain.insert(generate(&model, ids, options)?)
@@ -121,6 +154,9 @@ fn main() -> nuvec::Result<()> {
         if let Some(g) = &speculative {
             let stats = g.stats();
             drafts.set((stats.drafted, stats.accepted));
+            if stats.pauses > 0 {
+                eprintln!("kill switch: {} pauses", stats.pauses);
+            }
         }
         Ok((first_seconds, decode_seconds, count))
     };
@@ -176,6 +212,82 @@ fn main() -> nuvec::Result<()> {
         None => {}
     }
 
+    if let Some(path) = value("--trace") {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
+        let turns: Vec<&str> = text
+            .split("\n---\n")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        warm_up()?;
+        let mut reference: Vec<Vec<u32>> = Vec::new();
+        for which in ["plain", "lookup", "suffix"] {
+            let mut suffix = SuffixDecoding::default();
+            let mut context: Vec<u32> = Vec::new();
+            let (mut tokens, mut seconds, mut drafted, mut accepted, mut verifies) =
+                (0usize, 0.0f64, 0usize, 0usize, 0usize);
+            let mut matches = true;
+            for (i, turn) in turns.iter().enumerate() {
+                context.extend(tokenizer.encode(&format!("{turn}\n")));
+                let mut speculative = None;
+                let mut plain = None;
+                let generation: &mut dyn Iterator<Item = nuvec::Result<u32>> = match which {
+                    "plain" => plain.insert(generate(&model, &context, options)?),
+                    "lookup" => speculative.insert(speculative_generate(
+                        &model,
+                        &context,
+                        options,
+                        Box::new(PromptLookup::default()) as Box<dyn Drafter>,
+                        DraftPolicy::Auto,
+                    )?),
+                    _ => speculative.insert(speculative_generate(
+                        &model,
+                        &context,
+                        options,
+                        Box::new(&mut suffix) as Box<dyn Drafter + '_>,
+                        DraftPolicy::Auto,
+                    )?),
+                };
+                let first = generation.next().transpose()?;
+                let start = Instant::now();
+                let mut out: Vec<u32> = first.into_iter().collect();
+                for id in generation {
+                    out.push(id?);
+                }
+                seconds += start.elapsed().as_secs_f64();
+                tokens += out.len().saturating_sub(1);
+                if let Some(g) = &speculative {
+                    let stats = g.stats();
+                    (drafted, accepted, verifies) = (
+                        drafted + stats.drafted,
+                        accepted + stats.accepted,
+                        verifies + stats.verifies,
+                    );
+                }
+                drop(speculative);
+                match which {
+                    "plain" => reference.push(out.clone()),
+                    _ => matches &= reference.get(i) == Some(&out),
+                }
+                if which == "suffix" {
+                    suffix.remember(&[context.as_slice(), &out].concat());
+                }
+                context.extend(&out);
+            }
+            println!(
+                "{{\"trace\": \"{}\", \"drafter\": \"{which}\", \"turns\": {}, \
+                 \"tokens\": {tokens}, \"decode\": {:.2}, \"drafted\": {drafted}, \
+                 \"accepted\": {accepted}, \"verifies\": {verifies}, \"matches_plain\": {matches}}}",
+                std::path::Path::new(&path)
+                    .file_stem()
+                    .map_or_else(String::new, |f| f.to_string_lossy().into_owned()),
+                turns.len(),
+                tokens as f64 / seconds.max(1e-9),
+            );
+        }
+        return Ok(());
+    }
+
     if let Some(n) = value("--batch") {
         let n: usize = n.parse().unwrap_or_else(|_| fail("--batch: not a number"));
         let path = value("--ids-file").unwrap_or_else(|| fail("--ids-file"));
@@ -187,7 +299,9 @@ fn main() -> nuvec::Result<()> {
         let longest = prompts.iter().map(Vec::len).max().unwrap_or(0);
         let block_size = 16;
         let blocks = n * (longest + options.max_tokens).div_ceil(block_size) + n;
-        let mut batcher = Batcher::new(&model, blocks, block_size, n)?;
+        let invariant = args.iter().any(|a| a == "--batch-invariant");
+        let mut batcher = Batcher::new(&model, blocks, block_size, n)?.batch_invariant(invariant);
+        nuvec::gpu::profile::reset();
         let start = Instant::now();
         let mut outputs = vec![Vec::new(); n];
         let mut ids = Vec::new();
@@ -220,6 +334,9 @@ fn main() -> nuvec::Result<()> {
         let wall = start.elapsed().as_secs_f64();
         let decode_wall = decode_start.elapsed().as_secs_f64();
         drop(batcher);
+        if nuvec::gpu::profile::enabled() {
+            print_profile(&format!("{n} requests"));
+        }
         let total: usize = outputs.iter().map(Vec::len).sum();
         let mut matches = true;
         for (prompt, out) in prompts.iter().zip(&outputs) {
@@ -247,16 +364,21 @@ fn main() -> nuvec::Result<()> {
         for path in files.split(',') {
             let ids = &read_ids(path)[0];
             for _ in 0..runs {
+                nuvec::gpu::profile::reset();
                 let (first, _, _) = run(ids, one)?;
+                let peak = device.memory().peak_with_mapped;
                 println!(
                     "{{\"ids_file\": \"{}\", \"prompt_tokens\": {}, \"ttft_s\": {first:.4}, \
-                     \"prefill\": {:.2}}}",
+                     \"prefill\": {:.2}, \"peak_bytes\": {peak}}}",
                     std::path::Path::new(path)
                         .file_name()
                         .map_or_else(String::new, |f| f.to_string_lossy().into_owned()),
                     ids.len(),
                     ids.len() as f64 / first
                 );
+            }
+            if nuvec::gpu::profile::enabled() {
+                print_profile(&format!("{} prompt tokens", ids.len()));
             }
         }
     }
@@ -281,21 +403,26 @@ fn main() -> nuvec::Result<()> {
             );
         }
         if nuvec::gpu::profile::enabled() {
-            let rows = nuvec::gpu::profile::report();
-            let total: f64 = rows.iter().map(|r| r.2).sum();
-            eprintln!(
-                "GPU time, {} prompt tokens: {:.1} ms",
-                ids.len(),
-                total * 1e3
-            );
-            for (kernel, n, seconds) in rows.iter().take(25) {
-                eprintln!(
-                    "{:>8.2} ms {:>5.1}% {n:>6}  {kernel}",
-                    seconds * 1e3,
-                    100.0 * seconds / total
-                );
-            }
+            print_profile(&format!("{} prompt tokens", ids.len()));
         }
     }
     Ok(())
+}
+
+/// The profiler's GPU time per kernel since the last report (the top 25), to stderr.
+fn print_profile(what: &str) {
+    let rows = nuvec::gpu::profile::report();
+    let total: f64 = rows.iter().map(|r| r.2).sum();
+    let dispatches: u64 = rows.iter().map(|r| r.1).sum();
+    eprintln!(
+        "GPU time, {what}: {:.1} ms in {dispatches} dispatches",
+        total * 1e3
+    );
+    for (kernel, n, seconds) in rows.iter().take(25) {
+        eprintln!(
+            "{:>8.2} ms {:>5.1}% {n:>6}  {kernel}",
+            seconds * 1e3,
+            100.0 * seconds / total
+        );
+    }
 }

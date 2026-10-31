@@ -243,10 +243,24 @@ pub(crate) fn prefill_rows(
         let chunk = Array::from_slice(&chunk, [b, n as i32]);
         let _ = model.forward(&chunk, cache).check()?;
         eval(&cache.iter().flat_map(KvCache::state).collect::<Vec<_>>())?;
+        clear_cache();
         start += n;
     }
     Ok(())
 }
+
+/// Releases the GPU's cached buffers, as mlx-lm's `mx.clear_cache()` after each prefill
+/// chunk and every [`CLEAR_EVERY`] tokens: a chunk's scores and activations (sized by the
+/// keys it attends to, so the next chunk's are larger) would otherwise stay cached beside
+/// the next chunk's.
+pub(crate) fn clear_cache() {
+    if let Some(d) = nuvec::gpu::Device::shared() {
+        d.clear_cache();
+    }
+}
+
+/// Tokens between [`clear_cache`] calls while decoding, as mlx-lm's `generate_step`.
+pub(crate) const CLEAR_EVERY: usize = 256;
 
 impl Generation<'_> {
     /// The token following `input` (`[L]` ids), not evaluated.
@@ -303,6 +317,10 @@ impl Iterator for Generation<'_> {
             }
             return None;
         }
+        // mlx-lm clears after the first token (the prompt's last buffers) and every 256th.
+        if (self.produced - 1).is_multiple_of(CLEAR_EVERY) {
+            clear_cache();
+        }
         self.next = next;
         Some(Ok(token))
     }
@@ -310,6 +328,64 @@ impl Iterator for Generation<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Prefilling prompts of the same length together gives each row's cache the keys and
+    /// values of the prompt prefilled alone (the `Batcher`'s grouped prefill), for every
+    /// family's attention layers: sliding windows, K = V layers with their own KV-head
+    /// count, KV-shared layers, Gated DeltaNet states.
+    #[test]
+    fn grouped_prefill_rows_equal_each_prompt_alone() {
+        nuvec::with_row_exact(|| {
+            use super::prefill_rows;
+            use nuvec::Array;
+            if !nuvec::with_stream(nuvec::Device::gpu(0), || {
+                (nuvec::Array::from(1.0f32) + 1.0).eval().is_ok()
+            }) {
+                return;
+            }
+            let bits = |a: &Array| {
+                a.astype(nuvec::DType::F32)
+                    .view(nuvec::DType::U32)
+                    .to_vec::<u32>()
+                    .unwrap()
+            };
+            for name in [
+                "gemma4_moe_q4",
+                "qwen3_5_q4",
+                "qwen3_5_moe_q4",
+                "gpt_oss_q4",
+            ] {
+                let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures")
+                    .join(name);
+                let model = crate::load_model(&dir).unwrap();
+                for len in [9u32, 70, 186] {
+                    let rows: Vec<Vec<u32>> = (0..4u32)
+                        .map(|r| (0..len).map(|t| (t * 7 + r * 3) % 50 + 1).collect())
+                        .collect();
+                    let refs: Vec<&[u32]> = rows.iter().map(Vec::as_slice).collect();
+                    let mut both = model.new_cache();
+                    prefill_rows(&model, &mut both, &refs, 2048).unwrap();
+                    for (i, row) in rows.iter().enumerate() {
+                        let mut alone = model.new_cache();
+                        prefill_rows(&model, &mut alone, &[row.as_slice()], 2048).unwrap();
+                        for (layer, (b, a)) in both.iter().zip(&alone).enumerate() {
+                            let b = b.row(i as i32);
+                            let (bs, as_) = (b.state(), a.state());
+                            assert_eq!(bs.len(), as_.len(), "{name} layer {layer}");
+                            for (x, y) in bs.iter().zip(&as_) {
+                                assert_eq!(x.shape(), y.shape(), "{name} layer {layer} row {i}");
+                                assert!(
+                                    bits(x) == bits(y),
+                                    "{name} length {len} layer {layer} row {i}: cache differs"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
     use std::cell::Cell;
 
     use super::Wired;

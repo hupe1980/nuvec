@@ -24,6 +24,12 @@ pub fn from_primitive(primitive: Primitive, inputs: Vec<Array>) -> Result<Vec<Ar
     Array::from_op(primitive, inputs)
 }
 
+/// The broadcast shape of `a` and `b` (NumPy rules), or `op`'s shape-mismatch error, as
+/// the binary operations compute it.
+pub fn broadcast_shapes(op: &'static str, a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
+    Ok(crate::view::broadcast_shapes(op, a, b)?.to_vec())
+}
+
 /// A placeholder with this dtype and shape, standing for an input while a function is
 /// traced (as in MLX): operations can be recorded on it, but evaluating anything that
 /// depends on it fails. Placeholders are tracers.

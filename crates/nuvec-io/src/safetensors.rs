@@ -5,7 +5,7 @@
 //! mapped bytes, read from disk (or the page cache) when first used. Files whose tensors are
 //! not aligned to their element sizes (MLX writes headers without padding) are not mapped:
 //! their tensors are read once, with parallel positioned reads, into one buffer per file
-//! where each is aligned ([`MappedFile::read_ranges`]).
+//! where each starts at a multiple of 256 bytes ([`MappedFile::read_ranges`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -27,7 +27,7 @@ pub struct SafeTensors {
     pub metadata: BTreeMap<String, String>,
 }
 
-/// safetensors' dtype names, with MLX's `C64` for complex64.
+/// safetensors' dtype names, with MLX's `C64` for complex64 and fp8 tensors read as bytes.
 fn dtype_of(name: &str) -> Option<DType> {
     Some(match name {
         "BOOL" => DType::Bool,
@@ -44,6 +44,9 @@ fn dtype_of(name: &str) -> Option<DType> {
         "F32" => DType::F32,
         "F64" => DType::F64,
         "C64" => DType::Complex64,
+        // MLX's reading of fp8 tensors: bytes (`to_fp8`/`from_fp8`, quantization scales);
+        // `F8_E5M2` has no reading (MLX rejects it too).
+        "F8_E4M3" | "F8_E8M0" => DType::U8,
         _ => return None,
     })
 }
@@ -77,6 +80,10 @@ fn usize_of(v: &Json, what: &str) -> Result<usize> {
 /// The reference implementation's limit on the header size.
 const MAX_HEADER: usize = 100_000_000;
 
+/// Where tensors read from a misaligned file start in their buffer: multiples of 256 bytes
+/// (decode at 0.99 → 1.00× mlx-lm on Gemma 4 E4B; 1 KiB and 16 KiB pages measured the same).
+const TENSOR_ALIGN: usize = 256;
+
 /// A parsed and validated header: the metadata and the tensors' byte ranges (sorted, tiling
 /// the data section from `start` to the end of the file).
 struct Header {
@@ -98,25 +105,26 @@ impl Header {
 
     /// Where the tensors `keep` accepts go in one buffer read from the file: in file order,
     /// each continuing the previous kept tensor's file range if it follows it in the file
-    /// and lands aligned to its element size, else starting a new range at the next multiple
-    /// of 16. MLX-written files are aligned relative to their data section, so their kept
-    /// tensors take one range per gap left by rejected ones.
+    /// and lands at a multiple of [`TENSOR_ALIGN`], else starting a new range at the next
+    /// one. (MLX's tensors are separate allocations; at the file's own offsets, a
+    /// quantized product ran up to 4% slower, depending on where its weights fell relative
+    /// to its scales.)
     fn plan(&self, keep: &dyn Fn(&str) -> bool) -> ReadPlan {
         let mut plan = ReadPlan::default();
         // The file end of the current range, if any.
         let mut file_end = None;
-        for (index, (begin, end, name, dtype, _)) in self.ranges.iter().enumerate() {
+        for (index, (begin, end, name, _, _)) in self.ranges.iter().enumerate() {
             if !keep(name) {
                 continue;
             }
             let at = (self.start + begin) as u64;
             let n = end - begin;
-            let offset = if file_end == Some(at) && plan.len.is_multiple_of(dtype.size()) {
+            let offset = if file_end == Some(at) && plan.len.is_multiple_of(TENSOR_ALIGN) {
                 let last = plan.ranges.last_mut().expect("an open range");
                 last.2 += n;
                 plan.len
             } else {
-                let offset = plan.len.next_multiple_of(16);
+                let offset = plan.len.next_multiple_of(TENSOR_ALIGN);
                 plan.ranges.push((at, offset, n));
                 offset
             };
@@ -284,8 +292,9 @@ pub struct Footprint {
 }
 
 impl Footprint {
-    /// The footprint of one file of `file_len` bytes with this header.
-    fn of(header: &Header, file_len: usize) -> Self {
+    /// The footprint of one file of `file_len` bytes with this header, loading the tensors
+    /// `keep` accepts.
+    fn of(header: &Header, file_len: usize, keep: &dyn Fn(&str) -> bool) -> Self {
         if header.aligned() {
             let mapping = nuvec_core::MappedFile::mapping_size(file_len as u64);
             Footprint {
@@ -294,7 +303,7 @@ impl Footprint {
                 transient: mapping,
             }
         } else {
-            let copied = nuvec_core::MappedFile::copy_size(header.plan(&|_| true).len as u64);
+            let copied = nuvec_core::MappedFile::copy_size(header.plan(keep).len as u64);
             Footprint {
                 mapped: 0,
                 copied,
@@ -327,6 +336,30 @@ impl Footprint {
 /// # }
 /// ```
 pub fn safetensors_footprint(path: impl AsRef<Path>) -> Result<Footprint> {
+    safetensors_footprint_filtered(path, |_| true)
+}
+
+/// What [`load_safetensors_filtered`] with `keep` will hold, as [`safetensors_footprint`]
+/// (a file, or every `*.safetensors` file of a directory): `copied` counts only the kept
+/// tensors of misaligned files; aligned files are mapped whole whatever is kept.
+///
+/// ```
+/// # fn main() -> nuvec_core::Result<()> {
+/// # if cfg!(miri) { return Ok(()); }
+/// use nuvec_core::array;
+///
+/// let path = std::env::temp_dir().join("nuvec-footprint-filtered-doc.safetensors");
+/// nuvec_io::save_safetensors(&path, &[("a", &array![1.0]), ("b", &array![2.0])], &[])?;
+/// let all = nuvec_io::safetensors_footprint(&path)?;
+/// let some = nuvec_io::safetensors_footprint_filtered(&path, |name| name == "b")?;
+/// assert_eq!(some, all); // aligned: mapped whole
+/// # Ok(())
+/// # }
+/// ```
+pub fn safetensors_footprint_filtered(
+    path: impl AsRef<Path>,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Footprint> {
     let path = path.as_ref();
     let files = if path.is_dir() {
         let mut files: Vec<_> = std::fs::read_dir(path)
@@ -342,7 +375,7 @@ pub fn safetensors_footprint(path: impl AsRef<Path>) -> Result<Footprint> {
     let mut total = Footprint::default();
     for file in &files {
         let (header, len) = read_header(file)?;
-        let one = Footprint::of(&header, len);
+        let one = Footprint::of(&header, len, &keep);
         total.mapped += one.mapped;
         total.copied += one.copied;
     }
@@ -392,7 +425,7 @@ pub fn load_safetensors_filtered(
     let plan = (!aligned).then(|| header.plan(&keep));
     let need = match &plan {
         Some(plan) => nuvec_core::MappedFile::copy_size(plan.len as u64),
-        None => Footprint::of(&header, len).transient,
+        None => Footprint::of(&header, len, &|_| true).transient,
     };
     if let Some(room) = nuvec_core::MappedFile::headroom()
         && need > room
@@ -620,5 +653,34 @@ pub fn save_safetensors_async(
     });
     SaveHandle {
         thread: Some(thread),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_tensors_start_at_multiples_of_tensor_align() {
+        // As MLX writes them: an unpadded header (data at an odd offset), tensors back to
+        // back. `a` (300 bytes) ends off the alignment; `b` follows it; `skip` is rejected;
+        // `c` (256 bytes) is followed by `d`, which then lands aligned and continues `c`.
+        let json = br#"{"a":{"dtype":"U32","shape":[75],"data_offsets":[0,300]},
+            "b":{"dtype":"BF16","shape":[5],"data_offsets":[300,310]},
+            "skip":{"dtype":"U8","shape":[2],"data_offsets":[310,312]},
+            "c":{"dtype":"U32","shape":[64],"data_offsets":[312,568]},
+            "d":{"dtype":"U32","shape":[1],"data_offsets":[568,572]}}"#;
+        let start = 8 + json.len();
+        let header = parse_header(json, start, start + 572).unwrap();
+        let plan = header.plan(&|name| name != "skip");
+        let offsets: Vec<usize> = plan.tensors.iter().map(|&(_, at)| at).collect();
+        assert_eq!(offsets, [0, 512, 768, 1024]);
+        assert!(offsets.iter().all(|o| o.is_multiple_of(TENSOR_ALIGN)));
+        let s = start as u64;
+        assert_eq!(
+            plan.ranges,
+            [(s, 0, 300), (s + 300, 512, 10), (s + 312, 768, 260)]
+        );
+        assert_eq!(plan.len, 1028);
     }
 }

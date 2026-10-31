@@ -24,37 +24,39 @@ nuvec brings [MLX](https://github.com/ml-explore/mlx)'s programming model to Rus
 
 - 🦀 **Pure Rust.** No C++ build, no FFI to MLX. Metal is reached through Apple's system frameworks ([`objc2-metal`](https://crates.io/crates/objc2-metal)); `unsafe` stays in the Metal runtime, nuvec-core's three kernel-dispatch calls and one CPU matrix-product call, and the other crates contain none.
 - 💤 **Lazy arrays on unified memory.** Operations build a graph; nothing runs until you read a result. The CPU and GPU share memory, so there are no copies between them.
-- 🔁 **Composable transforms.** `grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`, `checkpoint` and `compile` nest in any order, through complex numbers too, over tuples, maps and your own structs (gradients come back with the same shape).
+- 🔁 **Composable transforms.** `grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`, `checkpoint` and `compile` (shaped or shapeless) nest in any order, through complex numbers too, over tuples, maps and your own structs (gradients come back with the same shape).
 - 🧠 **Models as plain structs.** `#[derive(Module)]` gives MLX's parameter names; optimizers, freezing, LoRA, `save_weights` and a compiled training step (`compile_mut`) work on the model's own type.
-- 🔥 **MLX's Metal kernels.** GEMM and GEMV, quantized products (1, 2, 3, 4, 5, 6 and 8 bits), fused attention, RMSNorm, RoPE, sort, scan, mixture-of-experts gather kernels, plus your own kernels from source (`fast::MetalKernel`).
+- 🔥 **MLX's Metal kernels.** GEMM and GEMV, quantized products (affine 1, 2, 3, 4, 5, 6 and 8 bits; MXFP4, MXFP8, NVFP4), fused attention, RMSNorm, RoPE, sort, scan, mixture-of-experts gather kernels, plus your own kernels from source (`fast::MetalKernel`). Metal 4 TensorOps kernels for M5 Neural Accelerators ship off until measured on an M5 (`NUVEC_NAX=on` forces them).
+- 🌐 **Several Macs.** MLX's collectives (`all_sum`, `all_gather`, `send`/`recv`, …) as lazy, differentiable array operations over MLX's TCP ring, with tensor-parallel layers.
 - 🧪 **Tested against MLX.** Nearly a thousand cases replay results recorded from real MLX, with random layouts, gradients and every dtype.
-- 🤖 **LLM runtime.** Llama, Mistral and Qwen 2/3/3.5, dense, hybrid (Gated DeltaNet) or mixture-of-experts, straight from mlx-community or Hugging Face checkpoints; speculative decoding and batched serving included.
+- 🤖 **LLM runtime.** Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4, dense, hybrid (Gated DeltaNet) or mixture-of-experts, straight from mlx-community or Hugging Face checkpoints; speculative decoding (MTP heads, prompt lookup, SuffixDecoding; greedy or sampled) and batched serving included.
 - 💾 **Memory-mapped weights.** Checkpoints whose tensors are aligned (files nuvec writes are) are mapped and handed to the GPU without a copy; mlx-community checkpoints have unpadded headers and are read once at load, in parallel, using no more memory than MLX.
-- ⚙️ **An engine for servers.** Attention plans and score-memory caps, one peak-memory metric comparable with MLX's, a memory limit that refuses instead of swapping, checkpoint footprints before loading, row-independent few-row products and documented determinism (used, for example, by the [mrun](https://github.com/hupe1980/mrun) inference server).
+- ⚙️ **An engine for servers.** Attention plans and score-memory caps, one peak-memory metric comparable with MLX's, a memory limit that refuses instead of swapping, checkpoint footprints before loading, batch-invariant serving on request and documented determinism (used, for example, by the [mrun](https://github.com/hupe1980/mrun) inference server).
 
 ## 📊 Performance
 
-nuvec-lm against mlx-lm 0.32.2 with the same token ids, measured on 2026-10-23 with nuvec 0.4.0 on an Apple M4 Pro (48 GB). Decoding is greedy, and each cell is the median of four runs. Ratios above 1 favour nuvec.
+nuvec-lm against mlx-lm 0.32.2 with the same token ids on an Apple M4 Pro (48 GB), measured on 2026-10-27 with nuvec 0.5.0 (`just bench-parity --tier full`). Decoding is greedy; ratios above 1 favour nuvec.
 
-| Model | Kind | Decode (25 / 961 / 3,841-token prompt) | Prefill (961 tokens) | Time to first token (2,048 tokens) |
+| Model | Kind | Decode (25 / 961 / 3,841-token prompt) | Time to first token (2K / 32K tokens) | 4 requests |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B 4-bit | dense | 1.10× / 1.09× / 1.06× | 1.04× | 1.03× |
-| Llama-3.2-3B-Instruct 4-bit | dense | 1.00× / 1.00× / 1.00× | 1.01× | 1.00× |
-| Llama-3.1-8B-Instruct 4-bit | dense | 1.01× / 1.01× / 1.00× | 1.01× | 1.00× |
-| Qwen3-8B 4-bit | dense | 1.00× / 1.01× / 1.01× | 1.01× | 1.00× |
-| Qwen3.5-9B 4-bit | hybrid | 0.99× / 0.99× / 0.99× | 1.00× | 1.00× |
-| Qwen3.8-27B 4-bit | hybrid | 1.02× / 1.01× / 1.02× | 1.01× | 1.01× |
-| Qwen3-30B-A3B 4-bit | MoE | 1.03× / 1.03× / 1.03× | 0.99× | 0.99× |
-| Qwen3.6-35B-A3B 4-bit | hybrid MoE | 1.01× / 1.01× / 1.01× | 0.98× | 1.00× |
+| Qwen3-0.6B 4-bit | dense | 1.09× / 1.08× / 1.06× | 1.03× / 1.02× | 0.96× |
+| Llama 3.2 3B 4-bit | dense | 1.00× / 1.00× / 1.00× | 1.00× / 1.01× | 1.02× |
+| Llama 3.1 8B 4-bit | dense | 1.00× / 1.00× / 1.00× | 1.00× / 1.00× | 1.01× |
+| Qwen3-8B 4-bit | dense | 1.01× / 1.02× / 1.01× | 1.00× / 1.01× | 1.01× |
+| Qwen3.5-9B 4-bit | hybrid | 0.99× / 0.99× / 0.99× | 1.00× / 1.00× | 1.00× |
+| Qwen3.8-27B 4-bit | hybrid | 1.00× / 1.00× / 1.01× | 1.01× / 1.00× | 1.01× |
+| Qwen3-30B-A3B 4-bit | MoE | 1.03× / 1.03× / 1.04× | 0.98× / 1.01× | 0.99× |
+| Qwen3.6-35B-A3B 4-bit | hybrid MoE | 1.00× / 1.00× / 1.00× | 1.00× / 0.98× | 0.98× |
+| gpt-oss-20b MXFP4 | MoE, sliding window | 0.99× / 0.98× / 0.98× | 1.04× / 1.04× | 1.00× |
+| gpt-oss-20b 8-bit | MoE, sliding window | 1.01× / 1.00× / 1.00× | 1.03× / 1.02× | 1.01× |
+| Gemma 4 E4B 4-bit | dense, sliding window | 0.97× / 0.97× / 0.97× | 1.06× / 1.07× | 0.99× |
+| Gemma 4 26B-A4B 4-bit | MoE, sliding window | 0.98× / 0.98× / 0.98× | 1.07× / 1.08× | 0.98× |
 
-The geometric mean is 1.02× for decode and 1.00× for prefill (the 25-token rows are not counted). For Qwen3.6-35B-A3B the time to first token is 0.98× at 32K and 64K tokens. At 261,952 tokens nuvec prefills in 20.5 minutes, and mlx-lm runs out of GPU memory on the same 48 GB machine.
+- **Geometric means:** decode 1.01×, time to first token 1.02× at 2K and 32K tokens, peak memory 1.02× (slightly below mlx-lm's), warm load to the first token 1.74× faster, 1 / 4 / 8 concurrent requests 1.01× / 1.00× / 1.00×.
+- **Longest contexts:** Qwen3.6-35B-A3B's first token at 64K tokens is 0.97×; at 261,952 tokens (0.4.0 record) nuvec prefills it in 20.5 minutes, where mlx-lm runs out of GPU memory on the same 48 GB machine.
+- **No regression:** the quick tier (4 models, about 45 minutes) runs nuvec 0.4.1 in the same session: 1.00× of 0.5.0 over 24 cells.
 
-Beyond single requests:
-- **Warm load to the first token:** 1.13–2.77× faster (geometric mean 1.63×).
-- **Peak memory:** 1.02× (slightly below mlx-lm's).
-- **Serving several requests at once:** 1.02× / 0.99× / 0.99× aggregate throughput at 1 / 4 / 8 requests. The lowest cells are 0.97×.
-
-The full record (JSON) and the method are on the [benchmarks](https://hupe1980.github.io/nuvec/docs/benchmarks/) page. Speculative decoding with prompt-lookup drafts more than doubles decode speed on text that repeats its input.
+The full record (JSON) and the method are on the [benchmarks](https://hupe1980.github.io/nuvec/docs/benchmarks/) page. Speculative decoding with the model's own multi-token-prediction head decodes Qwen3.8-27B 1.66× and Qwen3.5-9B 1.36× faster on natural text, with output identical to plain decoding.
 
 ## 🚀 Quick start
 
@@ -172,7 +174,8 @@ cargo run --release -p nuvec-lm --example generate -- \
 | [`nuvec-kernels`](crates/nuvec-kernels) | Metal kernel sources and the precompiled `nuvec.metallib` |
 | [`nuvec-cpu`](crates/nuvec-cpu) | Pure-Rust CPU kernels |
 | [`nuvec-io`](crates/nuvec-io) | safetensors, npy and IDX; memory-mapped loading |
-| [`nuvec-nn`](crates/nuvec-nn) | Modules (`#[derive(Module)]`), layers (Linear, quantized, LoRA, norms, RoPE, dropout), losses, optimizers (SGD, Adam, AdamW, Lion, Muon, parameter groups) |
+| [`nuvec-distributed`](crates/nuvec-distributed) | MLX's TCP ring for `nuvec::distributed` (collectives across processes and Macs) |
+| [`nuvec-nn`](crates/nuvec-nn) | Modules (`#[derive(Module)]`), layers (Linear, quantized, LoRA, norms, RoPE, dropout, tensor-parallel sharded linear), losses, optimizers (SGD, Adam, AdamW, Lion, Muon, parameter groups) |
 | [`nuvec-lm`](crates/nuvec-lm) | LLM runtime: models, tokenizer, KV cache, sampling, speculative decoding, LoRA adapters |
 
 ## 🖥️ Platforms
@@ -204,7 +207,7 @@ Python is not needed to build or test: the fixtures recorded from MLX are checke
 
 | Command | Compares |
 |---|---|
-| `just bench-parity` | nuvec-lm vs mlx-lm over a roster of cached models: decode, time to first token, peak memory, load, concurrency (a JSON record; the table above) |
+| `just bench-parity` | nuvec-lm vs mlx-lm and vs the previous release, one model per architecture (about 45 minutes; fails on a confirmed regression); `--tier full` for the whole roster and long contexts (a JSON record; the table above) |
 | `just bench-gemm` / `bench-quant` / `bench-fast` | matrix products, quantized products, fused kernels |
 | `just bench-compile`, `just bench-load`, `just mnist` | compiled functions, checkpoint loading, MNIST training |
 | `just fixtures`, `lm-fixtures`, `nn-fixtures`, `io-fixtures` | re-record the reference results |

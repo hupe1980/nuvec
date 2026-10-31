@@ -502,9 +502,12 @@ impl<'a> Visit<'a> {
         self.leaf(name, &p.value, LeafKind::Param, !p.frozen);
     }
 
-    /// A buffer leaf (never trainable).
-    pub fn buffer(&mut self, name: &str, a: &Array) {
-        self.leaf(name, a, LeafKind::Buffer, false);
+    /// A buffer leaf (never trainable): an [`Array`], or an `Option<Array>` that is a leaf
+    /// when present.
+    pub fn buffer(&mut self, name: &str, a: &(impl BufferLeaf + ?Sized)) {
+        if let Some(a) = a.buffer_array() {
+            self.leaf(name, a, LeafKind::Buffer, false);
+        }
     }
 
     /// A child tree named `name` (empty: transparent).
@@ -532,6 +535,35 @@ impl<'a> Visit<'a> {
         let len = self.push(name);
         self.visitor.static_field(&self.path, value);
         self.path.truncate(len);
+    }
+}
+
+/// What a `#[tree(buffer)]` field may hold: an [`Array`], or an `Option<Array>` (a leaf when
+/// present, as MLX's optional buffers such as affine-only quantization biases).
+pub trait BufferLeaf {
+    /// The array, if present.
+    fn buffer_array(&self) -> Option<&Array>;
+    /// The array, mutably, if present.
+    fn buffer_array_mut(&mut self) -> Option<&mut Array>;
+}
+
+impl BufferLeaf for Array {
+    fn buffer_array(&self) -> Option<&Array> {
+        Some(self)
+    }
+
+    fn buffer_array_mut(&mut self) -> Option<&mut Array> {
+        Some(self)
+    }
+}
+
+impl BufferLeaf for Option<Array> {
+    fn buffer_array(&self) -> Option<&Array> {
+        self.as_ref()
+    }
+
+    fn buffer_array_mut(&mut self) -> Option<&mut Array> {
+        self.as_mut()
     }
 }
 
@@ -604,8 +636,11 @@ impl<'a> VisitMut<'a> {
         self.path.truncate(len);
     }
 
-    /// A buffer leaf.
-    pub fn buffer(&mut self, name: &str, a: &mut Array) {
+    /// A buffer leaf: an [`Array`], or an `Option<Array>` that is a leaf when present.
+    pub fn buffer(&mut self, name: &str, a: &mut (impl BufferLeaf + ?Sized)) {
+        let Some(a) = a.buffer_array_mut() else {
+            return;
+        };
         let len = self.push(name);
         self.visitor.leaf(&self.path, a, LeafKind::Buffer, None);
         self.path.truncate(len);

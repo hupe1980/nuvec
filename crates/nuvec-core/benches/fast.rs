@@ -12,6 +12,7 @@ use nuvec_core::{
 /// (name, shape): the operation is chosen by the name's prefix.
 const CASES: &[(&str, &[usize])] = &[
     ("rms_norm-decode", &[1, 4096]),
+    ("rms_norm-e4b", &[1, 2560]),
     ("rms_norm-prefill", &[2048, 4096]),
     ("layer_norm-prefill", &[2048, 4096]),
     ("rope-decode", &[1, 32, 1, 128]),
@@ -32,6 +33,8 @@ const CASES: &[(&str, &[usize])] = &[
     // of a 3,841-token prompt over the whole cache.
     ("sdpa-chunk2048", &[1, 16, 8, 2048, 2048, 128]),
     ("sdpa-chunk1793", &[1, 16, 8, 1793, 3841, 128]),
+    // Qwen3.6's attention: the last 2,048-token chunk of a 34K-token prompt.
+    ("sdpa-chunk-q36-32k", &[1, 16, 2, 2048, 32768, 256]),
     // Speculative verification: 2–8 causal query rows over the cache (Qwen3-8B and
     // Qwen3.6 heads), including rows on both sides of a key-block bucket edge.
     ("sdpa-verify2-1k", &[1, 32, 8, 2, 1025, 128]),
@@ -39,6 +42,26 @@ const CASES: &[(&str, &[usize])] = &[
     ("sdpa-verify8-4k", &[1, 32, 8, 8, 4096, 128]),
     ("sdpa-verify4-q36", &[1, 16, 2, 4, 8194, 256]),
     ("sdpa-verify8-q36", &[1, 16, 2, 8, 32768, 256]),
+    // Sliding windows (`-w<keys>`): gpt-oss (D 64, W 128) and Gemma 4 sliding layers
+    // (D 256, W 1024).
+    ("sdpa-wdecode-w128", &[1, 64, 8, 1, 4096, 64]),
+    ("sdpa-wprefill64-w128", &[1, 64, 8, 2048, 2175, 64]),
+    ("sdpa-wdecode256-w1024", &[1, 16, 8, 1, 8192, 256]),
+    ("sdpa-wprefill256-w1024", &[1, 16, 8, 2048, 3071, 256]),
+    // Decode over exactly the window's keys (what mlx-lm's rotating cache passes).
+    ("sdpa-wsdecode-w128", &[1, 64, 8, 1, 128, 64]),
+    ("sdpa-wsdecode256-w1024", &[1, 16, 8, 1, 1024, 256]),
+    // The same without a window (plain causal decode at head size 256).
+    ("sdpa-decode256-1k", &[1, 16, 8, 1, 1024, 256]),
+    // Gemma 4 global layers (D 512): decode, and MLX's blocked causal prefill.
+    ("sdpa-d512-decode4k", &[1, 32, 4, 1, 4096, 512]),
+    ("sdpa-d512-decode32k", &[1, 32, 4, 1, 32768, 512]),
+    ("sdpa-d512-prefill", &[1, 16, 2, 2048, 2048, 512]),
+    // Gemma 4 E4B's decode: sliding layers (D 256, 512 keys) and global layers (D 512 with
+    // 4 query heads per key head: the composition in both engines).
+    ("sdpa-e4b-d256-512", &[1, 8, 2, 1, 512, 256]),
+    ("sdpa-e4b-d512-1k", &[1, 8, 2, 1, 1024, 512]),
+    ("sdpa-e4b-d512-4k", &[1, 8, 2, 1, 4096, 512]),
 ];
 
 fn op(name: &str, x: &Array, w: &Array, targets: &Array) -> Array {
@@ -50,7 +73,11 @@ fn op(name: &str, x: &Array, w: &Array, targets: &Array) -> Array {
             } else {
                 fast::AttentionMask::None
             };
-            fast::scaled_dot_product_attention(x, w, w, 0.088, &fast::AttentionOptions::from(mask))
+            let mut options = fast::AttentionOptions::from(mask);
+            if let Some((_, w)) = name.rsplit_once("-w") {
+                options = fast::AttentionOptions::causal().window(w.parse().expect("window"));
+            }
+            fast::scaled_dot_product_attention(x, w, w, 0.088, &options)
         }
         "rms_norm" => fast::rms_norm(x, w, 1e-5),
         "layer_norm" => fast::layer_norm(x, w, w, 1e-5),
@@ -75,7 +102,9 @@ fn main() -> Result<()> {
         (DType::BF16, "bfloat16"),
     ];
     for (dtype, label) in dtypes {
-        for &(name, shape) in CASES.iter().filter(|(n, _)| n.contains(filter.as_str())) {
+        // `BENCH_FILTER`: names containing it, or any of its `|`-separated alternatives.
+        let chosen = |n: &str| filter.split('|').any(|f| n.contains(f));
+        for &(name, shape) in CASES.iter().filter(|(n, _)| chosen(n)) {
             let uniform =
                 |s: &[usize]| random::uniform(-1.0, 1.0, s, DType::F32, None).astype(dtype);
             let (x, w, shape) = if name.starts_with("sdpa") {

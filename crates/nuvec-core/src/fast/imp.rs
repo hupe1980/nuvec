@@ -88,15 +88,28 @@ pub enum FastOp {
         /// Positions between taps.
         dilation: usize,
     },
-    /// `(q, k_cache, v_cache, block_tables, lengths)`: [`paged_attention`](crate::fast::paged_attention).
+    /// `(q, k_cache, v_cache, block_tables, lengths[, sinks])`:
+    /// [`paged_attention`](crate::fast::paged_attention).
     PagedAttention {
         /// `f32::to_bits` of the score scale.
         scale: u32,
+        /// A sliding window of this many keys (0: none).
+        window: u32,
+        /// Whether per-head attention sinks (`[Hq]`) are the last input.
+        sinks: bool,
     },
     /// `(cache, new, slots)`: [`paged_write`](crate::fast::paged_write).
     PagedWrite,
     /// `(x)`: softmax over the last axis, accumulated in float32.
     Softmax,
+    /// `(x)`: [`FastOp::Softmax`] of causally masked scores: row `r` of the second-to-last
+    /// axis (a multiple of `rows` long) keeps columns up to `r % rows + L − rows` (`L` the
+    /// last axis), the others taken as the dtype's lowest finite value (MLX's blocked
+    /// attention mask) and so 0 in the result.
+    CausalSoftmax {
+        /// Rows per block.
+        rows: u32,
+    },
     /// `(x)`: `log(sum(exp(x)))` over the last axis, which becomes size 1.
     LogSumExp,
     /// `(logits, targets)`: `logsumexp(logits) - logits[target]` per row, in float32.
@@ -114,6 +127,8 @@ pub enum FastOp {
         mask: bool,
         /// Whether per-head attention sinks (`[Hq]`) are the last input.
         sinks: bool,
+        /// A sliding window of this many keys (0: none; needs `causal`).
+        window: u32,
         /// The vector kernels' passes over the keys (1 or 2; at most 8 queries), or 0 for
         /// the tiled kernel. Set by the attention plan.
         passes: u8,
@@ -136,17 +151,19 @@ pub enum FastOp {
     /// `(a, b, lhs_indices, rhs_indices[, offsets])`: matrix products of gathered batches
     /// (see [`gather_mm`](crate::ops::gather_mm)), as [`FastOp::GatherQmm`] in full precision.
     GatherMm,
-    /// `(x, w, scales, biases, lhs_indices, rhs_indices[, offsets])`: quantized matrix
-    /// products of gathered batches (see [`gather_qmm`](crate::ops::gather_qmm)); the indices are uint32
-    /// and broadcast to the output's batch shape. `offsets` (int32, one per batch of `w`)
-    /// marks where each weight batch's rows start when the rows are sorted by it.
+    /// `(x, w, scales[, biases][, global_scale], lhs_indices, rhs_indices[, offsets])`:
+    /// quantized matrix products of gathered batches (see
+    /// [`gather_qmm`](crate::ops::gather_qmm)); biases for affine only, a global scale
+    /// (float32, one per weight batch) for nvfp4 only. The indices are uint32 and broadcast
+    /// to the output's batch shape. `offsets` (int32, one per batch of `w`) marks where each
+    /// weight batch's rows start when the rows are sorted by it.
     GatherQmm {
-        /// Values per scale and bias.
-        group_size: usize,
-        /// Bits per value.
-        bits: u8,
+        /// The mode, group size and bits.
+        quant: crate::Quant,
         /// `x · wᵀ` (else `x · w`).
         transpose: bool,
+        /// Whether a global scale is given.
+        global_scale: bool,
     },
 }
 
@@ -181,10 +198,26 @@ pub(crate) fn on_gpu(dtype: DType, size: usize) -> bool {
         && size < u32::MAX as usize
 }
 
+/// [`on_gpu`] for a row softmax or log-sum-exp over the last axis (of `axis` elements),
+/// whose kernel also takes 2^32 elements and more (64-bit row offsets; one threadgroup of
+/// at most 1,024 threads per row).
+pub(crate) fn rows_on_gpu(dtype: DType, size: usize, axis: usize) -> bool {
+    let axis = axis.max(1);
+    on_gpu(dtype, size)
+        || (on_gpu(dtype, 1) && axis < i32::MAX as usize && size / axis * 1024 < u32::MAX as usize)
+}
+
 /// Records `op` as one GPU kernel, or builds its fallback graph (CPU stream, other dtypes,
 /// empty arrays).
 pub(crate) fn record_or_fallback(op: FastOp, inputs: Vec<Array>) -> Result<Vec<Array>> {
-    if on_gpu(inputs[0].dtype(), inputs[0].size()) {
+    let x = &inputs[0];
+    let gpu = match op {
+        FastOp::Softmax | FastOp::LogSumExp | FastOp::CausalSoftmax { .. } => {
+            rows_on_gpu(x.dtype(), x.size(), x.dims().last().copied().unwrap_or(1))
+        }
+        _ => on_gpu(x.dtype(), x.size()),
+    };
+    if gpu {
         Array::from_op(Primitive::Fast(op), inputs)
     } else {
         op.fallback(&inputs)
@@ -422,9 +455,10 @@ fn rsqrt(x: &Array) -> Result<Array> {
     divide(1.0, sqrt(x)?)
 }
 
-/// `softmax` over the last axis from ordinary operations, in float32 for half types.
+/// `softmax` over the last axis from ordinary operations, in float32 for half types
+/// (float64 stays float64).
 fn softmax_graph(x: &Array) -> Result<Array> {
-    let xf = if x.dtype() == DType::F32 {
+    let xf = if matches!(x.dtype(), DType::F32 | DType::F64) {
         x.clone()
     } else {
         astype(x, DType::F32)?
@@ -432,6 +466,31 @@ fn softmax_graph(x: &Array) -> Result<Array> {
     let m = stop_gradient(&max(&xf, &[-1], true)?)?;
     let e = exp(&subtract(&xf, &m)?)?;
     astype(&divide(&e, sum(&e, &[-1], true)?)?, x.dtype())
+}
+
+/// `x` (`[.., R, L]`) with the columns past `r % rows + L − rows` of each row `r` set to the
+/// dtype's lowest finite value ([`FastOp::CausalSoftmax`]'s mask).
+fn causal_masked(x: &Array, rows: usize) -> Result<Array> {
+    let d = x.dims();
+    let (r, l) = (d[d.len() - 2], d[d.len() - 1]);
+    let i = |n: usize| n as isize;
+    // One block's `[rows, L]` mask, repeated down the `R` rows.
+    let row = arange((l - rows) as f64, l as f64, 1.0, DType::I32)?;
+    let col = arange(0.0, l as f64, 1.0, DType::I32)?;
+    let seen = crate::ops::imp::greater_equal(&expand_dims(&row, 1)?, &expand_dims(&col, 0)?)?;
+    let seen = broadcast_to(&expand_dims(&seen, 0)?, &[r / rows, rows, l])?;
+    let seen = reshape(&seen, &[i(r), i(l)])?;
+    where_(&seen, x, lowest_finite(x.dtype()))
+}
+
+/// The dtype's lowest finite value (as a float).
+fn lowest_finite(dtype: DType) -> f64 {
+    match dtype {
+        DType::F16 => f64::from(crate::f16::MIN),
+        DType::BF16 => f64::from(crate::bf16::MIN),
+        DType::F64 => f64::MIN,
+        _ => f64::from(f32::MIN),
+    }
 }
 
 /// `log(sum(exp(x)))` over the last axis (kept), from ordinary operations.
@@ -466,6 +525,7 @@ impl FastOp {
             Self::PagedAttention { .. } => "paged_attention",
             Self::PagedWrite => "paged_write",
             Self::Softmax => "softmax",
+            Self::CausalSoftmax { .. } => "causal_softmax",
             Self::LogSumExp => "logsumexp",
             Self::CrossEntropy => "cross_entropy",
             Self::CrossEntropyVjp => "cross_entropy_vjp",
@@ -479,9 +539,9 @@ impl FastOp {
     /// `(dtype, shape)` per output, after checking the input count.
     pub(crate) fn outputs(&self, inputs: &[Array]) -> Result<Vec<(DType, Vec<usize>)>> {
         let arity = match self {
-            Self::Softmax | Self::LogSumExp => 1,
+            Self::Softmax | Self::CausalSoftmax { .. } | Self::LogSumExp => 1,
             Self::RmsNorm { .. } | Self::CrossEntropy | Self::DepthwiseConv1d { .. } => 2,
-            Self::PagedAttention { .. } => 5,
+            Self::PagedAttention { sinks, .. } => 5 + usize::from(*sinks),
             Self::PagedWrite => 3,
             Self::AddRmsNorm { .. } | Self::RmsNormVjp { .. } | Self::LayerNorm { .. } => 3,
             Self::LayerNormVjp { .. } | Self::CrossEntropyVjp => 4,
@@ -492,7 +552,14 @@ impl FastOp {
             Self::Attention { mask, sinks, .. } => 3 + usize::from(*mask) + usize::from(*sinks),
             Self::GatedDelta { .. } => 6,
             Self::GatedDeltaSlots => 7,
-            Self::GatherQmm { .. } => inputs.len().clamp(6, 7),
+            Self::GatherQmm {
+                quant,
+                global_scale,
+                ..
+            } => {
+                let n = crate::quantized::GatherOperands::arity(quant.mode, *global_scale);
+                inputs.len().clamp(n, n + 1)
+            }
             Self::GatherMm => inputs.len().clamp(4, 5),
         };
         if inputs.len() != arity || inputs[0].ndim() == 0 {
@@ -510,7 +577,8 @@ impl FastOp {
             | Self::LayerNorm { .. }
             | Self::Rope { .. }
             | Self::NormRope { .. }
-            | Self::Softmax => {
+            | Self::Softmax
+            | Self::CausalSoftmax { .. } => {
                 vec![like(x)]
             }
             Self::LogSumExp => {
@@ -562,14 +630,18 @@ impl FastOp {
                 vec![(x.dtype(), shape)]
             }
             Self::GatherQmm {
-                bits, transpose, ..
+                quant,
+                transpose,
+                global_scale,
             } => {
+                let ops =
+                    crate::quantized::GatherOperands::split(inputs, quant.mode, *global_scale);
                 let w = inputs[1].dims();
                 let n = match transpose {
                     true => w[w.len() - 2],
-                    false => w[w.len() - 1] * 32 / usize::from(*bits),
+                    false => w[w.len() - 1] * 32 / quant.bits.max(1) as usize,
                 };
-                let mut shape = inputs[4].dims().to_vec();
+                let mut shape = ops.lhs.dims().to_vec();
                 shape.extend([x.dims()[x.ndim() - 2], n]);
                 vec![(x.dtype(), shape)]
             }
@@ -610,6 +682,11 @@ impl FastOp {
             Self::RmsNormVjp { .. } => param(&inputs[1]) && like(&inputs[2]),
             Self::LayerNormVjp { .. } => param(&inputs[1]) && param(&inputs[2]) && like(&inputs[3]),
             Self::Softmax | Self::LogSumExp => true,
+            Self::CausalSoftmax { rows } => {
+                let d = x.dims();
+                let (r, l) = (*rows as usize, d[d.len() - 1]);
+                d.len() >= 2 && r > 0 && r <= l && d[d.len() - 2].is_multiple_of(r)
+            }
             Self::Rope { dims, .. } => {
                 let offset = &inputs[1];
                 x.ndim() >= 3
@@ -673,9 +750,13 @@ impl FastOp {
                     && *dilation > 0
                     && matches!((span, padded), (Some(s), Some(p)) if p >= s)
             }
-            Self::PagedAttention { .. } => {
-                let [q, k, v, tables, lengths] = inputs else {
+            Self::PagedAttention { sinks, .. } => {
+                let [q, k, v, tables, lengths] = &inputs[..5] else {
                     unreachable!("five inputs")
+                };
+                let sinks_ok = !sinks || {
+                    let s = &inputs[5];
+                    s.ndim() == 1 && Some(&s.size()) == q.dims().get(1) && s.dtype() == q.dtype()
                 };
                 let (b, hq, d) = (q.dims().first(), q.dims().get(1), q.dims().get(3));
                 q.ndim() == 4
@@ -686,7 +767,8 @@ impl FastOp {
                     && Some(&k.dims()[3]) == d
                     && k.dims()[1] > 0
                     && hq.is_some_and(|h| h % k.dims()[1] == 0)
-                    && matches!(d, Some(64 | 128 | 256))
+                    && matches!(d, Some(64 | 128 | 256 | 512))
+                    && sinks_ok
                     && k.dims()[2].is_power_of_two()
                     && k.size() < u32::MAX as usize
                     && tables.ndim() == 2
@@ -773,9 +855,20 @@ impl FastOp {
                     && state
             }
             Self::GatherMm | Self::GatherQmm { .. } => {
-                let (w, lhs, rhs) = match self {
-                    Self::GatherMm => (&inputs[1], &inputs[2], &inputs[3]),
-                    _ => (&inputs[1], &inputs[4], &inputs[5]),
+                let (w, lhs, rhs, offsets) = match self {
+                    Self::GatherQmm {
+                        quant,
+                        global_scale,
+                        ..
+                    } => {
+                        let ops = crate::quantized::GatherOperands::split(
+                            inputs,
+                            quant.mode,
+                            *global_scale,
+                        );
+                        (ops.w, ops.lhs, ops.rhs, ops.offsets)
+                    }
+                    _ => (&inputs[1], &inputs[2], &inputs[3], inputs.get(4)),
                 };
                 if x.ndim() < 2 || w.ndim() < 2 {
                     return invalid("operands must be [..., M, K] and [..., K, N]".into());
@@ -783,30 +876,46 @@ impl FastOp {
                 let (m, k) = (x.dims()[x.ndim() - 2], last(x));
                 let inner = match self {
                     Self::GatherQmm {
-                        group_size,
-                        bits,
+                        quant,
                         transpose,
+                        global_scale,
                     } => {
-                        crate::quantized::check_params(name, *group_size, u32::from(*bits))?;
-                        let (scales, biases) = (&inputs[2], &inputs[3]);
-                        let n = w.ndim();
-                        let packing = scales.dtype() == x.dtype()
-                            && biases.dtype() == x.dtype()
-                            && biases.dims() == scales.dims()
-                            && w.dtype() == DType::U32
-                            && scales.ndim() == n
-                            && w.dims()[..n - 1] == scales.dims()[..n - 1]
-                            && last(w).checked_mul(32)
-                                == last(scales)
-                                    .checked_mul(*group_size)
-                                    .and_then(|c| c.checked_mul(usize::from(*bits)));
-                        // The kernel takes transposed weights (`x · wᵀ`) only.
-                        let columns = last(scales) * group_size;
-                        (packing && *transpose).then_some(columns)
+                        let product = crate::primitive::Primitive::QuantizedMatmul {
+                            quant: *quant,
+                            transpose: *transpose,
+                        };
+                        let columns = product.quantized_columns(w, &inputs[2..], *quant)?;
+                        // Affine kernels take transposed weights (`x · wᵀ`) and the scales'
+                        // dtype; the floating-point modes uint8 scales either way, and a
+                        // float32 global scale per weight batch for nvfp4.
+                        let kernel = match quant.mode {
+                            crate::QuantMode::Affine => {
+                                !global_scale && inputs[2].dtype() == x.dtype() && *transpose
+                            }
+                            mode => {
+                                let ops = crate::quantized::GatherOperands::split(
+                                    inputs,
+                                    mode,
+                                    *global_scale,
+                                );
+                                ops.global_scale.is_none_or(|g| {
+                                    mode == crate::QuantMode::Nvfp4
+                                        && g.dtype() == DType::F32
+                                        && g.dims() == &w.dims()[..w.ndim() - 2]
+                                })
+                            }
+                        };
+                        // `x`'s last dimension is the weights' columns (transposed) or rows.
+                        let inner = if *transpose {
+                            columns
+                        } else {
+                            w.dims()[w.ndim() - 2]
+                        };
+                        kernel.then_some(inner)
                     }
                     _ => (w.dtype() == x.dtype()).then_some(w.dims()[w.ndim() - 2]),
                 };
-                let offsets = match inputs.get(if *self == Self::GatherMm { 4 } else { 6 }) {
+                let offsets = match offsets {
                     None => true,
                     Some(o) => {
                         let experts: usize = w.dims()[..w.ndim() - 2].iter().product();
@@ -910,6 +1019,7 @@ impl FastOp {
                 causal,
                 mask,
                 sinks,
+                window,
                 ..
             } => vec![attention_graph(
                 inputs,
@@ -918,7 +1028,8 @@ impl FastOp {
                 *mask,
                 *sinks,
                 None,
-                None,
+                (*window > 0).then_some(*window as usize),
+                false,
             )?],
             Self::Rope {
                 dims,
@@ -982,9 +1093,14 @@ impl FastOp {
                     (*stride, *padding, *dilation, c),
                 )?]
             }
-            Self::PagedAttention { scale } => vec![paged_attention_graph(inputs, float(*scale))?],
+            Self::PagedAttention { scale, window, .. } => {
+                vec![paged_attention_graph(inputs, float(*scale), *window)?]
+            }
             Self::PagedWrite => vec![paged_write_graph(inputs)?],
             Self::Softmax => vec![softmax_graph(x)?],
+            Self::CausalSoftmax { rows } => {
+                vec![softmax_graph(&causal_masked(x, *rows as usize)?)?]
+            }
             Self::GatedDelta { steps } => gated_delta_graph(inputs, *steps)?,
             Self::GatedDeltaSlots => {
                 // The states at the slots, the rule, then the new states back at the slots.
@@ -1010,14 +1126,14 @@ impl FastOp {
                 )?]
             }
             Self::GatherQmm {
-                group_size,
-                bits,
+                quant,
                 transpose,
-            } => vec![gather_qmm_graph(
+                global_scale,
+            } => vec![crate::quantized::gather_qmm_graph(
                 inputs,
-                *group_size,
-                u32::from(*bits),
+                *quant,
                 *transpose,
+                *global_scale,
             )?],
             Self::LogSumExp => vec![logsumexp_graph(x)?],
             Self::CrossEntropy => {
@@ -1053,6 +1169,7 @@ impl FastOp {
         cotangents: &[Array],
         wanted: &[bool],
     ) -> Result<Vec<Option<Array>>> {
+        self.check_quantized_derivative(wanted)?;
         let g = &cotangents[0];
         let pick = |all: Vec<Array>| -> Vec<Option<Array>> {
             all.into_iter()
@@ -1102,7 +1219,8 @@ impl FastOp {
                 out.extend(std::iter::repeat_n(None, inputs.len() - 1));
                 Ok(out)
             }
-            Self::Softmax => {
+            Self::Softmax | Self::CausalSoftmax { .. } => {
+                // (Masked entries are 0 in the output, so their cotangent is 0 too.)
                 let s = &outputs[0];
                 let sg = multiply(s, g)?;
                 let dx = subtract(&sg, multiply(s, sum(&sg, &[-1], true)?)?)?;
@@ -1142,6 +1260,36 @@ impl FastOp {
         }
     }
 
+    /// A gathered quantized product differentiates in `x` only (and, for affine, its
+    /// scales and biases, through the fallback graph): a derivative asked for the packed
+    /// weights, the floating-point modes' uint8 scales or the global scale is an error, not a
+    /// silent zero (MLX has none).
+    fn check_quantized_derivative(&self, wanted: &[bool]) -> Result<()> {
+        let Self::GatherQmm {
+            quant,
+            global_scale,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let what = if wanted[1] {
+            Some("the packed (quantized) weights")
+        } else if quant.mode != crate::QuantMode::Affine && wanted[2] {
+            Some("the uint8 scales")
+        } else if *global_scale && wanted[3] {
+            Some("the global scale")
+        } else {
+            None
+        };
+        match what {
+            Some(what) => Err(Error::InvalidArgument(format!(
+                "gather_qmm: there is no gradient with respect to {what}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Reverse mode through the fallback graph, for the wanted floating-point inputs.
     fn fallback_vjp(
         &self,
@@ -1170,6 +1318,8 @@ impl FastOp {
 
     /// Forward-mode rule through the fallback graph (integer inputs are constants).
     pub(crate) fn jvp(&self, inputs: &[Array], tangents: &[Option<Array>]) -> Result<Vec<Array>> {
+        let wanted: Vec<bool> = tangents.iter().map(Option::is_some).collect();
+        self.check_quantized_derivative(&wanted)?;
         let active: Vec<usize> = (0..inputs.len())
             .filter(|&i| tangents[i].is_some() && inputs[i].dtype().category() == Category::Float)
             .collect();
@@ -1214,9 +1364,11 @@ impl FastOp {
             }
         };
         let simple = match self {
-            Self::RmsNorm { .. } | Self::LayerNorm { .. } | Self::Softmax | Self::LogSumExp => {
-                rest_unbatched
-            }
+            Self::RmsNorm { .. }
+            | Self::LayerNorm { .. }
+            | Self::Softmax
+            | Self::CausalSoftmax { .. }
+            | Self::LogSumExp => rest_unbatched,
             Self::Rope { .. } => rest_unbatched && inputs[1].size() == 1,
             Self::CrossEntropy => true,
             _ => false,
@@ -1293,6 +1445,118 @@ mod tests {
         assert_eq!(default_stream(), gpu, "the default stream is restored");
         crate::set_default_stream(Stream::default_for(Device::cpu()));
     }
+
+    /// `FastOp::CausalSoftmax`: masked columns are exactly 0 and rows sum to 1; float64
+    /// gradients equal finite differences; vmap equals the per-item op; the GPU kernels
+    /// (block and looped) equal the CPU fallback on strided views in every float dtype.
+    #[test]
+    fn causal_softmax_kernels_fallback_gradients_and_vmap() {
+        let causal = |x: &Array, rows: u32| one(FastOp::CausalSoftmax { rows }, vec![x.clone()]);
+        let values = |a: &Array| a.try_astype(DType::F64).unwrap().to_vec::<f64>().unwrap();
+        crate::with_stream(Device::cpu(), || {
+            let (r, l, rows) = (6usize, 5usize, 3usize);
+            let data: Vec<f64> = (0..2 * r * l)
+                .map(|i| ((i * 37 % 23) as f64) / 7.0 - 1.5)
+                .collect();
+            let x = Array::from_slice(&data, [2, r, l]);
+            let p = values(&causal(&x, rows as u32).unwrap());
+            for (row, chunk) in p.chunks(l).enumerate() {
+                let last = row % rows + l - rows;
+                assert!((chunk.iter().sum::<f64>() - 1.0).abs() < 1e-12, "row {row}");
+                assert!(
+                    chunk[last + 1..].iter().all(|&v| v == 0.0),
+                    "row {row} masked"
+                );
+            }
+            // Finite differences of `Σ w · causal_softmax(x)`.
+            let w: Vec<f64> = (0..2 * r * l)
+                .map(|i| ((i * 11 % 7) as f64) / 3.0 - 1.0)
+                .collect();
+            let w = Array::from_slice(&w, [2, r, l]);
+            let f = |xs: &[Array]| -> Result<Array> {
+                sum(&multiply(&causal(&xs[0], rows as u32)?, &w)?, &[], false)
+            };
+            let g = values(
+                &crate::transforms::grad_flat(f, &[0])(std::slice::from_ref(&x)).unwrap()[0],
+            );
+            let h = 1e-6;
+            for k in [0, 7, 13, 29, 44, 59] {
+                let shifted = |d: f64| {
+                    let mut v = data.clone();
+                    v[k] += d;
+                    values(&f(&[Array::from_slice(&v, [2, r, l])]).unwrap())[0]
+                };
+                let fd = (shifted(h) - shifted(-h)) / (2.0 * h);
+                assert!(
+                    (g[k] - fd).abs() <= 1e-6 * fd.abs().max(1.0),
+                    "d/dx[{k}]: {} vs {fd}",
+                    g[k]
+                );
+            }
+            let batched = crate::transforms::vmap_flat(
+                |xs: &[Array]| -> Result<Vec<Array>> { Ok(vec![causal(&xs[0], rows as u32)?]) },
+                &[Some(0)],
+                &[0],
+            )(std::slice::from_ref(&x))
+            .unwrap();
+            for b in 0..2 {
+                let item = slice(
+                    &x,
+                    &[
+                        SliceArg::new(Some(b), Some(b + 1), 1),
+                        SliceArg::full(),
+                        SliceArg::full(),
+                    ],
+                )
+                .unwrap();
+                let one_item = values(
+                    &causal(
+                        &reshape(&item, &[r as isize, l as isize]).unwrap(),
+                        rows as u32,
+                    )
+                    .unwrap(),
+                );
+                let got = &values(&batched[0])[b as usize * r * l..(b as usize + 1) * r * l];
+                if cfg!(miri) {
+                    // Miri perturbs transcendental results in their last bits.
+                    assert!(
+                        got.iter()
+                            .zip(&one_item)
+                            .all(|(x, y)| (x - y).abs() < 1e-12)
+                    );
+                } else {
+                    assert_eq!(got, &one_item[..]);
+                }
+            }
+        });
+        if crate::with_stream(Device::gpu(0), || {
+            add(Array::from(1.0f32), 1.0).and_then(|a| a.eval())
+        })
+        .is_err()
+        {
+            return; // no Metal device
+        }
+        // Block (≤ 4,096 columns) and looped kernels, on a transposed (strided) view.
+        for (dtype, tol) in [(DType::F32, 1e-6), (DType::F16, 2e-3), (DType::BF16, 1e-2)] {
+            for (rows, l) in [(4u32, 9usize), (8, 4100)] {
+                let r = 2 * rows as usize;
+                let data: Vec<f32> = (0..r * l)
+                    .map(|i| ((i * 37 % 101) as f32) / 17.0 - 3.0)
+                    .collect();
+                let x = Array::from_slice(&data, [l, r]).try_astype(dtype).unwrap();
+                let x = crate::ops::imp::transpose(&x, &[1, 0]).unwrap();
+                let cpu = crate::with_stream(Device::cpu(), || values(&causal(&x, rows).unwrap()));
+                let gpu = crate::with_stream(Device::gpu(0), || values(&causal(&x, rows).unwrap()));
+                for (k, (c, g)) in cpu.iter().zip(&gpu).enumerate() {
+                    assert!(
+                        (c - g).abs() <= tol,
+                        "{dtype} rows {rows} L {l}: {k}: {c} vs {g}"
+                    );
+                    assert_eq!(*c == 0.0, *g == 0.0, "{dtype}: masked {k}");
+                }
+            }
+        }
+    }
 }
 
 /// `g` summed over every axis but the last.
@@ -1318,7 +1582,9 @@ fn rope_graph(
     let shape: Vec<isize> = x.dims().iter().map(|&d| d as isize).collect();
     let nd = x.ndim();
     let (b, t, d) = (x.dims()[0], x.dims()[nd - 2], x.dims()[nd - 1]);
-    let x4 = reshape(x, &[b as isize, -1, t as isize, d as isize])?;
+    // The middle dimensions explicitly (`-1` is ambiguous when `t` or `d` is 0).
+    let middle: usize = x.dims()[1..nd - 2].iter().product();
+    let x4 = reshape(x, &[b as isize, middle as isize, t as isize, d as isize])?;
     let dtype = x.dtype();
     let half = dims / 2;
     let offset = &inputs[1];
@@ -1498,9 +1764,20 @@ pub(crate) fn paged_attention(
     block_tables: &Array,
     lengths: &Array,
     scale: f32,
+    options: &crate::fast::AttentionOptions<'_>,
 ) -> Result<Array> {
     let invalid = |msg: String| Err(Error::InvalidArgument(format!("paged_attention: {msg}")));
     floating("paged_attention", q.dtype())?;
+    if matches!(options.mask, AttentionMask::Array(_)) {
+        return invalid(
+            "an array mask is not supported (the attention is causal by lengths)".into(),
+        );
+    }
+    let window = match options.window {
+        Some(w) if w < 1 => return invalid(format!("the window must be at least 1, got {w}")),
+        Some(w) => w as u32,
+        None => 0,
+    };
     if q.ndim() != 4 || k_cache.ndim() != 4 || k_cache.dims() != v_cache.dims() {
         return invalid(format!(
             "q must be [B, Hq, L, D] and the caches [blocks, Hkv, block_size, D], got {:?}, \
@@ -1535,20 +1812,30 @@ pub(crate) fn paged_attention(
     if k_cache.dims()[0] == 0 {
         return invalid("the caches hold no blocks".into());
     }
+    if let Some(s) = options.sinks
+        && (s.ndim() != 1 || s.size() != hq)
+    {
+        return invalid(format!("sinks must be [{hq}], got {:?}", s.dims()));
+    }
     let dtype = q.dtype();
-    let inputs = vec![
+    let mut inputs = vec![
         q.clone(),
         astype(k_cache, dtype)?,
         astype(v_cache, dtype)?,
         astype(block_tables, DType::I32)?,
         astype(lengths, DType::I32)?,
     ];
+    if let Some(s) = options.sinks {
+        inputs.push(astype(s, dtype)?);
+    }
     let op = FastOp::PagedAttention {
         scale: scale.to_bits(),
+        window,
+        sinks: options.sinks.is_some(),
     };
     // The kernels use 32-bit offsets into the caches.
     let small = k_cache.size() < u32::MAX as usize;
-    if matches!(d, 64 | 128 | 256) && k_cache.dims()[2].is_power_of_two() && small {
+    if matches!(d, 64 | 128 | 256 | 512) && k_cache.dims()[2].is_power_of_two() && small {
         one(op, inputs)
     } else {
         Ok(op.fallback(&inputs)?.swap_remove(0))
@@ -1622,10 +1909,11 @@ fn paged_keys(cache: &Array, tables: &Array) -> Result<Array> {
 
 /// [`paged_attention`] from ordinary operations: every listed block gathered, then
 /// attention with a mask of each sequence's positions.
-fn paged_attention_graph(inputs: &[Array], scale: f32) -> Result<Array> {
-    let [q, k_cache, v_cache, tables, lengths] = inputs else {
+fn paged_attention_graph(inputs: &[Array], scale: f32, window: u32) -> Result<Array> {
+    let [q, k_cache, v_cache, tables, lengths] = &inputs[..5] else {
         unreachable!("five inputs")
     };
+    let sinks = inputs.get(5);
     let (b, lq) = (q.dims()[0], q.dims()[2]);
     let (k, v) = (paged_keys(k_cache, tables)?, paged_keys(v_cache, tables)?);
     let s = k.dims()[2];
@@ -1646,8 +1934,29 @@ fn paged_attention_graph(inputs: &[Array], scale: f32) -> Result<Array> {
         reshape(lengths, &[b as isize, 1, 1, 1])?,
         subtract(&queries, (lq - 1) as f64)?,
     )?;
-    let mask = less(&positions, &end)?;
-    let options = crate::fast::AttentionOptions::default().mask(&mask);
+    let mut mask = less(&positions, &end)?;
+    if window > 0 {
+        // Position `p` is in the window of the query whose last key is `end − 1` when
+        // `p ≥ end − window`.
+        mask = multiply(
+            &mask,
+            &crate::ops::imp::greater_equal(&positions, &subtract(&end, f64::from(window))?)?,
+        )?;
+    }
+    // Positions no query of a sequence attends (before its first window, after its length)
+    // may hold another sequence's keys, NaN included: their values are zeroed, so masked
+    // probabilities (zero) never meet them (the kernels never read them).
+    let lens = reshape(lengths, &[b as isize, 1, 1, 1])?;
+    let mut live = less(&positions, &lens)?;
+    if window > 0 {
+        let start = subtract(&lens, (lq as u32 + window - 1) as f64)?;
+        live = multiply(&live, &crate::ops::imp::greater_equal(&positions, &start)?)?;
+    }
+    let live = crate::ops::imp::transpose(&live, &[0, 1, 3, 2])?;
+    let v = where_(&live, &v, 0.0)?;
+    let options = crate::fast::AttentionOptions::default()
+        .mask(&mask)
+        .sinks(sinks);
     scaled_dot_product_attention(q, &k, &v, scale, &options)
 }
 
@@ -1762,6 +2071,8 @@ pub(crate) fn attention_key(
     }
     let window = match options.window {
         Some(w) if w < 1 => return invalid(format!("the window must be at least 1, got {w}")),
+        // A window of all the keys is plain causal attention (the same path).
+        Some(w) if w as usize >= ks[2] && matches!(options.mask, AttentionMask::Causal) => None,
         Some(w) => Some(w as usize),
         None => None,
     };
@@ -1845,6 +2156,9 @@ pub(crate) fn plan_attention(
             }
         }
         Route::Composed { .. } => crate::fast::AttentionKernel::Composed,
+        Route::Blocked { rows } => crate::fast::AttentionKernel::BlockedD512 {
+            rows: as_i32(*rows),
+        },
     };
     Ok(crate::fast::AttentionPlan {
         kernel,
@@ -1880,6 +2194,12 @@ pub(crate) fn scaled_dot_product_attention(
         options,
         attention_target(dtype, q.size()),
     )?;
+    // No queries: an empty result. No keys: every query's weighted sum is empty (a sink
+    // takes all the weight), so zeros.
+    if key.lq == 0 || key.lk == 0 {
+        let (qs, vs) = (q.dims(), v.dims());
+        return Ok(crate::ops::zeros([qs[0], qs[1], qs[2], vs[3]], dtype));
+    }
     let plan = plan::plan(&key)?;
     let (qs, ks) = (q.dims(), k.dims());
     let (q, k, v) = (astype(q, dtype)?, astype(k, dtype)?, astype(v, dtype)?);
@@ -1923,7 +2243,8 @@ pub(crate) fn scaled_dot_product_attention(
                 .collect::<Result<Vec<_>>>()?;
             crate::indexing::concatenate(&outs, 2)
         }
-        Route::Composed { rows } => {
+        Route::Composed { rows } | Route::Blocked { rows } => {
+            let merged = matches!(plan.route, Route::Blocked { .. });
             let rows = (*rows).max(1);
             let mut outs: Vec<Array> = Vec::with_capacity(key.lq.div_ceil(rows));
             let mut start = 0;
@@ -1932,7 +2253,7 @@ pub(crate) fn scaled_dot_product_attention(
                 // Each block's queries wait for the previous block's output, so one
                 // block's scores are live at a time.
                 let after = outs.last().cloned();
-                outs.push(call.composed(start, end, after)?);
+                outs.push(call.composed(start, end, after, merged)?);
                 start = end;
             }
             if outs.len() == 1 {
@@ -2017,6 +2338,7 @@ impl Call<'_> {
             causal: self.key.mask == MaskKind::Causal,
             mask: mask.is_some(),
             sinks: self.sinks.is_some(),
+            window: self.key.window.map_or(0, |w| w as u32),
             passes,
             blocks: blocks as u32,
             gqa_kernel,
@@ -2060,7 +2382,8 @@ impl Call<'_> {
                     has_mask,
                     self.sinks.is_some(),
                     None,
-                    None,
+                    self.key.window,
+                    false,
                 )
             }
         }
@@ -2068,7 +2391,13 @@ impl Call<'_> {
 
     /// The composition over query rows `start..end`, with the keys those rows see (the
     /// causal prefix, cut to the window), evaluated after `after` when given.
-    fn composed(&self, start: usize, end: usize, after: Option<Array>) -> Result<Array> {
+    fn composed(
+        &self,
+        start: usize,
+        end: usize,
+        after: Option<Array>,
+        merged: bool,
+    ) -> Result<Array> {
         let key = self.key;
         let causal = key.mask == MaskKind::Causal;
         // Under a causal mask, row `i` sees keys up to `i + Lk − Lq`.
@@ -2098,6 +2427,7 @@ impl Call<'_> {
             self.sinks.is_some(),
             Some(offset),
             key.window,
+            merged,
         )
     }
 }
@@ -2109,6 +2439,7 @@ fn attention_config(op: &FastOp, inputs: &[Array]) -> bool {
         causal,
         mask,
         sinks,
+        window,
         passes,
         blocks,
         gqa_kernel,
@@ -2118,6 +2449,9 @@ fn attention_config(op: &FastOp, inputs: &[Array]) -> bool {
     else {
         return false;
     };
+    if window > 0 && (!causal || mask || gqa_kernel) {
+        return false;
+    }
     let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
     let (lq, lk, d, dv) = (q.dims()[2], k.dims()[2], q.dims()[3], v.dims()[3]);
     let gqa = q.dims()[1] / k.dims()[1];
@@ -2150,6 +2484,11 @@ fn attention_config(op: &FastOp, inputs: &[Array]) -> bool {
 /// Under `causal`, query `i` sees keys up to `i + offset` (`offset` defaults to `Lk − Lq`,
 /// the queries being the last positions), and with a `window` only the `window` keys up
 /// to that one.
+///
+/// With `merged`, each key head's grouped queries form one product (`rep·Lq` rows), as
+/// MLX's blocked head-512 path multiplies them; otherwise one per query head, as MLX's
+/// fallback.
+#[allow(clippy::too_many_arguments)]
 fn attention_graph(
     inputs: &[Array],
     scale: f32,
@@ -2158,6 +2497,7 @@ fn attention_graph(
     has_sinks: bool,
     offset: Option<isize>,
     window: Option<usize>,
+    merged: bool,
 ) -> Result<Array> {
     let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
     let dtype = q.dtype();
@@ -2166,8 +2506,12 @@ fn attention_graph(
     let rep = hq / hkv;
     let i = |n: usize| n as isize;
     let mut q = multiply(q, f64::from(scale))?;
+    // (Causal only: an array mask or sinks keep the per-head layout.)
+    let merged = merged && rep > 1 && !has_mask && !has_sinks;
     let (mut k, mut v) = (k.clone(), v.clone());
-    if rep > 1 {
+    if merged {
+        q = reshape(&q, &[i(b), i(hkv), i(rep * lq), i(q.dims()[3])])?;
+    } else if rep > 1 {
         q = reshape(&q, &[i(b), i(hkv), i(rep), i(lq), i(q.dims()[3])])?;
         k = expand_dims(&k, 2)?;
         v = expand_dims(&v, 2)?;
@@ -2175,7 +2519,19 @@ fn attention_graph(
     let n = k.ndim();
     let mut axes: Vec<usize> = (0..n).collect();
     axes.swap(n - 2, n - 1);
+    // Merged, the scores stay `[B, Hkv, rep·Lq, Lk]` (masked and normalised in place) and
+    // the mask repeats per grouped head.
     let mut scores = crate::ops::imp::matmul(&q, &crate::ops::imp::transpose(&k, &axes)?)?;
+    let lowest = lowest_finite(dtype);
+    // A merged causal block whose last query sees the last key masks in its softmax
+    // (MLX's blocked path masks the same scores in place): no separate mask pass.
+    let tail = lk as isize - lq as isize;
+    if merged && causal && window.is_none() && tail >= 0 && offset.is_none_or(|o| o == tail) {
+        let rows = u32::try_from(lq).map_err(|_| Error::InvalidArgument("rows".into()))?;
+        let probs = one(FastOp::CausalSoftmax { rows }, vec![scores])?;
+        let out = crate::ops::imp::matmul(&probs, &v)?;
+        return reshape(&out, &[i(b), i(hq), i(lq), i(v.dims()[n - 1])]);
+    }
     let mask = if causal {
         let offset = offset.unwrap_or(lk as isize - lq as isize) as f64;
         let qi = expand_dims(&arange(offset, offset + lq as f64, 1.0, DType::I32)?, 1)?;
@@ -2189,6 +2545,14 @@ fn attention_graph(
             )?,
             None => seen,
         })
+        .map(|m| match merged {
+            true => reshape(
+                &broadcast_to(&expand_dims(&m, 0)?, &[rep, lq, lk])?,
+                &[i(rep * lq), i(lk)],
+            ),
+            false => Ok(m),
+        })
+        .transpose()?
     } else if has_mask {
         let m = &inputs[3];
         Some(if rep > 1 {
@@ -2201,12 +2565,6 @@ fn attention_graph(
     };
     if let Some(m) = mask {
         scores = if m.dtype() == DType::Bool {
-            let lowest = match dtype {
-                DType::F16 => f64::from(crate::f16::MIN),
-                DType::BF16 => f64::from(crate::bf16::MIN),
-                DType::F64 => f64::MIN,
-                _ => f64::from(f32::MIN),
-            };
             where_(&m, &scores, lowest)?
         } else {
             add(&scores, &m)?
@@ -2214,8 +2572,14 @@ fn attention_graph(
     }
     let probs = if has_sinks {
         // softmax over [sink, scores...], without the sink's column.
-        let s = astype(&scores, DType::F32)?;
-        let sink = astype(inputs.last().expect("sinks"), DType::F32)?;
+        // In float32 (float64 stays float64).
+        let acc = if dtype == DType::F64 {
+            DType::F64
+        } else {
+            DType::F32
+        };
+        let s = astype(&scores, acc)?;
+        let sink = astype(inputs.last().expect("sinks"), acc)?;
         let shape: Vec<isize> = if rep > 1 {
             vec![1, i(hkv), i(rep), 1, 1]
         } else {
@@ -2226,7 +2590,7 @@ fn attention_graph(
         let e = exp(&subtract(&s, &m)?)?;
         let denom = add(sum(&e, &[-1], true)?, exp(&subtract(&sink, &m)?)?)?;
         astype(&divide(&e, &denom)?, dtype)?
-    } else if on_gpu(dtype, scores.size()) {
+    } else if rows_on_gpu(dtype, scores.size(), scores.dims()[scores.ndim() - 1]) {
         crate::ops::imp::softmax(&scores, &[-1])?
     } else {
         softmax_graph(&scores)?
@@ -2438,32 +2802,4 @@ fn gated_delta_graph(inputs: &[Array], steps: bool) -> Result<Vec<Array>> {
         (true, true) => zeros(&[b, 0, hv, dv, dk], state.dtype())?,
     };
     Ok(vec![y, s])
-}
-
-/// The gathered quantized products from ordinary operations: the indexed batches of `x` and
-/// of the weights, then one batched quantized product.
-fn gather_qmm_graph(
-    inputs: &[Array],
-    group_size: usize,
-    bits: u32,
-    transpose: bool,
-) -> Result<Array> {
-    let (lhs, rhs) = (&inputs[4], &inputs[5]);
-    let rows = |a: &Array, indices: &Array| -> Result<Array> {
-        let nd = a.ndim();
-        let flat = reshape(
-            a,
-            &[-1, a.dims()[nd - 2] as isize, a.dims()[nd - 1] as isize],
-        )?;
-        crate::indexing::take(&flat, indices, Some(0))
-    };
-    crate::quantized::quantized_matmul(
-        &rows(&inputs[0], lhs)?,
-        &rows(&inputs[1], rhs)?,
-        &rows(&inputs[2], rhs)?,
-        &rows(&inputs[3], rhs)?,
-        transpose,
-        group_size,
-        bits,
-    )
 }

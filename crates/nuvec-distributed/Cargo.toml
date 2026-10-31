@@ -1,0 +1,34 @@
+[package]
+name = "nuvec-distributed"
+description = "Distributed backends for nuvec: MLX's TCP ring for collectives across processes and Macs"
+exclude.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+nuvec-core.workspace = true
+
+[dev-dependencies]
+# Compiled functions with collectives (tests/ring.rs).
+nuvec-compile.workspace = true
+# Sharded layers (tests/sharded.rs). Path-only, so the published package has no cycle.
+nuvec = { path = "../nuvec" }
+nuvec-nn = { path = "../nuvec-nn" }
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "all_sum"
+harness = false

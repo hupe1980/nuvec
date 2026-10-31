@@ -17,6 +17,10 @@ pub fn key(seed: u64) -> Array {
 fn time_seed() -> u64 {
     static SEED: OnceLock<u64> = OnceLock::new();
     *SEED.get_or_init(|| {
+        // Miri isolates the clock: a fixed seed there (reproducible runs too).
+        if cfg!(miri) {
+            return 0x5eed;
+        }
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64)

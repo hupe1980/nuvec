@@ -93,7 +93,9 @@ fn one_token_prompts_are_served() {
     }
     for name in ["qwen3_f32", "qwen3_5_f32"] {
         let (model, prompt) = fixture(name);
-        let mut batcher = Batcher::new(&model, 32, 4, 3).unwrap();
+        let mut batcher = Batcher::new(&model, 32, 4, 3)
+            .unwrap()
+            .batch_invariant(true);
         assert!(batcher.submit(Vec::new(), greedy(4)).is_err(), "{name}");
         let requests = [
             (vec![prompt[0]], 8),
@@ -126,7 +128,7 @@ fn unfittable_prompts_are_rejected_and_outgrown_requests_finish() {
     for name in ["qwen3_f32", "qwen3_5_f32"] {
         let (model, prompt) = fixture(name);
         // 4 blocks of 4 positions: 16 positions in all.
-        let mut batcher = Batcher::new(&model, 4, 4, 2).unwrap();
+        let mut batcher = Batcher::new(&model, 4, 4, 2).unwrap().batch_invariant(true);
         let long: Vec<u32> = prompt.iter().cycle().take(16).copied().collect();
         assert!(
             batcher.submit(long, greedy(1)).is_err(),
@@ -137,7 +139,7 @@ fn unfittable_prompts_are_rejected_and_outgrown_requests_finish() {
         assert_eq!(tokens[0], solo(&model, &prompt[..3], 4), "{name}");
         assert_eq!(finished[0], Some(FinishReason::Length), "{name}");
         // Alone, 3 + 40 tokens do not fit in 16 positions.
-        let mut batcher = Batcher::new(&model, 4, 4, 2).unwrap();
+        let mut batcher = Batcher::new(&model, 4, 4, 2).unwrap().batch_invariant(true);
         batcher.submit(prompt[..3].to_vec(), greedy(40)).unwrap();
         let (tokens, finished) = run(&mut batcher, 1, 100);
         assert_eq!(finished[0], Some(FinishReason::CacheFull), "{name}");
@@ -161,7 +163,7 @@ fn cancelled_requests_finish_and_free_their_blocks() {
     }
     let (model, prompt) = fixture("qwen3_f32");
     // 8 blocks of 4 positions, two requests at a time.
-    let mut batcher = Batcher::new(&model, 8, 4, 2).unwrap();
+    let mut batcher = Batcher::new(&model, 8, 4, 2).unwrap().batch_invariant(true);
     let running = batcher.submit(prompt[..5].to_vec(), greedy(10)).unwrap();
     let kept = batcher.submit(prompt[2..6].to_vec(), greedy(6)).unwrap();
     let waiting = batcher.submit(prompt[1..4].to_vec(), greedy(4)).unwrap();
@@ -268,7 +270,9 @@ fn a_request_ending_with_a_step_in_flight_emits_nothing_more() {
         let eos = first[2];
         let end = first.iter().position(|&t| t == eos).expect("present");
         model.config.eos_token_ids = vec![eos];
-        let mut batcher = Batcher::new(&model, 64, 4, 2).unwrap();
+        let mut batcher = Batcher::new(&model, 64, 4, 2)
+            .unwrap()
+            .batch_invariant(true);
         batcher.submit(prompt[..5].to_vec(), greedy(8)).unwrap();
         batcher.submit(prompt[1..7].to_vec(), greedy(8)).unwrap();
         let (tokens, finished) = run(&mut batcher, 2, 100);

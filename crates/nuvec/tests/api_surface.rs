@@ -215,11 +215,11 @@ mod spec_062 {
             |x, i| x.put_along_axis(i, 0.0, 0),
             |x, i| x.scatter_add_along_axis(i, 1.0, -1),
         ];
-        const QUANT: fn(&Array) -> (Array, Array, Array) = |w| w.quantize(64, 4);
-        const QUANT_OPS: [fn(&Array, &Array, &Array, &Array) -> Array; 3] = [
-            |w, s, b, _| w.dequantize(s, b, 64, 4),
-            |x, w, s, b| x.quantized_matmul(w, s, b, true, 64, 4),
-            |x, w, s, b| x.gather_qmm(w, s, b, None, None, true, 64, 4, false),
+        const QUANT: fn(&Array) -> nuvec::Quantized = |w| w.quantize(nuvec::Quant::affine(64, 4));
+        const QUANT_OPS: [fn(&Array, &nuvec::Quantized) -> Array; 3] = [
+            |_, q| q.dequantize(None),
+            |x, q| x.quantized_matmul(q, true),
+            |x, q| x.gather_qmm(q, None, None, nuvec::GatherQmm::default()),
         ];
         const MM: M = |a, b| a.gather_mm(b, None, None, false);
         const CONV: M = |x, w| x.conv1d(w, 1, 0, 1, 1);
@@ -245,7 +245,9 @@ mod spec_062 {
         const _: fn(&Array, i32, i32) -> Vec<Array> = ops::split;
         const _: fn(&Array, i32) -> [Array; 3] = ops::split_n;
         const _: fn(ScalarOrArray, ScalarOrArray, ScalarOrArray) -> Array = ops::where_;
-        const _: fn(&Array, i32, i32) -> (Array, Array, Array) = ops::quantize;
+        const _: fn(&Array, nuvec::Quant) -> nuvec::Quantized = ops::quantize;
+        const _: fn(&nuvec::Quantized, Option<nuvec::DType>) -> Array = ops::dequantize;
+        const _: fn(&Array, &nuvec::Quantized, bool) -> Array = ops::quantized_matmul;
         const _: fn() -> &'static [&'static str] = ops::__op_names;
 
         #[test]
@@ -574,6 +576,112 @@ mod spec_063 {
             let _: Array = h(&mut s, x)?;
             let flat = nuvec::compile_flat(|xs: &[Array]| Ok(xs.to_vec()));
             let _: Vec<Array> = flat(std::slice::from_ref(x))?;
+            let shapeless = nuvec::compile::Options::default().shapeless(true);
+            let _: bool = shapeless.shapeless;
+            let flat = nuvec::compile::compile_flat_with(shapeless, |xs: &[Array]| Ok(xs.to_vec()));
+            let _: Vec<Array> = flat(std::slice::from_ref(x))?;
+            Ok(())
+        }
+    }
+
+    /// Speculation (spec 054): on-device acceptance, capture-all Gated DeltaNet with
+    /// storage rounding, and nuvec-lm's drafters, policy and MTP head.
+    mod speculation {
+        use nuvec::fast::{self, StepOptions};
+        use nuvec::{Array, DType, Result, speculative};
+        use nuvec_lm::{
+            Auto, Draft, DraftPolicy, Drafter, Model, MtpDrafter, PromptLookup, SpeculativeStats,
+            SuffixDecoding,
+        };
+
+        #[test]
+        fn pinned() -> Result<()> {
+            const _: fn(&Array, &Array, &Array) -> Array = speculative::accept_greedy;
+            const _: fn(&Array, &Array, Option<&Array>, &Array, &Array) -> Array =
+                speculative::accept_sampled;
+            const _: fn(&Array) -> Result<(usize, u32, bool)> = speculative::read;
+            let _: StepOptions = StepOptions::default().storage(DType::BF16);
+            const _: fn(
+                &Array,
+                &Array,
+                &Array,
+                &Array,
+                &Array,
+                &Array,
+                &StepOptions,
+            ) -> (Array, Array) = fast::gated_delta_steps_with;
+            let _: Draft = Draft::from_tokens(&[1, 2]);
+            let _: Draft = Draft::empty();
+            let _: DraftPolicy = DraftPolicy::default();
+            let _ = [
+                DraftPolicy::Auto,
+                DraftPolicy::Fixed(2),
+                DraftPolicy::Adaptive(4),
+            ];
+            let _: Auto = Auto {
+                len: 1,
+                break_even: 0.5,
+            };
+            let _: PromptLookup = PromptLookup::default();
+            let mut s = SuffixDecoding::default();
+            s.remember(&[1, 2, 3]);
+            let _: Vec<u32> = s.suggest(&[1, 2], 1);
+            const _: fn(&Model) -> Result<MtpDrafter> = MtpDrafter::new;
+            const _: fn(&Model) -> usize = nuvec_lm::verify_rows;
+            const _: fn(&Model) -> bool = Model::has_mtp;
+            const _: fn(&Model, &Array, &Array, &mut [nuvec_lm::KvCache]) -> Array =
+                Model::mtp_forward;
+            const _: fn(&Model, &Array) -> Array = Model::logits;
+            let _: fn(&mut Model, &str) -> Result<()> = |m, p| m.attach_mtp(p);
+            let s = SpeculativeStats::default();
+            let _: [usize; 5] = [s.steps, s.verifies, s.drafted, s.accepted, s.pauses];
+            fn takes_drafter<D: Drafter>(_: D) {}
+            takes_drafter(PromptLookup::default());
+            takes_drafter(&mut SuffixDecoding::default());
+            Ok(())
+        }
+    }
+
+    /// The Neural Accelerator status (spec 059).
+    #[test]
+    fn nax_status_is_pinned() {
+        use nuvec::gpu::{NaxReason, NaxStatus};
+        let _: fn(&nuvec::gpu::Device) -> NaxStatus = nuvec::gpu::Device::nax;
+        let s = NaxStatus::Off(NaxReason::Unmeasured);
+        assert!(!s.is_active());
+        assert!(NaxStatus::Active { forced: true }.is_active());
+        let _ = [
+            NaxReason::Override,
+            NaxReason::Os,
+            NaxReason::Generation,
+            NaxReason::NoLibrary,
+            NaxReason::PipelineError,
+        ];
+    }
+
+    /// `distributed`: the group, the collectives and the ring's entry points.
+    mod distributed {
+        use nuvec::distributed::{self, Group, Options};
+        use nuvec::{Array, DType, Result};
+
+        #[test]
+        fn pinned() -> Result<()> {
+            let g: Group = Group::single();
+            let _: (usize, usize) = (g.rank(), g.size());
+            let _: Result<Group> = g.split(0, 0);
+            let _: Group = distributed::default_group();
+            let x = Array::from(1.0f32);
+            let _: Array = distributed::all_sum(&x, None);
+            let _: Array = distributed::all_max(&x, Some(&g));
+            let _: Array = distributed::all_min(&x, None);
+            let _: Array = distributed::all_gather(&x, None);
+            let _: Array = distributed::sum_gradients(&x, None);
+            const _: fn(&Array, usize, Option<&Group>) -> Array = distributed::send;
+            const _: fn(&Array, usize, Option<&Group>) -> Array = distributed::recv_like;
+            let _: Array = distributed::recv([2], DType::F32, 1, None);
+            const _: fn(bool) -> Result<Group> = distributed::init;
+            const _: fn(&[Vec<String>], usize, &Options) -> Result<Group> = distributed::init_with;
+            let _: Options = Options::default().timeout(std::time::Duration::from_secs(1));
             Ok(())
         }
     }
@@ -619,7 +727,9 @@ mod spec_063 {
             sources::<BTreeMap<String, Array>>();
             let l: Linear = Linear::new(4, 2).without_bias();
             let q: QuantizedLinear = QuantizedLinear::from_linear(&l);
-            let _: QuantizedLinear = QuantizedLinear::from_linear_with(&l, 32, 4);
+            let _: QuantizedLinear =
+                QuantizedLinear::from_linear_with(&l, nuvec::Quant::affine(32, 4));
+            let _: QuantizedLinear = QuantizedLinear::from_linear_with(&l, nuvec::QuantMode::Mxfp4);
             let e = nuvec_nn::Embedding::new(10, 64);
             let _: QuantizedEmbedding = QuantizedEmbedding::from_embedding(&e);
             let _: RmsNorm = RmsNorm::new(4).eps(1e-6);
@@ -707,6 +817,192 @@ mod spec_063 {
     }
 }
 
+/// Spec 055: floating-point quantization modes (MXFP4, MXFP8, NVFP4), bit views and E4M3
+/// conversions, and the checkpoint side in nuvec-nn and nuvec-lm.
+mod spec_055 {
+    use std::str::FromStr;
+
+    use nuvec::{Array, DType, GatherQmm, Quant, QuantMode, Quantized, ops};
+
+    const MODES: [QuantMode; 4] = [
+        QuantMode::Affine,
+        QuantMode::Mxfp4,
+        QuantMode::Mxfp8,
+        QuantMode::Nvfp4,
+    ];
+    const NAME: fn(QuantMode) -> &'static str = QuantMode::name;
+    const QUANT: [Quant; 3] = [
+        Quant::new(QuantMode::Nvfp4),
+        Quant::affine(64, 4).group_size(32).bits(8),
+        Quant {
+            mode: QuantMode::Mxfp8,
+            group_size: 32,
+            bits: 8,
+        },
+    ];
+
+    fn quant() {
+        let _: Quant = Quant::default();
+        let _: Quant = QuantMode::Mxfp4.into();
+        let _: Result<QuantMode, _> = QuantMode::from_str("mxfp4");
+        let _: String = QuantMode::Nvfp4.to_string();
+    }
+
+    fn quantized(w: Array, s: Array) -> nuvec::Result<()> {
+        let q = Quantized::new(w, s, None, QuantMode::Mxfp4);
+        let _: (&Array, &Array, &Option<Array>, Quant) = (&q.weight, &q.scales, &q.biases, q.quant);
+        let _: Array = q.dequantize(DType::BF16);
+        q.check()
+    }
+
+    const OPS: [fn(&Array) -> Array; 3] = [
+        |x| x.view(DType::U32),
+        |x| x.to_fp8(),
+        |x| x.from_fp8(DType::F16),
+    ];
+    const _: fn(&Array, DType) -> Array = ops::view;
+    const _: fn(&Array) -> Array = ops::to_fp8;
+    const _: fn(&Array, DType) -> Array = ops::from_fp8;
+    const _: fn(&Array, &Quantized, Option<&Array>, Option<&Array>, GatherQmm<'_>) -> Array =
+        ops::gather_qmm;
+
+    fn gather(x: &Array, q: &Quantized, rhs: &Array, scale: &Array) -> Array {
+        let o = GatherQmm::default()
+            .transpose(true)
+            .sorted_indices(true)
+            .global_scale(scale);
+        let _: (bool, bool, Option<&Array>) = (o.transpose, o.sorted_indices, o.global_scale);
+        x.gather_qmm(q, None, Some(rhs), o)
+    }
+
+    #[test]
+    fn op_names() {
+        for name in [
+            "view",
+            "to_fp8",
+            "from_fp8",
+            "quantize",
+            "quantized_matmul",
+            "gather_qmm",
+        ] {
+            assert!(ops::__op_names().contains(&name), "{name}");
+        }
+    }
+
+    fn nn(l: &nuvec_nn::Linear, e: &nuvec_nn::Embedding) {
+        use nuvec_nn::{QuantizedEmbedding, QuantizedLinear};
+        let q = QuantizedLinear::from_linear_with(l, Quant::new(QuantMode::Nvfp4));
+        let _: (&Option<Array>, Quant) = (&q.biases, q.quant);
+        let _: Quantized = q.quantized();
+        let _: Array = q.dequantized_weight(DType::BF16);
+        let qe = QuantizedEmbedding::from_embedding_with(e, QuantMode::Mxfp8);
+        let _: (&Option<Array>, Quant, Quantized) = (&qe.biases, qe.quant, qe.quantized());
+    }
+
+    fn lm(q: &nuvec_lm::Quantization) {
+        let _: Quant = q.default;
+        let _: &Vec<nuvec_lm::LayerQuant> = &q.layers;
+        let l: Option<&nuvec_lm::LayerQuant> = q.for_layer("model.layers.0.mlp.gate");
+        let _ = l.map(|l| (&l.path, l.quant, l.global_scale));
+    }
+    const _: fn(&nuvec_lm::Config) -> Option<&nuvec_lm::Quantization> = |c| c.quantization.as_ref();
+    const _: fn(&Array) -> Array = nuvec_lm::quant::mxfp4_from_hf_blocks;
+    type Weights = std::collections::BTreeMap<String, Array>;
+    const _: fn(Weights, nuvec_lm::PackedFormat, Quant) -> nuvec::Result<Weights> =
+        nuvec_lm::quant::convert_packed;
+    fn packed(q: &nuvec_lm::Quantization) -> u8 {
+        match q.packed {
+            Some(nuvec_lm::PackedFormat::Awq) => 1,
+            Some(nuvec_lm::PackedFormat::Gptq { v1 }) => 2 + u8::from(v1),
+            Some(_) => 4,
+            None => 0,
+        }
+    }
+}
+
+/// Spec 056 (gpt-oss and Gemma 4): windows and sinks in the attention options (paged too),
+/// the blocked head-512 plan, `norm_rope_kv`, `power`, RoPE scalings, the activations and
+/// the model settings.
+mod spec_056 {
+    use nuvec::fast::{self, AttentionKernel, AttentionOptions, Rotation};
+    use nuvec::{Array, ops};
+    use nuvec_nn::{Llama3, LongRope, Rope, RopeScaling, Yarn};
+
+    fn attention(q: &Array, k: &Array, sinks: &Array, tables: &Array, lengths: &Array) {
+        let o = AttentionOptions::causal().window(128).sinks(Some(sinks));
+        let _: Option<i32> = o.window;
+        let _: Array = fast::scaled_dot_product_attention(q, k, k, 0.125, &o);
+        let _: Array = fast::paged_attention(q, k, k, tables, lengths, 0.125, &o);
+    }
+
+    fn kernel(k: AttentionKernel) -> i32 {
+        match k {
+            AttentionKernel::BlockedD512 { rows } => rows,
+            _ => 0,
+        }
+    }
+
+    fn norm_rope_kv(x: &Array, w: &Array, r: Rotation<'_>) -> (Array, Array) {
+        fast::norm_rope_kv(x, Some((w, 1e-6)), 1e-6, r, 0, None)
+    }
+
+    const _: fn(&Array, &Array) -> Array = |a, b| a.power(b);
+    const _: fn(&Array, &Array) -> Array = |a, b| ops::power(a, b);
+    const _: fn(&Array, &Array, f32, f32) -> Array = nuvec_nn::swiglu_oai;
+    const _: fn(&Array, &Array) -> Array = nuvec_nn::geglu;
+    const _: fn(&Array) -> Array = nuvec_nn::gelu_approx;
+    const _: fn(&Array, f32) -> Array = nuvec_nn::logit_softcap;
+
+    fn rope() {
+        let scalings = [
+            RopeScaling::None,
+            RopeScaling::Linear { factor: 2.0 },
+            RopeScaling::Llama3(Llama3::default()),
+            RopeScaling::Yarn(Yarn::default()),
+            RopeScaling::LongRope(LongRope::default()),
+            RopeScaling::Proportional {
+                rotated_dims: 128,
+                factor: 1.0,
+            },
+        ];
+        for s in &scalings {
+            let _: Option<Array> = s.frequencies(512, 1e6);
+            let _: f32 = s.mscale();
+            let r = Rope::scaled(512, 1e6, s);
+            let _: (f32, Rotation<'_>) = (r.mscale(), r.rotation());
+        }
+    }
+
+    fn lm(c: &nuvec_lm::Config) {
+        let _: &Vec<Option<usize>> = &c.layer_windows;
+        let _: bool = c.attention_sinks;
+        if let Some(g) = &c.gemma4 {
+            let _: &nuvec_lm::Gemma4 = g;
+            let _ = (
+                g.global_head_dim,
+                g.global_kv_heads,
+                g.k_eq_v,
+                g.kv_shared_layers,
+            );
+            let _ = (g.double_wide_mlp, g.per_layer_input, g.per_layer_vocab);
+            let _: (Option<f32>, &(f32, RopeScaling), &(f32, RopeScaling)) =
+                (g.final_logit_softcap, &g.sliding_rope, &g.full_rope);
+            let _: usize = g.first_shared(c.num_hidden_layers);
+            let _ = g.moe.as_ref().map(|m| m.experts_per_token);
+        }
+        let _ = nuvec_lm::Activation::GeGlu;
+        let _ = nuvec_lm::Activation::SwiGluOai {
+            alpha: 1.702,
+            limit: 7.0,
+        };
+    }
+
+    #[test]
+    fn op_names() {
+        assert!(ops::__op_names().contains(&"power"));
+    }
+}
+
 /// The engine surface: every `nuvec::` item a runtime built on nuvec (such as an inference
 /// server's tensor adapter) uses, and the engine items (attention plan, memory statistics, checkpoint footprint, snapshots, the
 /// row-independence constant). Changing any of these is a semver event for runtimes.
@@ -766,15 +1062,25 @@ mod engine_surface {
     const JOIN: [fn(&[Array]) -> Array; 2] = [|xs| ops::concatenate(xs, 0), |xs| ops::stack(xs, 0)];
     const CONV: M = |x, w| x.conv1d(w, 1, 0, 1, 4);
     // Quantized and gathered (mixture-of-experts) products.
-    const QUANT: fn(&Array) -> (Array, Array, Array) = |w| w.quantize(64, 4);
-    const DEQUANT: fn(&Array, &Array, &Array) -> Array = |w, s, b| w.dequantize(s, b, 64, 4);
-    const QMM: fn(&Array, &Array, &Array, &Array) -> Array =
-        |x, w, s, b| x.quantized_matmul(w, s, b, true, 64, 4);
-    const GQMM: fn(&Array, &Array, &Array, &Array, &Array) -> Array =
-        |x, w, s, b, i| ops::gather_qmm(x, w, s, b, None, Some(i), true, 64, 4, true);
+    const QUANT: fn(&Array) -> nuvec::Quantized = |w| w.quantize(nuvec::Quant::affine(64, 4));
+    const DEQUANT: fn(&nuvec::Quantized) -> Array = |q| q.dequantize(None);
+    const QMM: fn(&Array, &nuvec::Quantized) -> Array = |x, q| x.quantized_matmul(q, true);
+    const GQMM: fn(&Array, &nuvec::Quantized, &Array) -> Array = |x, q, i| {
+        ops::gather_qmm(
+            x,
+            q,
+            None,
+            Some(i),
+            nuvec::GatherQmm::default().sorted_indices(true),
+        )
+    };
     const GMM: fn(&Array, &Array, &Array) -> Array =
         |x, w, i| ops::gather_mm(x, w, None, Some(i), true);
     const ROWS: usize = nuvec::ROW_INDEPENDENT_ROWS;
+    // Row-exact products (D-103) and the grouped-gather rule.
+    const ROW_EXACT: fn(fn() -> Array) -> Array = |f| nuvec::with_row_exact(f);
+    const IS_ROW_EXACT: fn() -> bool = nuvec::row_exact;
+    const GROUPS: fn(usize, usize) -> bool = nuvec::GatherQmm::groups;
     // Fused kernels and attention.
     const _: fn(&Array, &Array, &Array, f32, &AttentionOptions<'_>) -> Array =
         fast::scaled_dot_product_attention;
@@ -873,11 +1179,12 @@ mod engine_surface {
         d.clear_cache();
         d.reset_peak();
         let info = d.info();
-        let _: (&str, Option<u32>, Option<char>, u64) = (
+        let _: (&str, Option<u32>, Option<char>, u64, u64) = (
             &info.name,
             info.generation,
             info.class,
             info.recommended_working_set,
+            info.physical_memory,
         );
         Ok(())
     }
@@ -889,6 +1196,14 @@ mod engine_surface {
     const _: fn(&str, &[(&str, &Array)], &[(&str, &str)]) -> Result<()> =
         |p, t, m| io::save_safetensors(p, t, m);
     const _: fn(&str) -> Result<Footprint> = |p| io::safetensors_footprint(p);
+    const _: fn(&str, fn(&str) -> bool) -> Result<Footprint> =
+        |p, keep| io::safetensors_footprint_filtered(p, keep);
+    // Storage identity (aliasing checks) and floor division (Python's `//`).
+    const _: fn(&Array) -> Option<usize> = Array::buffer_id;
+    const _: fn(&Array, &Array) -> Array = |a, b| a.floor_divide(b);
+    const _: fn(&Array, &Array) -> Array = |a, b| nuvec::ops::floor_divide(a, b);
+    const _: fn(&Array, &Array) -> Array = |a, b| a.power(b);
+    const _: fn(&Array, &Array) -> Array = |a, b| nuvec::ops::power(a, b);
     const _: fn(&str, &[(&str, &Array)], &[(&str, &str)]) -> SaveHandle =
         |p, t, m| io::save_safetensors_async(p, t, m);
     const _: fn(SaveHandle) -> Result<()> = SaveHandle::wait;

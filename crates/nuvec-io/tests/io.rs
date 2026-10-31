@@ -181,7 +181,7 @@ fn malformed_files_are_rejected() {
             .concat()
         },
         {
-            let h = b"{\"x\":{\"dtype\":\"F8_E4M3\",\"shape\":[1],\"data_offsets\":[0,1]}}";
+            let h = b"{\"x\":{\"dtype\":\"F4\",\"shape\":[1],\"data_offsets\":[0,1]}}";
             [
                 (h.len() as u64).to_le_bytes().to_vec(),
                 h.to_vec(),
@@ -215,6 +215,36 @@ fn malformed_files_are_rejected() {
     std::fs::write(&path, b"\x93NUMPY\x01\x00\x10\x00{'descr': '>f4'").unwrap();
     assert!(load_npy(&path).is_err());
     assert!(load_safetensors(temp("missing.safetensors")).is_err());
+    std::fs::remove_file(path).ok();
+}
+
+/// fp8 tensors load as bytes, as MLX reads them (`F8_E5M2` is refused, as in MLX), also at a
+/// misaligned offset.
+#[test]
+fn fp8_tensors_load_as_bytes() {
+    let h = b"{\"q\":{\"dtype\":\"F8_E4M3\",\"shape\":[2,2],\"data_offsets\":[0,4]},\"s\":{\"dtype\":\"F8_E8M0\",\"shape\":[3],\"data_offsets\":[4,7]},\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[7,11]}}";
+    let mut bytes = (h.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(h);
+    bytes.extend([56, 126, 197, 0, 127, 125, 255]);
+    bytes.extend(2.5f32.to_le_bytes());
+    let path = temp("fp8.safetensors");
+    std::fs::write(&path, &bytes).unwrap();
+    let st = load_safetensors(&path).unwrap();
+    let (q, s) = (&st.tensors["q"], &st.tensors["s"]);
+    assert_eq!((q.dtype(), q.shape()), (DType::U8, &[2, 2][..]));
+    assert_eq!(q.to_vec::<u8>().unwrap(), [56, 126, 197, 0]);
+    assert_eq!(s.to_vec::<u8>().unwrap(), [127, 125, 255]);
+    assert_eq!(
+        q.from_fp8(DType::F32).to_vec::<f32>().unwrap(),
+        [1.0, 448.0, -3.25, 0.0]
+    );
+    assert_eq!(st.tensors["w"].to_vec::<f32>().unwrap(), [2.5]);
+    let h = b"{\"x\":{\"dtype\":\"F8_E5M2\",\"shape\":[1],\"data_offsets\":[0,1]}}";
+    let mut bytes = (h.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(h);
+    bytes.push(0);
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(load_safetensors(&path).is_err(), "F8_E5M2");
     std::fs::remove_file(path).ok();
 }
 

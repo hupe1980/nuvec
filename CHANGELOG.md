@@ -6,6 +6,200 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-25
+
+### Added
+
+- Floating-point quantization modes MXFP4, MXFP8 and NVFP4 (MLX's `mode`), selected with
+  `QuantMode` / `Quant`: codes and scales equal MLX's Metal quantizer's on both devices,
+  products and gathers equal MLX's on the GPU, and up to `ROW_INDEPENDENT_ROWS` rows keep
+  the bits of their one-row products. NVFP4 experts take a per-expert global scale
+  (`GatherQmm::global_scale`).
+- Neural Accelerator (NAX) kernels for M5-class GPUs: dense GEMM and affine 2/4/8-bit
+  quantized products on Metal 4 TensorOps, in a second kernel library for macOS 26.2 (the
+  baseline keeps macOS 15). `NUVEC_NAX=auto|on|off`, `nuvec::gpu::Device::nax()`; `auto`
+  stays off until an M5 measurement (`just nax-report`), `on` forces them on any GPU with
+  TensorOps. Thin products (16- and 32-row or column tiles), split-K products and sorted
+  mixture-of-experts gathers have NAX kernels too.
+- Speculative decoding v2 (nuvec-lm): `MtpDrafter` with the model's multi-token-prediction
+  head (Qwen 3.5–3.8; `Model::attach_mtp` loads it from `scripts/extract_mtp.py`'s file and
+  quantizes it like the body; checkpoints that keep `mtp.*` load it directly),
+  `SuffixDecoding`, `DraftPolicy::Auto` (measured draft length per drafter and model, with a
+  kill switch) and sampled verification (temperature, top-p, min-p, top-k). Greedy output
+  stays bit-identical to plain decoding. `Model::{forward_hidden, logits, mtp_forward,
+  new_mtp_cache}`, `verify_rows`.
+- `nuvec::speculative::{accept_greedy, accept_sampled}`: acceptance on the device, one
+  `[3]` read per verification; `fast::gated_delta_steps_with` (states rounded to a storage
+  dtype per step).
+- `nuvec::distributed` (MLX's `mx.distributed`): `Group`, `all_sum`, `all_max`, `all_min`,
+  `all_gather`, `send`, `recv`, `recv_like` and `sum_gradients` as lazy operations with MLX's
+  gradient rules, and the new `nuvec-distributed` crate with MLX's TCP ring (`init` reads
+  `MLX_HOSTFILE` and `MLX_RANK`). nuvec-nn: `sharded::{AllToShardedLinear,
+  ShardedToAllLinear}` for tensor parallelism. `just bench-distributed` compares with MLX's
+  ring.
+- `Squeeze` and `ExpandDims` primitives (MLX's): `squeeze`, `expand_dims` and reductions
+  without `keepdims` record them, so their shapes follow the input's.
+- Shapeless compile (MLX's `shapeless=True`): `compile::Options::shapeless(true)` traces once
+  per input structure, dtypes and ranks and replays for any shapes, bit for bit the
+  uncompiled function; operations that fix a shape fail the trace with an error naming them.
+  `compile::compile_flat_with` takes options.
+- `view` (bit reinterpretation, MLX's `mx.view`), `to_fp8` and `from_fp8` (E4M3 bytes).
+- nuvec-nn: quantized layers in any mode (`from_linear_with(&l, quant)`,
+  `from_embedding_with`, `quantized()`, `dequantized_weight(dtype)`).
+- nuvec-lm: MXFP4, MXFP8 and NVFP4 checkpoints (mlx-lm's per-layer `mode`, modes recognised
+  from the tensors, expert global scales); AutoAWQ and GPTQ checkpoints (4-bit, and 8-bit
+  GPTQ), converted at load to MLX's affine layout (`PackedFormat`,
+  `quant::convert_packed`); `quant::mxfp4_from_hf_blocks` for gpt-oss's blocks. Other Hugging
+  Face `quantization_config` formats are refused with a message.
+- nuvec-io: `F8_E4M3` and `F8_E8M0` tensors load as `uint8`.
+- `gpu::Device::kernel_names`.
+- `floor_divide` (MLX's, Python's `//`), `power` (MLX's, `**`), `Array::buffer_id` (which
+  arrays share storage), `io::safetensors_footprint_filtered` (the footprint of a filtered
+  load), and `DeviceInfo::physical_memory`.
+- Sliding-window attention: `AttentionOptions::window(W)` (causal only) skips keys outside
+  the window in the vector and tiled kernels and in every composition block;
+  `paged_attention` takes the same options (window, sinks) and head size 512.
+- Head-512 causal prefill in half precision runs MLX's blocked path
+  (`AttentionKernel::BlockedD512`): 256 queries per block over only the keys they see, the
+  mask applied inside the softmax; bit for bit MLX's result.
+- `fast::norm_rope_kv`: for K = V attention (as Gemma 4's), normalised and rotated keys and
+  normalised values from one projection in one call.
+- nuvec-nn: `RopeScaling` (linear, Llama 3, YaRN, LongRoPE, proportional) with
+  `Rope::scaled`, `Rope::mscale` and `Rope::rotation`; `swiglu_oai`, `geglu`,
+  `logit_softcap` (compiled, as mlx-lm's).
+- nuvec-lm: gpt-oss (sliding and full layers, sinks, YaRN, biased router and experts,
+  MXFP4 checkpoints and Hugging Face's MXFP4 originals) and Gemma 4 (`gemma4`,
+  `gemma4_text`; per-kind head sizes and RoPE, per-layer inputs, KV-shared layers, K = V,
+  the experts branch, the logit soft cap; vision and audio weights skipped). Sliding-window
+  layers' caches keep their window plus 256 positions (trimmable within them).
+- nuvec-lm tokenizers: o200k's split pattern (gpt-oss, GPT-4o) and SentencePiece-style BPE
+  with byte fallback (Gemma, Llama 2, Mistral v0.1–v0.3), equal to Hugging Face
+  `tokenizers`' ids and decodes.
+
+### Changed
+
+- Attention with head size 192 or 256 composes (product, softmax, product) as MLX's
+  fallback does up to 8 GiB of scores (was 4 GiB), and runs the tiled kernel beyond, where
+  the scores no longer fit beside a large model. A 2,048-token chunk over 64K keys takes
+  400 ms (was 416; MLX 399), over 131K keys 813 ms (was 841; MLX 809), with MLX's peak
+  memory. Qwen3.6-35B-A3B's time to first
+  token at 64K tokens: 115 s (was 127).
+- Qwen3 and Qwen 3.5/3.6 mixture-of-experts layers weight their experts as mlx-lm's blocks
+  do: the router's precise softmax and the weighted sum in the activations' type, the top
+  experts chosen by probability. Before, the sum was a float32 product over float32 copies
+  of the expert outputs (more memory, and other low bits than mlx-lm's).
+- Prompts prefilled together (`[B, L, K]` quantized products) split K only for one batch
+  item, as MLX; under `with_row_exact` each item is partitioned as alone. Qwen3-0.6B serves
+  8 requests at mlx-lm's speed (was 0.93×).
+
+- `compile` builds its fused kernels as `mx.compile` builds its: constant scalars are
+  literals in the kernel, and Metal's default math functions apply, which only `power`
+  uses. Fused `power` can differ from the uncompiled result in the low bits, as in MLX.
+  Compiled `geglu` (Gemma's gate) at 1M float32 elements runs 2× faster, on par with MLX.
+
+- **Breaking:** quantized and gathered (mixture-of-experts) products route as MLX's: from
+  2 rows they take MLX's multi-vector `qmv_wide` (now ported for affine weights too) and
+  MLX's matrix-vector and grouped-gather limits, which give a row other low bits than its
+  one-row product. `nuvec::with_row_exact` restores per-row products up to
+  `ROW_INDEPENDENT_ROWS` rows; speculative verification runs in it (still lossless), and
+  `Batcher::batch_invariant(true)` serves each request its solo tokens. Batched serving of
+  Gemma 4 26B-A4B and gpt-oss-20b is now on par with mlx-lm (was 0.82–0.98×).
+- **Breaking (nuvec-lm):** `Drafter::draft` takes the model and returns a `Draft` (tokens as
+  an `Array`, maybe on the device; `Draft::new(tokens)`, its length from the shape), with
+  `observe`, `needs_hidden` and `auto`; `Drafter` is implemented for `&mut D` and `Box<D>`;
+  `SuffixDecoding`'s suffix length is set with `with_min_match` (the index is keyed by it);
+  `speculative_generate` takes a `DraftPolicy` instead of a draft length; `PromptLookup`'s
+  host draft is `lookup`.
+- **Breaking:** quantization takes a `Quant` and returns a `Quantized` (weight, scales,
+  `Option` biases, quant): `w.quantize(Quant::affine(64, 4))`, `q.dequantize(dtype)`,
+  `x.quantized_matmul(&q, transpose)`, `x.gather_qmm(&q, lhs, rhs, GatherQmm)` replace the
+  `(group_size, bits)` arguments and the separate scales and biases.
+- **Breaking:** nuvec-nn's `QuantizedLinear` and `QuantizedEmbedding` hold `biases:
+  Option<Array>` and `quant: Quant` instead of `group_size` and `bits`.
+- **Breaking:** nuvec-lm's `Quantization` is `{ default: Quant, layers: Vec<LayerQuant> }`,
+  and the model builder's callback returns `Option<LayerQuant>`.
+- **Breaking:** `gpu::DeviceInfo` is `#[non_exhaustive]`.
+- Updates (`slice_update`, `at(..).set`) on the CPU write into a base nothing else holds,
+  as MLX's CPU does, instead of copying it.
+- `softmax` of float16 and bfloat16 computes in float32 and rounds once on every path (the
+  CPU and axes other than the last too), as MLX's `precise=True`; the fused kernel already
+  did.
+- Untransposed quantized products with `K` from 1024 run MLX's `qvm_split_k` (affine too),
+  so their results equal MLX's; sorted gathers find each expert's rows in one dispatch.
+- **Breaking:** `paged_attention` takes `&AttentionOptions` (window, sinks).
+- **Breaking:** nuvec-lm's `config::RopeScaling` is nuvec-nn's.
+- Affine dequantize on the GPU computes `code · scale + bias` as one fused multiply-add in
+  float32, as MLX's Metal kernel (equal to MLX's GPU bit for bit; the CPU keeps MLX's CPU
+  rounding).
+- `gelu_approx` cubes with `power`, as MLX's `x**3` (equal to MLX bit for bit in half
+  precision).
+
+### Fixed
+
+- Tensors read from misaligned checkpoints (mlx-community's) kept their file offsets in one
+  buffer; a quantized product ran up to 4% slower depending on where its weights fell. They
+  now start at multiples of 256 bytes: Gemma 4 E4B decode 0.99× → 1.00× mlx-lm.
+- nuvec-lm never released the GPU's cached buffers while generating, so a prefill chunk's
+  scores stayed cached beside the next chunk's. It now clears the cache where mlx-lm does:
+  after each prefill chunk, after the first and every 256th token, and every 512 batch
+  steps.
+- Operations on arrays of 2^32 elements or more ran on the CPU (40 s instead of 0.8 for
+  attention over 8 GiB of scores) and were never written in place. Element-wise operations,
+  row softmax and log-sum-exp, and matrix products on the tiled kernel now run on the GPU
+  with 64-bit indexing, as MLX's; fused kernels, reductions, gathers and updates of that
+  size still fall back to the CPU.
+- A batch-invariant `Batcher` now gives each request its solo tokens on Gemma 4
+  26B-A4B too. Grouped prefill chose quantized and mixture-of-experts kernels by the
+  group's size, and head-512 decode ran a different attention kernel than solo decoding
+  below 1,024 keys.
+- Sorted mixture-of-experts gathers indexed their operands as dense arrays: a weight sliced
+  along an axis, a broadcast expert axis or a K-slice of a wider activation gave wrong
+  results. They are made dense first.
+- A NAX library or kernel that failed to load failed every NAX product from then on; any NAX
+  failure now turns NAX off and the product runs on the existing kernels.
+- Attention with no queries failed and with no keys (causal) panicked; both give their
+  result (empty, or zeros).
+- `compile` merged identical collectives (two equal `recv`s received one message) and
+  treated `stop_gradient` as an identity.
+- `checkpoint_flat` drew new random numbers when recomputing (the tree form did not).
+- A custom batching rule returning too few outputs, or a wrong batch axis, gave wrong
+  shapes; it is an error naming the primitive.
+- `distributed`: after a failed transfer the ring read misaligned bytes; it now fails every
+  later operation with the first error. A mismatched `recv` drains the payload.
+  `NUVEC_DISTRIBUTED_TIMEOUT` rejects values that are not positive numbers (it panicked).
+- nuvec-lm: `attach_mtp` left a half-built head when loading failed; `load_adapters`
+  refused mlx-lm's `"num_layers": -1`; `linear_to_lora_layers` without keys failed on
+  mixture-of-experts models and could leave a model partly converted; SuffixDecoding's
+  eviction scanned the whole store; model-free drafters drafted twice per token;
+  `resolve` ignored `HF_HUB_CACHE`; qwen2, gpt-oss and Qwen 3.5 configs without
+  `rope_theta` used another default than mlx-lm.
+- nuvec-nn: `MultiOptimizer` panicked on an optimizer returning too few parameters.
+- The allocator evicted cached buffers that GPU work still used, and fence waits were
+  deduplicated by address (a reused address could skip a wait).
+- GPU work could reuse memory of the command buffer committed just before it, which made
+  the new command buffer wait for that one instead of overlapping it: decode attention ran
+  at 1.15–1.2× MLX's time in bursts (D-058's open gap). Buffers up to 64 MiB of the
+  latest committed command buffer are no longer handed to new GPU work; idle memory is
+  preferred. Head-size-512 decode in float32 (8 MiB partials) went from 1.05× to 0.97×
+  MLX's time; a 28K-token prefill keeps its peak.
+- Updates and element-wise operations sometimes copied an input they could have written in
+  place (donation) when the GPU work that produced it completed at the same moment: the
+  completion handler's brief handle, or the evaluation's stale record of the input, hid
+  that nothing else held it.
+- Attention kernels compiled their sliding-window code into every model's kernels (a
+  function constant in the key loops), which cost about 8% where no window is used. The
+  window is now a template parameter: windowless kernels compile to MLX's code
+  (head-size-512 decode in float16 from 1.06× to 0.98–1.00× MLX's time).
+- Sliding-window decode attention depended on where the window's keys sat in the cache
+  (keys were assigned to SIMD groups by absolute position), so the `Batcher`'s paged cache
+  and `generate`'s compacted cache rounded differently and gpt-oss's batched tokens drifted
+  from solo decoding after tens of tokens. The vector and paged kernels now count a
+  window's keys from its first key: each row equals MLX's call over exactly those keys.
+- `softmax` on the CPU and the attention composition (with sinks too) computed float64 in
+  float32.
+- Kernels compiled at runtime (`NUVEC_METALLIB=off`) used Metal's fast math functions; they
+  now use the precise ones, as the precompiled library.
+
 ## [0.4.1] - 2026-10-24
 
 ### Added
@@ -246,7 +440,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/hupe1980/nuvec/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/hupe1980/nuvec/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/hupe1980/nuvec/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hupe1980/nuvec/compare/v0.2.0...v0.3.0

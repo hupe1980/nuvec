@@ -99,12 +99,22 @@ def scalar(spec: str) -> bool | int | float | complex:
     return {"bool": lambda v: v == "True", "int": int, "float": float}[kind](value)
 
 
+def qparams(p: dict[str, str]) -> dict[str, object]:
+    """MLX's quantization keywords from a case's parameters (mode defaults when absent)."""
+    out: dict[str, object] = {"mode": p.get("mode", "affine")}
+    for key in ("group_size", "bits"):
+        if key in p:
+            out[key] = int(p[key])
+    return out
+
+
 def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
     if xs:
         xs = [pre_view(xs[0], p.get("pre"))] + xs[1:]
     binary = {
         "add": mx.add, "subtract": mx.subtract, "multiply": mx.multiply, "divide": mx.divide,
-        "maximum": mx.maximum, "minimum": mx.minimum, "logaddexp": mx.logaddexp, "equal": mx.equal,
+        "maximum": mx.maximum, "minimum": mx.minimum, "logaddexp": mx.logaddexp,
+        "floor_divide": mx.floor_divide, "power": mx.power, "equal": mx.equal,
         "not_equal": mx.not_equal, "less": mx.less, "less_equal": mx.less_equal,
         "greater": mx.greater, "greater_equal": mx.greater_equal, "matmul": mx.matmul,
     }
@@ -153,14 +163,18 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         return mx.fast.scaled_dot_product_attention(xs[0], xs[1], xs[2], scale=float(p["scale"]),
                                                     mask=mask, sinks=sinks)
     if op == "quantize":
-        return list(mx.quantize(xs[0], group_size=int(p["group_size"]), bits=int(p["bits"])))
+        return list(mx.quantize(xs[0], **qparams(p)))
     if op == "dequantize":
-        return mx.dequantize(xs[0], xs[1], xs[2], group_size=int(p["group_size"]),
-                             bits=int(p["bits"]))
+        biases = xs[2] if len(xs) > 2 else None
+        dtype = DTYPES[int(p["dtype"])][1] if "dtype" in p else None
+        return mx.dequantize(xs[0], xs[1], biases, dtype=dtype, **qparams(p))
     if op in ("quantized_matmul", "quantized_matmul_xsb"):
-        x, w, s, b = xs if op == "quantized_matmul" else (xs[0], xs[3], xs[1], xs[2])
-        return mx.quantized_matmul(x, w, s, b, transpose=p["transpose"] == "1",
-                                   group_size=int(p["group_size"]), bits=int(p["bits"]))
+        if op == "quantized_matmul":
+            x, w, s = xs[:3]
+            b = xs[3] if len(xs) > 3 else None
+        else:
+            x, w, s, b = xs[0], xs[3], xs[1], xs[2]
+        return mx.quantized_matmul(x, w, s, b, transpose=p["transpose"] == "1", **qparams(p))
     if op in ("logsumexp", "softmax"):
         axes = nums(p.get("axes", "")) or None
         if op == "softmax":
@@ -220,6 +234,20 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         rhs = next(rest) if "r" in p["idx"] else None
         b = mx.swapaxes(xs[1], -1, -2) if p.get("tb") == "1" else xs[1]
         return mx.gather_mm(xs[0], b, lhs, rhs, sorted_indices=p["sorted"] == "1")
+    if op == "gather_qmm":
+        # Inputs: x, w, scales, a global scale if `gs`, then the indices that `idx` names.
+        rest = iter(xs[3:])
+        gs = next(rest) if p.get("gs") == "1" else None
+        lhs = next(rest) if "l" in p["idx"] else None
+        rhs = next(rest) if "r" in p["idx"] else None
+        return mx.gather_qmm(xs[0], xs[1], xs[2], None, lhs, rhs, transpose=p["transpose"] == "1",
+                             global_scale=gs, sorted_indices=p["sorted"] == "1", **qparams(p))
+    if op == "to_fp8":
+        return mx.to_fp8(xs[0])
+    if op == "from_fp8":
+        return mx.from_fp8(xs[0], DTYPES[int(p["dtype"])][1])
+    if op == "view":
+        return xs[0].view(DTYPES[int(p["dtype"])][1])
     if op == "repeat":
         axis = int(p["axis"]) if p.get("axis", "") != "" else None
         return mx.repeat(xs[0], int(p["repeats"]), axis)
@@ -1012,6 +1040,280 @@ for dt in ["float32", "int32"]:
                 api_case("reduce", f"mx.{fn}(x, axis=-1, reverse={rev}, inclusive={inc})", [x])
         api_case("reduce", f"mx.{fn}(x, reverse=True)", [x], "t")
 
+# ── GPU cases: floating-point quantization ──────────────────────────────────
+#
+# MLX's Metal kernels are the reference for the microscaling modes (its CPU writes +0 where
+# Metal writes -0, and rounds some scales differently), so these cases run on MLX's GPU
+# stream and nuvec compares them bit for bit on both of its devices.
+
+OUT_GPU = OUT.with_name("mlx_gpu.bin")
+gpu_cases: list[tuple[str, str, list[mx.array], list[mx.array]]] = []
+
+
+def case_gpu(name: str, op: str, inputs: list[mx.array], **params: object) -> None:
+    p = {k: str(v) for k, v in params.items()}
+    spelled = op + "".join(f"|{k}={v}" for k, v in p.items())
+    with mx.stream(mx.gpu):
+        out = apply(op, p, list(inputs))
+        outs = out if isinstance(out, list) else [out]
+        mx.eval(outs)
+    gpu_cases.append((name, spelled, list(inputs), outs))
+
+
+FP_MODES = {"mxfp4": 32, "mxfp8": 32, "nvfp4": 16}
+
+
+def fp_edges(mode: str) -> np.ndarray:
+    """Rows of 64 values (whole groups in every mode) that reach each rounding branch."""
+    big = 448.0 if mode == "mxfp8" else 6.0
+    # With a group maximum of `big`, the scale is exactly 1 and values encode as written.
+    if mode == "mxfp8":
+        ties = [1.0625, 1.1875, 0.0029296875, 0.001953125, 3.25, 240.0, 464.0 / 2, 13.0]
+    else:
+        ties = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 0.1]
+    tied = np.array([big] + ties + [-t for t in ties] + [0.0] * (64 - 1 - 2 * len(ties)))
+    rows = [
+        np.zeros(64),                                    # all-zero groups: scale code 0
+        -np.abs(rng.normal(size=64)) - 0.01,             # one-signed (negative) groups
+        tied,                                            # exact ties at scale 1
+        np.concatenate([np.full(32, 1e30), rng.normal(size=32)]),  # beyond f16's range
+        np.concatenate([[np.nan], rng.normal(size=31), [np.inf], rng.normal(size=31)]),
+        np.concatenate([[-np.inf], rng.normal(size=63)]),
+        np.concatenate([np.array([0xFFC00000], dtype=np.uint32).view(np.float32),  # -NaN
+                        rng.normal(size=63)]),
+        rng.normal(size=64) * 1e-40,                     # f32 subnormals
+        np.where(np.arange(64) % 2 == 0, -0.0, 1e-3),     # -0 beside tiny values
+        rng.normal(size=64) * 1e5,
+        rng.normal(size=64) * 1e-5,
+    ]
+    return np.stack(rows).astype(np.float32)
+
+
+for mode, gs in FP_MODES.items():
+    for dt in ["float32", "float16", "bfloat16"]:
+        for shape in [(3, 2 * gs), (5, 7 * gs), (2, 3, 4 * gs)]:
+            name = f"fp-quantize-{mode}-{dt}-{'x'.join(map(str, shape))}"
+            case_gpu(name, "quantize", [make(dt, shape)], mode=mode)
+        case_gpu(f"fp-quantize-edges-{mode}-{dt}", "quantize",
+                 [mx.array(fp_edges(mode)).astype(MX[dt])], mode=mode)
+        # Strided inputs: a transposed matrix, and the last axis reversed.
+        case_gpu(f"fp-quantize-t-{mode}-{dt}", "quantize", [make(dt, (4 * gs, 3))], mode=mode,
+                 pre="t")
+        case_gpu(f"fp-quantize-r-{mode}-{dt}", "quantize", [make(dt, (3, 4 * gs))], mode=mode,
+                 pre="r")
+        for out in [None, "float16", "float32", "bfloat16"]:
+            with mx.stream(mx.gpu):
+                wq, scales = mx.quantize(make(dt, (4, 4 * gs)), mode=mode)
+                mx.eval(wq, scales)
+            extra = {} if out is None else {"dtype": CODE[out]}
+            case_gpu(f"fp-dequantize-{mode}-{dt}-{out or 'default'}", "dequantize", [wq, scales],
+                     mode=mode, **extra)
+        with mx.stream(mx.gpu):
+            wq, scales = mx.quantize(mx.array(fp_edges(mode)).astype(MX[dt]), mode=mode)
+            mx.eval(wq, scales)
+        case_gpu(f"fp-dequantize-edges-{mode}-{dt}", "dequantize", [wq, scales], mode=mode,
+                 dtype=CODE["float32"])
+
+# Products on MLX's paths (where nuvec runs MLX's kernel with MLX's dispatch): one row
+# (qmv_fast, qmv at K = 2880, qmv_quad, partial rows), qmv_wide between R = 8 and MLX's
+# vector limit (13 on the M4 Pro at these sizes), qmv_quad above R, split-K, batched qmm_t
+# and qmv, untransposed qvm (fewer than 4 rows) and qmm_n, a 1-D x.
+FP_PRODUCTS = [
+    ("qmv-fast", (1, 4096), (32, 4096), True),
+    ("qmv-k2880", (1, 2880), (40, 2880), True),
+    ("qmv-quad128", (1, 128), (40, 128), True),
+    ("qmv-quad64", (1, 64), (24, 64), True),
+    ("qmv-partial", (1, 4096), (30, 4096), True),
+    ("qmv-wide", (11, 1024), (40, 1024), True),
+    ("qmv-wide-k2880", (10, 2880), (24, 2880), True),
+    ("quad-rows", (12, 128), (64, 128), True),
+    ("splitk", (40, 512), (64, 512), True),
+    ("splitk-k2880", (16, 2880), (32, 2880), True),
+    ("qmm-t-batched", (2, 20, 512), (2, 24, 512), True),
+    ("qmv-batched", (2, 1, 512), (2, 24, 512), True),
+    ("qvm", (1, 64), (64, 128), False),
+    ("qvm-3", (3, 96), (96, 64), False),
+    ("qmm-n", (32, 64), (64, 96), False),
+    ("vector", (512,), (24, 512), True),
+]
+for mode, gs in FP_MODES.items():
+    for dt in ["float32", "float16", "bfloat16"]:
+        for name, xs, ws, t in FP_PRODUCTS:
+            if not t and ws[-1] % gs:
+                continue
+            with mx.stream(mx.gpu):
+                wq, scales = mx.quantize(make(dt, ws) / 4, mode=mode)
+                mx.eval(wq, scales)
+            case_gpu(f"fp-qmm-{mode}-{dt}-{name}", "quantized_matmul", [make(dt, xs) / 4, wq, scales],
+                     mode=mode, transpose=int(t))
+
+# Gathers on MLX's paths: per-row gather_qmv(_fast) (unsorted, or sorted below MLX's grouping
+# rule), the grouped gather_qmm_rhs (more than 64 sorted rows, 4 or more per expert),
+# gather_qmm_t from the vector limit on, untransposed gather_qvm (fewer than 4 rows) and
+# gather_qmm_n (more than 8 rows); nvfp4 also with a global scale per expert. gpt-oss's
+# inner size (K = 2880, not fast-aligned) in bfloat16 only, with fewer experts and outputs
+# than the model, to keep the file small.
+FP_GATHERS = [
+    ("qmv-1", 8, 32, 512, 1, 1, False, True),
+    ("qmv-2", 8, 32, 512, 1, 2, False, True),
+    ("qmv-5-k2880", 4, 12, 2880, 1, 5, False, True),
+    ("qmv-16", 8, 32, 512, 1, 16, False, True),
+    ("sorted-few", 8, 32, 512, 1, 20, True, True),
+    ("grouped", 8, 32, 256, 1, 100, True, True),
+    ("qmm-t", 4, 32, 256, 40, 3, False, True),
+    ("qvm", 8, 64, 128, 1, 3, False, False),
+    ("qmm-n", 8, 64, 128, 12, 2, False, False),
+]
+OSS_GATHERS = [
+    ("oss-decode", 4, 16, 2880, 1, 4, False, True),
+    ("oss-grouped", 4, 16, 2880, 1, 72, True, True),
+]
+for mode, gs in FP_MODES.items():
+    for dt in ["float32", "float16", "bfloat16"]:
+        for name, e, n, k, m, batches, srt, t in FP_GATHERS + (OSS_GATHERS if dt == "bfloat16" else []):
+            with mx.stream(mx.gpu):
+                wq, scales = mx.quantize(make(dt, (e, n, k) if t else (e, k, n)) / 4, mode=mode)
+                mx.eval(wq, scales)
+            ids = np.array([(i * 7 + 3) % e for i in range(batches)], dtype=np.uint32)
+            if srt:
+                ids.sort()
+            rhs = mx.array(ids)
+            x = make(dt, (batches, m, k)) / 4
+            for global_scale in [False] + ([True] if mode == "nvfp4" else []):
+                inputs = [x, wq, scales]
+                extra = {}
+                if global_scale:
+                    inputs.append(mx.array((0.25 + np.arange(e) / 8).astype(np.float32)))
+                    extra["gs"] = 1
+                case_gpu(f"fp-gather-{mode}-{dt}-{name}{'-gs' if global_scale else ''}", "gather_qmm",
+                         inputs + [rhs], mode=mode, transpose=int(t), sorted=int(srt), idx="r",
+                         **extra)
+
+# E4M3 conversions: every float16 and bfloat16 bit pattern, a float32 sweep of 2^20 values
+# (random magnitudes over the whole range, ties, saturation, subnormals, NaN and infinities),
+# and every code back in each float type.
+every16 = np.arange(65536, dtype=np.uint16)
+case_gpu("fp8-to-float16-all", "to_fp8", [mx.array(every16).view(mx.float16)])
+case_gpu("fp8-to-bfloat16-all", "to_fp8", [mx.array(every16).view(mx.bfloat16)])
+sweep = (rng.standard_normal(1 << 20) * np.exp2(rng.integers(-30, 12, 1 << 20))).astype(np.float32)
+sweep[:16] = [0.0, -0.0, np.inf, -np.inf, np.nan, 448.0, 464.0, 465.0, 1e-40, -1e-40, 2.0**-9,
+              2.0**-10, 3 * 2.0**-11, 1.0625, 1.1875, -240.0]
+sweep[16] = np.array([0xFFC00000], dtype=np.uint32).view(np.float32)[0]  # -NaN
+case_gpu("fp8-to-float32-sweep", "to_fp8", [mx.array(sweep)])
+codes = mx.array(np.arange(256, dtype=np.uint8))
+for dt in ["float16", "bfloat16", "float32"]:
+    case_gpu(f"fp8-from-{dt}", "from_fp8", [codes], dtype=CODE[dt])
+
+# Untransposed products from K = 1024 (MLX's qvm_split_k: 8 partitions, 32 above K = 8192,
+# summed in the output dtype; K = 2880 does not split evenly; float32 sums are the standard
+# reduction, so only one split there), after every other case so the earlier inputs keep
+# their random values.
+FP_SPLIT_K = [
+    ("qvm-splitk", (1, 2048), (2048, 64)),
+    ("qvm-splitk-k2880", (3, 2880), (2880, 32)),
+    ("qvm-splitk32", (2, 8320), (8320, 32)),
+    ("qvm-splitk-batched", (2, 1, 1024), (2, 1024, 32)),
+]
+for mode in FP_MODES:
+    for dt in ["float32", "float16", "bfloat16"]:
+        for name, xs, ws in FP_SPLIT_K:
+            if dt == "float32" and name in ("qvm-splitk32", "qvm-splitk-batched"):
+                continue
+            with mx.stream(mx.gpu):
+                wq, scales = mx.quantize(make(dt, ws) / 4, mode=mode)
+                mx.eval(wq, scales)
+            case_gpu(f"fp-qmm-{mode}-{dt}-{name}", "quantized_matmul", [make(dt, xs) / 4, wq, scales],
+                     mode=mode, transpose=0)
+
+# The same in affine mode (scales and biases), 4 bits in groups of 64 and 8 bits in 32.
+AFFINE_SPLIT_K = [
+    ("qvm-splitk", (1, 2048), (2048, 128)),
+    ("qvm-splitk-k2880", (3, 2880), (2880, 64)),
+    ("qvm-splitk32", (2, 8320), (8320, 64)),
+    ("qvm-splitk-batched", (2, 1, 1024), (2, 1024, 64)),
+]
+for gs, bits in [(64, 4), (32, 8)]:
+    for dt in ["float32", "float16", "bfloat16"]:
+        for name, xs, ws in AFFINE_SPLIT_K:
+            if dt == "float32" and name in ("qvm-splitk32", "qvm-splitk-batched"):
+                continue
+            with mx.stream(mx.gpu):
+                wq, scales, biases = mx.quantize(make(dt, ws) / 4, group_size=gs, bits=bits)
+                mx.eval(wq, scales, biases)
+            case_gpu(f"affine-qmm-b{bits}-{dt}-{name}", "quantized_matmul",
+                     [make(dt, xs) / 4, wq, scales, biases], group_size=gs, bits=bits,
+                     transpose=0)
+
+# floor_divide (added after every other case, with inputs of its own, so earlier cases keep
+# their random values): every integer type with mixed signs and both remainders (no zero
+# divisors: MLX leaves them undefined), MIN // 1, floats with ties, infinities, NaN and zero
+# divisors, a broadcast and an integer/float promotion.
+fd = np.random.default_rng(SEED + 55)
+for dt in INTS:
+    lo, hi = (0, 100) if dt.startswith("u") else (-100, 100)
+    a = fd.integers(lo, hi, (4, 6)).astype(dt)
+    b = fd.integers(1, 9, (6,)).astype(dt)
+    if not dt.startswith("u"):
+        b = b * np.where(fd.integers(0, 2, (6,)) == 0, -1, 1).astype(dt)
+    case(f"floor_divide-{dt}", "floor_divide", [mx.array(a), mx.array(b)])
+case("floor_divide-int32-min", "floor_divide",
+     [mx.array(np.array([np.iinfo(np.int32).min, -7, 7], np.int32)), mx.array(np.array([1, 7, -7], np.int32))])
+special = np.array([7.5, -7.5, 6.0, -6.0, 1.0, -1.0, np.inf, -np.inf, np.nan, 0.0, 1e30, -3.0], np.float32)
+divisor = np.array([2.0, 2.0, -2.0, 4.0, 0.0, 0.0, 2.0, 3.0, 1.0, 0.0, 1e-30, 0.1], np.float32)
+for dt in FLOATS:
+    case(f"floor_divide-{dt}-special", "floor_divide",
+         [mx.array(special).astype(getattr(mx, dt)), mx.array(divisor).astype(getattr(mx, dt))])
+    case(f"floor_divide-{dt}", "floor_divide",
+         [mx.array(fd.standard_normal((3, 5)) * 10).astype(getattr(mx, dt)),
+          mx.array(fd.standard_normal((5,)) + 0.5).astype(getattr(mx, dt))])
+case("floor_divide-int-float", "floor_divide",
+     [mx.array(np.array([7, -7, 9], np.int32)), mx.array(np.array([2.5, 2.5, -4.0], np.float32))])
+
+# power (appended, inputs of its own): integer squaring with wrapping and zero exponents
+# (no negative ones: MLX leaves them undefined), floats with negative bases, zeros,
+# fractional and negative exponents, infinities and NaN, and an integer/float promotion.
+pw = np.random.default_rng(SEED + 59)
+for dt in ["int8", "uint8", "int32", "uint32", "int64"]:
+    lo = 0 if dt.startswith("u") else -5
+    case(f"power-{dt}", "power", [mx.array(pw.integers(lo, 6, (12,)).astype(dt)),
+                                  mx.array(pw.integers(0, 9, (12,)).astype(dt))])
+pbase = np.array([2.0, -2.0, 0.0, -0.0, 1.5, -1.5, np.inf, -np.inf, np.nan, 1.0, 0.5, 10.0], np.float32)
+pexp = np.array([0.5, 3.0, -1.0, 2.0, -2.5, 0.5, 0.0, 3.0, 1.0, np.nan, np.inf, -3.0], np.float32)
+for dt in FLOATS:
+    case(f"power-{dt}-special", "power",
+         [mx.array(pbase).astype(getattr(mx, dt)), mx.array(pexp).astype(getattr(mx, dt))])
+    case(f"power-{dt}", "power", [mx.array(np.abs(pw.standard_normal((3, 5))) * 4).astype(getattr(mx, dt)),
+                                  mx.array(pw.standard_normal((5,)) * 2).astype(getattr(mx, dt))])
+    if dt != "float64":
+        case_gpu(f"power-gpu-{dt}", "power",
+                 [mx.array(np.abs(pw.standard_normal((4, 64))) * 4).astype(getattr(mx, dt)),
+                  mx.array(pw.standard_normal((4, 64)) * 3).astype(getattr(mx, dt))])
+case("power-int-float", "power",
+     [mx.array(np.array([2, -3, 4], np.int32)), mx.array(np.array([0.5, 2.0, -1.5], np.float32))])
+
+# Affine dequantize on MLX's GPU (compiled with contraction: up to one rounding from MLX's
+# CPU, whose results mlx.bin holds): every bit width and group size, three dtypes, with
+# inputs of their own (appended last). Quantize is MLX's CPU's on both devices.
+aq = np.random.default_rng(SEED + 57)
+for dt in ["float32", "float16", "bfloat16"]:
+    for bits in [2, 3, 4, 5, 6, 8]:
+        for gs in [32, 64, 128]:
+            w = mx.array((aq.standard_normal((6, 256)) * 2).astype(np.float32)).astype(getattr(mx, dt))
+            with mx.stream(mx.gpu):
+                q, s, b = mx.quantize(w, group_size=gs, bits=bits)
+                mx.eval(q, s, b)
+            case_gpu(f"affine-dequantize-{dt}-b{bits}-g{gs}", "dequantize", [q, s, b], group_size=gs,
+                     bits=bits)
+
+# MLX's blocked head-512 prefill (`use_blocked_d512`: half precision, causal, 1,024 queries
+# or more): grouped queries over a longer key cache, and a block count that is not whole.
+dq = np.random.default_rng(SEED + 58)
+for dt, (hq, hkv, lq, lk) in [("bfloat16", (2, 1, 1024, 1030)), ("float16", (1, 1, 1100, 1100))]:
+    q, k, v = (mx.array(dq.standard_normal((1, h, n, 512)).astype(np.float32)).astype(getattr(mx, dt))
+               for h, n in [(hq, lq), (hkv, lk), (hkv, lk)])
+    case_gpu(f"sdpa-d512-{dt}-{lq}x{lk}", "sdpa", [q, k, v], scale=round(512 ** -0.5, 6),
+             mask="causal")
+
 # ── Writer ──────────────────────────────────────────────────────────────────
 
 def string(s: str) -> bytes:
@@ -1031,9 +1333,10 @@ def tensor(a: mx.array) -> bytes:
     return head + struct.pack("<Q", len(data)) + data
 
 
-def write(out: Path, cases: list[tuple[str, str, list[mx.array], list[mx.array]]]) -> None:
+def write(out: Path, cases: list[tuple[str, str, list[mx.array], list[mx.array]]],
+          device: str = "cpu") -> None:
     blob = bytearray(b"BSMXFIX1")
-    blob += string(f"mlx={mx.__version__} device=cpu seed={SEED}")
+    blob += string(f"mlx={mx.__version__} device={device} seed={SEED}")
     blob += struct.pack("<I", len(cases))
     for name, op, inputs, outputs in cases:
         blob += string(name) + string(op)
@@ -1047,6 +1350,7 @@ def write(out: Path, cases: list[tuple[str, str, list[mx.array], list[mx.array]]
 def main() -> None:
     write(OUT, cases)
     write(OUT_API, api_cases)
+    write(OUT_GPU, gpu_cases, device="gpu")
 
 
 if __name__ == "__main__":

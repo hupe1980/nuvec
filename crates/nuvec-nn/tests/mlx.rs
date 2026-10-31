@@ -677,3 +677,89 @@ fn lora_dropout_and_rslora() {
         .add(x.matmul(&lora.lora_a).matmul(&lora.lora_b).multiply(20.0));
     assert_eq!(f32s(&eval), f32s(&full));
 }
+
+/// Floating-point quantized layers against MLX's (recorded on its GPU): the quantized
+/// parameters byte for byte, outputs bit for bit on the GPU (one row, `qmv_quad`), MLX's
+/// parameter names, and embedding rows in bfloat16.
+#[test]
+fn fp_quantized_layers_equal_mlx() {
+    let gpu =
+        nuvec::with_stream(nuvec::Device::gpu(0), || (Array::from(1.0f32) * 2.0).eval()).is_ok();
+    let bytes = |a: &Array| -> Vec<u8> {
+        match a.dtype() {
+            DType::U8 => a.to_vec::<u8>().unwrap(),
+            DType::U32 => a
+                .to_vec::<u32>()
+                .unwrap()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            _ => a
+                .astype(DType::F32)
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        }
+    };
+    for (name, mode) in [
+        ("mxfp4", nuvec::QuantMode::Mxfp4),
+        ("mxfp8", nuvec::QuantMode::Mxfp8),
+        ("nvfp4", nuvec::QuantMode::Nvfp4),
+    ] {
+        let g = |k: &str| get(&format!("qlinear_{name}.{k}"));
+        let linear = Linear {
+            weight: Param::new(g("weight")),
+            bias: Some(Param::new(g("bias"))),
+        };
+        let q = QuantizedLinear::from_linear_with(&linear, mode);
+        assert!(q.biases.is_none(), "{name}");
+        assert_eq!(bytes(&q.weight), bytes(&g("qweight")), "{name} weight");
+        assert_eq!(bytes(&q.scales), bytes(&g("scales")), "{name} scales");
+        let e = |k: &str| get(&format!("qembed_{name}.{k}"));
+        let qe = QuantizedEmbedding::from_embedding_with(
+            &Embedding {
+                weight: Param::new(e("weight")),
+            },
+            mode,
+        );
+        assert_eq!(bytes(&qe.weight), bytes(&e("qweight")), "{name} embedding");
+        assert_eq!(
+            bytes(&qe.scales),
+            bytes(&e("scales")),
+            "{name} embedding scales"
+        );
+        let rows = qe.forward(&e("ids"));
+        assert_eq!(
+            rows.dtype(),
+            DType::BF16,
+            "{name}: MLX's floating-point embeddings are bfloat16"
+        );
+        assert_eq!(bytes(&rows), bytes(&e("rows")), "{name} rows");
+        if gpu {
+            nuvec::with_stream(nuvec::Device::gpu(0), || {
+                assert_eq!(bytes(&q.forward(&g("x"))), bytes(&g("y")), "{name} forward");
+                assert_eq!(
+                    bytes(&qe.as_linear(&g("x"))),
+                    bytes(&e("linear")),
+                    "{name} as_linear"
+                );
+            });
+        }
+    }
+    assert_eq!(
+        names(&QuantizedLinear::from_linear_with(
+            &Linear::new(64, 8),
+            nuvec::QuantMode::Mxfp4
+        )),
+        fixture_names("QuantizedLinear_mxfp4")
+    );
+    assert_eq!(
+        names(&QuantizedEmbedding::from_embedding_with(
+            &Embedding::new(10, 64),
+            nuvec::QuantMode::Nvfp4
+        )),
+        fixture_names("QuantizedEmbedding_nvfp4")
+    );
+}

@@ -1,4 +1,5 @@
-//! `compile` on the GPU: compiled results equal uncompiled ones bit for bit (random shapes,
+//! `compile` on the GPU: compiled results equal uncompiled ones bit for bit, except fused
+//! `power` (Metal's fast `pow`, as MLX's compiled kernels; within a few ulps) (random shapes,
 //! layouts and dtypes), traces are cached per signature, and transforms compose. Every
 //! test skips when no Metal device is available.
 
@@ -475,4 +476,50 @@ fn copy_survives_compile_and_in_place_updates() {
         graph::primitive(&out[0]),
         Some(Primitive::Copy) | None
     ));
+}
+
+/// A compiled function keeps `stop_gradient`: the gradient of `stop_gradient(x) · x` is
+/// `x`, compiled or not, and so is a compiled gradient of it.
+#[test]
+fn compile_keeps_stop_gradient() {
+    if !gpu() {
+        return;
+    }
+    let x = array![1.5f32, -2.0, 3.0];
+    let body = |xs: &[Array]| Ok(vec![xs[0].stop_gradient().multiply(&xs[0]).sum(..)]);
+    let compiled = compile_flat(body);
+    let plain = grad(|x: &Array| Ok(body(std::slice::from_ref(x))?.remove(0)))(&x).unwrap();
+    let through = grad(|x: &Array| Ok(compiled(std::slice::from_ref(x))?.remove(0)))(&x).unwrap();
+    let outer = compile_flat(move |xs: &[Array]| {
+        Ok(vec![grad(|x: &Array| {
+            Ok(compiled(std::slice::from_ref(x))?.remove(0))
+        })(&xs[0])?])
+    });
+    let fused = outer(std::slice::from_ref(&x)).unwrap().remove(0);
+    for g in [&plain, &through, &fused] {
+        assert_eq!(g.to_vec::<f32>().unwrap(), x.to_vec::<f32>().unwrap());
+    }
+}
+
+/// Fused `power` uses Metal's fast `pow`, as `mx.compile`'s kernels do: within a few ulps
+/// of the uncompiled (precise) result; the constants around it are literals in the kernel.
+#[test]
+fn fused_power_is_close_to_the_precise_one() {
+    if !gpu() {
+        return;
+    }
+    let x = nuvec_core::random::uniform(0.1, 4.0, [4096], DType::F32, None);
+    let f = |xs: &[Array]| -> Result<Vec<Array>> {
+        Ok(vec![xs[0].power(3.0).multiply(0.044715).add(&xs[0])])
+    };
+    let compiled = compile_flat(f);
+    let fused = compiled(std::slice::from_ref(&x)).unwrap()[0]
+        .to_vec::<f32>()
+        .unwrap();
+    let plain = f(std::slice::from_ref(&x)).unwrap()[0]
+        .to_vec::<f32>()
+        .unwrap();
+    for (a, b) in fused.iter().zip(&plain) {
+        assert!((a - b).abs() <= 4.0 * f32::EPSILON * b.abs(), "{a} vs {b}");
+    }
 }

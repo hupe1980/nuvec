@@ -191,14 +191,39 @@ fn memory_in_use_is_reused_only_by_gpu_work_ordered_after_it() {
         device.new_gpu_buffer(n * 4).unwrap(),
     ));
     assert_eq!(device.memory().system_allocations, allocations + 2);
-    // Committed (complete or not): GPU work gets it, ordered after it by its fence.
+    // Committed (complete or not): GPU work gets it, ordered after it by its fence, once
+    // a later command buffer is committed (the latest one's memory is left alone, so the
+    // next command buffer overlaps it instead of waiting for it).
     device.clear_cache();
     let mut out = device.new_buffer(n * 4).unwrap();
     drop(cmd); // abandoned: never submitted
     let pending = encode(&mut out).commit_then(record_failure);
     drop(out);
+    // (Unless it already completed, this is a new allocation.)
+    let fresh = device.new_gpu_buffer(n * 4).unwrap();
+    let mut other = device.new_buffer(16).unwrap();
+    let mut later = device.ordered_command_buffer().unwrap();
+    let small = (4u32).to_le_bytes();
+    let tiny = device.buffer_from(&[0u8; 16]).unwrap();
+    // SAFETY: four floats in each 16-byte buffer.
+    unsafe {
+        later.dispatch(
+            &add,
+            &[
+                Arg::read(&tiny),
+                Arg::read(&tiny),
+                Arg::write(&mut other),
+                Arg::bytes(&small),
+            ],
+            4,
+        )
+    }
+    .unwrap();
+    let later = later.commit_then(record_failure);
+    drop(fresh);
     let allocations = device.memory().system_allocations;
     let reused = device.new_gpu_buffer(n * 4).unwrap();
+    later.wait();
     assert_eq!(
         device.memory().system_allocations,
         allocations,
@@ -209,6 +234,71 @@ fn memory_in_use_is_reused_only_by_gpu_work_ordered_after_it() {
     drop(reused);
     pending.wait();
     assert_gpu_ok();
+}
+
+/// Buffers above 64 MiB (prefill-sized) are reused by GPU work even when the latest
+/// committed command buffer still uses them, so a long prefill's chunks share their
+/// intermediates; smaller ones (decode-sized) are not while little is cached, so
+/// consecutive command buffers overlap instead of waiting (D-100, D-102).
+#[test]
+fn only_large_buffers_of_the_latest_command_buffer_are_reused() {
+    let Some(device) = device() else { return };
+    let add = device.pipeline("nuvec_add_f32").unwrap();
+    for (n, reuse) in [(17 << 20, true), (4 << 20, false)] {
+        // `n` floats: 68 MiB, then 16 MiB.
+        let a = device.buffer_from(&vec![0u8; n * 4]).unwrap();
+        device.clear_cache();
+        let mut out = device.new_buffer(n * 4).unwrap();
+        let mut cmd = device.ordered_command_buffer().unwrap();
+        let count = (n as u32).to_le_bytes();
+        let args = [
+            Arg::read(&a),
+            Arg::read(&a),
+            Arg::write(&mut out),
+            Arg::bytes(&count),
+        ];
+        // SAFETY: `nuvec_add_f32` touches the first `n` floats of each buffer, which all
+        // hold `n` floats.
+        unsafe { cmd.dispatch(&add, &args, n) }.unwrap();
+        let pending = cmd.commit_then(record_failure);
+        drop(out); // in use by the latest committed command buffer
+        let allocations = device.memory().system_allocations;
+        let next = device.new_gpu_buffer(n * 4).unwrap();
+        let fresh = device.memory().system_allocations - allocations;
+        assert_eq!(fresh, u64::from(!reuse), "{n} floats");
+        drop(next);
+        pending.wait();
+        assert_gpu_ok();
+    }
+    // With over 1 GiB cached (a long prefill's command buffers), smaller ones are reused too,
+    // so the cache does not grow by a command buffer's intermediates per command buffer.
+    let n = 4 << 20; // 16 MiB of floats
+    let a = device.buffer_from(&vec![0u8; n * 4]).unwrap();
+    device.clear_cache();
+    let parked: Vec<_> = (0..9)
+        .map(|_| device.new_buffer(129 << 20).unwrap())
+        .collect();
+    drop(parked); // 1.13 GiB cached, sizes no 16 MiB allocation takes
+    let mut out = device.new_buffer(n * 4).unwrap();
+    let mut cmd = device.ordered_command_buffer().unwrap();
+    let count = (n as u32).to_le_bytes();
+    let args = [
+        Arg::read(&a),
+        Arg::read(&a),
+        Arg::write(&mut out),
+        Arg::bytes(&count),
+    ];
+    // SAFETY: as above.
+    unsafe { cmd.dispatch(&add, &args, n) }.unwrap();
+    let pending = cmd.commit_then(record_failure);
+    drop(out);
+    let allocations = device.memory().system_allocations;
+    let next = device.new_gpu_buffer(n * 4).unwrap();
+    assert_eq!(device.memory().system_allocations, allocations, "reused");
+    drop(next);
+    pending.wait();
+    assert_gpu_ok();
+    device.clear_cache();
 }
 
 #[test]

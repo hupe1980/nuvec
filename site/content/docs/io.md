@@ -23,9 +23,9 @@ save_safetensors("out.safetensors", &[("weight", w)], &[("format", "mlx")])?;
 # }
 ```
 
-Files whose tensors are not aligned to their element size — MLX writes headers without padding, so mlx-community checkpoints are among them — are not mapped: their tensors are read once, with parallel positioned reads (up to 8 threads), into one buffer per file in which each is aligned, as MLX reads them. `load_safetensors_filtered(path, keep)` returns only the tensors `keep` accepts and does not read the others from such files (nuvec-lm skips vision and multi-token-prediction weights this way).
+Files whose tensors are not aligned to their element size — MLX writes headers without padding, so mlx-community checkpoints are among them — are not mapped: their tensors are read once, with parallel positioned reads (up to 8 threads), into one buffer per file in which each starts at a multiple of 256 bytes (MLX gives each tensor an allocation of its own; packed at their file offsets, quantized products ran up to 4% slower). `load_safetensors_filtered(path, keep)` returns only the tensors `keep` accepts and does not read the others from such files (nuvec-lm skips vision and multi-token-prediction weights this way).
 
-`safetensors_footprint` reads only the headers of a file or a directory and reports what loading will hold: the bytes kept mapped, the bytes read into memory, and the transient peak (their sum: no file is mapped and copied at once). A load whose transient would pass the memory limit fails before mapping or reading anything.
+`safetensors_footprint` reads only the headers of a file or a directory and reports what loading will hold: the bytes kept mapped, the bytes read into memory, and the transient peak (their sum: no file is mapped and copied at once); `safetensors_footprint_filtered(path, keep)` does the same for a filtered load. A load whose transient would pass the memory limit fails before mapping or reading anything.
 
 Saving follows the reference implementation: tensors by decreasing element size after a header padded to 8 bytes, so files nuvec writes always load without a copy. Files are written to `path.tmp` and renamed into place; `save_safetensors_async` writes in the background and returns a handle (`wait()` gives the result), for snapshots taken with `copy` while work continues.
 

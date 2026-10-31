@@ -93,7 +93,8 @@ pub struct CommandBuffer {
     /// For ordered command buffers: this command buffer's fence (updated at the end of its
     /// work and recorded on the buffers it writes), and the fences already waited for.
     own: Option<Fence>,
-    waited: Vec<usize>,
+    /// Held (not their addresses): a dropped fence's address could be reused by a new one.
+    waited: Vec<Fence>,
     encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     /// Buffers read and written since the last barrier.
     reads: Vec<usize>,
@@ -322,9 +323,13 @@ impl CommandBuffer {
             for (buffer, _, write) in args.iter().filter_map(Arg::buffer) {
                 for fence in buffer.pending_fences(write) {
                     let key = Retained::as_ptr(&fence) as usize;
-                    if key != own && !self.waited.contains(&key) {
+                    let seen = self
+                        .waited
+                        .iter()
+                        .any(|f| Retained::as_ptr(f) as usize == key);
+                    if key != own && !seen {
                         encoder.waitForFence(&fence);
-                        self.waited.push(key);
+                        self.waited.push(fence);
                     }
                 }
             }
@@ -476,7 +481,9 @@ impl CommandBuffer {
             unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&handler)) };
             self.raw.commit();
         });
+        let sequence = super::buffer::commit_sequence();
         for (guard, write) in guards {
+            guard.committed_as(sequence);
             guard.submitted(write);
             // With a fence, these uses now order work committed later; without one, they
             // count as committed once complete.

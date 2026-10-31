@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Paged attention (nuvec's own) on MLX v0.32.4's vector attention (`sdpa_vector` and the
+// Paged attention (nuvec's own; head sizes 64, 128, 256 and 512) on MLX v0.32.4's vector attention (`sdpa_vector` and the
 // first pass of `sdpa_vector_2pass`, sdpa.metal): keys and values live in blocks of
 // `block_size` (a power of two) positions,
 // `[blocks, kv_heads, block_size, D]`, and each sequence of a batch reads its keys through
@@ -12,6 +12,12 @@
 // https://github.com/ml-explore/mlx/blob/main/LICENSE
 
 #include "fast.h"
+
+// Attention sinks (one logit per query head in the softmax) and a sliding window (each
+// query attends its last `window` keys; earlier keys, whose blocks may already belong to
+// other sequences, are never read), as `sdpa_vector`'s.
+constant bool pa_has_sinks [[function_constant(40)]];
+constant bool pa_has_window [[function_constant(41)]];
 
 // Out-of-range inputs never reach outside the caches (`indexing.metal`'s clamp rule): a
 // sequence's length is clamped to the table's capacity, `max_blocks * block_size` (so the
@@ -31,7 +37,7 @@ inline uint paged_block(const device int* table, int i, int shift, int num_block
 // SIMD-groups per (sequence, query head, query).
 // The declared limit keeps 1,024 threads per threadgroup available where instrumented
 // builds (shader validation) or smaller register files would otherwise lower it.
-template <typename T, int D>
+template <typename T, int D, bool W = false>
 [[kernel, max_total_threads_per_threadgroup(1024)]] void paged_attention(
     const device T* queries [[buffer(0)]],
     const device T* k_cache [[buffer(1)]],
@@ -41,6 +47,8 @@ template <typename T, int D>
     const device int* lengths [[buffer(5)]],
     const constant int* params [[buffer(6)]],
     const constant float& scale [[buffer(7)]],
+    const device T* sinks [[buffer(8), function_constant(pa_has_sinks)]],
+    const constant int& window [[buffer(9), function_constant(pa_has_window)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -83,8 +91,18 @@ template <typename T, int D>
 
   U max_score = mlx::Limits<U>::finite_min;
   U sum_exp_score = 0;
+  if (pa_has_sinks && simd_gid == 0) {
+    max_score = static_cast<U>(sinks[head]);
+    sum_exp_score = 1;
+  }
 
-  for (int i = simd_gid; i <= last; i += BN) {
+  // A window's keys are assigned to SIMD groups from its first key, as `sdpa_vector`'s.
+  int first = simd_gid;
+  if (W) {
+    first += max(last - window + 1, 0);
+  }
+
+  for (int i = first; i <= last; i += BN) {
     const uint at = paged_block(table, i, shift, num_blocks) * page_stride + head_offset +
         (uint(i & within) * uint(D)) + simd_lid * qk_per_thread;
     const device T* keys = k_cache + at;
@@ -141,7 +159,7 @@ template <typename T, int D>
 // `i % blocks`, read through the block table. Writes MLX's partials layout (outputs, sums
 // and maxima per block), reduced by `sdpa_vector_2pass_2`. `params`: Hkv, L,
 // log2(block_size), max_blocks, blocks, num_blocks.
-template <typename T, int D, int TK = 4>
+template <typename T, int D, int TK = 4, bool W = false>
 [[kernel, max_total_threads_per_threadgroup(1024)]] void paged_attention_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* k_cache [[buffer(1)]],
@@ -153,6 +171,8 @@ template <typename T, int D, int TK = 4>
     const device int* lengths [[buffer(7)]],
     const constant int* params [[buffer(8)]],
     const constant float& scale [[buffer(9)]],
+    const device T* sinks [[buffer(10), function_constant(pa_has_sinks)]],
+    const constant int& window [[buffer(11), function_constant(pa_has_window)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -189,6 +209,10 @@ template <typename T, int D, int TK = 4>
 
   U max_score = mlx::Limits<U>::finite_min;
   U sum_exp_score = 0;
+  if (pa_has_sinks && block_idx == 0) {
+    max_score = static_cast<U>(sinks[head]);
+    sum_exp_score = 1;
+  }
 
   // The offset of key `i` (this head) in the caches.
   const uint head_offset = uint(kv_head) * uint(block_size * D) + simd_lid * qk_per_thread;
@@ -197,7 +221,10 @@ template <typename T, int D, int TK = 4>
         uint(i & within) * uint(D);
   };
 
+  // A window's keys are partitioned from its first key, `lo`, as `sdpa_vector_2pass_1`'s.
   int i = block_idx;
+  const int lo = W ? max(last - window + 1, 0) : 0;
+  i += lo;
   for (; i + (TK - 1) * blocks <= last; i += blocks * TK) {
     // Prefetch: issue all TK K/V loads first so the hardware can overlap them.
     T k_reg[TK][qk_per_thread];
@@ -280,19 +307,33 @@ template <typename T>
   cache[at] = src[(size_t(t) * hkv + h) * d + e];
 }
 
+#define instantiate_paged_w(tname, type, w, suffix)                                    \
+  template [[host_name("nuvec_paged_attention_" #tname "_64" suffix)]] [[kernel]]      \
+  decltype(paged_attention<type, 64, w>) paged_attention<type, 64, w>;                 \
+  template [[host_name("nuvec_paged_attention_" #tname "_128" suffix)]] [[kernel]]     \
+  decltype(paged_attention<type, 128, w>) paged_attention<type, 128, w>;               \
+  template [[host_name("nuvec_paged_attention_" #tname "_256" suffix)]] [[kernel]]     \
+  decltype(paged_attention<type, 256, w>) paged_attention<type, 256, w>;               \
+  template [[host_name("nuvec_paged_attention_" #tname "_512" suffix)]] [[kernel]]     \
+  decltype(paged_attention<type, 512, w>) paged_attention<type, 512, w>;               \
+  template [[host_name("nuvec_paged_attention_2pass_1_" #tname "_64" suffix)]]         \
+  [[kernel]] decltype(paged_attention_2pass_1<type, 64, 4, w>)                         \
+  paged_attention_2pass_1<type, 64, 4, w>;                                             \
+  template [[host_name("nuvec_paged_attention_2pass_1_" #tname "_128" suffix)]]        \
+  [[kernel]] decltype(paged_attention_2pass_1<type, 128, 4, w>)                        \
+  paged_attention_2pass_1<type, 128, 4, w>;                                            \
+  template [[host_name("nuvec_paged_attention_2pass_1_" #tname "_256" suffix)]]        \
+  [[kernel]] decltype(paged_attention_2pass_1<type, 256, 1, w>)                        \
+  paged_attention_2pass_1<type, 256, 1, w>;                                            \
+  template [[host_name("nuvec_paged_attention_2pass_1_" #tname "_512" suffix)]]        \
+  [[kernel]] decltype(paged_attention_2pass_1<type, 512, 1, w>)                        \
+  paged_attention_2pass_1<type, 512, 1, w>;
+
+// The window is a template parameter (`_w` kernels), not a function constant in the loops
+// (D-102).
 #define instantiate_paged(tname, type)                                                 \
-  template [[host_name("nuvec_paged_attention_" #tname "_64")]] [[kernel]]             \
-  decltype(paged_attention<type, 64>) paged_attention<type, 64>;                       \
-  template [[host_name("nuvec_paged_attention_" #tname "_128")]] [[kernel]]            \
-  decltype(paged_attention<type, 128>) paged_attention<type, 128>;                     \
-  template [[host_name("nuvec_paged_attention_" #tname "_256")]] [[kernel]]            \
-  decltype(paged_attention<type, 256>) paged_attention<type, 256>;                     \
-  template [[host_name("nuvec_paged_attention_2pass_1_" #tname "_64")]] [[kernel]]     \
-  decltype(paged_attention_2pass_1<type, 64>) paged_attention_2pass_1<type, 64>;       \
-  template [[host_name("nuvec_paged_attention_2pass_1_" #tname "_128")]] [[kernel]]    \
-  decltype(paged_attention_2pass_1<type, 128>) paged_attention_2pass_1<type, 128>;     \
-  template [[host_name("nuvec_paged_attention_2pass_1_" #tname "_256")]] [[kernel]]    \
-  decltype(paged_attention_2pass_1<type, 256, 1>) paged_attention_2pass_1<type, 256, 1>; \
+  instantiate_paged_w(tname, type, false, "")                                          \
+  instantiate_paged_w(tname, type, true, "_w")                                         \
   template [[host_name("nuvec_paged_write_" #tname)]] [[kernel]]                       \
   decltype(paged_write<type>) paged_write<type>;
 

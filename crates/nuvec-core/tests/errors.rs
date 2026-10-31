@@ -153,7 +153,7 @@ fn every_op_family_reports_the_callers_location() {
     );
     // Quantization and convolution.
     case!(
-        x.quantize(64, 4).0,
+        x.quantize(Quant::affine(64, 4)).weight,
         "quantize",
         OpErrorKind::InvalidArgument(_)
     );
@@ -251,8 +251,8 @@ fn best_effort_metadata() {
     assert!(parts.iter().all(Array::is_failed));
     assert_eq!(f32s([2, 3]).split(4, 1).len(), 4);
     assert_eq!(f32s([2, 3]).split_at(&[1, 2], 7).len(), 3);
-    let (q, s, b) = f32s([2, 3]).quantize(64, 4);
-    assert!(q.is_failed() && s.is_failed() && b.is_failed());
+    let q = f32s([2, 3]).quantize(Quant::affine(64, 4));
+    assert!(q.weight.is_failed() && q.scales.is_failed() && q.biases.unwrap().is_failed());
     // Host decisions on a failed array's shape go through `shape_n`, a boundary.
     assert_eq!(failed.shape_n::<2>().unwrap_err(), failed.check_ref());
     assert!(f32s([2, 3]).shape_n::<4>().is_err());
@@ -343,7 +343,10 @@ fn random_arguments_never_panic() {
                     14 => vec![x.topk(a1, a2), x.partition(a1, a2), x.repeat(a1, a2)],
                     15 => vec![x.select(&y, 0.0), x.logsumexp(a1), x.softmax([a1])],
                     16 => vec![ops::arange(a1, a2, rng.axis()), ops::full(&shape[..], a1)],
-                    17 => vec![x.quantize(a1 * 16, a2).0, x.conv1d(&y, a1, a2, 1, 1)],
+                    17 => vec![
+                        x.quantize(Quant::affine(a1 * 16, a2)).weight,
+                        x.conv1d(&y, a1, a2, 1, 1),
+                    ],
                     18 => vec![fast::rms_norm(&x, &y, 1e-5), fast::softmax_like(&x)],
                     _ => vec![
                         x.i(y.astype(DType::I32)),

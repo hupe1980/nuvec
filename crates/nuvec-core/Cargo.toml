@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name = "rows"
 harness = false
+
+[[bench]]
+name = "paged"
+harness = false

@@ -31,7 +31,7 @@ macro_rules! pairs {
 
 fn table() -> Vec<(&'static str, Op, Op)> {
     let mut t = pairs! { c =>
-        add(&c.y); subtract(&c.y); multiply(&c.y); divide(&c.y); maximum(&c.y); minimum(&c.y); logaddexp(&c.y);
+        add(&c.y); subtract(&c.y); multiply(&c.y); divide(&c.y); maximum(&c.y); minimum(&c.y); logaddexp(&c.y); floor_divide(&c.y); power(&c.y);
         equal(&c.y); not_equal(&c.y); less(&c.y); less_equal(&c.y); greater(&c.y); greater_equal(&c.y);
         negative(); abs(); exp(); log(); sqrt(); sin(); cos(); tanh(); sigmoid(); erfinv();
         sign(); conjugate(); stop_gradient(); contiguous(); copy();
@@ -78,41 +78,52 @@ fn table() -> Vec<(&'static str, Op, Op)> {
         |c| ops::conv1d(&conv_input(&c.x), &conv_weight(), 1, 1, 1, 1),
     ));
     t.push((
+        "view",
+        |c| c.x.view(DType::U32),
+        |c| ops::view(&c.x, DType::U32),
+    ));
+    t.push(("to_fp8", |c| c.x.to_fp8(), |c| ops::to_fp8(&c.x)));
+    t.push((
+        "from_fp8",
+        |c| c.x.to_fp8().from_fp8(DType::F32),
+        |c| ops::from_fp8(&ops::to_fp8(&c.x), DType::F32),
+    ));
+    t.push((
         "quantize",
-        |c| weights(&c.x).quantize(64, 4).1,
-        |c| ops::quantize(&weights(&c.x), 64, 4).1,
+        |c| weights(&c.x).quantize(Quant::affine(64, 4)).scales,
+        |c| ops::quantize(&weights(&c.x), Quant::affine(64, 4)).scales,
     ));
     t.push((
         "dequantize",
         |c| {
-            let (q, s, b) = weights(&c.x).quantize(64, 4);
-            q.dequantize(&s, &b, 64, 4)
+            let q = weights(&c.x).quantize(Quant::affine(64, 4));
+            q.dequantize(None)
         },
         |c| {
-            let (q, s, b) = ops::quantize(&weights(&c.x), 64, 4);
-            ops::dequantize(&q, &s, &b, 64, 4)
+            let q = ops::quantize(&weights(&c.x), Quant::affine(64, 4));
+            ops::dequantize(&q, None)
         },
     ));
     t.push((
         "quantized_matmul",
         |c| {
-            let (q, s, b) = weights(&c.x).quantize(64, 4);
-            weights(&c.y).quantized_matmul(&q, &s, &b, true, 64, 4)
+            let q = weights(&c.x).quantize(Quant::affine(64, 4));
+            weights(&c.y).quantized_matmul(&q, true)
         },
         |c| {
-            let (q, s, b) = weights(&c.x).quantize(64, 4);
-            ops::quantized_matmul(&weights(&c.y), &q, &s, &b, true, 64, 4)
+            let q = weights(&c.x).quantize(Quant::affine(64, 4));
+            ops::quantized_matmul(&weights(&c.y), &q, true)
         },
     ));
     t.push((
         "gather_qmm",
         |c| {
-            let (q, s, b) = weights(&c.x).quantize(64, 4);
-            weights(&c.y).gather_qmm(&q, &s, &b, None, None, true, 64, 4, false)
+            let q = weights(&c.x).quantize(Quant::affine(64, 4));
+            weights(&c.y).gather_qmm(&q, None, None, GatherQmm::default())
         },
         |c| {
-            let (q, s, b) = weights(&c.x).quantize(64, 4);
-            ops::gather_qmm(&weights(&c.y), &q, &s, &b, None, None, true, 64, 4, false)
+            let q = weights(&c.x).quantize(Quant::affine(64, 4));
+            ops::gather_qmm(&weights(&c.y), &q, None, None, GatherQmm::default())
         },
     ));
     t.push((

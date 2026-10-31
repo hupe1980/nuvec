@@ -127,8 +127,7 @@ fn expected(c: &Case, class: char) -> Route {
         let head =
             (d == dv && matches!(d, 64 | 72 | 80 | 96 | 128 | 192 | 256)) || (d, dv) == (96, 64);
         let causal_ok = !causal || lq <= lk;
-        let scores = c.b * c.hq * lq * lk * c.dtype.size();
-        let huge = scores > 4 << 30;
+        let huge = c.b * c.hq * lq * lk * c.dtype.size() > 8 << 30;
         let slow = match d {
             192 => !huge,
             256 => !(huge || (causal && lq >= 1024 && lk <= 8192)),
@@ -790,4 +789,138 @@ fn long_prefill_schedule_plans_hold_the_budget() {
         eprintln!("{lq}×{lk}: {plan:?}, measured scratch {measured}");
         assert!(measured <= plan.scratch_bytes + (1 << 20) + plan.scratch_bytes / 32);
     }
+}
+
+/// MLX's blocked head-512 prefill (`use_blocked_d512`): half precision, causal, `Lq ≥ 1024`
+/// and `Lq ≤ Lk`, no array mask or sinks (a window allowed), 256 rows halved under a cap;
+/// its result equals the composition with a boolean mask, windowed too, and its measured
+/// scratch is within the plan's.
+#[test]
+fn head_512_prefill_runs_in_blocks() {
+    if common::require_gpu().is_none() {
+        return;
+    }
+    set_default_stream(Stream::default_for(Device::gpu(0)));
+    let (q, k) = ([1, 4, 1024, 512], [1, 2, 1100, 512]);
+    let plan = |q: &[i32], dtype: DType, opts: &fast::AttentionOptions<'_>| {
+        fast::plan_attention(q, &k, &k, dtype, opts).unwrap().kernel
+    };
+    let causal = fast::AttentionOptions::causal();
+    let blocked = |rows| fast::AttentionKernel::BlockedD512 { rows };
+    assert_eq!(plan(&q, DType::BF16, &causal), blocked(256));
+    assert_eq!(plan(&q, DType::F16, &causal), blocked(256));
+    assert_eq!(plan(&q, DType::BF16, &causal.window(64)), blocked(256));
+    assert_eq!(
+        plan(&q, DType::F32, &causal),
+        fast::AttentionKernel::Composed
+    );
+    assert_eq!(
+        plan(&[1, 4, 1023, 512], DType::BF16, &causal),
+        fast::AttentionKernel::Composed
+    );
+    let sinks = ops::zeros([4], DType::BF16);
+    assert_eq!(
+        plan(&q, DType::BF16, &causal.sinks(Some(&sinks))),
+        fast::AttentionKernel::Composed
+    );
+    let mask = ops::ones([1024, 1100], DType::Bool);
+    let masked = fast::AttentionOptions::default().mask(&mask);
+    assert_eq!(
+        plan(&q, DType::BF16, &masked),
+        fast::AttentionKernel::Composed
+    );
+    // A block of 256 rows holds 4 · 256 · 1,100 two-byte scores: under a cap of half
+    // that, 128 rows; below 32 rows' worth, the capped composition decides.
+    let row = 4 * 1100 * 2;
+    assert_eq!(
+        plan(&q, DType::BF16, &causal.max_score_bytes(row * 128)),
+        blocked(128)
+    );
+    assert!(!matches!(
+        plan(&q, DType::BF16, &causal.max_score_bytes(row * 16)),
+        fast::AttentionKernel::BlockedD512 { .. }
+    ));
+
+    let mut rng = common::Rng::new(56);
+    let mut random = |shape: [usize; 4]| {
+        let n: usize = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|_| rng.f64() as f32).collect();
+        Array::from_slice(&v, shape).astype(DType::BF16)
+    };
+    let (qa, ka, va) = (
+        random([1, 4, 1024, 512]),
+        random([1, 2, 1100, 512]),
+        random([1, 2, 1100, 512]),
+    );
+    eval(&[&qa, &ka, &va]).unwrap();
+    let scale = 512f32.powf(-0.5);
+    for window in [None, Some(64), Some(700)] {
+        let opts = match window {
+            Some(w) => causal.window(w),
+            None => causal,
+        };
+        // The band as a boolean mask: query `i` sees keys `i + 76 − W < j ≤ i + 76`.
+        let w = window.unwrap_or(i32::MAX);
+        let band: Vec<bool> = (0..1024)
+            .flat_map(|i| (0..1100).map(move |j| j <= i + 76 && j > i + 76 - w))
+            .collect();
+        let band = Array::from_slice(&band, [1024, 1100]);
+        let want = fast::scaled_dot_product_attention(
+            &qa,
+            &ka,
+            &va,
+            scale,
+            &fast::AttentionOptions::default().mask(&band),
+        );
+        let got = fast::scaled_dot_product_attention(&qa, &ka, &va, scale, &opts);
+        let (g, e) = (
+            got.astype(DType::F32).to_vec::<f32>().unwrap(),
+            want.astype(DType::F32).to_vec::<f32>().unwrap(),
+        );
+        for (i, (a, b)) in g.iter().zip(&e).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-2 * b.abs().max(1.0),
+                "window {window:?}: element {i}: {a} vs {b}"
+            );
+        }
+    }
+    // G6: the measured scratch is within the plan's.
+    let dev = nuvec_gpu::Device::shared().expect("Metal");
+    let p = fast::plan_attention(&q, &k, &k, DType::BF16, &causal).unwrap();
+    let out = fast::scaled_dot_product_attention(&qa, &ka, &va, scale, &causal);
+    dev.reset_peak();
+    out.eval().unwrap();
+    let m = dev.memory();
+    let measured = m.peak - m.active;
+    assert!(
+        measured <= p.scratch_bytes + (1 << 20) + p.scratch_bytes / 32,
+        "measured {measured}, planned {}",
+        p.scratch_bytes
+    );
+}
+
+/// A window bounds the keys a decode row reads, and the vector kernel's passes and key
+/// partitions follow it: gpt-oss's window of 128 over a 4,096-key cache is one pass, where
+/// plain causal attention over the same keys takes two (GQA 8, at least 4,096 keys).
+#[test]
+fn windowed_decode_plans_from_the_window_keys() {
+    let (q, k) = ([1, 64, 1, 64], [1, 8, 4096, 64]);
+    let plan = |opts: &fast::AttentionOptions<'_>| {
+        fast::plan_attention(&q, &k, &k, DType::F16, opts)
+            .unwrap()
+            .kernel
+    };
+    let causal = fast::AttentionOptions::causal();
+    let one_pass = fast::AttentionKernel::Vector {
+        passes: 1,
+        blocks: 1,
+        dispatches: 1,
+    };
+    assert_eq!(plan(&causal.window(128)), one_pass);
+    assert!(matches!(
+        plan(&causal),
+        fast::AttentionKernel::Vector { passes: 2, .. }
+    ));
+    // A window covering every key plans as plain causal attention.
+    assert_eq!(plan(&causal.window(4096)), plan(&causal));
 }

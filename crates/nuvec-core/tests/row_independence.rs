@@ -136,7 +136,8 @@ mod verify_rows {
             return;
         }
         let mut split = 0;
-        for &(hq, hkv) in &[(8, 1), (24, 2), (16, 1)] {
+        // GQA 4 and 6 (Qwen 3.5–3.8 9B and 27B), 8, 12 and 16.
+        for &(hq, hkv) in &[(16, 4), (24, 4), (8, 1), (24, 2), (16, 1)] {
             for d in [64, 128, 256] {
                 for (e, edge) in [1024, 8192, 32768, 65536].into_iter().enumerate() {
                     for lq in [2, 3, 5, 8] {
@@ -268,55 +269,62 @@ mod affine {
     /// contiguous, sliced (an offset) and transposed (non-contiguous).
     #[test]
     fn quantized_rows_equal_one_row() {
-        if !gpu() {
-            return;
-        }
-        let mut case = 0u64;
-        for bits in [1, 2, 3, 4, 5, 6, 8] {
-            for gs in [32, 64, 128] {
-                case += 1;
-                let dtype = if case.is_multiple_of(2) {
-                    DType::F16
-                } else {
-                    DType::BF16
-                };
-                // K aligned to the fast kernels (2,048) or not (a multiple of the group
-                // size only); N with and without a partial last block.
-                let k = if case.is_multiple_of(3) {
-                    2048 + gs
-                } else {
-                    2048
-                };
-                let n = if case.is_multiple_of(2) { 520 } else { 512 };
-                let w = pattern(&[n, k], dtype, case);
-                let (wq, s, b) = w.quantize(gs, bits);
-                // Untransposed weights are quantized along N.
-                let wn = pattern(&[k, 640], dtype, case + 100);
-                let (wqn, sn, bn) = wn.quantize(gs, bits);
-                for rows in (2..=ROW_INDEPENDENT_ROWS as i32)
-                    .filter(|r| [2, 3, 4, 7, 8, 13, 16].contains(r))
-                {
-                    let base = pattern(&[rows + 2, k], dtype, rows as u64);
-                    let layouts = [
-                        base.i(..rows),
-                        base.i(2..2 + rows),
-                        pattern(&[k, rows], dtype, 9).t(),
-                    ];
-                    for (l, x) in layouts.iter().enumerate() {
-                        let name =
-                            format!("{dtype} bits {bits} gs {gs} K={k} N={n} B={rows} layout {l}");
-                        check_one_by_one(&name, x, |x| {
-                            x.quantized_matmul(&wq, &s, &b, true, gs, bits)
-                        });
-                        if l == 0 {
-                            check_one_by_one(&format!("{name} untransposed"), x, |x| {
-                                x.quantized_matmul(&wqn, &sn, &bn, false, gs, bits)
-                            });
+        nuvec_core::with_row_exact(|| {
+            if !gpu() {
+                return;
+            }
+            let mut case = 0u64;
+            for bits in [1, 2, 3, 4, 5, 6, 8] {
+                for gs in [32, 64, 128] {
+                    case += 1;
+                    let dtype = if case.is_multiple_of(2) {
+                        DType::F16
+                    } else {
+                        DType::BF16
+                    };
+                    // K aligned to the fast kernels (2,048) or not (a multiple of the group
+                    // size only).
+                    let k = if case.is_multiple_of(3) {
+                        2048 + gs
+                    } else {
+                        2048
+                    };
+                    // N with a partial last block, whole blocks, or fewer outputs than one
+                    // block (the matrix-vector kernels' small case).
+                    let n = match case % 5 {
+                        0 => 6,
+                        1 | 3 => 520,
+                        _ => 512,
+                    };
+                    let w = pattern(&[n, k], dtype, case);
+                    let wq = w.quantize(Quant::affine(gs, bits));
+                    // Untransposed weights are quantized along N.
+                    let wn = pattern(&[k, 640], dtype, case + 100);
+                    let wqn = wn.quantize(Quant::affine(gs, bits));
+                    for rows in (2..=ROW_INDEPENDENT_ROWS as i32)
+                        .filter(|r| [2, 3, 4, 7, 8, 13, 16].contains(r))
+                    {
+                        let base = pattern(&[rows + 2, k], dtype, rows as u64);
+                        let layouts = [
+                            base.i(..rows),
+                            base.i(2..2 + rows),
+                            pattern(&[k, rows], dtype, 9).t(),
+                        ];
+                        for (l, x) in layouts.iter().enumerate() {
+                            let name = format!(
+                                "{dtype} bits {bits} gs {gs} K={k} N={n} B={rows} layout {l}"
+                            );
+                            check_one_by_one(&name, x, |x| x.quantized_matmul(&wq, true));
+                            if l == 0 {
+                                check_one_by_one(&format!("{name} untransposed"), x, |x| {
+                                    x.quantized_matmul(&wqn, false)
+                                });
+                            }
                         }
                     }
                 }
             }
-        }
+        });
     }
 
     /// A tiled quantized product over a batch of items (`[B, L, K]`, as a batched prefill
@@ -325,28 +333,30 @@ mod affine {
     /// alone), many (no split) and between.
     #[test]
     fn quantized_batch_items_equal_one_item() {
-        if !gpu() {
-            return;
-        }
-        for (case, (l, n, k)) in [
-            (40, 256, 4096),
-            (194, 1024, 4096),
-            (100, 512, 2048),
-            (300, 4096, 4096),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let w = pattern(&[n, k], DType::BF16, case as u64 + 30);
-            let (wq, s, b) = w.quantize(64, 4);
-            for items in [2, 4, 8] {
-                let x = pattern(&[items, l, k], DType::BF16, case as u64 + 40);
-                let y = x.quantized_matmul(&wq, &s, &b, true, 64, 4);
-                assert_rows(&format!("B={items} L={l} N={n} K={k}"), &y, 0, |r| {
-                    x.i(r..r + 1).quantized_matmul(&wq, &s, &b, true, 64, 4)
-                });
+        nuvec_core::with_row_exact(|| {
+            if !gpu() {
+                return;
             }
-        }
+            for (case, (l, n, k)) in [
+                (40, 256, 4096),
+                (194, 1024, 4096),
+                (100, 512, 2048),
+                (300, 4096, 4096),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let w = pattern(&[n, k], DType::BF16, case as u64 + 30);
+                let wq = w.quantize(Quant::affine(64, 4));
+                for items in [2, 4, 8] {
+                    let x = pattern(&[items, l, k], DType::BF16, case as u64 + 40);
+                    let y = x.quantized_matmul(&wq, true);
+                    assert_rows(&format!("B={items} L={l} N={n} K={k}"), &y, 0, |r| {
+                        x.i(r..r + 1).quantized_matmul(&wq, true)
+                    });
+                }
+            }
+        });
     }
 }
 
@@ -355,74 +365,116 @@ mod gather {
 
     /// Gathered (mixture-of-experts) products over B = 2..=R tokens with top-2 and top-8
     /// routing: each output row (one token and expert) has the bits of the same row run
-    /// alone, with unsorted indices (`[B, top-k]`) and with rows sorted by expert.
+    /// alone, with unsorted indices (`[B, top-k]`) and with rows sorted by expert; affine,
+    /// the floating-point modes (NVFP4 with a global scale too) and dense experts.
     #[test]
     fn gathered_rows_equal_one_row() {
-        if !gpu() {
-            return;
-        }
-        let (e, n, k) = (16, 96, 512);
-        let wf = pattern(&[e, n, k], DType::BF16, 1);
-        let (q4, s4, b4) = wf.quantize(64, 4);
-        let (q8, s8, b8) = wf.quantize(32, 8);
-        let dense = pattern(&[e, k, n], DType::F16, 2);
-        let products: [(&str, Box<dyn Fn(&Array, &Array, bool) -> Array>); 3] = [
-            (
-                "gather_qmm 4-bit",
-                Box::new(|x: &Array, ids: &Array, sorted| {
-                    ops::gather_qmm(x, &q4, &s4, &b4, None, Some(ids), true, 64, 4, sorted)
-                }),
-            ),
-            (
-                "gather_qmm 8-bit",
-                Box::new(|x: &Array, ids: &Array, sorted| {
-                    ops::gather_qmm(x, &q8, &s8, &b8, None, Some(ids), true, 32, 8, sorted)
-                }),
-            ),
-            (
-                "gather_mm",
-                Box::new(|x: &Array, ids: &Array, sorted| {
-                    ops::gather_mm(&x.astype(DType::F16), &dense, None, Some(ids), sorted)
-                }),
-            ),
-        ];
-        for (name, product) in &products {
-            for topk in [2, 8] {
-                for b in [2, 5, ROW_INDEPENDENT_ROWS as i32] {
-                    // Unsorted: tokens `[B, 1, 1, K]` against `[B, top-k]` experts.
-                    let base = pattern(&[b + 1, 1, 1, k], DType::BF16, b as u64);
-                    let x = base.i(1..);
-                    let ids: Vec<u32> = (0..b * topk)
-                        .map(|i| ((i * 7 + i / topk) % e) as u32)
-                        .collect();
-                    let ids = Array::from_slice(&ids, [b, topk]);
-                    let out = product(&x, &ids, false);
-                    out.eval().unwrap();
-                    for t in 0..b {
-                        let one = product(&x.i(t..t + 1), &ids.i(t..t + 1), false);
-                        assert!(
-                            bits(&out.i(t..t + 1)) == bits(&one),
-                            "{name} top-{topk} B={b}: token {t} differs"
-                        );
+        nuvec_core::with_row_exact(|| {
+            if !gpu() {
+                return;
+            }
+            let (e, n, k) = (16, 96, 512);
+            let wf = pattern(&[e, n, k], DType::BF16, 1);
+            let q4 = wf.quantize(Quant::affine(64, 4));
+            let q8 = wf.quantize(Quant::affine(32, 8));
+            let dense = pattern(&[e, k, n], DType::F16, 2);
+            // The floating-point modes (spec 055), NVFP4 also with a global scale per expert.
+            let mx4 = wf.quantize(QuantMode::Mxfp4);
+            let mx8 = wf.quantize(QuantMode::Mxfp8);
+            let nv4 = wf.quantize(QuantMode::Nvfp4);
+            let scale = Array::from_slice(
+                &(0..e).map(|i| 0.25 + i as f32 / 8.0).collect::<Vec<_>>(),
+                [e],
+            );
+            let fp = |q: &'static Quantized, global: Option<&'static Array>| {
+                Box::new(move |x: &Array, ids: &Array, sorted: bool| {
+                    let mut options = GatherQmm::default().sorted_indices(sorted);
+                    if let Some(g) = global {
+                        options = options.global_scale(g);
                     }
-                    // Sorted: one row per (token, expert), sorted by expert.
-                    let rows = b * topk;
-                    let mut sorted: Vec<u32> = (0..b * topk).map(|i| (i % e) as u32).collect();
-                    sorted.sort_unstable();
-                    let sorted = Array::from(sorted);
-                    let xs = pattern(&[rows, 1, k], DType::BF16, 3 + b as u64);
-                    let out = product(&xs, &sorted, true);
-                    out.eval().unwrap();
-                    for r in 0..rows {
-                        let one = product(&xs.i(r..r + 1), &sorted.i(r..r + 1), true);
-                        assert!(
-                            bits(&out.i(r..r + 1)) == bits(&one),
-                            "{name} sorted, {rows} rows: row {r} differs"
-                        );
+                    ops::gather_qmm(x, q, None, Some(ids), options)
+                }) as Box<dyn Fn(&Array, &Array, bool) -> Array>
+            };
+            let (mx4, mx8, nv4, scale): (&'static _, &'static _, &'static _, &'static _) = (
+                Box::leak(Box::new(mx4)),
+                Box::leak(Box::new(mx8)),
+                Box::leak(Box::new(nv4)),
+                Box::leak(Box::new(scale)),
+            );
+            let products: [(&str, Box<dyn Fn(&Array, &Array, bool) -> Array>); 7] = [
+                ("gather_qmm mxfp4", fp(mx4, None)),
+                ("gather_qmm mxfp8", fp(mx8, None)),
+                ("gather_qmm nvfp4", fp(nv4, None)),
+                ("gather_qmm nvfp4 global scale", fp(nv4, Some(scale))),
+                (
+                    "gather_qmm 4-bit",
+                    Box::new(|x: &Array, ids: &Array, sorted| {
+                        ops::gather_qmm(
+                            x,
+                            &q4,
+                            None,
+                            Some(ids),
+                            GatherQmm::default().sorted_indices(sorted),
+                        )
+                    }),
+                ),
+                (
+                    "gather_qmm 8-bit",
+                    Box::new(|x: &Array, ids: &Array, sorted| {
+                        ops::gather_qmm(
+                            x,
+                            &q8,
+                            None,
+                            Some(ids),
+                            GatherQmm::default().sorted_indices(sorted),
+                        )
+                    }),
+                ),
+                (
+                    "gather_mm",
+                    Box::new(|x: &Array, ids: &Array, sorted| {
+                        ops::gather_mm(&x.astype(DType::F16), &dense, None, Some(ids), sorted)
+                    }),
+                ),
+            ];
+            for (name, product) in &products {
+                for topk in [2, 8] {
+                    for b in [2, 5, ROW_INDEPENDENT_ROWS as i32] {
+                        // Unsorted: tokens `[B, 1, 1, K]` against `[B, top-k]` experts.
+                        let base = pattern(&[b + 1, 1, 1, k], DType::BF16, b as u64);
+                        let x = base.i(1..);
+                        let ids: Vec<u32> = (0..b * topk)
+                            .map(|i| ((i * 7 + i / topk) % e) as u32)
+                            .collect();
+                        let ids = Array::from_slice(&ids, [b, topk]);
+                        let out = product(&x, &ids, false);
+                        out.eval().unwrap();
+                        for t in 0..b {
+                            let one = product(&x.i(t..t + 1), &ids.i(t..t + 1), false);
+                            assert!(
+                                bits(&out.i(t..t + 1)) == bits(&one),
+                                "{name} top-{topk} B={b}: token {t} differs"
+                            );
+                        }
+                        // Sorted: one row per (token, expert), sorted by expert.
+                        let rows = b * topk;
+                        let mut sorted: Vec<u32> = (0..b * topk).map(|i| (i % e) as u32).collect();
+                        sorted.sort_unstable();
+                        let sorted = Array::from(sorted);
+                        let xs = pattern(&[rows, 1, k], DType::BF16, 3 + b as u64);
+                        let out = product(&xs, &sorted, true);
+                        out.eval().unwrap();
+                        for r in 0..rows {
+                            let one = product(&xs.i(r..r + 1), &sorted.i(r..r + 1), true);
+                            assert!(
+                                bits(&out.i(r..r + 1)) == bits(&one),
+                                "{name} sorted, {rows} rows: row {r} differs"
+                            );
+                        }
                     }
                 }
             }
-        }
+        });
     }
 }
 

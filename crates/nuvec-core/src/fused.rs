@@ -22,6 +22,9 @@ pub enum FusedRef {
     Input(usize),
     /// The result of the step at this position.
     Step(usize),
+    /// The constant at this position, written into the kernel as a literal (as MLX's
+    /// compiled kernels write theirs).
+    Constant(usize),
 }
 
 /// A graph of element-wise operations evaluated as one kernel, with one or more of its
@@ -32,6 +35,8 @@ pub struct Fused(Arc<Graph>);
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Graph {
     inputs: Vec<DType>,
+    /// Scalar constants: a float dtype and the value's bits.
+    constants: Vec<(DType, u64)>,
     steps: Vec<(Primitive, Vec<FusedRef>)>,
     /// The steps whose results are outputs.
     outputs: Vec<usize>,
@@ -92,12 +97,30 @@ impl Fused {
         steps: Vec<(Primitive, Vec<FusedRef>)>,
         outputs: &[usize],
     ) -> Result<Self> {
+        Self::with_constants(inputs, &[], steps, outputs)
+    }
+
+    /// [`Fused::new`] with scalar `constants` (a float dtype, `F32`, `F16` or `BF16`, and the
+    /// value's bits) that steps refer to as [`FusedRef::Constant`]: they are part of the
+    /// kernel, as literals, rather than inputs read from memory.
+    pub fn with_constants(
+        inputs: &[DType],
+        constants: &[(DType, u64)],
+        steps: Vec<(Primitive, Vec<FusedRef>)>,
+        outputs: &[usize],
+    ) -> Result<Self> {
         let invalid = |what: String| Err(Error::InvalidArgument(format!("fused: {what}")));
         if steps.is_empty() || outputs.is_empty() {
             return invalid("no steps or no outputs".into());
         }
         if let Some(o) = outputs.iter().find(|&&o| o >= steps.len()) {
             return invalid(format!("output step {o} of {}", steps.len()));
+        }
+        if let Some((d, _)) = constants
+            .iter()
+            .find(|(d, _)| !matches!(d, DType::F32 | DType::F16 | DType::BF16))
+        {
+            return invalid(format!("a {d:?} constant"));
         }
         let mut dtypes: Vec<DType> = Vec::with_capacity(steps.len());
         for (k, (primitive, args)) in steps.iter().enumerate() {
@@ -106,6 +129,7 @@ impl Fused {
                 ds.push(match *arg {
                     FusedRef::Input(i) if i < inputs.len() => inputs[i],
                     FusedRef::Step(j) if j < k => dtypes[j],
+                    FusedRef::Constant(c) if c < constants.len() => constants[c].0,
                     _ => return invalid(format!("step {k} refers to {arg:?}")),
                 });
             }
@@ -121,13 +145,20 @@ impl Fused {
         }
         let mut graph = Graph {
             inputs: inputs.to_vec(),
+            constants: constants.to_vec(),
             steps,
             outputs: outputs.to_vec(),
             dtypes,
             id: 0,
         };
         let mut h = DefaultHasher::new();
-        (&graph.inputs, &graph.steps, &graph.outputs).hash(&mut h);
+        (
+            &graph.inputs,
+            &graph.constants,
+            &graph.steps,
+            &graph.outputs,
+        )
+            .hash(&mut h);
         graph.id = h.finish();
         Ok(Self(Arc::new(graph)))
     }
@@ -161,6 +192,7 @@ impl Fused {
                 .map(|r| match *r {
                     FusedRef::Input(i) => inputs[i].clone(),
                     FusedRef::Step(j) => results[j].clone(),
+                    FusedRef::Constant(c) => constant_array(self.0.constants[c]),
                 })
                 .collect();
             results.push(Array::from_op(primitive.clone(), args)?.swap_remove(0));
@@ -262,6 +294,27 @@ impl Fused {
         for (i, d) in g.inputs.iter().enumerate() {
             let _ = writeln!(s, "  device const {}* a{i} = in{i} + offs[{i}];", msl(*d));
         }
+        // Constants as float literals, as MLX writes them: the compiler folds them early (a
+        // literal exponent specializes `pow`). The shortest round-trip form reads back as the
+        // same float, which holds half and bfloat values exactly; non-finite values are
+        // written from their bits.
+        for (c, &(d, bits)) in g.constants.iter().enumerate() {
+            let value = match d {
+                DType::F16 => crate::f16::from_bits(bits as u16).to_f32(),
+                DType::BF16 => crate::bf16::from_bits(bits as u16).to_f32(),
+                _ => f32::from_bits(bits as u32),
+            };
+            let t = msl(d);
+            if value.is_finite() {
+                let _ = writeln!(s, "  const {t} c{c} = {t}({value:?}f);");
+            } else {
+                let _ = writeln!(
+                    s,
+                    "  const {t} c{c} = {t}(as_type<float>(0x{:x}u));",
+                    value.to_bits()
+                );
+            }
+        }
         let _ = writeln!(
             s,
             "  for (uint i = tid * {per_thread}; i < min(size, (tid + 1) * {per_thread}); ++i) {{"
@@ -277,10 +330,12 @@ impl Fused {
         let arg = |r: &FusedRef| match *r {
             FusedRef::Input(i) => format!("x{i}"),
             FusedRef::Step(j) => format!("t{j}"),
+            FusedRef::Constant(c) => format!("c{c}"),
         };
         let dtype = |r: &FusedRef| match *r {
             FusedRef::Input(i) => g.inputs[i],
             FusedRef::Step(j) => g.dtypes[j],
+            FusedRef::Constant(c) => g.constants[c].0,
         };
         for (k, (primitive, args)) in g.steps.iter().enumerate() {
             let a: Vec<String> = args.iter().map(arg).collect();
@@ -300,6 +355,15 @@ impl Fused {
         }
         s.push_str("  }\n}\n");
         s
+    }
+}
+
+/// A fused constant as a scalar array (for the composition).
+fn constant_array((dtype, bits): (DType, u64)) -> Array {
+    match dtype {
+        DType::F16 => Array::from(crate::f16::from_bits(bits as u16)),
+        DType::BF16 => Array::from(crate::bf16::from_bits(bits as u16)),
+        _ => Array::from(f32::from_bits(bits as u32)),
     }
 }
 
@@ -357,6 +421,8 @@ fn binary_expr(op: BinaryOp, a: &str, b: &str) -> String {
         BinaryOp::Maximum => format!("op_max({a}, {b})"),
         BinaryOp::Minimum => format!("op_min({a}, {b})"),
         BinaryOp::LogAddExp => format!("op_logaddexp({a}, {b})"),
+        BinaryOp::FloorDivide => format!("op_floordiv({a}, {b})"),
+        BinaryOp::Power => format!("op_pow({a}, {b})"),
         BinaryOp::Equal => format!("nbool{{uchar(op_eq({a}, {b}))}}"),
         BinaryOp::NotEqual => format!("nbool{{uchar(!op_eq({a}, {b}))}}"),
         BinaryOp::Less => format!("nbool{{uchar(op_lt({a}, {b}))}}"),

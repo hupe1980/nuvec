@@ -6,13 +6,15 @@
    `## [Unreleased]`, update the link lines at the bottom.
 3. `just ci` and `cargo publish --workspace --dry-run --locked`.
 4. Benchmarks on an idle Mac on AC power (models in the Hugging Face cache, [uv](https://docs.astral.sh/uv/)):
-   - `just bench-parity --nuvec-ref vPREVIOUS --out target/bench-parity/base.json` (the
-     previous release, same day), then `just bench-parity --release` (all sections on a
-     minor release, `--sections decode,ttft` on a patch). Long runs continue with
-     `--resume`; `--budget SECONDS` stops between children.
-   - `just bench-compare target/bench-parity/base.json site/static/benchmarks/X.Y.Z/<machine>.json`:
-     a cell that fell by more than 2% blocks the release or is explained in the notes.
-   - `just bench-validate`; update the README and the benchmarks page from the record.
+   - `just bench-parity --release` (the quick tier, about 45 minutes): nuvec against
+     mlx-lm and against the previous release (the latest `v*` tag, built in a worktree and
+     run in the same session). It exits 4 when a cell stays below 0.97× of the previous
+     release after a re-measure: fix it or explain it in the notes.
+   - On a minor release also `just bench-parity --release --tier full` (hours; continue
+     with `--resume`, stop between children with `--budget SECONDS`).
+   - `just bench-validate`; update the README and the benchmarks page from the records.
+   - `just soak 1`: an hour of server-like work on a caller-owned thread without growth.
+   - `just test-large`: arrays of 2^32 elements and more on the GPU (~14 GB, run alone).
 5. `just api-check` (the pinned surface and `cargo semver-checks` on `nuvec` and `nuvec-lm`).
 6. Commit (records under `site/static/benchmarks/` included), push to `main`, wait for CI.
 7. Tag `vX.Y.Z` on that commit and push the tag. The release workflow checks the tag, the

@@ -1,9 +1,11 @@
 //! Replays outputs recorded from real MLX (`scripts/mlx_fixtures.py`) without Python.
 
+mod common;
 #[path = "common/fixture.rs"]
 mod fixture;
 
-use fixture::{check, compare, from_array, load, run};
+use fixture::{Case, check, check_exact, compare, from_array, load, load_gpu, run, values};
+use nuvec_core::{Device, with_stream};
 
 #[test]
 fn fixture_meta() {
@@ -48,4 +50,77 @@ fn comparator_detects_corruption() {
         err.contains("add-float32") && err.contains("element 4"),
         "{err}"
     );
+}
+
+/// The floating-point quantization modes against MLX's Metal output, bit for bit, on the
+/// CPU and (when present) the GPU.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "hundreds of cases: too slow under Miri, and covered natively"
+)]
+fn mlx_gpu_fixtures_bit_for_bit() {
+    let (meta, cases) = load_gpu();
+    assert!(
+        meta.contains("mlx=0.32.4") && meta.contains("device=gpu"),
+        "{meta}"
+    );
+    let mut devices = vec![];
+    if common::require_gpu().is_some() {
+        devices.push(Device::gpu(0));
+    }
+    devices.push(Device::cpu());
+    for device in devices {
+        // Products, affine dequantize, the blocked head-512 attention and `pow` are
+        // bit-exact on the GPU (MLX's kernels and dispatch); the CPU follows MLX's CPU
+        // (another accumulation order, two roundings per dequantized element, the C
+        // library's `pow`) and meets FR-008's bound instead.
+        let failures: Vec<String> = cases
+            .iter()
+            .filter_map(|c| {
+                with_stream(device, || match (device == Device::cpu(), cpu_differs(c)) {
+                    (true, true) => check_within(c),
+                    _ => check_exact(c),
+                })
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{device:?}: {} of {} MLX GPU fixture cases differ:\n{}",
+            failures.len(),
+            cases.len(),
+            failures.join("\n")
+        );
+    }
+}
+
+fn cpu_differs(case: &Case) -> bool {
+    matches!(case.op.as_str(), "quantized_matmul" | "gather_qmm")
+        || case.name.starts_with("affine-dequantize-")
+        || case.name.starts_with("sdpa-d512-")
+        || case.name.starts_with("power-gpu-")
+}
+
+/// FR-008's bound against MLX's GPU output, `|a - b| <= atol · max|b| + rtol · |b|`: the
+/// absolute part scales with the output (sums of `K` products cancel to values near zero).
+fn check_within(case: &Case) -> Option<String> {
+    let got = match run(case).and_then(|a| {
+        a.iter()
+            .map(from_array)
+            .collect::<nuvec_core::Result<Vec<_>>>()
+    }) {
+        Ok(got) => got,
+        Err(e) => return Some(format!("{}: nuvec error: {e}", case.name)),
+    };
+    let (atol, rtol) = match case.outputs[0].dtype {
+        nuvec_core::DType::F32 => (1e-5, 1e-4),
+        nuvec_core::DType::F16 => (1e-3, 5e-3),
+        _ => (1e-2, 4e-2),
+    };
+    let (g, e) = (values(&got[0]), values(&case.outputs[0]));
+    let scale = e.iter().fold(1.0f64, |m, v| m.max(v.0.abs()));
+    g.iter().zip(&e).enumerate().find_map(|(i, (a, b))| {
+        ((a.0 - b.0).abs() > atol * scale + rtol * b.0.abs())
+            .then(|| format!("{}: element {i}: {} vs MLX {}", case.name, a.0, b.0))
+    })
 }

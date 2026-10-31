@@ -47,28 +47,46 @@ fn workload() -> Result<Vec<Array>> {
     let w = normal(&[4096, 4096], bf16_, 5);
     out.push(normal(&[1, 4096], bf16_, 6).matmul(&w.t()));
     // Quantized: matrix-vector, matrix-matrix, and the transposed-weight product.
-    let (wq, scales, biases) = w.quantize(64, 4);
+    let wq = w.quantize(Quant::affine(64, 4));
     for (rows, seed) in [(1, 7), (8, 8), (256, 9)] {
         let x = normal(&[rows, 4096], bf16_, seed);
-        out.push(x.quantized_matmul(&wq, &scales, &biases, true, 64, 4));
+        out.push(x.quantized_matmul(&wq, true));
     }
-    out.push(normal(&[1, 4096], bf16_, 10).quantized_matmul(&wq, &scales, &biases, false, 64, 4));
+    out.push(normal(&[1, 4096], bf16_, 10).quantized_matmul(&wq, false));
     // Mixture of experts: rows sorted by expert through 16 quantized experts.
     let experts = normal(&[16, 512, 1024], bf16_, 11);
-    let (eq, es, eb) = experts.quantize(64, 4);
+    let eq = experts.quantize(Quant::affine(64, 4));
     let ids: Vec<u32> = (0..512u32).map(|i| i * 16 / 512).collect();
     let ids = Array::from(ids);
     out.push(normal(&[512, 1, 1024], bf16_, 12).gather_qmm(
         &eq,
-        &es,
-        &eb,
         None,
         Some(&ids),
-        true,
-        64,
-        4,
-        true,
+        GatherQmm::default().sorted_indices(true),
     ));
+    // The floating-point modes: a product and a sorted gather each (NVFP4 with global
+    // scales).
+    for (seed, mode) in [
+        (36, QuantMode::Mxfp4),
+        (37, QuantMode::Mxfp8),
+        (38, QuantMode::Nvfp4),
+    ] {
+        let q = experts.quantize(mode);
+        out.push(
+            normal(&[64, 4096], bf16_, seed).quantized_matmul(&w.i(..512).quantize(mode), true),
+        );
+        let mut options = GatherQmm::default().sorted_indices(true);
+        let scale = Array::from_slice(&[0.5f32; 16], [16]);
+        if mode == QuantMode::Nvfp4 {
+            options = options.global_scale(&scale);
+        }
+        out.push(normal(&[512, 1, 1024], bf16_, seed + 10).gather_qmm(
+            &q,
+            None,
+            Some(&ids),
+            options,
+        ));
+    }
     // Attention: decode over many keys (two passes), causal prefill (tiled).
     let (k, v) = (
         normal(&[1, 4, 8192, 128], bf16_, 13),
@@ -136,6 +154,33 @@ fn workload() -> Result<Vec<Array>> {
         &ops::zeros([1, 8, 128, 128], f32_),
     );
     out.extend([y, state]);
+    // Speculation: capture-all Gated DeltaNet with bfloat16 storage, a causal verify call
+    // over 1,030 keys (rows on both sides of the two-pass switch), on-device acceptance.
+    let (y, states) = fast::gated_delta_steps_with(
+        &(normal(&[1, 5, 4, 128], bf16_, 34) * 0.05),
+        &(normal(&[1, 5, 4, 128], bf16_, 35) * 0.05),
+        &normal(&[1, 5, 8, 128], bf16_, 36),
+        &normal(&[1, 5, 8], f32_, 37).sigmoid(),
+        &normal(&[1, 5, 8], bf16_, 38).sigmoid(),
+        &ops::zeros([1, 8, 128, 128], f32_),
+        &fast::StepOptions::default().storage(bf16_),
+    );
+    out.extend([y, states]);
+    let verify = fast::scaled_dot_product_attention(
+        &normal(&[1, 16, 8, 128], bf16_, 39),
+        &normal(&[1, 4, 1030, 128], bf16_, 40),
+        &normal(&[1, 4, 1030, 128], bf16_, 41),
+        0.088,
+        &fast::AttentionOptions::causal(),
+    );
+    out.push(verify);
+    let logits = normal(&[5, 4096], f32_, 42);
+    let draft = logits.i(0..4).argmax(-1);
+    out.push(speculative::accept_greedy(
+        &logits,
+        &draft,
+        &ops::zeros([1], DType::U32),
+    ));
     Ok(out)
 }
 

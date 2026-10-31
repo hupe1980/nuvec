@@ -1036,7 +1036,15 @@ impl Optimizer for MultiOptimizer {
             } else {
                 &mut next.default
             };
-            for (&i, a) in idx.iter().zip(opt.apply(&p, &g)?) {
+            let updated = opt.apply(&p, &g)?;
+            if updated.len() != idx.len() {
+                return Err(Error::InvalidArgument(format!(
+                    "MultiOptimizer: a group's optimizer returned {} parameters for {}",
+                    updated.len(),
+                    idx.len()
+                )));
+            }
+            for (&i, a) in idx.iter().zip(updated) {
                 out[i] = Some(a);
             }
         }

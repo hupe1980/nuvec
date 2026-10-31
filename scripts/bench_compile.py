@@ -45,7 +45,18 @@ def adam(p, m, v, g):
     return [p - step * 1e-3, m, v]
 
 
-CASES = [("gelu", 1, gelu), ("swiglu", 2, swiglu), ("adam", 4, adam)]
+def geglu(g, u):  # mlx-lm's Gemma `geglu`: nn.gelu_approx(g) * u
+    return [0.5 * g * (1 + mx.tanh(0.7978846 * (g + 0.044715 * g ** 3))) * u]
+
+
+def swiglu_oai(g, u):  # mlx-lm's gpt-oss `swiglu`, alpha 1.702, limit 7
+    g = mx.minimum(g, 7.0)
+    u = mx.clip(u, -7.0, 7.0)
+    return [(u + 1) * (g * mx.sigmoid(1.702 * g))]
+
+
+CASES = [("gelu", 1, gelu), ("swiglu", 2, swiglu), ("geglu", 2, geglu),
+         ("swiglu-oai", 2, swiglu_oai), ("adam", 4, adam)]
 
 
 def mlx_results() -> dict[tuple[str, int, str], tuple[float, float]]:

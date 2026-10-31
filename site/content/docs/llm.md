@@ -1,6 +1,6 @@
 +++
 title = "LLM runtime"
-description = "nuvec-lm runs Llama, Mistral and Qwen 2/3/3.5 models from mlx-community or Hugging Face checkpoints on Apple Silicon at mlx-lm's speed, with samplers, speculative decoding and batched serving."
+description = "nuvec-lm runs Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 models from mlx-community or Hugging Face checkpoints on Apple Silicon, matching mlx-lm's outputs and speed, with samplers, speculative decoding and batched serving."
 weight = 90
 [extra]
 group = "Libraries"
@@ -17,8 +17,10 @@ group = "Libraries"
 | Qwen 3 | `qwen3` | per-head q/k norms |
 | Qwen 3 MoE | `qwen3_moe` | sparse layers per `decoder_sparse_step`, dense `mlp_only_layers` |
 | Qwen 3.5 / 3.6 | `qwen3_5`, `qwen3_5_text`, `qwen3_5_moe`, `qwen3_5_moe_text` | hybrid Gated DeltaNet and gated attention, partial RoPE, dense or mixture-of-experts |
+| gpt-oss | `gpt_oss` | sliding and full layers, attention sinks, YaRN, biased router and experts with the clamped SwiGLU; MXFP4 and affine checkpoints, Hugging Face's MXFP4 originals converted at load |
+| Gemma 4 | `gemma4`, `gemma4_text`, `gemma4_unified`, `gemma4_unified_text` | sliding and full layers with their own head sizes and RoPE, per-layer inputs, KV-shared layers, K = V, the experts branch, the logit soft cap; vision and audio weights are skipped |
 
-Checkpoints load from a directory or a Hugging Face repository id found in the local cache — mlx-community's quantized checkpoints as well as original Hugging Face ones (fused or per-expert MoE weights, multimodal wrappers). Checkpoints whose tensors are aligned (files nuvec writes are) are memory-mapped without a copy; mlx-community checkpoints have unpadded headers and are read once at load, in parallel, without the vision and multi-token-prediction weights the language model does not use (as mlx-lm). Loading runs nothing through the model; `Model::warm_up` builds its kernels ahead of a first request. Nothing is downloaded.
+Checkpoints load from a directory or a Hugging Face repository id found in the local cache — mlx-community's quantized checkpoints (affine, MXFP4, MXFP8 and NVFP4, with per-layer modes) as well as original Hugging Face ones (fused or per-expert MoE weights, multimodal wrappers), including AutoAWQ and GPTQ checkpoints (4-bit, and 8-bit GPTQ), converted at load to MLX's affine layout. Hugging Face MXFP4 (except gpt-oss's originals), FP8, compressed-tensors and ModelOpt checkpoints need an MLX conversion first (`mlx_lm.convert`). Checkpoints whose tensors are aligned (files nuvec writes are) are memory-mapped without a copy; mlx-community checkpoints have unpadded headers and are read once at load, in parallel, without the vision and multi-token-prediction weights the language model does not use (as mlx-lm). Loading runs nothing through the model; `Model::warm_up` builds its kernels ahead of a first request. Nothing is downloaded.
 
 ## Generating
 
@@ -43,7 +45,7 @@ for id in generate(&model, &prompt, options)? {
 
 - **End of sequence:** generation stops at the model's end-of-sequence ids (those of `config.json` and `generation_config.json`, as mlx-lm) without yielding them, or at `max_tokens`.
 - **Samplers:** greedy (temperature 0, the default), temperature, top-p, min-p and top-k, with mlx-lm's filters chained in mlx-lm's order. Settings are checked when generation starts (`Sampler::validate`). With `GenerateOptions::seed`, sampled tokens are reproducible, also when batched with other requests.
-- **Tokenizer:** byte-level BPE read from `tokenizer.json` (GPT-2, Llama 3, Qwen 2/3/3.5 split patterns), special tokens included; `encode` adds the tokens the tokenizer's post-processor adds (Llama's `<|begin_of_text|>`), as mlx-lm does. SentencePiece-style tokenizers (Llama 2, Mistral v0.1–v0.3) and other split patterns are not supported. `StreamDecoder` turns token ids into text without splitting multi-byte characters.
+- **Tokenizer:** BPE read from `tokenizer.json`, special tokens included: byte-level (GPT-2, Llama 3, Qwen 2/3/3.5 and o200k's gpt-oss split patterns) and SentencePiece-style with byte fallback (Gemma, Llama 2, Mistral v0.1–v0.3); `encode` adds the tokens the tokenizer's post-processor adds (Llama's `<|begin_of_text|>`), as mlx-lm does. Other split patterns (Mistral's Tekken) are not supported. `StreamDecoder` turns token ids into text without splitting multi-byte characters.
 - **Cache:** `Generation::cache()` exposes the KV cache (and Gated DeltaNet state) for inspection.
 
 ## How generation is fast
@@ -82,7 +84,9 @@ Each sequence gets exactly the tokens it would get decoding alone. Hybrid models
 
 ## Serving many requests
 
-`Batcher` puts it together: requests are queued, admitted while there is room, prefilled (on quantized models, prompts of the same length over 64 tokens admitted together in one batch, each with its solo tokens), and decoded together; each finishes at an end-of-sequence token or its `max_tokens`. Decoding is pipelined as `generate`: each `step` submits the next step before reading the previous one's tokens, so one step can be in flight between calls; a request that ends meanwhile emits nothing more.
+`Batcher` puts it together: requests are queued, admitted while there is room, prefilled (on quantized models, prompts of the same length over 64 tokens admitted together in one batch), and decoded together; each finishes at an end-of-sequence token or its `max_tokens`. Decoding is pipelined as `generate`: each `step` submits the next step before reading the previous one's tokens, so one step can be in flight between calls; a request that ends meanwhile emits nothing more.
+
+Products route as MLX routes them, so a request's output can differ in its low bits depending on what it is batched with, as with mlx-lm's `BatchGenerator`. `Batcher::new(..)?.batch_invariant(true)` serves every request exactly the tokens it gets alone, at some cost in throughput (up to about 20% on mixture-of-experts models at 8 requests).
 
 ```rust,no_run
 use nuvec_lm::{Batcher, Event, GenerateOptions, load};

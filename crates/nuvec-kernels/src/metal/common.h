@@ -53,7 +53,29 @@ inline long loc(uint i, constant int* shape, constant long* strides, int ndim) {
     inline T op_min(T a, T b) { return a < b ? a : b; }                      \
     inline bool op_eq(T a, T b) { return a == b; }                           \
     inline bool op_lt(T a, T b) { return a < b; }                            \
-    inline bool is_nan_(T) { return false; }
+    inline bool is_nan_(T) { return false; }                                 \
+    /* Toward negative infinity (MLX's FloorDivide); 0 for a zero divisor, */ \
+    /* and MIN / -1 wraps. */                                                 \
+    inline T op_floordiv(T a, T b) {                                         \
+        if (b == T(0)) return T(0);                                          \
+        if (T(-1) < T(0) && b == T(-1)) return op_neg(a);                    \
+        T q = a / b;                                                         \
+        if (T(-1) < T(0) && a % b != T(0) && ((a < T(0)) != (b < T(0)))) {  \
+            q = T(q - T(1));                                                 \
+        }                                                                    \
+        return q;                                                            \
+    }                                                                        \
+    /* Squaring (MLX's Power); 0 for a negative exponent; wraps. */           \
+    inline T op_pow(T a, T b) {                                              \
+        if (b < T(0)) return T(0);                                           \
+        U r = U(1), x = U(a), e = U(b);                                      \
+        while (e) {                                                          \
+            if (e & U(1)) r = r * x;                                         \
+            e >>= 1;                                                         \
+            x = x * x;                                                       \
+        }                                                                    \
+        return T(r);                                                         \
+    }
 
 NUVEC_INT_OPS(uchar, uint)
 NUVEC_INT_OPS(ushort, uint)
@@ -149,11 +171,18 @@ inline float erfinv_(float a) {
     inline T op_tanh(T a) { return T(precise::tanh(float(a))); }                              \
     inline T op_sigmoid(T a) { return T(sigmoid_(float(a))); }                                \
     inline T op_erfinv(T a) { return T(erfinv_(float(a))); }                                  \
-    inline T op_logaddexp(T a, T b) { return T(logaddexp_(float(a), float(b))); }
+    inline T op_logaddexp(T a, T b) { return T(logaddexp_(float(a), float(b))); }            \
+    inline T op_floordiv(T a, T b) { return T(precise::floor(float(op_div(a, b)))); }
 
 NUVEC_FLOAT_OPS(half)
 NUVEC_FLOAT_OPS(bfloat)
 NUVEC_FLOAT_OPS(float)
+
+// MLX's Power: `metal::pow` in the type (half natively; bfloat through float, as MLX's
+// `bfloat16_t`).
+inline half op_pow(half a, half b) { return metal::pow(a, b); }
+inline float op_pow(float a, float b) { return metal::pow(a, b); }
+inline bfloat op_pow(bfloat a, bfloat b) { return bfloat(metal::pow(float(a), float(b))); }
 
 // ── Arithmetic: bool (add = OR, subtract = XOR, multiply = AND, as in MLX) ──
 

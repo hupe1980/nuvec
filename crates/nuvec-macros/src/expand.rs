@@ -76,7 +76,11 @@ fn group(
             None => base,
         };
         let r = role(&attrs, &f.ty);
-        if !matches!(r, Role::Ignored | Role::Static | Role::Mode) && !seen.insert(name.clone()) {
+        // Transparent fields (an empty segment) name their own children: not checked here.
+        if !matches!(r, Role::Ignored | Role::Static | Role::Mode)
+            && !name.is_empty()
+            && !seen.insert(name.clone())
+        {
             return Err(Error::new(
                 f.span(),
                 format!("two fields have the path segment {name:?}: rename one"),

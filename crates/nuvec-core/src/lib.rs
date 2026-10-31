@@ -82,11 +82,13 @@ mod custom;
 mod derivatives;
 mod device;
 mod display;
+pub mod distributed;
 mod dtype;
 mod error;
 mod eval;
 pub mod fast;
 mod file;
+mod fp8;
 // Parts of it are only used by the Metal backend.
 #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
 mod fused;
@@ -105,6 +107,7 @@ pub mod random;
 mod scalar;
 mod shape;
 mod sorting;
+pub mod speculative;
 mod transforms;
 pub mod tree;
 mod view;
@@ -126,6 +129,7 @@ pub use error::{Error, OpErrorKind, Result};
 pub use eval::{Scheduled, async_eval, eval, schedule};
 pub use file::MappedFile;
 pub use index::{ArrayIndex, At, Ellipsis, NewAxis, Step, Stepped};
+pub use quantized::{GatherQmm, Quant, QuantMode, Quantized};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
 pub use transforms::{
     GradOutput, InAxes, InAxis, IntoResult, OutAxes, Vmap, grad, grad_flat, jvp, jvp_flat,
@@ -149,10 +153,53 @@ pub mod prelude {
 }
 
 /// Products with at most this many rows give each row the bits of the same row's
-/// one-row product (the row-independence contract): dense matrix products in float32,
-/// float16 and bfloat16, quantized products (every bit width and group size), and the
-/// gathered (mixture-of-experts) products. See the `nuvec` crate's "Determinism" section.
+/// one-row product: dense matrix products in float32, float16 and bfloat16 always, and
+/// quantized and gathered (mixture-of-experts) products evaluated under
+/// [`with_row_exact`]. See the `nuvec` crate's "Determinism" section.
 pub const ROW_INDEPENDENT_ROWS: usize = 8;
+
+thread_local! {
+    /// Whether products evaluated on this thread keep rows independent ([`with_row_exact`]).
+    static ROW_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with row-exact products on this thread: quantized and gathered products of up
+/// to [`ROW_INDEPENDENT_ROWS`] rows (tokens, for gathers) evaluated or built inside give
+/// each row the bits of its one-row product, through one matrix-vector product per row
+/// (or nuvec's few-row kernels with the same arithmetic). Outside it they route as MLX
+/// does, whose multi-vector kernels are faster from 2 rows on but give a row other bits
+/// than its one-row product (D-103). Speculative verification runs in this mode, and so
+/// can batched serving that must equal each request run alone.
+pub fn with_row_exact<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ROW_EXACT.with(|r| r.set(self.0));
+        }
+    }
+    let _restore = Restore(ROW_EXACT.with(|r| r.replace(true)));
+    f()
+}
+
+/// Whether products evaluated or built on this thread now are row-exact
+/// ([`with_row_exact`]).
+pub fn row_exact() -> bool {
+    ROW_EXACT.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// Whether products evaluated on this thread may take the Neural Accelerator kernels
+    /// when they are active.
+    pub(crate) static NAX_ROUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Lets (`true`, the default) or keeps (`false`) products evaluated on this thread from the
+/// Neural Accelerator kernels, so a test compares them with the existing kernels; returns
+/// the previous setting. A test diagnostic, not a stable API: `NUVEC_NAX` is the switch.
+#[doc(hidden)]
+pub fn __nax_route(on: bool) -> bool {
+    NAX_ROUTE.with(|r| r.replace(on))
+}
 
 /// The version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

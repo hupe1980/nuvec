@@ -167,6 +167,16 @@ impl Buffer {
         }
     }
 
+    /// Whether the CPU may write the bytes now: host memory, or a Metal buffer that is not
+    /// a mapped file and that no submitted GPU work uses.
+    pub(crate) fn cpu_writable(&self) -> bool {
+        match &self.storage {
+            Storage::Host(_) => true,
+            #[cfg(all(target_os = "macos", not(miri)))]
+            Storage::Metal(buffer) => !buffer.is_mapped() && !buffer.in_use(),
+        }
+    }
+
     /// Whether the bytes live in GPU-visible unified memory.
     #[cfg_attr(not(all(test, target_os = "macos", not(miri))), allow(dead_code))]
     pub(crate) fn is_metal(&self) -> bool {

@@ -8,8 +8,8 @@ use std::sync::Mutex;
 
 use nuvec_core::{Array, DType, MappedFile, ops};
 use nuvec_io::{
-    load_safetensors, load_safetensors_filtered, safetensors_footprint, save_safetensors,
-    save_safetensors_async,
+    load_safetensors, load_safetensors_filtered, safetensors_footprint,
+    safetensors_footprint_filtered, save_safetensors, save_safetensors_async,
 };
 
 static MEMORY: Mutex<()> = Mutex::new(());
@@ -328,4 +328,75 @@ fn filtered_loads_hold_only_kept_tensors() {
     );
     drop(st);
     std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn filtered_footprints_count_only_kept_tensors_of_misaligned_files() {
+    let _one = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = device() else { return };
+    // An MLX-style file with a kept and a dropped float32 tensor.
+    let path = temp("filtered");
+    let (kept, dropped) = (300_000usize, 500_000usize);
+    let h = format!(
+        "{{\"keep\":{{\"dtype\":\"F32\",\"shape\":[{kept}],\"data_offsets\":[0,{}]}},\
+         \"drop\":{{\"dtype\":\"F32\",\"shape\":[{dropped}],\"data_offsets\":[{},{}]}}}}",
+        kept * 4,
+        kept * 4,
+        (kept + dropped) * 4
+    );
+    let mut h = h.into_bytes();
+    if (8 + h.len()).is_multiple_of(4) {
+        h.push(b' ');
+    }
+    let mut bytes = (h.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(&h);
+    bytes.extend((0..kept + dropped).flat_map(|i| (i as f32).to_le_bytes()));
+    std::fs::write(&path, bytes).unwrap();
+
+    let keep = |name: &str| name == "keep";
+    let all = safetensors_footprint(&path).unwrap();
+    let some = safetensors_footprint_filtered(&path, keep).unwrap();
+    assert_eq!(
+        all.copied,
+        MappedFile::copy_size(((kept + dropped) * 4) as u64)
+    );
+    assert_eq!(
+        (some.mapped, some.copied),
+        (0, MappedFile::copy_size((kept * 4) as u64))
+    );
+    assert_eq!(some.transient, some.copied);
+    // The filtered load allocates exactly that.
+    let start = dev.memory();
+    let st = load_safetensors_filtered(&path, keep).unwrap();
+    let m = dev.memory();
+    assert_eq!((m.active - start.active) as u64, some.copied);
+    assert_eq!(st.tensors.len(), 1);
+    drop(st);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn tensors_of_one_file_share_a_buffer_id() {
+    let _one = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    // Aligned (mapped) and misaligned (read into one buffer per file).
+    let aligned = temp("ids-aligned");
+    let (a, b) = (
+        ops::arange(0, 64, 1).astype(DType::F32),
+        ops::arange(0, 32, 1).astype(DType::I32),
+    );
+    save_safetensors(&aligned, &[("a", &a), ("b", &b)], &[]).unwrap();
+    let mlx = temp("ids-mlx");
+    misaligned(&mlx, 1000);
+    for path in [&aligned, &mlx] {
+        let st = load_safetensors(path).unwrap();
+        let ids: Vec<_> = st.tensors.values().map(|t| t.buffer_id()).collect();
+        assert!(
+            ids.iter().all(|id| id.is_some() && *id == ids[0]),
+            "{path:?}: {ids:?}"
+        );
+    }
+    let other = load_safetensors(&aligned).unwrap();
+    let st = load_safetensors(&mlx).unwrap();
+    assert_ne!(other.tensors["a"].buffer_id(), st.tensors["x"].buffer_id());
+    let _ = (std::fs::remove_file(&aligned), std::fs::remove_file(&mlx));
 }

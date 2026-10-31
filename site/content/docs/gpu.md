@@ -56,6 +56,17 @@ gpu.set_wired_limit(gpu.info().recommended_working_set as usize)?;
 
 `nuvec_lm::WiredLimit` does this for the duration of a generation, as mlx-lm does.
 
+## Neural Accelerators (M5)
+
+M5-class GPUs have a Neural Accelerator in every GPU core, reached through Metal 4's TensorOps (`matmul2d` from Metal Performance Primitives). nuvec ships kernels for them in a second kernel library for macOS 26.2 and later, so the baseline still runs on macOS 15: dense GEMM (64 × 64 tiles, thin tiles of 16 or 32 rows or columns, and split K), affine 2/4/8-bit quantized products, and the sorted mixture-of-experts gather.
+
+- `NUVEC_NAX=auto` (default), `on` or `off`; `nuvec::gpu::Device::nax()` reports whether they run and why not.
+- Under `auto` they stay **off** until someone measures them on an M5: nobody on the project has one yet. An eligible M5 reports `Off(Unmeasured)`.
+- `NUVEC_NAX=on` forces them on any GPU with TensorOps (every Apple GPU on macOS 26.2). On earlier GPUs they run on the ordinary GPU cores at about the speed of the SIMD kernels, which is how they are tested.
+- The kernels let `matmul2d` load its operands as tensors and read results through each element's reported coordinates, so they do not depend on the GPU's register layout (MLX's NAX kernels hard-code the M5's, which differs on earlier GPUs).
+
+**Have an M5?** `just nax-report` checks correctness and benchmarks nuvec's NAX kernels against its SIMD kernels and MLX's own NAX path, and writes a report to attach to an issue. That measurement is what turns `auto` on.
+
 ## Profiling
 
 Set `NUVEC_PROFILE=1` to record the GPU time of every kernel:

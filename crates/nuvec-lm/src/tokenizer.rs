@@ -1,7 +1,9 @@
 //! Byte-level BPE tokenizers read from Hugging Face `tokenizer.json` files: those whose
-//! pre-tokenizer splits by the GPT-2 pattern or a GPT-4-style one (GPT-2, Llama 3, Qwen
-//! 2/3/3.5). Other split patterns (Mistral's Tekken among them) and SentencePiece-style
-//! byte-fallback BPE (Llama 2, Mistral v0.1–v0.3) are rejected when the file is read.
+//! pre-tokenizer splits by the GPT-2 pattern, a GPT-4-style one (GPT-2, Llama 3, Qwen
+//! 2/3/3.5) or o200k's (GPT-4o, gpt-oss); and SentencePiece-style BPE over characters
+//! with byte fallback (Gemma, Llama 2, Mistral v0.1–v0.3: spaces as `▁`, characters
+//! outside the vocabulary as `<0xNN>` bytes). Other split patterns (Mistral's Tekken among
+//! them) are rejected when the file is read.
 //!
 //! Encoding follows the `tokenizers` library: added tokens are split off first (in one
 //! pass, the longest match at the earliest position); the rest is normalized (NFC, when
@@ -38,6 +40,10 @@ enum Pattern {
         /// Qwen 3.5).
         marks: bool,
     },
+    /// o200k (GPT-4o, gpt-oss): words as upper-case letters then lower-case ones (marks
+    /// in both), each with an optional contraction, runs of at most 3 digits, punctuation
+    /// with trailing newlines or slashes, newlines, then whitespace.
+    O200k,
 }
 
 const GPT2: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
@@ -45,11 +51,20 @@ const GPT4_PREFIX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}
 const GPT4_SUFFIX: &str = r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const MARKS_PREFIX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}";
 const MARKS_SUFFIX: &str = r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+const O200K: &str = concat!(
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+",
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+",
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+);
 
 impl Pattern {
     fn parse(regex: &str) -> Result<Self> {
         if regex == GPT2 {
             return Ok(Self::Gpt2);
+        }
+        if regex == O200K {
+            return Ok(Self::O200k);
         }
         let quantified = |prefix: &str, suffix: &str| {
             regex
@@ -77,6 +92,7 @@ impl Pattern {
             let n = match self {
                 Self::Gpt2 => gpt2_match(&chars, i),
                 Self::Gpt4 { digits, marks } => gpt4_match(&chars, i, digits, marks),
+                Self::O200k => o200k_match(&chars, i),
             }
             .max(1);
             let start = chars[i].0;
@@ -213,6 +229,196 @@ fn gpt4_match(chars: &[(usize, char)], i: usize, digits: usize, marks: bool) -> 
     spaces(chars, i)
 }
 
+/// o200k's upper-case class `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]`.
+fn is_upper_class(c: char) -> bool {
+    use GeneralCategory as G;
+    is_mark(c)
+        || matches!(
+            get_general_category(c),
+            G::UppercaseLetter | G::TitlecaseLetter | G::ModifierLetter | G::OtherLetter
+        )
+}
+
+/// o200k's lower-case class `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`.
+fn is_lower_class(c: char) -> bool {
+    use GeneralCategory as G;
+    is_mark(c)
+        || matches!(
+            get_general_category(c),
+            G::LowercaseLetter | G::ModifierLetter | G::OtherLetter
+        )
+}
+
+/// o200k's two word alternatives at `j` (after the optional prefix), as the regular
+/// expression backtracks: `U*L+` (the longest `U*` that leaves an `L`), then `U+L*`; each
+/// with an optional contraction. Their length, or `None`.
+fn o200k_word(chars: &[(usize, char)], j: usize, upper_first: bool) -> Option<usize> {
+    let ups = run(chars, j, is_upper_class);
+    let end = if upper_first {
+        // `U*L+`: give back upper-class characters until an `L` follows.
+        (0..=ups).rev().find_map(|m| {
+            let k = j + m;
+            (k < chars.len() && is_lower_class(chars[k].1))
+                .then(|| k + run(chars, k, is_lower_class))
+        })?
+    } else {
+        // `U+L*`
+        if ups == 0 {
+            return None;
+        }
+        j + ups + run(chars, j + ups, is_lower_class)
+    };
+    let tail = if end < chars.len() {
+        contraction(chars, end, true)
+    } else {
+        0
+    };
+    Some(end + tail - j)
+}
+
+fn o200k_match(chars: &[(usize, char)], i: usize) -> usize {
+    let c = chars[i].1;
+    // `[^\r\n\p{L}\p{N}]?`, with the prefix tried first.
+    let prefix = !matches!(c, '\r' | '\n') && !is_letter(c) && !is_number(c);
+    for upper_first in [true, false] {
+        if prefix
+            && i + 1 < chars.len()
+            && let Some(n) = o200k_word(chars, i + 1, upper_first)
+        {
+            return 1 + n;
+        }
+        if let Some(n) = o200k_word(chars, i, upper_first) {
+            return n;
+        }
+    }
+    // `\p{N}{1,3}`
+    let n = run(chars, i, is_number);
+    if n > 0 {
+        return n.min(3);
+    }
+    // ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
+    let space = usize::from(c == ' ');
+    let n = run(chars, i + space, is_other);
+    if n > 0 {
+        let end = i + space + n;
+        return space + n + run(chars, end, |c| matches!(c, '\r' | '\n' | '/'));
+    }
+    // `\s*[\r\n]+`: through the last newline of the whitespace run.
+    let ws = run(chars, i, char::is_whitespace);
+    if let Some(last) = (i..i + ws)
+        .rev()
+        .find(|&k| matches!(chars[k].1, '\r' | '\n'))
+    {
+        return last + 1 - i;
+    }
+    spaces(chars, i)
+}
+
+/// A SentencePiece-style tokenizer's normalizer step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Normalize {
+    Nfc,
+    /// `Prepend`: the text before a non-empty segment.
+    Prepend(String),
+    /// `Replace` of a string.
+    Replace(String, String),
+}
+
+/// How a SentencePiece-style pre-tokenizer splits a segment (`Split` on a string, or
+/// `Metaspace`'s split on its replacement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SplitOn {
+    Nothing,
+    /// The delimiter ends the piece before it (`MergedWithPrevious`).
+    After(String),
+    /// The delimiter starts the piece after it (`MergedWithNext`, `Metaspace`).
+    Before(String),
+    /// The delimiter is a piece of its own (`Isolated`).
+    Isolated(String),
+}
+
+/// `Metaspace`'s prepend scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prepend {
+    Always,
+    First,
+    Never,
+}
+
+/// SentencePiece-style BPE (`byte_fallback`, `Metaspace`): BPE over characters, spaces
+/// as the replacement character, characters outside the vocabulary as their bytes'
+/// `<0xNN>` tokens (or the unknown token).
+#[derive(Debug, Clone)]
+struct Spm {
+    normalize: Vec<Normalize>,
+    /// `Metaspace` as the pre-tokenizer: its replacement and prepend scheme.
+    metaspace: Option<(char, Prepend)>,
+    split: SplitOn,
+    /// The `<0xNN>` tokens' ids by byte.
+    bytes: Vec<Option<u32>>,
+    /// The byte of each `<0xNN>` token.
+    byte_of: HashMap<u32, u8>,
+    unk: Option<u32>,
+    /// Consecutive unknown characters give one unknown token (`fuse_unk`).
+    fuse_unk: bool,
+    /// The character the decoder turns back into a space.
+    replacement: char,
+    /// Spaces the decoder strips from the start of the text (`Strip` after `Fuse`, or
+    /// `Metaspace`'s prepended space).
+    strip: usize,
+}
+
+impl Spm {
+    /// The normalizer's and pre-tokenizer's pieces of a segment (`first`: it starts the
+    /// text).
+    fn pieces(&self, text: &str, first: bool) -> Vec<String> {
+        let mut t: String = text.to_owned();
+        for step in &self.normalize {
+            t = match step {
+                Normalize::Nfc => t.nfc().collect(),
+                Normalize::Prepend(p) if !t.is_empty() => format!("{p}{t}"),
+                Normalize::Prepend(_) => t,
+                Normalize::Replace(a, b) => t.replace(a.as_str(), b),
+            };
+        }
+        if let Some((r, scheme)) = self.metaspace {
+            t = t.replace(' ', r.encode_utf8(&mut [0; 4]));
+            let prepend = match scheme {
+                Prepend::Always => true,
+                Prepend::First => first,
+                Prepend::Never => false,
+            };
+            if prepend && !t.is_empty() && !t.starts_with(r) {
+                t.insert(0, r);
+            }
+        }
+        let cut = |t: &str, d: &str, f: &dyn Fn(usize) -> (usize, usize)| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut start = 0;
+            for (at, _) in t.match_indices(d) {
+                let (end, next) = f(at);
+                if end > start {
+                    out.push(t[start..end].to_owned());
+                }
+                if next > end {
+                    out.push(t[end..next].to_owned());
+                }
+                start = next;
+            }
+            if start < t.len() {
+                out.push(t[start..].to_owned());
+            }
+            out
+        };
+        match &self.split {
+            SplitOn::Nothing => vec![t],
+            SplitOn::After(d) => cut(&t, d, &|at| (at + d.len(), at + d.len())),
+            SplitOn::Before(d) => cut(&t, d, &|at| (at, at)),
+            SplitOn::Isolated(d) => cut(&t, d, &|at| (at, at + d.len())),
+        }
+    }
+}
+
 /// GPT-2's map from bytes to printable characters (byte-level BPE).
 fn byte_chars() -> [char; 256] {
     let mut table = ['\0'; 256];
@@ -229,7 +435,7 @@ fn byte_chars() -> [char; 256] {
     table
 }
 
-/// A byte-level BPE tokenizer.
+/// A BPE tokenizer: byte-level (GPT-2 style) or SentencePiece-style with byte fallback.
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
     vocab: HashMap<String, u32>,
@@ -245,6 +451,8 @@ pub struct Tokenizer {
     added_ids: HashSet<u32>,
     nfc: bool,
     pattern: Pattern,
+    /// SentencePiece-style BPE instead of byte-level.
+    spm: Option<Box<Spm>>,
     ignore_merges: bool,
     to_char: [char; 256],
     to_byte: HashMap<char, u8>,
@@ -396,11 +604,11 @@ impl Tokenizer {
         if model.get("type").and_then(Json::as_str) != Some("BPE") {
             return Err(invalid("only BPE models are supported"));
         }
-        if model.get("byte_fallback").and_then(Json::as_bool) == Some(true) {
-            return Err(invalid(
-                "byte-fallback (SentencePiece-style) BPE is not supported",
-            ));
-        }
+        let metaspace_pre = |p: Option<&Json>| {
+            p.and_then(|p| p.get("type")).and_then(Json::as_str) == Some("Metaspace")
+        };
+        let spm_mode = model.get("byte_fallback").and_then(Json::as_bool) == Some(true)
+            || metaspace_pre(file.get("pre_tokenizer"));
         let mut vocab = HashMap::new();
         let mut tokens: Vec<Option<String>> = Vec::new();
         let put = |tokens: &mut Vec<Option<String>>, s: &str, id: u32| {
@@ -465,14 +673,19 @@ impl Tokenizer {
                 .push(i);
         }
         let added_ids = added.iter().map(|&(_, id, _)| id).collect();
-        let nfc = match file.get("normalizer") {
-            None | Some(Json::Null) => false,
-            Some(n) => match n.get("type").and_then(Json::as_str) {
-                Some("NFC") => true,
-                _ => return Err(invalid("unsupported normalizer")),
-            },
+        let (nfc, pattern, spm) = if spm_mode {
+            let spm = Self::spm(file, model, &vocab)?;
+            (false, Pattern::Gpt2, Some(Box::new(spm)))
+        } else {
+            let nfc = match file.get("normalizer") {
+                None | Some(Json::Null) => false,
+                Some(n) => match n.get("type").and_then(Json::as_str) {
+                    Some("NFC") => true,
+                    _ => return Err(invalid("unsupported normalizer")),
+                },
+            };
+            (nfc, Self::pattern(file.get("pre_tokenizer"))?, None)
         };
-        let pattern = Self::pattern(file.get("pre_tokenizer"))?;
         let to_char = byte_chars();
         let to_byte = to_char
             .iter()
@@ -488,6 +701,7 @@ impl Tokenizer {
             added_ids,
             nfc,
             pattern,
+            spm,
             ignore_merges: model
                 .get("ignore_merges")
                 .and_then(Json::as_bool)
@@ -496,6 +710,166 @@ impl Tokenizer {
             to_byte,
             template: template(file.get("post_processor")),
             words: WordCache::default(),
+        })
+    }
+
+    /// A SentencePiece-style tokenizer's normalizer, pre-tokenizer and decoder.
+    fn spm(file: &Json, model: &Json, vocab: &HashMap<String, u32>) -> Result<Spm> {
+        fn steps(n: &Json, out: &mut Vec<Normalize>) -> Result<()> {
+            let text = |k: &str| n.get(k).and_then(Json::as_str).map(str::to_owned);
+            match n.get("type").and_then(Json::as_str) {
+                Some("Sequence") => {
+                    for n in n
+                        .get("normalizers")
+                        .and_then(Json::as_array)
+                        .unwrap_or_default()
+                    {
+                        steps(n, out)?;
+                    }
+                }
+                Some("NFC") => out.push(Normalize::Nfc),
+                Some("Prepend") => out.push(Normalize::Prepend(
+                    text("prepend").ok_or_else(|| invalid("Prepend without text"))?,
+                )),
+                Some("Replace") => {
+                    let pattern = n
+                        .get("pattern")
+                        .and_then(|p| p.get("String"))
+                        .and_then(Json::as_str)
+                        .ok_or_else(|| invalid("Replace of a regular expression"))?;
+                    let content =
+                        text("content").ok_or_else(|| invalid("Replace without content"))?;
+                    out.push(Normalize::Replace(pattern.to_owned(), content));
+                }
+                other => return Err(invalid(format!("unsupported normalizer {other:?}"))),
+            }
+            Ok(())
+        }
+        let mut normalize = Vec::new();
+        if let Some(n) = file.get("normalizer").filter(|n| **n != Json::Null) {
+            steps(n, &mut normalize)?;
+        }
+        let one_char = |s: Option<&str>| s.and_then(|s| s.chars().next()).unwrap_or('▁');
+        let (mut metaspace, mut split) = (None, SplitOn::Nothing);
+        let pre = file.get("pre_tokenizer").filter(|p| **p != Json::Null);
+        let pres: Vec<&Json> = match pre {
+            Some(p) if p.get("type").and_then(Json::as_str) == Some("Sequence") => p
+                .get("pretokenizers")
+                .and_then(Json::as_array)
+                .unwrap_or_default()
+                .iter()
+                .collect(),
+            Some(p) => vec![p],
+            None => Vec::new(),
+        };
+        for p in pres {
+            match p.get("type").and_then(Json::as_str) {
+                Some("Metaspace") => {
+                    let r = one_char(p.get("replacement").and_then(Json::as_str));
+                    let scheme = match p.get("prepend_scheme").and_then(Json::as_str) {
+                        Some("first") => Prepend::First,
+                        Some("never") => Prepend::Never,
+                        Some("always") => Prepend::Always,
+                        None if p.get("add_prefix_space").and_then(Json::as_bool)
+                            == Some(false) =>
+                        {
+                            Prepend::Never
+                        }
+                        None => Prepend::Always,
+                        Some(other) => {
+                            return Err(invalid(format!("unsupported prepend scheme {other:?}")));
+                        }
+                    };
+                    metaspace = Some((r, scheme));
+                    if p.get("split").and_then(Json::as_bool) != Some(false) {
+                        split = SplitOn::Before(r.to_string());
+                    }
+                }
+                Some("Split") => {
+                    let d = p
+                        .get("pattern")
+                        .and_then(|p| p.get("String"))
+                        .and_then(Json::as_str)
+                        .ok_or_else(|| invalid("Split on a regular expression"))?
+                        .to_owned();
+                    if p.get("invert").and_then(Json::as_bool) == Some(true) {
+                        return Err(invalid("inverted Split"));
+                    }
+                    split = match p.get("behavior").and_then(Json::as_str) {
+                        Some("MergedWithPrevious") => SplitOn::After(d),
+                        Some("MergedWithNext") => SplitOn::Before(d),
+                        Some("Isolated") | None => SplitOn::Isolated(d),
+                        other => return Err(invalid(format!("unsupported split {other:?}"))),
+                    };
+                }
+                other => return Err(invalid(format!("unsupported pre-tokenizer {other:?}"))),
+            }
+        }
+        // The decoder: `▁` back to spaces, then (after `Fuse`) the leading spaces stripped.
+        let mut replacement = metaspace.map_or('▁', |(r, _)| r);
+        let mut strip = 0;
+        let decoders: Vec<&Json> = match file.get("decoder").filter(|d| **d != Json::Null) {
+            Some(d) if d.get("type").and_then(Json::as_str) == Some("Sequence") => d
+                .get("decoders")
+                .and_then(Json::as_array)
+                .unwrap_or_default()
+                .iter()
+                .collect(),
+            Some(d) => vec![d],
+            None => Vec::new(),
+        };
+        for d in decoders {
+            match d.get("type").and_then(Json::as_str) {
+                Some("Replace") => {
+                    let from = d
+                        .get("pattern")
+                        .and_then(|p| p.get("String"))
+                        .and_then(Json::as_str);
+                    if d.get("content").and_then(Json::as_str) == Some(" ") {
+                        replacement = one_char(from);
+                    }
+                }
+                Some("Strip") => {
+                    if d.get("content").and_then(Json::as_str) == Some(" ") {
+                        strip = d.get("start").and_then(Json::as_i64).unwrap_or(0).max(0) as usize;
+                    }
+                }
+                Some("Metaspace") => {
+                    replacement = one_char(d.get("replacement").and_then(Json::as_str));
+                    let scheme = d.get("prepend_scheme").and_then(Json::as_str);
+                    let added = d.get("add_prefix_space").and_then(Json::as_bool);
+                    if scheme.map_or(added != Some(false), |s| s != "never") {
+                        strip = 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let bytes: Vec<Option<u32>> = (0..=255u8)
+            .map(|b| vocab.get(&format!("<0x{b:02X}>")).copied())
+            .collect();
+        let byte_of = bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(b, id)| Some((id.as_ref().copied()?, b as u8)))
+            .collect();
+        let unk = model
+            .get("unk_token")
+            .and_then(Json::as_str)
+            .and_then(|t| vocab.get(t).copied());
+        Ok(Spm {
+            normalize,
+            metaspace,
+            split,
+            bytes,
+            byte_of,
+            unk,
+            fuse_unk: model
+                .get("fuse_unk")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
+            replacement,
+            strip,
         })
     }
 
@@ -596,7 +970,7 @@ impl Tokenizer {
             });
             match found {
                 Some((content, id, _)) => {
-                    self.encode_plain(&text[plain..i], &mut ids);
+                    self.encode_plain(&text[plain..i], plain == 0, &mut ids);
                     ids.push(*id);
                     i += content.len();
                     plain = i;
@@ -604,12 +978,26 @@ impl Tokenizer {
                 None => i += 1,
             }
         }
-        self.encode_plain(&text[plain..], &mut ids);
+        self.encode_plain(&text[plain..], plain == 0, &mut ids);
         ids
     }
 
-    fn encode_plain(&self, text: &str, ids: &mut Vec<u32>) {
+    /// A segment between added tokens (`first`: it starts the text).
+    fn encode_plain(&self, text: &str, first: bool, ids: &mut Vec<u32>) {
         if text.is_empty() {
+            return;
+        }
+        if let Some(spm) = &self.spm {
+            let mut words = self.words.0.lock().unwrap_or_else(PoisonError::into_inner);
+            for piece in spm.pieces(text, first) {
+                if let Some(cached) = words.get(&piece) {
+                    ids.extend(cached);
+                    continue;
+                }
+                let merged = self.merge(self.spm_symbols(spm, &piece));
+                words.insert(&piece, &merged);
+                ids.extend(merged);
+            }
             return;
         }
         let normalized: String;
@@ -643,10 +1031,38 @@ impl Tokenizer {
     /// of n characters takes O(n log n) (a merge that no longer applies is skipped when
     /// it comes up).
     fn bpe(&self, word: &str) -> Vec<u32> {
-        let mut symbols: Vec<u32> = word
+        let symbols: Vec<u32> = word
             .chars()
             .filter_map(|c| self.vocab.get(c.encode_utf8(&mut [0; 4]) as &str).copied())
             .collect();
+        self.merge(symbols)
+    }
+
+    /// A SentencePiece-style piece's symbols: each character's token, or its bytes'
+    /// `<0xNN>` tokens, or the unknown token (consecutive ones fused with `fuse_unk`).
+    fn spm_symbols(&self, spm: &Spm, piece: &str) -> Vec<u32> {
+        let mut symbols = Vec::with_capacity(piece.len());
+        for c in piece.chars() {
+            let mut buf = [0; 4];
+            let s = c.encode_utf8(&mut buf);
+            if let Some(&id) = self.vocab.get(s as &str) {
+                symbols.push(id);
+                continue;
+            }
+            let bytes: Option<Vec<u32>> = s.bytes().map(|b| spm.bytes[b as usize]).collect();
+            match (bytes, spm.unk) {
+                (Some(bytes), _) => symbols.extend(bytes),
+                (None, Some(unk)) if !(spm.fuse_unk && symbols.last() == Some(&unk)) => {
+                    symbols.push(unk);
+                }
+                _ => {}
+            }
+        }
+        symbols
+    }
+
+    /// Merges symbols by rank (lowest first, leftmost on ties).
+    fn merge(&self, mut symbols: Vec<u32>) -> Vec<u32> {
         let n = symbols.len();
         if n < 2 {
             return symbols;
@@ -697,20 +1113,43 @@ impl Tokenizer {
         out
     }
 
-    /// The bytes of `ids` (added tokens as their text).
+    /// The bytes of `ids` (added tokens as their text), with the decoder's leading
+    /// spaces stripped (SentencePiece-style tokenizers).
     pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        let mut out = self.token_bytes(ids);
+        self.strip_leading(&mut out);
+        out
+    }
+
+    /// The bytes of `ids`, token by token (nothing stripped).
+    fn token_bytes(&self, ids: &[u32]) -> Vec<u8> {
         let mut out = Vec::new();
         for &id in ids {
             let Some(Some(token)) = self.tokens.get(id as usize) else {
                 continue;
             };
-            if self.added_ids.contains(&id) {
+            // A `<0xNN>` byte token is its byte even when listed as an added token.
+            let byte = self.spm.as_ref().and_then(|spm| spm.byte_of.get(&id));
+            if let Some(&b) = byte {
+                out.push(b);
+            } else if self.added_ids.contains(&id) {
                 out.extend_from_slice(token.as_bytes());
+            } else if let Some(spm) = &self.spm {
+                let mut buf = [0; 4];
+                let space = spm.replacement.encode_utf8(&mut buf);
+                out.extend_from_slice(token.replace(&*space, " ").as_bytes());
             } else {
                 out.extend(token.chars().filter_map(|c| self.to_byte.get(&c)));
             }
         }
         out
+    }
+
+    /// Strips the decoder's leading spaces from the start of a text.
+    fn strip_leading(&self, out: &mut Vec<u8>) {
+        let n = self.spm.as_ref().map_or(0, |s| s.strip);
+        let spaces = out.iter().take(n).take_while(|&&b| b == b' ').count();
+        out.drain(..spaces);
     }
 
     /// The text of `ids` (invalid UTF-8, such as a split character, is replaced).
@@ -720,16 +1159,38 @@ impl Tokenizer {
 }
 
 /// Turns a stream of ids into text, holding back bytes until they form whole characters.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct StreamDecoder {
     pending: Vec<u8>,
+    /// Leading spaces stripped so far, or `None` once text other than them came out.
+    stripped: Option<usize>,
+}
+
+impl Default for StreamDecoder {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            stripped: Some(0),
+        }
+    }
 }
 
 impl StreamDecoder {
     /// The text completed by `id`: whole characters, an invalid byte sequence as one
     /// U+FFFD, and an unfinished character at the end held back.
     pub fn push(&mut self, tokenizer: &Tokenizer, id: u32) -> String {
-        self.pending.extend(tokenizer.decode_bytes(&[id]));
+        let mut bytes = tokenizer.token_bytes(&[id]);
+        if let Some(done) = self.stripped {
+            let limit = tokenizer
+                .spm
+                .as_ref()
+                .map_or(0, |s| s.strip)
+                .saturating_sub(done);
+            let n = bytes.iter().take(limit).take_while(|&&b| b == b' ').count();
+            bytes.drain(..n);
+            self.stripped = bytes.is_empty().then_some(done + n);
+        }
+        self.pending.extend(bytes);
         let mut text = String::new();
         let mut done = 0;
         loop {
@@ -772,6 +1233,27 @@ impl StreamDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// o200k's pattern (GPT-4o, gpt-oss) against Hugging Face `tokenizers`
+    /// (`scripts/lm_fixtures.py --only o200k`).
+    #[test]
+    fn o200k_splits_as_tokenizers() {
+        let file = include_str!("../tests/fixtures/o200k_splits.json");
+        let fixture = json::parse(file.as_bytes()).unwrap();
+        let pattern = fixture.get("pattern").and_then(Json::as_str).unwrap();
+        assert_eq!(Pattern::parse(pattern).unwrap(), Pattern::O200k);
+        for case in fixture.get("cases").and_then(Json::as_array).unwrap() {
+            let text = case.get("text").and_then(Json::as_str).unwrap();
+            let want: Vec<&str> = case
+                .get("pieces")
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect();
+            assert_eq!(pieces(Pattern::O200k, text), want, "{text:?}");
+        }
+    }
 
     fn pieces(p: Pattern, s: &str) -> Vec<&str> {
         p.split(s)

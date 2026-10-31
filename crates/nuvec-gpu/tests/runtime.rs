@@ -233,6 +233,18 @@ fn misuse_is_reported() {
         device.pipeline("no_such_kernel").unwrap_err(),
         GpuError::MissingKernel("no_such_kernel".into())
     );
+    // A NAX kernel name looks in the NAX library (an error when it is not loaded). While NAX
+    // is off, the error leaves the status as it was; while it is active, any NAX failure
+    // turns it off (`Off(PipelineError)`), so products take the existing kernels.
+    let nax = device.nax();
+    assert!(device.pipeline("nuvec_nax_no_such_kernel").is_err());
+    match nax.is_active() {
+        false => assert_eq!(device.nax(), nax),
+        true => assert_eq!(
+            device.nax(),
+            nuvec_gpu::NaxStatus::Off(nuvec_gpu::NaxReason::PipelineError)
+        ),
+    }
     let pipeline = device.pipeline("nuvec_add_f32").unwrap();
     let small = device.new_buffer(16).unwrap();
     let mut cmd = device.command_buffer().unwrap();
@@ -517,6 +529,12 @@ fn reused_memory_is_written_after_in_flight_readers() {
         pending.push(cmd.commit_then(record_failure));
         acc = next;
     }
+    // One more command buffer, so that the latest committed one does not use `a`: small
+    // buffers of the latest are not reused while it runs (D-100).
+    let mut other = device.new_buffer(n * 4).unwrap();
+    let mut cmd = device.ordered_command_buffer().unwrap();
+    add(&mut cmd, &device, &zeros, &zeros, &mut other, n as u32);
+    pending.push(cmd.commit_then(record_failure));
     let before = device.memory().system_allocations;
     drop(a);
     let mut reused = device.new_gpu_buffer(n * 4).unwrap();
@@ -640,7 +658,9 @@ fn a_panicking_completion_handler_does_not_abort() {
 fn reading_reused_memory_waits_for_the_previous_owner() {
     with_timeout(std::time::Duration::from_secs(30), || {
         let Some(device) = device() else { return };
-        let n = 1 << 20;
+        // 68 MiB: buffers up to 64 MiB of the latest committed command buffer are not
+        // reused while it runs (D-100, D-102); larger ones are.
+        let n = 17 << 20;
         let a = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
         device.clear_cache();
         let mut out = device.new_buffer(n * 4).unwrap();

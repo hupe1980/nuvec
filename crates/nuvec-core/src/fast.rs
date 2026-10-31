@@ -38,7 +38,7 @@ use std::panic::Location;
 
 use smallvec::SmallVec;
 
-use crate::Array;
+use crate::{Array, DType};
 
 pub use crate::kernel::{KernelCall, KernelConfig, MetalKernel, TemplateArg};
 pub use imp::{AttentionMask, FastOp, Rotation};
@@ -172,6 +172,69 @@ pub fn norm_rope<'a>(
     })
 }
 
+/// Gemma 4's keys and values from one projection (`attention_k_eq_v`): K is `x`
+/// (`[B, H, L, D]`, any strides) normalised with `k_norm = (weight, eps)` and rotated at
+/// positions `offset..` (as [`norm_rope`]); V is `x` RMS-normalised without a weight
+/// (`v_eps`; mlx-lm's `RMSNormNoScale`). With `caches = (k_cache, v_cache)` both are written
+/// at `offset` (in place when the evaluation owns them), as [`norm_rope`] writes one.
+///
+/// Each is one fused kernel reading `x` (V rotates by angle 0: infinite wavelengths, an
+/// exact identity), and equals the composition ([`rms_norm`], [`rope`], the update) bit for
+/// bit on the GPU.
+///
+/// ```
+/// use nuvec_core::{DType, fast::{self, Rotation}, ops};
+///
+/// let x = ops::ones([1, 2, 3, 8], DType::F32);
+/// let w = ops::ones([8], DType::F32);
+/// let rotation = Rotation { dims: 8, traditional: false, base: Some(1e4), scale: 1.0, freqs: None };
+/// let (k, v) = fast::norm_rope_kv(&x, Some((&w, 1e-6)), 1e-6, rotation, 0, None);
+/// assert_eq!((k.shape(), v.shape()), (&[1, 2, 3, 8][..], &[1, 2, 3, 8][..]));
+/// ```
+#[track_caller]
+pub fn norm_rope_kv<'a>(
+    x: &Array,
+    k_norm: Option<(&Array, f32)>,
+    v_eps: f32,
+    rotation: Rotation<'_>,
+    offset: i32,
+    caches: impl Into<Option<(&'a Array, &'a Array)>>,
+) -> (Array, Array) {
+    let caches = caches.into();
+    let k = norm_rope(x, k_norm, rotation, offset, caches.map(|c| c.0));
+    let d = x.shape().last().copied().unwrap_or(0);
+    let ones = crate::ops::ones([d], x.dtype());
+    let still = crate::ops::full([d / 2], f32::INFINITY);
+    let identity = Rotation {
+        dims: d - d % 2,
+        traditional: false,
+        base: None,
+        scale: 1.0,
+        freqs: Some(&still),
+    };
+    let v = match d {
+        // No pair to rotate: the norm, written into the cache as `norm_rope` would.
+        0 | 1 => {
+            let v = crate::fast::rms_norm(x, None, v_eps);
+            match caches {
+                Some((_, cache)) => {
+                    let l = x.shape().get(2).copied().unwrap_or(0);
+                    cache.clone().at((.., .., offset..offset + l)).set(&v)
+                }
+                None => v,
+            }
+        }
+        _ => norm_rope(
+            x,
+            Some((&ones, v_eps)),
+            identity,
+            offset,
+            caches.map(|c| c.1),
+        ),
+    };
+    (k, v)
+}
+
 /// Attention over a paged KV cache, for a batch of sequences of different lengths.
 ///
 /// Keys and values live in blocks of positions, `k_cache` and `v_cache` being
@@ -179,15 +242,18 @@ pub fn norm_rope<'a>(
 /// `block_tables[b]` lists (`[B, max_blocks]`, integers; entries past the sequence's blocks
 /// are ignored). `q` is `[B, Hq, L, D]` (`Hq` a multiple of `kv_heads`): the last `L`
 /// positions of each sequence, whose keys are already in the cache. Query `l` of sequence
-/// `b` attends positions `0..=lengths[b] − L + l` (causal at the end; `lengths[b] ≥ L`).
-/// Returns `[B, Hq, L, D]`.
+/// `b` attends positions `0..=lengths[b] − L + l` (causal at the end; `lengths[b] ≥ L`),
+/// with `options`' window only the last `window` of those, and its sinks (`[Hq]`) in the
+/// softmax; an array mask is an error (`max_score_bytes` bounds only the composition).
+/// Returns `[B, Hq, L, D]`. Blocks wholly before a sequence's window are never read, so
+/// they may already hold other sequences' keys.
 ///
 /// Out-of-range inputs never read outside the caches: block ids are clamped to
 /// `0..blocks` and lengths to `0..=max_blocks · block_size` (the table's capacity), on
 /// every device.
 ///
 /// On the GPU this is MLX's vector attention (one pass, or two for long caches) reading
-/// keys through the block table, for head sizes 64, 128 and 256 and power-of-two block
+/// keys through the block table, for head sizes 64, 128, 256 and 512 and power-of-two block
 /// sizes (others run the composition). Each sequence's result equals
 /// [`scaled_dot_product_attention`]'s vector kernel over the same keys stored contiguously
 /// when both take the same number of passes.
@@ -199,13 +265,15 @@ pub fn paged_attention(
     block_tables: &Array,
     lengths: &Array,
     scale: f32,
+    options: &AttentionOptions<'_>,
 ) -> Array {
-    Array::sticky(
-        "paged_attention",
-        Location::caller(),
+    let ins = operands(
         &[q, k_cache, v_cache, block_tables, lengths],
-        || imp::paged_attention(q, k_cache, v_cache, block_tables, lengths, scale),
-    )
+        &[options.sinks],
+    );
+    Array::sticky("paged_attention", Location::caller(), &ins, || {
+        imp::paged_attention(q, k_cache, v_cache, block_tables, lengths, scale, options)
+    })
 }
 
 /// `cache` (`[blocks, kv_heads, block_size, D]`) with the positions `new` holds
@@ -278,7 +346,25 @@ impl<'a> AttentionOptions<'a> {
         self
     }
 
-    /// A sliding window of `keys` keys (needs [`AttentionOptions::causal`]).
+    /// A sliding window of `keys` keys (needs [`AttentionOptions::causal`]): query `i`
+    /// attends to keys `i + Lk − Lq − keys < j ≤ i + Lk − Lq`. The vector and tiled kernels
+    /// skip the keys before the window, so a full cache needs no slicing; a cache that keeps
+    /// only the last `W − 1 + L` positions (nuvec-lm's sliding-window `KvCache`) passes
+    /// just those, with the same result:
+    ///
+    /// ```
+    /// use nuvec_core::{DType, fast::{self, AttentionOptions}, random};
+    ///
+    /// let (w, l) = (4, 2);
+    /// let q = random::normal([1, 2, l, 8], DType::F32, 0.0, 1.0, None);
+    /// let k = random::normal([1, 2, 10, 8], DType::F32, 0.0, 1.0, None);
+    /// let opts = AttentionOptions::causal().window(w);
+    /// let full = fast::scaled_dot_product_attention(&q, &k, &k, 0.35, &opts);
+    /// let tail = k.i((.., .., 10 - (w - 1 + l)..));
+    /// let sliced = fast::scaled_dot_product_attention(&q, &tail, &tail, 0.35, &opts);
+    /// let diff = full.subtract(&sliced).abs().max(..).item::<f32>().unwrap();
+    /// assert!(diff < 1e-6);
+    /// ```
     #[must_use]
     pub fn window(mut self, keys: i32) -> Self {
         self.window = Some(keys);
@@ -325,6 +411,13 @@ pub enum AttentionKernel {
     Composed,
     /// The composition per block of `rows` queries, one block after another.
     ComposedBlocks {
+        /// Queries per block (the last block may have fewer).
+        rows: i32,
+    },
+    /// MLX's blocked prefill at head size 512 (half precision, causal, `Lq ≥ 1024`, no
+    /// array mask or sinks): blocks of `rows` queries (256, halved under a cap), each over
+    /// only the keys its rows see.
+    BlockedD512 {
         /// Queries per block (the last block may have fewer).
         rows: i32,
     },
@@ -402,7 +495,11 @@ pub fn plan_attention(
 /// [`plan_attention`] decides, and reports, how the call runs. On the GPU, up to 8 queries
 /// use MLX's vector kernels, more use its tiled kernel or the composition (as MLX: the
 /// composition is faster for some head sizes and shapes); the CPU runs the composition.
-/// A window runs through the composition (keys sliced to the window).
+/// At head size 512, causal prefill of 1,024 queries or more in half precision (no array
+/// mask or sinks) runs as MLX's blocked path: the composition per block of 256 queries,
+/// each over only the keys its rows see, a key head's grouped queries in one product (bit
+/// for bit MLX's result, one block's scores live). A window narrows the keys of every
+/// composition block and is skipped inside the vector and tiled kernels.
 ///
 /// **The serial rule.** With 2 to 8 queries (speculative verification), each query row
 /// takes the configuration (passes, key partitions, kernel variant) of the same row run
@@ -430,8 +527,9 @@ pub fn plan_attention(
 /// dispatch (plus the gathered queries and outputs with several dispatches); tiled 0;
 /// composition `n·s` (the scores, masked and normalised in place) plus the larger of the
 /// scaled queries (`B·Hq·r·D·s`) and, with sinks below float32, the float32 softmax copy
-/// (`n·4`; three of them in blocks under 16 MiB), plus `r·L` bytes of causal mask; blocked,
-/// one block's composition plus the output's bytes (the blocks before concatenation).
+/// (`n·4`; three of them in blocks under 16 MiB), plus `r·L` bytes of causal mask; blocked
+/// (capped or head-512), one block's composition plus the output's bytes (the blocks
+/// before concatenation).
 #[track_caller]
 pub fn scaled_dot_product_attention(
     q: &Array,
@@ -521,6 +619,78 @@ pub fn gated_delta_steps(
         || {
             let (y, s) = imp::gated_delta_steps(q, k, v, g, beta, state)?;
             Ok([y, s])
+        },
+    );
+    (y, s)
+}
+
+/// Options of [`gated_delta_steps_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StepOptions {
+    /// The dtype states are stored in between steps (default: `state`'s).
+    pub storage: Option<DType>,
+}
+
+impl StepOptions {
+    /// Stores states in `dtype` between steps.
+    pub fn storage(mut self, dtype: DType) -> Self {
+        self.storage = Some(dtype);
+        self
+    }
+}
+
+/// [`gated_delta_steps`] for a runtime that stores its states in another dtype than
+/// float32 (bfloat16, say): each step's output is computed from the state the previous
+/// step stored, and its state is then stored in `options.storage`, so `states[t]` and the
+/// outputs equal `t + 1` serial [`gated_delta`] calls on a state kept in that dtype, bit
+/// for bit (each step runs the kernel serial decode runs). With float32 storage it is
+/// [`gated_delta_steps`].
+#[track_caller]
+pub fn gated_delta_steps_with(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    options: &StepOptions,
+) -> (Array, Array) {
+    let storage = options.storage.unwrap_or(state.dtype());
+    let [y, s] = Array::sticky_n(
+        "gated_delta_steps_with",
+        Location::caller(),
+        &[q, k, v, g, beta, state],
+        || {
+            if !matches!(storage, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(crate::Error::op(
+                    "gated_delta_steps_with",
+                    crate::OpErrorKind::UnsupportedDType(storage),
+                ));
+            }
+            let state = state.try_astype(storage)?;
+            if storage == DType::F32 {
+                let (y, s) = imp::gated_delta_steps(q, k, v, g, beta, &state)?;
+                return Ok([y, s]);
+            }
+            let steps = q.dims().get(1).copied().unwrap_or(0) as i32;
+            let (mut ys, mut states) = (Vec::new(), Vec::new());
+            let mut s = state;
+            for t in 0..steps {
+                let at = |a: &Array| a.i((.., t..t + 1));
+                let (y, next) = gated_delta(&at(q), &at(k), &at(v), &at(g), &at(beta), &s);
+                ys.push(y);
+                states.push(next.clone());
+                s = next;
+            }
+            if steps == 0 {
+                let (y, s) = imp::gated_delta_steps(q, k, v, g, beta, &s)?;
+                return Ok([y, s]);
+            }
+            Ok([
+                crate::ops::concatenate(&ys, 1),
+                crate::ops::stack(&states, 1),
+            ])
         },
     );
     (y, s)

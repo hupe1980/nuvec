@@ -42,6 +42,8 @@ NUVEC_BINARY_OP(Div, op_div(a, b))
 NUVEC_BINARY_OP(Max, op_max(a, b))
 NUVEC_BINARY_OP(Min, op_min(a, b))
 NUVEC_BINARY_OP(LogAddExp, op_logaddexp(a, b))
+NUVEC_BINARY_OP(FloorDivide, op_floordiv(a, b))
+NUVEC_BINARY_OP(Power, op_pow(a, b))
 NUVEC_BINARY_OP(Eq, nbool{uchar(op_eq(a, b))})
 NUVEC_BINARY_OP(Ne, nbool{uchar(!op_eq(a, b))})
 NUVEC_BINARY_OP(Lt, nbool{uchar(op_lt(a, b))})
@@ -300,6 +302,8 @@ template <typename T>
     NUVEC_BINARY(mul, Mul, name, T, T)          \
     NUVEC_BINARY(max, Max, name, T, T)          \
     NUVEC_BINARY(min, Min, name, T, T)          \
+    NUVEC_BINARY(floor_divide, FloorDivide, name, T, T) \
+    NUVEC_BINARY(power, Power, name, T, T)      \
     NUVEC_BINARY(eq, Eq, name, T, nbool)        \
     NUVEC_BINARY(ne, Ne, name, T, nbool)        \
     NUVEC_BINARY(lt, Lt, name, T, nbool)        \

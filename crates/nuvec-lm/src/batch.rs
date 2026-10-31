@@ -5,7 +5,13 @@
 //!
 //! Requests admitted at the same step whose prompts have the same length (more than 64
 //! tokens) are prefilled together on quantized models, one batched forward pass per chunk
-//! (as mlx-lm's `BatchGenerator`); each gets the bits it gets alone.
+//! (as mlx-lm's `BatchGenerator`).
+//!
+//! Products route as MLX routes them, so a request's tokens can depend in their low bits
+//! on the requests batched with it, as in mlx-lm. With
+//! [`batch_invariant`](Batcher::batch_invariant), every step runs row-exact
+//! ([`nuvec::with_row_exact`]): each request gets the tokens it gets alone, at some cost in
+//! throughput (D-103).
 //!
 //! Decoding is pipelined as [`generate`](crate::generate()): a step submits the next
 //! decoding step, fed with the tokens of the step before, then reads those tokens (one
@@ -38,6 +44,10 @@ use crate::paged::{PagedCache, Reservation, SeqId, forward_reserved};
 /// Tokens to prefill from which prompts of the same length admitted together are prefilled
 /// in one batch (more than every quantized product's matrix-vector limit, 33 rows).
 const BATCHED_PREFILL_MIN: usize = 64;
+
+/// Decoding steps between releases of the GPU's cached buffers, as mlx-lm's
+/// `BatchGenerator`.
+const CLEAR_EVERY_STEPS: usize = 512;
 
 /// A request of a [`Batcher`].
 pub type RequestId = usize;
@@ -128,19 +138,29 @@ pub struct Batcher<'a> {
     cancelled: Vec<RequestId>,
     /// The step submitted and not read yet.
     in_flight: Option<InFlight>,
+    /// Decoding steps read so far.
+    steps: usize,
     /// A fault hook: the forward pass fails whenever it includes this request.
     #[cfg(test)]
     fault: Option<RequestId>,
     /// Batched prefills so far.
     #[cfg(test)]
     batched: usize,
+    /// Whether steps run row-exact ([`Batcher::batch_invariant`]).
+    invariant: bool,
 }
 
 impl Drop for Batcher<'_> {
     /// Waits for the step in flight (its errors are moot).
     fn drop(&mut self) {
         if let Some(f) = self.in_flight.take() {
-            let _ = eval(std::slice::from_ref(&f.tokens));
+            let invariant = self.invariant;
+            let wait = || eval(std::slice::from_ref(&f.tokens));
+            let _ = if invariant {
+                nuvec::with_row_exact(wait)
+            } else {
+                wait()
+            };
         }
     }
 }
@@ -164,11 +184,21 @@ impl<'a> Batcher<'a> {
             preemptions: 0,
             cancelled: Vec::new(),
             in_flight: None,
+            steps: 0,
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
             batched: 0,
+            invariant: false,
         })
+    }
+
+    /// Whether each request gets the tokens it gets alone (`generate`), whatever it is
+    /// batched with: every step then runs row-exact ([`nuvec::with_row_exact`]), at some
+    /// cost in throughput. Off by default (MLX's routing, as mlx-lm's `BatchGenerator`).
+    pub fn batch_invariant(mut self, on: bool) -> Self {
+        self.invariant = on;
+        self
     }
 
     /// Queues a request and returns its id. The prompt must have at least one token and
@@ -453,6 +483,14 @@ impl<'a> Batcher<'a> {
     /// nothing else waits (see the module documentation) and reads the step in flight.
     /// Returns the tokens produced and the requests finished, in order.
     pub fn step(&mut self) -> Result<Vec<Event>> {
+        if self.invariant {
+            nuvec::with_row_exact(|| self.step_now())
+        } else {
+            self.step_now()
+        }
+    }
+
+    fn step_now(&mut self) -> Result<Vec<Event>> {
         let mut events = Vec::new();
         self.finish_cancelled(&mut events)?;
         if let Some(f) = &self.in_flight
@@ -475,8 +513,13 @@ impl<'a> Batcher<'a> {
         };
         let mut failed = Vec::new();
         let next = self.look_ahead(&flight, &mut failed);
-        self.read(flight, next, failed, &mut events)
-            .map(|()| events)
+        self.read(flight, next, failed, &mut events)?;
+        // As mlx-lm's `BatchGenerator` (prefills clear after each chunk).
+        self.steps += 1;
+        if self.steps.is_multiple_of(CLEAR_EVERY_STEPS) {
+            crate::generate::clear_cache();
+        }
+        Ok(events)
     }
 
     /// Submits a step for every running request, fed with their `next` tokens; when the
@@ -779,7 +822,9 @@ mod tests {
             };
             let prompt = [3u32, 17, 92, 5, 64, 33, 101, 8, 77];
             let prompts = [&prompt[..5], &prompt[2..9], &prompt[1..4]];
-            let mut batcher = Batcher::new(&model, 32, 4, 3).unwrap();
+            let mut batcher = Batcher::new(&model, 32, 4, 3)
+                .unwrap()
+                .batch_invariant(true);
             for p in prompts {
                 batcher.submit(p.to_vec(), greedy(8)).unwrap();
             }
@@ -833,7 +878,9 @@ mod tests {
             let base = [3u32, 17, 92, 5, 64, 33, 101, 8, 77, 2, 45, 120, 9, 56];
             let prompt = |n: usize| base.iter().cycle().take(n).copied().collect::<Vec<_>>();
             // 10 blocks of 4 positions, three requests at a time.
-            let mut batcher = Batcher::new(&model, 10, 4, 3).unwrap();
+            let mut batcher = Batcher::new(&model, 10, 4, 3)
+                .unwrap()
+                .batch_invariant(true);
             assert!(batcher.submit(prompt(40), greedy(1)).is_err(), "never fits");
             let requests = [
                 (prompt(1), 6),  // 0: one token
@@ -922,7 +969,9 @@ mod tests {
                 (cycled(3, n - 3), greedy(8)),
                 (cycled(4, n), greedy(8)),
             ];
-            let mut batcher = Batcher::new(&model, 256, 4, requests.len()).unwrap();
+            let mut batcher = Batcher::new(&model, 256, 4, requests.len())
+                .unwrap()
+                .batch_invariant(true);
             for (p, o) in &requests {
                 batcher.submit(p.clone(), *o).unwrap();
             }

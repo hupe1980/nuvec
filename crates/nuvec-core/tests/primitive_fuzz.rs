@@ -29,6 +29,15 @@ fn reshape_must_keep_the_element_count() {
 }
 
 #[test]
+fn unit_axes_must_be_sorted_in_range_and_of_size_one() {
+    rejected(Primitive::Squeeze(vec![0]), vec![f32s(&[2, 1])]);
+    rejected(Primitive::Squeeze(vec![2]), vec![f32s(&[2, 1])]);
+    rejected(Primitive::Squeeze(vec![1, 1]), vec![f32s(&[2, 1])]);
+    rejected(Primitive::ExpandDims(vec![3]), vec![f32s(&[2])]);
+    rejected(Primitive::ExpandDims(vec![1, 0]), vec![f32s(&[2])]);
+}
+
+#[test]
 fn slices_must_stay_in_bounds() {
     let slice = |start: usize, step: isize, len: usize| Primitive::Slice {
         start: vec![start],
@@ -87,47 +96,40 @@ fn concatenation_extents_must_not_overflow() {
 #[test]
 fn quantization_parameters_are_validated() {
     let w = f32s(&[4, 64]);
-    rejected(
-        Primitive::Quantize {
-            group_size: 0,
-            bits: 4,
-        },
-        vec![w.clone()],
-    );
-    rejected(
-        Primitive::Quantize {
-            group_size: 64,
-            bits: 7,
-        },
-        vec![w.clone()],
-    );
-    rejected(
-        Primitive::Quantize {
-            group_size: 64,
-            bits: 0,
-        },
-        vec![w.clone()],
-    );
-    let (packed, scales, biases) = w.quantize(64, 4);
+    for quant in [
+        Quant::affine(0, 4),
+        Quant::affine(64, 7),
+        Quant::affine(64, 0),
+        Quant::new(QuantMode::Mxfp4).group_size(64),
+        Quant::new(QuantMode::Nvfp4).bits(8),
+    ] {
+        rejected(Primitive::Quantize { quant }, vec![w.clone()]);
+    }
+    let q = w.quantize(Quant::affine(64, 4));
+    let (packed, scales, biases) = (q.weight, q.scales, q.biases.unwrap());
     let inputs = vec![packed.clone(), scales.clone(), biases.clone()];
+    for quant in [Quant::affine(64, 7), Quant::affine(0, 4)] {
+        let dtype = DType::F32;
+        rejected(Primitive::Dequantize { quant, dtype }, inputs.clone());
+    }
+    // Floating-point modes take uint8 scales and no biases.
     rejected(
         Primitive::Dequantize {
-            group_size: 64,
-            bits: 7,
+            quant: Quant::new(QuantMode::Mxfp4),
+            dtype: DType::F32,
         },
         inputs.clone(),
     );
     rejected(
         Primitive::Dequantize {
-            group_size: 0,
-            bits: 4,
+            quant: Quant::new(QuantMode::Mxfp4),
+            dtype: DType::F32,
         },
-        inputs.clone(),
+        vec![packed.clone(), scales.clone()],
     );
     rejected(
         Primitive::QuantizedMatmul {
-            group_size: 64,
-            bits: 7,
+            quant: Quant::affine(64, 7),
             transpose: true,
         },
         vec![
@@ -140,9 +142,9 @@ fn quantization_parameters_are_validated() {
     let indices = Array::from([0u32]);
     rejected(
         Primitive::Fast(FastOp::GatherQmm {
-            group_size: 64,
-            bits: 7,
+            quant: Quant::affine(64, 7),
             transpose: true,
+            global_scale: false,
         }),
         vec![
             f32s(&[1, 1, 64]),
@@ -290,6 +292,8 @@ fn case(rng: &mut SplitMix64) -> (Primitive, Vec<Array>) {
         BinaryOp::Maximum,
         BinaryOp::Minimum,
         BinaryOp::LogAddExp,
+        BinaryOp::FloorDivide,
+        BinaryOp::Power,
         BinaryOp::Equal,
         BinaryOp::Less,
         BinaryOp::GreaterEqual,
@@ -386,18 +390,28 @@ fn case(rng: &mut SplitMix64) -> (Primitive, Vec<Array>) {
             (p, 3)
         }
         22..=24 => {
-            let (group_size, bits) = ([0, 1, 32, 64, 128][rng.below(5)], rng.below(10) as u8);
+            let modes = [
+                QuantMode::Affine,
+                QuantMode::Mxfp4,
+                QuantMode::Mxfp8,
+                QuantMode::Nvfp4,
+            ];
+            let mode = modes[rng.below(4)];
+            let quant = Quant {
+                mode,
+                group_size: [0, 1, 16, 32, 64, 128][rng.below(6)],
+                bits: rng.below(10) as i32,
+            };
+            let biases = usize::from(mode == QuantMode::Affine);
             match rng.below(3) {
-                0 => (Primitive::Quantize { group_size, bits }, 1),
-                1 => (Primitive::Dequantize { group_size, bits }, 3),
+                0 => (Primitive::Quantize { quant }, 1),
+                1 => {
+                    let dtype = [DType::F32, DType::BF16, DType::U8][rng.below(3)];
+                    (Primitive::Dequantize { quant, dtype }, 2 + biases)
+                }
                 _ => {
                     let transpose = rng.coin();
-                    let p = Primitive::QuantizedMatmul {
-                        group_size,
-                        bits,
-                        transpose,
-                    };
-                    (p, 4)
+                    (Primitive::QuantizedMatmul { quant, transpose }, 3 + biases)
                 }
             }
         }
@@ -412,6 +426,14 @@ fn case(rng: &mut SplitMix64) -> (Primitive, Vec<Array>) {
         27 => {
             let n_deps = rng.below(3);
             (Primitive::Depends { n_deps }, 1 + n_deps)
+        }
+        28 => {
+            let n = rng.below(3);
+            (Primitive::Squeeze(rng.sizes(n)), 1)
+        }
+        29 => {
+            let n = rng.below(3);
+            (Primitive::ExpandDims(rng.sizes(n)), 1)
         }
         _ => {
             let (op, arity) = fast_op(rng, float);
@@ -497,6 +519,7 @@ fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (Fas
                 causal: rng.coin(),
                 mask,
                 sinks,
+                window: [0, 0, 1, 7, 128][rng.below(5)],
                 passes: rng.below(4) as u8,
                 blocks: [0, 1, 32, 128, 2048][rng.below(5)],
                 gqa_kernel: rng.coin(),
@@ -508,12 +531,20 @@ fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (Fas
         15 => (FastOp::GatedDeltaSlots, 7),
         16 => (FastOp::GatherMm, 4 + rng.below(2)),
         _ => {
+            let modes = [QuantMode::Affine, QuantMode::Mxfp4, QuantMode::Nvfp4];
+            let mode = modes[rng.below(3)];
+            let global_scale = mode == QuantMode::Nvfp4 && rng.coin();
             let op = FastOp::GatherQmm {
-                group_size: [0, 32, 64, 128][rng.below(4)],
-                bits: rng.below(10) as u8,
+                quant: Quant {
+                    mode,
+                    group_size: [0, 16, 32, 64, 128][rng.below(5)],
+                    bits: rng.below(10) as i32,
+                },
                 transpose: rng.coin(),
+                global_scale,
             };
-            (op, 6 + rng.below(2))
+            let arity = 5 + usize::from(mode == QuantMode::Affine) + usize::from(global_scale);
+            (op, arity + rng.below(2))
         }
     }
 }

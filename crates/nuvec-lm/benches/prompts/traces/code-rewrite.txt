@@ -1,0 +1,33 @@
+You are a careful Rust programmer. Here is a function:
+
+```rust
+pub fn summarize(orders: &Vec<Order>, region: &str) -> Summary {
+    let mut total = 0.0;
+    let mut count = 0;
+    let mut largest: Option<f64> = None;
+    for i in 0..orders.len() {
+        let order = &orders[i];
+        if order.region == region {
+            total = total + order.amount;
+            count = count + 1;
+            match largest {
+                None => largest = Some(order.amount),
+                Some(l) => {
+                    if order.amount > l {
+                        largest = Some(order.amount);
+                    }
+                }
+            }
+        }
+    }
+    Summary { total: total, count: count, largest: largest }
+}
+```
+
+Rewrite it to use iterators and take `&[Order]`. Reply with the complete function only.
+---
+Good. Now add a doc comment that explains every field of the returned `Summary`. Reply with the complete function only.
+---
+Rename `total` to `sum` everywhere, including the struct field, and reply with the complete function only.
+---
+Finally, make the region comparison case-insensitive. Reply with the complete function only.

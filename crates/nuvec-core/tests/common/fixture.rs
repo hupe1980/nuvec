@@ -125,6 +125,65 @@ pub fn load() -> (String, Vec<Case>) {
     parse(include_bytes!("../fixtures/mlx.bin"))
 }
 
+/// The fixtures recorded on MLX's GPU (the floating-point quantization modes, whose
+/// reference is MLX's Metal kernels), compared bit for bit by [`check_exact`].
+#[allow(dead_code)]
+pub fn load_gpu() -> (String, Vec<Case>) {
+    parse(include_bytes!("../fixtures/mlx_gpu.bin"))
+}
+
+/// Runs `case` and compares every output with MLX's bit for bit (dtype, shape and bytes;
+/// any NaN equals any NaN); `Some` describes the first difference.
+#[allow(dead_code)]
+pub fn check_exact(case: &Case) -> Option<String> {
+    let ran =
+        run(case).and_then(|arrays| arrays.iter().map(from_array).collect::<Result<Vec<_>>>());
+    let got = match ran {
+        Ok(got) => got,
+        Err(e) => return Some(format!("{} ({}): nuvec error: {e}", case.name, case.op)),
+    };
+    if got.len() != case.outputs.len() {
+        return Some(format!(
+            "{}: {} outputs vs MLX {}",
+            case.name,
+            got.len(),
+            case.outputs.len()
+        ));
+    }
+    for (g, e) in got.iter().zip(&case.outputs) {
+        if g.dtype != e.dtype || g.shape != e.shape {
+            return Some(format!(
+                "{}: {} {:?} vs MLX {} {:?}",
+                case.name, g.dtype, g.shape, e.dtype, e.shape
+            ));
+        }
+        let size = e.dtype.size();
+        let nan = |b: &[u8]| match e.dtype {
+            DType::F32 => f32::from_le_bytes(b.try_into().unwrap()).is_nan(),
+            DType::F16 => f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).is_nan(),
+            DType::BF16 => bf16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).is_nan(),
+            _ => false,
+        };
+        let differs = g
+            .data
+            .chunks_exact(size)
+            .zip(e.data.chunks_exact(size))
+            .position(|(a, b)| a != b && !(nan(a) && nan(b)));
+        if let Some(i) = differs {
+            let bytes = |t: &Tensor| t.data[i * size..(i + 1) * size].to_vec();
+            return Some(format!(
+                "{} ({}{:?}): element {i}: bytes {:02x?} vs MLX {:02x?}",
+                case.name,
+                case.op,
+                case.params,
+                bytes(g),
+                bytes(e)
+            ));
+        }
+    }
+    None
+}
+
 // ── Tensor <-> Array ────────────────────────────────────────────────────────
 
 macro_rules! decode {
@@ -403,9 +462,15 @@ pub fn run(case: &Case) -> Result<Vec<Array>> {
             Ok(jvp_flat(|ps: &[Array]| f(ps, cs), &xs[..n], &xs[n + consts..])?.1)
         }
         "quantize" => {
-            let (wq, s, b) =
-                xs[0].quantize(p("group_size").parse().unwrap(), p("bits").parse().unwrap());
-            Ok(vec![wq, s, b])
+            let x = match p("pre") {
+                "t" => xs[0].t(),
+                "r" => xs[0].i((Ellipsis, (..).step(-1))),
+                _ => xs[0].clone(),
+            };
+            let q = x.quantize(quant(case));
+            let mut out = vec![q.weight, q.scales];
+            out.extend(q.biases);
+            Ok(out)
         }
         "vmap" => {
             let in_axes: Vec<Option<i32>> = p("in_axes")
@@ -427,6 +492,24 @@ pub fn run(case: &Case) -> Result<Vec<Array>> {
     }
 }
 
+/// The case's quantization: `mode` (default affine) with its defaults, overridden by
+/// `group_size` and `bits` when given.
+fn quant(case: &Case) -> Quant {
+    let p = |k: &str| case.params.get(k).map(String::as_str).unwrap_or("");
+    let mode = match p("mode") {
+        "" => QuantMode::Affine,
+        m => m.parse().unwrap(),
+    };
+    let mut q = Quant::new(mode);
+    if let Ok(g) = p("group_size").parse() {
+        q = q.group_size(g);
+    }
+    if let Ok(b) = p("bits").parse() {
+        q = q.bits(b);
+    }
+    q
+}
+
 /// Runs operation `op` with the case's parameters on `xs`.
 fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
     let p = |k: &str| case.params.get(k).map(String::as_str).unwrap_or("");
@@ -439,9 +522,10 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
     }
     let dtype = || DTYPES[p("dtype").parse::<usize>().unwrap()];
     let keep = p("keepdims") == "1";
-    let gs = || p("group_size").parse().unwrap();
-    let bits = || p("bits").parse().unwrap();
     let t = || p("transpose") == "1";
+    let q = |w: &Array, s: &Array, b: Option<&Array>| {
+        Quantized::new(w.clone(), s.clone(), b.cloned(), quant(case))
+    };
     // An optional single axis: none means the flattened array.
     let axis = || (!p("axis").is_empty()).then(|| p("axis").parse::<i32>().unwrap());
     if op == "matmul" {
@@ -456,6 +540,8 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "maximum" => Some(ops::maximum),
         "minimum" => Some(ops::minimum),
         "logaddexp" => Some(ops::logaddexp),
+        "floor_divide" => Some(ops::floor_divide),
+        "power" => Some(ops::power),
         "equal" => Some(ops::equal),
         "not_equal" => Some(ops::not_equal),
         "less" => Some(ops::less),
@@ -554,9 +640,13 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
                 &options,
             )
         }
-        "dequantize" => xs[0].dequantize(&xs[1], &xs[2], gs(), bits()),
-        "quantized_matmul" => xs[0].quantized_matmul(&xs[1], &xs[2], &xs[3], t(), gs(), bits()),
-        "quantized_matmul_xsb" => xs[0].quantized_matmul(&xs[3], &xs[1], &xs[2], t(), gs(), bits()),
+        // The floating-point modes have no biases; `dtype` (a code) picks their output.
+        "dequantize" => {
+            let out = (!p("dtype").is_empty()).then(dtype);
+            q(&xs[0], &xs[1], xs.get(2)).dequantize(out)
+        }
+        "quantized_matmul" => xs[0].quantized_matmul(&q(&xs[1], &xs[2], xs.get(3)), t()),
+        "quantized_matmul_xsb" => xs[0].quantized_matmul(&q(&xs[3], &xs[1], Some(&xs[2])), t()),
         "softmax" => {
             let axes = reduce_axes(p("axes"), &xs[0]);
             xs[0].softmax(axes)
@@ -589,6 +679,23 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
                 _ => xs[1].clone(),
             };
             xs[0].gather_mm(&b, lhs, rhs, p("sorted") == "1")
+        }
+        "to_fp8" => xs[0].to_fp8(),
+        "from_fp8" => xs[0].from_fp8(dtype()),
+        "view" => xs[0].view(dtype()),
+        "gather_qmm" => {
+            // Inputs: x, w, scales, a global scale if `gs`, then the indices `idx` names.
+            let mut rest = xs[3..].iter();
+            let gs = (p("gs") == "1").then(|| rest.next().unwrap());
+            let lhs = p("idx").contains('l').then(|| rest.next().unwrap());
+            let rhs = p("idx").contains('r').then(|| rest.next().unwrap());
+            let mut options = GatherQmm::default()
+                .transpose(t())
+                .sorted_indices(p("sorted") == "1");
+            if let Some(g) = gs {
+                options = options.global_scale(g);
+            }
+            xs[0].gather_qmm(&q(&xs[1], &xs[2], None), lhs, rhs, options)
         }
         "repeat" => {
             let repeats = p("repeats").parse().unwrap();
@@ -744,7 +851,7 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
             let n = case.inputs[0].shape.iter().max().copied().unwrap_or(1) as f64;
             4.0 * (n + 1.0) * eps * e.abs().max(1.0)
         }
-        "exp" | "log" | "sqrt" | "sin" | "cos" | "tanh" | "sigmoid" => {
+        "exp" | "log" | "sqrt" | "sin" | "cos" | "tanh" | "sigmoid" | "power" => {
             4.0 * eps * e.abs().max(f64::MIN_POSITIVE)
         }
         // A sum of the larger operand and log1p(exp(·)): absolute error near zero.
@@ -758,6 +865,18 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
             let n = case.inputs[0].data.len() / expected.data.len().max(1) * expected.dtype.size()
                 / case.inputs[0].dtype.size().max(1);
             (n.max(1) as f64 + 1.0) * eps * e.abs().max(1.0)
+        }
+        // Affine on the GPU: MLX's Metal kernel (one rounding of `scale · code + bias`,
+        // pinned bit for bit by mlx_gpu.bin) against MLX's CPU (two): within one rounding of
+        // the larger term. Exact on the CPU.
+        "dequantize"
+            if !case.params.contains_key("mode")
+                && nuvec_core::default_stream().device.kind != nuvec_core::DeviceKind::Cpu =>
+        {
+            let bound = |t: &Tensor| values(t).iter().fold(0.0f64, |m, &(re, _)| m.max(re.abs()));
+            let bits: i32 = case.params["bits"].parse().unwrap();
+            2.0 * eps
+                * (bound(&case.inputs[1]) * f64::from((1 << bits) - 1) + bound(&case.inputs[2]))
         }
         // Bounded by K · max|x| · max|dequantized w|, with codes up to 2^bits - 1.
         "quantized_matmul" => {

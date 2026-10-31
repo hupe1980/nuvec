@@ -549,7 +549,19 @@ pub(crate) fn batch(
             })
             .unzip();
         let (results, axis) = step.primitive.vmap(&arrays, &axes)?;
-        for (o, r) in step.outputs().iter().zip(results) {
+        // A rule's results checked (custom rules are user code): one per output, each
+        // with the batch axis.
+        let outs = step.outputs();
+        if results.len() != outs.len() || results.iter().any(|r| axis >= r.ndim()) {
+            return Err(Error::InvalidArgument(format!(
+                "vmap: the batching rule of {} returned {} outputs with batch axis {axis} \
+                 ({} expected, each with that axis)",
+                step.primitive.name(),
+                results.len(),
+                outs.len()
+            )));
+        }
+        for (o, r) in outs.iter().zip(results) {
             batched.insert(key(o), (r, axis));
         }
     }

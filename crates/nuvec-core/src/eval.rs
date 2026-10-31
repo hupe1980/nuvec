@@ -360,7 +360,19 @@ fn donation(
     gpu: &mut GpuEval,
 ) -> Option<(usize, Data)> {
     let device = node.stream.device;
-    if node.is_tracer() || device.kind == DeviceKind::Cpu || !gpu.available(device) {
+    if node.is_tracer() {
+        return None;
+    }
+    if device.kind == DeviceKind::Cpu {
+        // MLX's CPU donation for updates: the base's buffer, if nothing else holds it.
+        return match primitive {
+            Primitive::SliceUpdate { .. } if donatable_size(inputs[0].size()) => {
+                owned_on_cpu(&mut inputs[0]).map(|data| (0, data))
+            }
+            _ => None,
+        };
+    }
+    if !gpu.available(device) {
         return None;
     }
     let base = match primitive {
@@ -387,8 +399,8 @@ fn donation(
     None
 }
 
-/// Whether a buffer of `size` elements may be written in place: the in-place kernels index
-/// with 32 bits (as the GPU's `supports` requires of every operand).
+/// Whether an update base of `size` elements may be written in place: the update kernels
+/// index with 32 bits (as the GPU's `supports` requires of their operands).
 fn donatable_size(size: usize) -> bool {
     size > 0 && size < u32::MAX as usize
 }
@@ -405,12 +417,30 @@ fn in_place_inputs(
         Primitive::Unary(op) if *op != UnaryOp::Conjugate => &[0],
         Primitive::Binary(_) => &[0, 1],
         Primitive::Select => &[1, 2],
-        Primitive::Fast(crate::fast::imp::FastOp::Softmax) => &[0],
+        Primitive::Fast(
+            crate::fast::imp::FastOp::Softmax | crate::fast::imp::FastOp::CausalSoftmax { .. },
+        ) => &[0],
         _ => &[],
     };
     let float = matches!(out.dtype, DType::F16 | DType::BF16 | DType::F32);
-    if !float || !donatable_size(out.size) {
+    if !float || out.size == 0 {
         return Vec::new();
+    }
+    // From 2^32 elements, only layouts the GPU's large kernels address (as `supports`).
+    if out.size >= u32::MAX as usize {
+        let large = match primitive {
+            Primitive::Fast(_) => {
+                let axis = out.shape.last().copied().unwrap_or(1).max(1);
+                out.size / axis * 1024 < u32::MAX as usize
+            }
+            _ => {
+                let metas: Vec<&crate::array::Output> = inputs.iter().map(Array::out).collect();
+                crate::gpu::large_elementwise(&metas, &out.shape)
+            }
+        };
+        if !large {
+            return Vec::new();
+        }
     }
     candidates
         .iter()
@@ -453,6 +483,11 @@ fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
     {
         return Some(data);
     }
+    // The in-flight cell is locked first: publishing locks it before it upgrades the node
+    // and drops the upgraded handle before it unlocks, so the count below is the node's real
+    // handles.
+    let cell = base.outputs.get(at)?.inflight.clone();
+    let mut state = cell.lock();
     if Arc::strong_count(base) != 1 {
         return None;
     }
@@ -461,11 +496,13 @@ fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
         let out = base.outputs.get_mut(at)?;
         if let Some(Ok(data)) = out.slot.get() {
             // The slot and (if it was published from in-flight work) the in-flight copy.
-            let handles = 1 + usize::from(out.inflight.get().is_some());
-            if !usable(data, out, handles) {
+            let published = matches!(*state, crate::array::InFlightState::Set(_));
+            if !usable(data, out, 1 + usize::from(published)) {
                 return None;
             }
-            out.inflight.clear();
+            if published {
+                *state = crate::array::InFlightState::Unset;
+            }
             return match out.slot.take() {
                 Some(Ok(data)) => Some(data),
                 _ => None,
@@ -477,7 +514,6 @@ fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
     if out.slot.get().is_some() {
         return None;
     }
-    let mut state = out.inflight.lock();
     let crate::array::InFlightState::Set(data) = &*state else {
         return None;
     };
@@ -486,6 +522,33 @@ fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
     }
     match std::mem::replace(&mut *state, crate::array::InFlightState::Donated) {
         crate::array::InFlightState::Set(data) => Some(data),
+        _ => None,
+    }
+}
+
+/// A finished input the CPU may write in place: no other handle to its node or buffer, the
+/// buffer holds exactly the row-major array, and it is CPU-writable (not a mapped file, no
+/// GPU work using it).
+fn owned_on_cpu(input: &mut Array) -> Option<Data> {
+    let at = input.output as usize;
+    let base = Arc::get_mut(&mut input.node)?;
+    let out = base.outputs.get_mut(at)?;
+    if out.inflight.get().is_some() {
+        return None;
+    }
+    let Some(Ok(data)) = out.slot.get() else {
+        return None;
+    };
+    let whole = data.offset == 0 && data.buffer.len() == out.size * out.dtype.size();
+    if !(out.flags.row_contiguous
+        && whole
+        && Arc::strong_count(&data.buffer) == 1
+        && data.buffer.cpu_writable())
+    {
+        return None;
+    }
+    match out.slot.take() {
+        Some(Ok(data)) => Some(data),
         _ => None,
     }
 }
@@ -526,8 +589,27 @@ fn in_place(
         Primitive::Fast(crate::fast::imp::FastOp::PagedWrite) => {
             gpu.paged_write_in_place(base, &operands(1), out)?
         }
-        Primitive::Fast(crate::fast::imp::FastOp::Softmax) => gpu.softmax_in_place(base, out)?,
+        Primitive::Fast(crate::fast::imp::FastOp::Softmax) => {
+            gpu.softmax_in_place(base, out, None)?
+        }
+        Primitive::Fast(crate::fast::imp::FastOp::CausalSoftmax { rows }) => {
+            gpu.softmax_in_place(base, out, Some(*rows as usize))?
+        }
         Primitive::Fast(op) => gpu.norm_rope_in_place(base, op, &operands(1), out)?,
+        Primitive::SliceUpdate { .. } if node.stream.device.kind == DeviceKind::Cpu => {
+            // The CPU reads the update in place: wait for the GPU work that produces it.
+            for input in &foreign {
+                input.out().slot.wait().clone()?;
+            }
+            if pending {
+                gpu.flush()?;
+            }
+            let slices = primitive.dim_slices(out.shape.len())?;
+            let mut base = base;
+            let buffer = Arc::get_mut(&mut base.buffer).expect("donated: the only handle");
+            crate::kernels::slice_update_into(buffer, &out.shape, operands(1)[0], &slices);
+            return Ok((vec![base], false));
+        }
         Primitive::SliceUpdate { .. } => {
             let slices = primitive.dim_slices(out.shape.len())?;
             gpu.slice_update_in_place(base, out, operands(1)[0], &slices)?
@@ -669,6 +751,16 @@ fn view_outputs(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Optio
             let (meta, data) = operands[0];
             view::nocopy_reshape(&meta.shape, &meta.strides, shape).and_then(|_| share(data.offset))
         }
+        // Removing or inserting size-1 dimensions is always a view.
+        Primitive::Squeeze(_) | Primitive::ExpandDims(_) => share(operands[0].1.offset),
+        // The offset counts elements: in the new dtype it must stay whole.
+        Primitive::View(dtype) => {
+            let (meta, data) = operands[0];
+            let (from, to) = (meta.dtype.size() as isize, dtype.size() as isize);
+            let bytes = data.offset * from;
+            let shared = from == to || (meta.flags.row_contiguous && bytes % to == 0);
+            shared.then(|| share(bytes / to)).flatten()
+        }
         _ => None,
     })
 }
@@ -681,6 +773,9 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
         Primitive::Binary(op) => new(kernels::binary(*op, operands[0], operands[1])?),
         Primitive::Select => new(kernels::select(operands[0], operands[1], operands[2])?),
         Primitive::AsType(dtype) => new(kernels::cast(operands[0], *dtype)?),
+        Primitive::ToFp8 => new(kernels::to_fp8(operands[0])?),
+        Primitive::SortedOffsets { groups } => new(kernels::sorted_offsets(operands[0], *groups)?),
+        Primitive::FromFp8(dtype) => new(kernels::from_fp8(operands[0], *dtype)?),
         Primitive::Reduce { op, axes } => new(kernels::reduce(*op, operands[0], axes)?),
         Primitive::ArgReduce { op, axis } => new(kernels::arg_reduce(*op, operands[0], *axis)?),
         Primitive::GatherAxis { axis } => {
@@ -735,41 +830,47 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
             "metal_kernel: custom kernels run on the GPU only".into(),
         )),
         Primitive::Compiled(fused) => fused.eval_cpu(operands),
-        Primitive::Quantize { group_size, bits } => {
-            let (packed, scales, biases) =
-                kernels::quantize(operands[0], *group_size, usize::from(*bits))?;
+        Primitive::Collective { op, group } => crate::distributed::eval_cpu(op, *group, operands),
+        Primitive::Quantize { quant } => {
+            let (group_size, bits) = quant.checked("quantize")?;
+            if quant.mode != crate::QuantMode::Affine {
+                let (packed, scales) = kernels::fp_quantize(operands[0], group_size, bits)?;
+                return Ok(vec![Data::new(packed), Data::new(scales)]);
+            }
+            let (packed, scales, biases) = kernels::quantize(operands[0], group_size, bits)?;
             Ok(vec![
                 Data::new(packed),
                 Data::new(scales),
                 Data::new(biases),
             ])
         }
-        Primitive::Dequantize { group_size, bits } => new(kernels::dequantize(
-            operands[0],
-            operands[1],
-            operands[2],
-            *group_size,
-            usize::from(*bits),
-        )?),
-        Primitive::QuantizedMatmul {
-            group_size,
-            bits,
-            transpose,
-        } => new(kernels::quantized_matmul(
-            operands,
-            *group_size,
-            usize::from(*bits),
-            *transpose,
-        )?),
+        Primitive::Dequantize { quant, dtype } => {
+            let (group_size, bits) = quant.checked("dequantize")?;
+            new(match quant.mode {
+                crate::QuantMode::Affine => {
+                    kernels::dequantize(operands[0], operands[1], operands[2], group_size, bits)?
+                }
+                _ => kernels::fp_dequantize(operands[0], operands[1], group_size, bits, *dtype)?,
+            })
+        }
+        Primitive::QuantizedMatmul { quant, transpose } => {
+            let (group_size, bits) = quant.checked("quantized_matmul")?;
+            new(kernels::quantized_matmul(
+                operands, *quant, group_size, bits, *transpose,
+            )?)
+        }
         Primitive::SliceUpdate { .. } => new(kernels::slice_update(
             operands[0],
             operands[1],
             &primitive.dim_slices(operands[0].0.shape.len())?,
         )?),
-        // A reshape that `view_outputs` could not express as a view copies.
-        Primitive::Reshape(_) | Primitive::Copy => {
-            new(kernels::contiguous(operands[0].0, operands[0].1)?)
-        }
+        // A reshape that `view_outputs` could not express as a view copies; so does a `view`,
+        // whose copy is then read in the new dtype.
+        Primitive::Reshape(_)
+        | Primitive::Squeeze(_)
+        | Primitive::ExpandDims(_)
+        | Primitive::Copy
+        | Primitive::View(_) => new(kernels::contiguous(operands[0].0, operands[0].1)?),
         Primitive::Transpose(_)
         | Primitive::Broadcast(_)
         | Primitive::Slice { .. }

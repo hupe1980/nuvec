@@ -221,6 +221,31 @@
               "type": "string"
             }
           }
+        },
+        "tier": {
+          "enum": [
+            "quick",
+            "full"
+          ]
+        },
+        "regression_baseline": {
+          "type": "object",
+          "required": [
+            "ref",
+            "commit",
+            "threshold"
+          ],
+          "properties": {
+            "ref": {
+              "type": "string"
+            },
+            "commit": {
+              "type": "string"
+            },
+            "threshold": {
+              "type": "number"
+            }
+          }
         }
       }
     },
@@ -313,6 +338,29 @@
               }
             }
           }
+        },
+        "regressions": {
+          "description": "Cells below the regression threshold against settings.regression_baseline, after one re-measurement.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "model",
+              "cell",
+              "vs_baseline"
+            ],
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "cell": {
+                "type": "string"
+              },
+              "vs_baseline": {
+                "type": "number"
+              }
+            }
+          }
         }
       },
       "additionalProperties": {
@@ -390,6 +438,24 @@
         },
         "goal_pass": {
           "type": "boolean"
+        },
+        "baseline": {
+          "description": "The baseline release's samples (settings.regression_baseline).",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/metric"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vs_baseline": {
+          "description": "HEAD against the baseline release, oriented as ratio (above 1 favours HEAD).",
+          "type": [
+            "number",
+            "null"
+          ]
         }
       },
       "if": {

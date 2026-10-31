@@ -5,7 +5,10 @@
 
 use std::time::Instant;
 
-use nuvec_core::{Array, DType, Device, Result, Stream, async_eval, eval, ops, set_default_stream};
+use nuvec_core::{
+    Array, DType, Device, GatherQmm, Quant, Result, Stream, async_eval, eval, ops,
+    set_default_stream,
+};
 
 fn uniform(shape: &[usize], dtype: DType) -> Result<Array> {
     let n: usize = shape.iter().product();
@@ -38,17 +41,15 @@ fn make(name: &str, dtype: DType, b: usize) -> Result<Op> {
     if name.starts_with("affine") {
         let bits = if name.starts_with("affine8") { 8 } else { 4 };
         let (n, k) = (dims(name)[0], dims(name)[1]);
-        let (wq, s, bi) = uniform(&[n, k], dtype)?.quantize(64, bits);
-        eval(&[&wq, &s, &bi])?;
+        let wq = uniform(&[n, k], dtype)?.quantize(Quant::affine(64, bits));
+        eval(&wq)?;
         let x = uniform(&[b, k], dtype)?;
-        return Ok(Box::new(move || {
-            Ok(x.quantized_matmul(&wq, &s, &bi, true, 64, bits))
-        }));
+        return Ok(Box::new(move || Ok(x.quantized_matmul(&wq, true))));
     }
     if name.starts_with("gather_qmm") {
         let (n, k) = (dims(name)[0], dims(name)[1]);
-        let (wq, s, bi) = uniform(&[128, n, k], dtype)?.quantize(64, 4);
-        eval(&[&wq, &s, &bi])?;
+        let wq = uniform(&[128, n, k], dtype)?.quantize(Quant::affine(64, 4));
+        eval(&wq)?;
         let sorted = name.contains("sorted");
         let mut ids: Vec<u32> = (0..b * 8)
             .map(|i| ((i * 37 + i / 8 * 11) % 128) as u32)
@@ -61,14 +62,9 @@ fn make(name: &str, dtype: DType, b: usize) -> Result<Op> {
                 Ok(ops::gather_qmm(
                     &x,
                     &wq,
-                    &s,
-                    &bi,
                     None,
                     Some(&ids),
-                    true,
-                    64,
-                    4,
-                    true,
+                    GatherQmm::default().sorted_indices(true),
                 ))
             }));
         }
@@ -78,14 +74,9 @@ fn make(name: &str, dtype: DType, b: usize) -> Result<Op> {
             Ok(ops::gather_qmm(
                 &x,
                 &wq,
-                &s,
-                &bi,
                 None,
                 Some(&ids),
-                true,
-                64,
-                4,
-                false,
+                GatherQmm::default(),
             ))
         }));
     }

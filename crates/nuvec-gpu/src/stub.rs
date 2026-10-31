@@ -23,6 +23,16 @@ impl Device {
     }
 
     /// Unreachable: no `Device` can be constructed on this target.
+    pub fn kernel_names(&self) -> crate::Result<Vec<String>> {
+        match self.0 {}
+    }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    pub fn nax(&self) -> crate::NaxStatus {
+        match self.0 {}
+    }
+
+    /// Unreachable: no `Device` can be constructed on this target.
     pub fn memory(&self) -> MemoryStats {
         match self.0 {}
     }

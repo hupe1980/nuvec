@@ -244,20 +244,20 @@ fn flatten_front(a: &Array, ndim: usize) -> Result<Array> {
 fn scale_bias_grads(
     dw: &Array,
     inputs: &[Array],
-    group_size: usize,
-    bits: u8,
+    quant: crate::Quant,
     wanted: [bool; 2],
 ) -> Result<[Option<Array>; 2]> {
     let (w, scales, biases) = (&inputs[0], &inputs[1], &inputs[2]);
+    let group_size = quant.group_size as usize;
     let dw = grouped(dw, group_size)?;
     let ds = match wanted[0] {
         true => {
             let codes = dequantize(
                 w,
                 &ones_like(scales)?,
-                &zeros_like(biases)?,
-                group_size,
-                u32::from(bits),
+                Some(&zeros_like(biases)?),
+                quant,
+                None,
             )?;
             Some(sum(
                 &multiply(&dw, grouped(&codes, group_size)?)?,
@@ -277,6 +277,14 @@ fn scale_bias_grads(
 fn no_weight_gradient(op: &str) -> Error {
     Error::InvalidArgument(format!(
         "{op}: there is no gradient with respect to the packed (quantized) weights"
+    ))
+}
+
+/// The floating-point modes' scales are uint8 codes: they have no derivative (MLX).
+fn no_scale_gradient(op: &str, quant: crate::Quant) -> Error {
+    Error::InvalidArgument(format!(
+        "{op}: there is no gradient with respect to {} scales (uint8 codes)",
+        quant.mode
     ))
 }
 
@@ -421,6 +429,19 @@ impl Primitive {
                     (BinaryOp::LogAddExp, _) => {
                         multiply(v, subtract(1, ops::sigmoid(&subtract(a, b)?)?)?)?
                     }
+                    // MLX's: `b · a^(b − 1)`, and `log(a) · a^b` (0 where `a ≤ 0`).
+                    (BinaryOp::Power, 0) => multiply(
+                        v,
+                        multiply(
+                            b,
+                            crate::ops::imp::binary(BinaryOp::Power, a, &subtract(b, 1)?)?,
+                        )?,
+                    )?,
+                    (BinaryOp::Power, _) => {
+                        let positive = greater(a, 0)?;
+                        let log_a = ops::log(&where_(&positive, a, 1)?)?;
+                        multiply(v, multiply(log_a, out)?)?
+                    }
                     // Comparisons have no derivative.
                     _ => return Ok(None),
                 }
@@ -467,10 +488,39 @@ impl Primitive {
                 })
                 .collect();
         }
+        if inputs.is_empty() {
+            return Ok(Vec::new()); // `recv`: nothing to differentiate
+        }
         let x = &inputs[0];
         let one = |a: Result<Array>| a.map(|a| vec![Some(a)]);
         match self {
             Self::Copy => one(Ok(g.clone())),
+            // MLX's rules: the reductions pass the cotangent through (each rank's loss is
+            // its own); a gather's input gets the cotangent's rows of this rank; a send's
+            // output is its input.
+            Self::Collective { op, group } => match op {
+                crate::distributed::CollectiveOp::Gather => {
+                    let rank = crate::distributed::group_rank(*group)?;
+                    let n = x.dims().first().copied().unwrap_or(1);
+                    let mut start = vec![0; g.ndim()];
+                    start[0] = rank * n;
+                    let mut len = g.dims().to_vec();
+                    len[0] = n;
+                    let rows = record(
+                        Self::Slice {
+                            start,
+                            step: vec![1; g.ndim()],
+                            len,
+                        },
+                        vec![g.clone()],
+                    )?;
+                    match x.ndim() {
+                        0 => one(record(Self::Squeeze(vec![0]), vec![rows])),
+                        _ => one(Ok(rows)),
+                    }
+                }
+                _ => one(Ok(g.clone())),
+            },
             Self::Depends { .. } => {
                 // The cotangent goes to `x`; the dependencies get none (zero).
                 let mut grads = vec![None; inputs.len()];
@@ -479,6 +529,8 @@ impl Primitive {
             }
             Self::AsType(_) => one(g.try_astype(x.dtype())),
             Self::Reshape(_) => one(reshape(g, &isize_shape(x.dims()))),
+            Self::Squeeze(axes) => one(record(Self::ExpandDims(axes.clone()), vec![g.clone()])),
+            Self::ExpandDims(axes) => one(record(Self::Squeeze(axes.clone()), vec![g.clone()])),
             Self::Transpose(axes) => {
                 let mut inverse = vec![0; axes.len()];
                 for (i, &a) in axes.iter().enumerate() {
@@ -589,7 +641,17 @@ impl Primitive {
                 Ok(vec![base, update])
             }
             Self::Broadcast(_) => one(sum_to(g, x.dims())),
-            Self::StopGradient | Self::ArgReduce { .. } | Self::RandomBits { .. } => Ok(vec![None]),
+            Self::StopGradient
+            | Self::ArgReduce { .. }
+            | Self::RandomBits { .. }
+            | Self::SortedOffsets { .. } => Ok(vec![None]),
+            Self::View(_) | Self::ToFp8 | Self::FromFp8(_) => match wanted[0] {
+                true => Err(Error::InvalidArgument(format!(
+                    "{}: there is no derivative through a bit reinterpretation or an fp8 code",
+                    self.name()
+                ))),
+                false => Ok(vec![None]),
+            },
             Self::Reduce { op, axes } => match op {
                 ReduceOp::Sum => one(broadcast_to(g, x.dims())),
                 ReduceOp::Prod => one(multiply(
@@ -635,34 +697,34 @@ impl Primitive {
             Self::MetalKernel(_) => Err(crate::Error::InvalidArgument("metal_kernel: no derivative or batching rule (wrap the kernel in `custom_function`)".into())),
             Self::Compiled(fused) => fused.vjp(inputs, cotangents, wanted),
             Self::Quantize { .. } => Ok(vec![None]),
-            Self::Dequantize { group_size, bits } => {
+            Self::Dequantize { quant, .. } => {
                 if wanted[0] {
                     return Err(no_weight_gradient("dequantize"));
                 }
-                let [ds, db] =
-                    scale_bias_grads(g, inputs, *group_size, *bits, [wanted[1], wanted[2]])?;
+                if quant.mode != crate::QuantMode::Affine {
+                    return match wanted[1] {
+                        true => Err(no_scale_gradient("dequantize", *quant)),
+                        false => Ok(vec![None, None]),
+                    };
+                }
+                let [ds, db] = scale_bias_grads(g, inputs, *quant, [wanted[1], wanted[2]])?;
                 Ok(vec![None, ds, db])
             }
-            Self::QuantizedMatmul {
-                group_size,
-                bits,
-                transpose,
-            } => {
+            Self::QuantizedMatmul { quant, transpose } => {
                 if wanted[1] {
                     return Err(no_weight_gradient("quantized_matmul"));
                 }
-                let (x, w, scales, biases) = (&inputs[0], &inputs[1], &inputs[2], &inputs[3]);
+                let (x, w, scales) = (&inputs[0], &inputs[1], &inputs[2]);
+                let biases = inputs.get(3);
                 let dx = match wanted[0] {
-                    true => Some(quantized_matmul(
-                        g,
-                        w,
-                        scales,
-                        biases,
-                        !transpose,
-                        *group_size,
-                        u32::from(*bits),
-                    )?),
+                    true => Some(quantized_matmul(g, w, scales, biases, !transpose, *quant)?),
                     false => None,
+                };
+                let Some(biases) = biases else {
+                    if wanted[2] {
+                        return Err(no_scale_gradient("quantized_matmul", *quant));
+                    }
+                    return Ok(vec![dx, None, None]);
                 };
                 let [ds, db] = match wanted[2] || wanted[3] {
                     true => {
@@ -675,7 +737,7 @@ impl Primitive {
                             false => matmul(&swap_last(&fx)?, &fg)?,
                         };
                         let rest = [w.clone(), scales.clone(), biases.clone()];
-                        scale_bias_grads(&dw, &rest, *group_size, *bits, [wanted[2], wanted[3]])?
+                        scale_bias_grads(&dw, &rest, *quant, [wanted[2], wanted[3]])?
                     }
                     false => [None, None],
                 };
@@ -762,12 +824,21 @@ impl Primitive {
                 None => zeros_like(out)?,
             }]);
         }
+        if inputs.is_empty() {
+            return Ok(vec![zeros_like(out)?]); // `recv`: a constant
+        }
         let x = &inputs[0];
         let one = |a: Result<Array>| a.map(|a| vec![a]);
         match self {
+            // MLX's rules: the collective of the tangent; a send's output is its input.
+            Self::Collective { op, .. } => match op {
+                crate::distributed::CollectiveOp::Send { .. } => one(tangent(0)),
+                _ => one(record(self.clone(), vec![tangent(0)?])),
+            },
             Self::Copy | Self::Depends { .. } => one(tangent(0)),
             Self::AsType(dtype) => one(tangent(0)?.try_astype(*dtype)),
             Self::Reshape(_) => one(reshape(&tangent(0)?, &isize_shape(out.dims()))),
+            Self::Squeeze(_) | Self::ExpandDims(_) => one(record(self.clone(), vec![tangent(0)?])),
             Self::Transpose(axes) => one(transpose(&tangent(0)?, axes)),
             Self::Slice { .. } | Self::Broadcast(_) => one(record(self.clone(), vec![tangent(0)?])),
             Self::SliceUpdate { .. } => one(record(self.clone(), vec![tangent(0)?, tangent(1)?])),
@@ -801,9 +872,19 @@ impl Primitive {
                 self.clone(),
                 (0..inputs.len()).map(tangent).collect::<Result<_>>()?,
             )),
-            Self::StopGradient | Self::ArgReduce { .. } | Self::RandomBits { .. } => {
+            Self::StopGradient
+            | Self::ArgReduce { .. }
+            | Self::RandomBits { .. }
+            | Self::SortedOffsets { .. } => {
                 one(zeros_like(out))
             }
+            Self::View(_) | Self::ToFp8 | Self::FromFp8(_) => match tangents[0] {
+                Some(_) => Err(Error::InvalidArgument(format!(
+                    "{}: there is no derivative through a bit reinterpretation or an fp8 code",
+                    self.name()
+                ))),
+                None => one(zeros_like(out)),
+            },
             Self::Reduce { op, axes } => {
                 let summed = |t: Array| {
                     record(
@@ -855,34 +936,31 @@ impl Primitive {
             Self::Compiled(fused) => fused.jvp(inputs, tangents),
             Self::Quantize { .. } => outputs.iter().map(zeros_like).collect(),
             // Linear in `(scales, biases)`: `dequantize(w, dscales, dbiases)`.
-            Self::Dequantize { group_size, bits } => one(dequantize(
-                &inputs[0],
-                &tangent(1)?,
-                &tangent(2)?,
-                *group_size,
-                u32::from(*bits),
-            )),
-            Self::QuantizedMatmul {
-                group_size,
-                bits,
-                transpose,
-            } => {
+            Self::Dequantize { quant, .. } if quant.mode == crate::QuantMode::Affine => {
+                one(dequantize(
+                    &inputs[0],
+                    &tangent(1)?,
+                    Some(&tangent(2)?),
+                    *quant,
+                    None,
+                ))
+            }
+            Self::Dequantize { quant, .. } => match tangents[1] {
+                Some(_) => Err(no_scale_gradient("dequantize", *quant)),
+                None => outputs.iter().map(zeros_like).collect(),
+            },
+            Self::QuantizedMatmul { quant, transpose } => {
                 let (x, w) = (&inputs[0], &inputs[1]);
+                let biases = inputs.get(3);
                 let mut total = match &tangents[0] {
-                    Some(t) => quantized_matmul(
-                        t,
-                        w,
-                        &inputs[2],
-                        &inputs[3],
-                        *transpose,
-                        *group_size,
-                        u32::from(*bits),
-                    )?,
+                    Some(t) => quantized_matmul(t, w, &inputs[2], biases, *transpose, *quant)?,
                     None => zeros_like(out)?,
                 };
-                if tangents[2].is_some() || tangents[3].is_some() {
-                    let dw =
-                        dequantize(w, &tangent(2)?, &tangent(3)?, *group_size, u32::from(*bits))?;
+                if biases.is_none() && tangents[2].is_some() {
+                    return Err(no_scale_gradient("quantized_matmul", *quant));
+                }
+                if biases.is_some() && (tangents[2].is_some() || tangents[3].is_some()) {
+                    let dw = dequantize(w, &tangent(2)?, Some(&tangent(3)?), *quant, None)?;
                     let dw = if *transpose { swap_last(&dw)? } else { dw };
                     total = ops::add(&total, matmul(x, &dw)?)?;
                 }

@@ -4,8 +4,14 @@
 // queries (`sdpa_vector`, the two-pass `sdpa_vector_2pass_1`/`_2` and its GQA variant;
 // kernels/sdpa_vector.h) and the tiled steel attention for long queries
 // (kernels/steel/attn/kernels/steel_attention.h), without the NAX and blocked head-dim-512
-// kernels. Function constants are renamed and renumbered (30–36, 210–211, 310–313) to stay
-// unique in the single translation unit of source mode.
+// kernels. Function constants are renamed and renumbered (30–37, 210–211, 310–314) to stay
+// unique in the single translation unit of source mode. nuvec adds a sliding window: a
+// causal band of `window` keys per query (the keys before it are skipped, never read),
+// compiled in only by the template parameter `W` (the `_w` kernels; the function constants
+// `sv_has_window`/`att_has_window` only declare the `window` argument). As a function
+// constant in the loops it cost the windowless kernels 8% (D-102). The vector kernels count a window's keys from its
+// first key, so a row's result is MLX's over exactly those keys (`keys[lo..=last]`), and
+// the same for any cache layout holding them (a compacted buffer, a paged cache).
 //
 // Copyright © 2024-26 Apple Inc. Licensed under the MIT License:
 // https://github.com/ml-explore/mlx/blob/main/LICENSE
@@ -21,6 +27,7 @@ constant bool sv_bool_mask [[function_constant(33)]];
 constant bool sv_float_mask [[function_constant(34)]];
 constant bool sv_has_sinks [[function_constant(35)]];
 constant int sv_blocks [[function_constant(36)]];
+constant bool sv_has_window [[function_constant(37)]];
 
 constant bool att_align_Q [[function_constant(210)]];
 constant bool att_align_K [[function_constant(211)]];
@@ -28,13 +35,14 @@ constant bool att_has_mask [[function_constant(310)]];
 constant bool att_do_causal [[function_constant(311)]];
 constant bool att_has_sinks [[function_constant(312)]];
 constant bool att_save_lse [[function_constant(313)]];
+constant bool att_has_window [[function_constant(314)]];
 
 namespace mlx {
 namespace sdpa_vec {
 
 // The declared limit keeps 1,024 threads per threadgroup available where instrumented
 // builds (shader validation) or smaller register files would otherwise lower it.
-template <typename T, int D, int V = D>
+template <typename T, int D, int V = D, bool W = false>
 [[kernel, max_total_threads_per_threadgroup(1024)]] void sdpa_vector(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
@@ -58,6 +66,7 @@ template <typename T, int D, int V = D>
     const device T* sinks [[buffer(16), function_constant(sv_has_sinks)]],
     const constant int& num_q_heads
     [[buffer(17), function_constant(sv_has_sinks)]],
+    const constant int& window [[buffer(18), function_constant(sv_has_window)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -118,8 +127,20 @@ template <typename T, int D, int V = D>
     sum_exp_score = 1;
   }
 
+  // A window starts at key `lo = last - window + 1`, and its keys are assigned to SIMD
+  // groups from there (key `lo + j` to group `j % BN`).
+  int first = simd_gid;
+  if (W) {
+    const int lo = N - int(tpg.y) + int(q_seq_idx) - window + 1;
+    if (lo > 0) {
+      first += lo;
+      keys += lo * k_seq_stride;
+      values += lo * v_seq_stride;
+    }
+  }
+
   // For each key
-  for (int i = simd_gid; i < N; i += BN) {
+  for (int i = first; i < N; i += BN) {
     bool use_key = true;
     if (sv_do_causal) {
       use_key = i <= (N - int(tpg.y) + int(q_seq_idx));
@@ -127,6 +148,9 @@ template <typename T, int D, int V = D>
       use_key = bmask[0];
     } else if (sv_float_mask) {
       use_key = (fmask[0] >= Limits<T>::finite_min);
+    }
+    if (W) {
+      use_key = use_key && i > (N - int(tpg.y) + int(q_seq_idx) - window);
     }
     if (use_key) {
       // Read the key
@@ -199,7 +223,7 @@ template <typename T, int D, int V = D>
   }
 }
 
-template <typename T, int D, int V = D, int TK = 4>
+template <typename T, int D, int V = D, int TK = 4, bool W = false>
 [[kernel, max_total_threads_per_threadgroup(1024)]] void sdpa_vector_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
@@ -222,6 +246,7 @@ template <typename T, int D, int V = D, int TK = 4>
     const constant int& mask_head_stride
     [[buffer(17), function_constant(sv_has_mask)]],
     const device T* sinks [[buffer(18), function_constant(sv_has_sinks)]],
+    const constant int& window [[buffer(19), function_constant(sv_has_window)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -287,8 +312,20 @@ template <typename T, int D, int V = D, int TK = 4>
   const int stride_mask_tok =
       (sv_bool_mask || sv_float_mask) ? sv_blocks * mask_kv_seq_stride : 0;
 
-  // For each key
+  // A window starts at key `lo = last - window + 1`, and its keys are partitioned from
+  // there (key `lo + j` to block `j % blocks`, in steps of `TK`).
   int i = block_idx;
+  const int last = N - q_seq_len + int(q_seq_idx);
+  if (W) {
+    const int lo = last - window + 1;
+    if (lo > 0) {
+      i += lo;
+      keys += lo * k_seq_stride;
+      values += lo * v_seq_stride;
+    }
+  }
+
+  // For each key
   for (; i + (TK - 1) * sv_blocks < N; i += sv_blocks * TK) {
     // Prefetch: issue all TK K/V loads first so the HW can overlap them.
     T k_reg[TK][qk_per_thread];
@@ -310,11 +347,14 @@ template <typename T, int D, int V = D, int TK = 4>
       int ii = i + t * sv_blocks;
       bool use_key = true;
       if (sv_do_causal) {
-        use_key = ii <= (N - q_seq_len + int(q_seq_idx));
+        use_key = ii <= last;
       } else if (sv_bool_mask) {
         use_key = bmask[t * stride_mask_tok];
       } else if (sv_float_mask) {
         use_key = (fmask[t * stride_mask_tok] >= Limits<T>::finite_min);
+      }
+      if (W) {
+        use_key = use_key && ii > last - window;
       }
       if (use_key) {
         U score = 0;
@@ -351,11 +391,14 @@ template <typename T, int D, int V = D, int TK = 4>
   for (; i < N; i += sv_blocks) {
     bool use_key = true;
     if (sv_do_causal) {
-      use_key = i <= (N - q_seq_len + int(q_seq_idx));
+      use_key = i <= last;
     } else if (sv_bool_mask) {
       use_key = bmask[0];
     } else if (sv_float_mask) {
       use_key = (fmask[0] >= Limits<T>::finite_min);
+    }
+    if (W) {
+      use_key = use_key && i > last - window;
     }
     if (use_key) {
       // Compute the i-th score
@@ -688,7 +731,8 @@ template <
     int WM,
     int WN,
     typename MaskType = float,
-    typename AccumType = float>
+    typename AccumType = float,
+    bool W = false>
 [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void attention(
     const device T* Q [[buffer(0)]],
     const device T* K [[buffer(1)]],
@@ -699,6 +743,7 @@ template <
     const device MaskType* mask [[buffer(6), function_constant(att_has_mask)]],
     const device T* sinks [[buffer(7), function_constant(att_has_sinks)]],
     device float* lse [[buffer(8), function_constant(att_save_lse)]],
+    const constant int& window [[buffer(9), function_constant(att_has_window)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -734,6 +779,20 @@ template <
   if (att_has_mask) {
     mask += tidl.z * mask_params->M_strides[0] + // Batch
         tidl.y * mask_params->M_strides[1]; // Head
+  }
+
+  // A window: key blocks before every query's window are skipped (their scores would all
+  // be masked: the first visible key multiplies their terms by exp(finite_min - s) = 0),
+  // and blocks reaching below the last query's window start are masked from below.
+  int kb_start = 0;
+  int kb_window_end = 0;
+  if (W) {
+    const int q_min = max(0, int(tid.x) * BQ + params->qL_off);
+    const int q_max = min(params->qL, int(tid.x + 1) * BQ) - 1 + params->qL_off;
+    kb_start = max(0, q_min - window + 1) / BK;
+    kb_window_end = max(0, q_max - window + 1 + BK - 1) / BK;
+    K += int64_t(kb_start) * BK * params->K_strides[2];
+    V += int64_t(kb_start) * BK * params->V_strides[2];
   }
 
   // Prepare threadgroup memory
@@ -913,7 +972,7 @@ template <
   }
 
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int kb = kb_start; kb < kb_lim; kb++) {
     // Load K block and apply scale
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!att_align_K && kb == (params->NK_aligned)) {
@@ -1002,8 +1061,8 @@ template <
       }
     }
 
-    // Mask out if causal
-    if (att_do_causal && kb >= kb_min_causal) {
+    // Mask out if causal (and below a window's start)
+    if (att_do_causal && (kb >= kb_min_causal || (W && kb < kb_window_end))) {
       using stile_t = decltype(Stile);
       using selem_t = typename stile_t::elem_type;
       constexpr auto neg_inf = Limits<selem_t>::finite_min;
@@ -1017,7 +1076,8 @@ template <
           const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
           STEEL_PRAGMA_UNROLL
           for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
-            if (row_pos < (col_pos + jj)) {
+            if (row_pos < (col_pos + jj) ||
+                (W && (col_pos + jj) <= row_pos - window)) {
               Stile.frag_at(i, j)[jj] = neg_inf;
             }
           }
@@ -1193,21 +1253,37 @@ template <
 } // namespace mlx
 
 template [[host_name("nuvec_sdpa_vector_float32_64_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 64, 64>) mlx::sdpa_vec::sdpa_vector<float, 64, 64>;
+template [[host_name("nuvec_sdpa_vector_float32_64_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 64, 64, true>) mlx::sdpa_vec::sdpa_vector<float, 64, 64, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_64_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 64, 64>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 64, 64>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_64_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 64, 64, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 64, 64, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float32_96_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 96, 64>) mlx::sdpa_vec::sdpa_vector<float, 96, 64>;
+template [[host_name("nuvec_sdpa_vector_float32_96_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 96, 64, true>) mlx::sdpa_vec::sdpa_vector<float, 96, 64, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_96_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 96, 64>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 96, 64>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_96_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 96, 64, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 96, 64, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float32_96_96")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 96, 96>) mlx::sdpa_vec::sdpa_vector<float, 96, 96>;
+template [[host_name("nuvec_sdpa_vector_float32_96_96_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 96, 96, true>) mlx::sdpa_vec::sdpa_vector<float, 96, 96, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_96_96")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 96, 96>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 96, 96>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_96_96_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 96, 96, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 96, 96, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float32_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 128, 128>) mlx::sdpa_vec::sdpa_vector<float, 128, 128>;
+template [[host_name("nuvec_sdpa_vector_float32_128_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 128, 128, true>) mlx::sdpa_vec::sdpa_vector<float, 128, 128, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 128, 128>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 128, 128>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_128_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 128, 128, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 128, 128, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float32_192_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 192, 128>) mlx::sdpa_vec::sdpa_vector<float, 192, 128>;
+template [[host_name("nuvec_sdpa_vector_float32_192_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 192, 128, true>) mlx::sdpa_vec::sdpa_vector<float, 192, 128, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_192_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 128>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 128>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_192_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 128, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 128, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float32_192_192")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 192, 192>) mlx::sdpa_vec::sdpa_vector<float, 192, 192>;
+template [[host_name("nuvec_sdpa_vector_float32_192_192_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 192, 192, true>) mlx::sdpa_vec::sdpa_vector<float, 192, 192, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_192_192")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 192>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 192>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_192_192_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 192, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 192, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float32_256_256")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 256, 256>) mlx::sdpa_vec::sdpa_vector<float, 256, 256>;
+template [[host_name("nuvec_sdpa_vector_float32_256_256_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 256, 256, true>) mlx::sdpa_vec::sdpa_vector<float, 256, 256, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_256_256")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 256, 256>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 256, 256>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_256_256_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 256, 256, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 256, 256, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float32_512_512")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 512, 512>) mlx::sdpa_vec::sdpa_vector<float, 512, 512>;
+template [[host_name("nuvec_sdpa_vector_float32_512_512_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<float, 512, 512, true>) mlx::sdpa_vec::sdpa_vector<float, 512, 512, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_512_512")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 512, 512>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 512, 512>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_512_512_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 512, 512, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 512, 512, 4, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_gqa_8_float32_64_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<float, 64, 64, 8, 8>) mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<float, 64, 64, 8, 8>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_gqa_8_float32_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<float, 128, 128, 8, 4>) mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<float, 128, 128, 8, 4>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_gqa_12_float32_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<float, 128, 128, 12, 4>) mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<float, 128, 128, 12, 4>;
@@ -1219,21 +1295,37 @@ template [[host_name("nuvec_sdpa_vector_2pass_2_float32_192")]] [[kernel]] declt
 template [[host_name("nuvec_sdpa_vector_2pass_2_float32_256")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_2<float, 256>) mlx::sdpa_vec::sdpa_vector_2pass_2<float, 256>;
 template [[host_name("nuvec_sdpa_vector_2pass_2_float32_512")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_2<float, 512>) mlx::sdpa_vec::sdpa_vector_2pass_2<float, 512>;
 template [[host_name("nuvec_sdpa_vector_bfloat16_64_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 64, 64>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 64, 64>;
+template [[host_name("nuvec_sdpa_vector_bfloat16_64_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 64, 64, true>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 64, 64, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_64_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 64, 64>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 64, 64>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_64_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 64, 64, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 64, 64, 4, true>;
 template [[host_name("nuvec_sdpa_vector_bfloat16_96_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 96, 64>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 96, 64>;
+template [[host_name("nuvec_sdpa_vector_bfloat16_96_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 96, 64, true>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 96, 64, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_96_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 96, 64>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 96, 64>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_96_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 96, 64, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 96, 64, 4, true>;
 template [[host_name("nuvec_sdpa_vector_bfloat16_96_96")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 96, 96>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 96, 96>;
+template [[host_name("nuvec_sdpa_vector_bfloat16_96_96_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 96, 96, true>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 96, 96, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_96_96")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 96, 96>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 96, 96>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_96_96_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 96, 96, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 96, 96, 4, true>;
 template [[host_name("nuvec_sdpa_vector_bfloat16_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 128, 128>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 128, 128>;
+template [[host_name("nuvec_sdpa_vector_bfloat16_128_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 128, 128, true>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 128, 128, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 128, 128>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 128, 128>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_128_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 128, 128, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 128, 128, 4, true>;
 template [[host_name("nuvec_sdpa_vector_bfloat16_192_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 192, 128>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 192, 128>;
+template [[host_name("nuvec_sdpa_vector_bfloat16_192_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 192, 128, true>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 192, 128, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_192_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 192, 128>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 192, 128>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_192_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 192, 128, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 192, 128, 4, true>;
 template [[host_name("nuvec_sdpa_vector_bfloat16_192_192")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 192, 192>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 192, 192>;
+template [[host_name("nuvec_sdpa_vector_bfloat16_192_192_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 192, 192, true>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 192, 192, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_192_192")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 192, 192>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 192, 192>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_192_192_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 192, 192, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 192, 192, 4, true>;
 template [[host_name("nuvec_sdpa_vector_bfloat16_256_256")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 256, 256>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 256, 256>;
+template [[host_name("nuvec_sdpa_vector_bfloat16_256_256_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 256, 256, true>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 256, 256, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_256_256")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 256, 256>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 256, 256>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_256_256_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 256, 256, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 256, 256, 4, true>;
 template [[host_name("nuvec_sdpa_vector_bfloat16_512_512")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 512, 512>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 512, 512>;
+template [[host_name("nuvec_sdpa_vector_bfloat16_512_512_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<bfloat16_t, 512, 512, true>) mlx::sdpa_vec::sdpa_vector<bfloat16_t, 512, 512, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_512_512")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 512, 512>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 512, 512>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_512_512_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 512, 512, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 512, 512, 4, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_gqa_8_bfloat16_64_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<bfloat16_t, 64, 64, 8, 8>) mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<bfloat16_t, 64, 64, 8, 8>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_gqa_8_bfloat16_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<bfloat16_t, 128, 128, 8, 4>) mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<bfloat16_t, 128, 128, 8, 4>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_gqa_12_bfloat16_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<bfloat16_t, 128, 128, 12, 4>) mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<bfloat16_t, 128, 128, 12, 4>;
@@ -1245,21 +1337,37 @@ template [[host_name("nuvec_sdpa_vector_2pass_2_bfloat16_192")]] [[kernel]] decl
 template [[host_name("nuvec_sdpa_vector_2pass_2_bfloat16_256")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_2<bfloat16_t, 256>) mlx::sdpa_vec::sdpa_vector_2pass_2<bfloat16_t, 256>;
 template [[host_name("nuvec_sdpa_vector_2pass_2_bfloat16_512")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_2<bfloat16_t, 512>) mlx::sdpa_vec::sdpa_vector_2pass_2<bfloat16_t, 512>;
 template [[host_name("nuvec_sdpa_vector_float16_64_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 64, 64>) mlx::sdpa_vec::sdpa_vector<half, 64, 64>;
+template [[host_name("nuvec_sdpa_vector_float16_64_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 64, 64, true>) mlx::sdpa_vec::sdpa_vector<half, 64, 64, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float16_64_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 64, 64>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 64, 64>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float16_64_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 64, 64, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 64, 64, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float16_96_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 96, 64>) mlx::sdpa_vec::sdpa_vector<half, 96, 64>;
+template [[host_name("nuvec_sdpa_vector_float16_96_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 96, 64, true>) mlx::sdpa_vec::sdpa_vector<half, 96, 64, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float16_96_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 96, 64>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 96, 64>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float16_96_64_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 96, 64, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 96, 64, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float16_96_96")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 96, 96>) mlx::sdpa_vec::sdpa_vector<half, 96, 96>;
+template [[host_name("nuvec_sdpa_vector_float16_96_96_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 96, 96, true>) mlx::sdpa_vec::sdpa_vector<half, 96, 96, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float16_96_96")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 96, 96>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 96, 96>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float16_96_96_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 96, 96, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 96, 96, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float16_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 128, 128>) mlx::sdpa_vec::sdpa_vector<half, 128, 128>;
+template [[host_name("nuvec_sdpa_vector_float16_128_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 128, 128, true>) mlx::sdpa_vec::sdpa_vector<half, 128, 128, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float16_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 128, 128>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 128, 128>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float16_128_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 128, 128, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 128, 128, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float16_192_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 192, 128>) mlx::sdpa_vec::sdpa_vector<half, 192, 128>;
+template [[host_name("nuvec_sdpa_vector_float16_192_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 192, 128, true>) mlx::sdpa_vec::sdpa_vector<half, 192, 128, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float16_192_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 192, 128>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 192, 128>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float16_192_128_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 192, 128, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 192, 128, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float16_192_192")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 192, 192>) mlx::sdpa_vec::sdpa_vector<half, 192, 192>;
+template [[host_name("nuvec_sdpa_vector_float16_192_192_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 192, 192, true>) mlx::sdpa_vec::sdpa_vector<half, 192, 192, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float16_192_192")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 192, 192>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 192, 192>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float16_192_192_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 192, 192, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 192, 192, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float16_256_256")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 256, 256>) mlx::sdpa_vec::sdpa_vector<half, 256, 256>;
+template [[host_name("nuvec_sdpa_vector_float16_256_256_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 256, 256, true>) mlx::sdpa_vec::sdpa_vector<half, 256, 256, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float16_256_256")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 256, 256>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 256, 256>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float16_256_256_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 256, 256, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 256, 256, 4, true>;
 template [[host_name("nuvec_sdpa_vector_float16_512_512")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 512, 512>) mlx::sdpa_vec::sdpa_vector<half, 512, 512>;
+template [[host_name("nuvec_sdpa_vector_float16_512_512_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector<half, 512, 512, true>) mlx::sdpa_vec::sdpa_vector<half, 512, 512, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float16_512_512")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 512, 512>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 512, 512>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float16_512_512_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<half, 512, 512, 4, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<half, 512, 512, 4, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_gqa_8_float16_64_64")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<half, 64, 64, 8, 8>) mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<half, 64, 64, 8, 8>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_gqa_8_float16_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<half, 128, 128, 8, 4>) mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<half, 128, 128, 8, 4>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_gqa_12_float16_128_128")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<half, 128, 128, 12, 4>) mlx::sdpa_vec::sdpa_vector_2pass_1_gqa<half, 128, 128, 12, 4>;
@@ -1271,57 +1379,112 @@ template [[host_name("nuvec_sdpa_vector_2pass_2_float16_192")]] [[kernel]] declt
 template [[host_name("nuvec_sdpa_vector_2pass_2_float16_256")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_2<half, 256>) mlx::sdpa_vec::sdpa_vector_2pass_2<half, 256>;
 template [[host_name("nuvec_sdpa_vector_2pass_2_float16_512")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_2<half, 512>) mlx::sdpa_vec::sdpa_vector_2pass_2<half, 512>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_256_256_tk1")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 256, 256, 1>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 256, 256, 1>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_bfloat16_256_256_tk1_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 256, 256, 1, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<bfloat16_t, 256, 256, 1, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_192_192_tk1")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 192, 1>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 192, 1>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_192_192_tk1_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 192, 1, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 192, 192, 1, true>;
 template [[host_name("nuvec_sdpa_vector_2pass_1_float32_256_256_tk1")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 256, 256, 1>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 256, 256, 1>;
+template [[host_name("nuvec_sdpa_vector_2pass_1_float32_256_256_tk1_w")]] [[kernel]] decltype(mlx::sdpa_vec::sdpa_vector_2pass_1<float, 256, 256, 1, true>) mlx::sdpa_vec::sdpa_vector_2pass_1<float, 256, 256, 1, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd192_bv192_wm4_wn1_maskfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 192, 192, 4, 1, half, float>) mlx::steel_attn::attention<half, 32, 16, 192, 192, 4, 1, half, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd192_bv192_wm4_wn1_maskfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 192, 192, 4, 1, half, float, true>) mlx::steel_attn::attention<half, 32, 16, 192, 192, 4, 1, half, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd192_bv192_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 192, 192, 4, 1, bool, float>) mlx::steel_attn::attention<half, 32, 16, 192, 192, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd192_bv192_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 192, 192, 4, 1, bool, float, true>) mlx::steel_attn::attention<half, 32, 16, 192, 192, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd128_bv128_wm4_wn1_maskfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 128, 128, 4, 1, half, float>) mlx::steel_attn::attention<half, 32, 16, 128, 128, 4, 1, half, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd128_bv128_wm4_wn1_maskfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 128, 128, 4, 1, half, float, true>) mlx::steel_attn::attention<half, 32, 16, 128, 128, 4, 1, half, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd128_bv128_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 128, 128, 4, 1, bool, float>) mlx::steel_attn::attention<half, 32, 16, 128, 128, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd128_bv128_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 128, 128, 4, 1, bool, float, true>) mlx::steel_attn::attention<half, 32, 16, 128, 128, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd96_bv96_wm4_wn1_maskfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 96, 96, 4, 1, half, float>) mlx::steel_attn::attention<half, 32, 32, 96, 96, 4, 1, half, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd96_bv96_wm4_wn1_maskfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 96, 96, 4, 1, half, float, true>) mlx::steel_attn::attention<half, 32, 32, 96, 96, 4, 1, half, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd96_bv96_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 96, 96, 4, 1, bool, float>) mlx::steel_attn::attention<half, 32, 32, 96, 96, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd96_bv96_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 96, 96, 4, 1, bool, float, true>) mlx::steel_attn::attention<half, 32, 32, 96, 96, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd96_bv64_wm4_wn1_maskfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 96, 64, 4, 1, half, float>) mlx::steel_attn::attention<half, 32, 32, 96, 64, 4, 1, half, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd96_bv64_wm4_wn1_maskfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 96, 64, 4, 1, half, float, true>) mlx::steel_attn::attention<half, 32, 32, 96, 64, 4, 1, half, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd96_bv64_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 96, 64, 4, 1, bool, float>) mlx::steel_attn::attention<half, 32, 32, 96, 64, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd96_bv64_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 96, 64, 4, 1, bool, float, true>) mlx::steel_attn::attention<half, 32, 32, 96, 64, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd80_bv80_wm4_wn1_maskfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 80, 80, 4, 1, half, float>) mlx::steel_attn::attention<half, 32, 32, 80, 80, 4, 1, half, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd80_bv80_wm4_wn1_maskfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 80, 80, 4, 1, half, float, true>) mlx::steel_attn::attention<half, 32, 32, 80, 80, 4, 1, half, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd80_bv80_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 80, 80, 4, 1, bool, float>) mlx::steel_attn::attention<half, 32, 32, 80, 80, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd80_bv80_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 80, 80, 4, 1, bool, float, true>) mlx::steel_attn::attention<half, 32, 32, 80, 80, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd72_bv72_wm4_wn1_maskfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 72, 72, 4, 1, half, float>) mlx::steel_attn::attention<half, 32, 32, 72, 72, 4, 1, half, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd72_bv72_wm4_wn1_maskfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 72, 72, 4, 1, half, float, true>) mlx::steel_attn::attention<half, 32, 32, 72, 72, 4, 1, half, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd72_bv72_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 72, 72, 4, 1, bool, float>) mlx::steel_attn::attention<half, 32, 32, 72, 72, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd72_bv72_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 72, 72, 4, 1, bool, float, true>) mlx::steel_attn::attention<half, 32, 32, 72, 72, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd64_bv64_wm4_wn1_maskfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 64, 64, 4, 1, half, float>) mlx::steel_attn::attention<half, 32, 32, 64, 64, 4, 1, half, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd64_bv64_wm4_wn1_maskfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 64, 64, 4, 1, half, float, true>) mlx::steel_attn::attention<half, 32, 32, 64, 64, 4, 1, half, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd64_bv64_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 64, 64, 4, 1, bool, float>) mlx::steel_attn::attention<half, 32, 32, 64, 64, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd64_bv64_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 64, 64, 4, 1, bool, float, true>) mlx::steel_attn::attention<half, 32, 32, 64, 64, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd256_bv256_wm4_wn2_maskfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 256, 256, 4, 2, half, float>) mlx::steel_attn::attention<half, 32, 16, 256, 256, 4, 2, half, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd256_bv256_wm4_wn2_maskfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 256, 256, 4, 2, half, float, true>) mlx::steel_attn::attention<half, 32, 16, 256, 256, 4, 2, half, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd256_bv256_wm4_wn2_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 256, 256, 4, 2, bool, float>) mlx::steel_attn::attention<half, 32, 16, 256, 256, 4, 2, bool, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk16_bd256_bv256_wm4_wn2_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 16, 256, 256, 4, 2, bool, float, true>) mlx::steel_attn::attention<half, 32, 16, 256, 256, 4, 2, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd256_bv256_wm4_wn2_maskfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 256, 256, 4, 2, half, float>) mlx::steel_attn::attention<half, 32, 32, 256, 256, 4, 2, half, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd256_bv256_wm4_wn2_maskfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 256, 256, 4, 2, half, float, true>) mlx::steel_attn::attention<half, 32, 32, 256, 256, 4, 2, half, float, true>;
 template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd256_bv256_wm4_wn2_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 256, 256, 4, 2, bool, float>) mlx::steel_attn::attention<half, 32, 32, 256, 256, 4, 2, bool, float>;
+template [[host_name("nuvec_steel_attention_float16_bq32_bk32_bd256_bv256_wm4_wn2_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<half, 32, 32, 256, 256, 4, 2, bool, float, true>) mlx::steel_attn::attention<half, 32, 32, 256, 256, 4, 2, bool, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd192_bv192_wm4_wn1_maskbfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 192, 192, 4, 1, bfloat16_t, float>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 192, 192, 4, 1, bfloat16_t, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd192_bv192_wm4_wn1_maskbfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 192, 192, 4, 1, bfloat16_t, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 192, 192, 4, 1, bfloat16_t, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd192_bv192_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 192, 192, 4, 1, bool, float>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 192, 192, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd192_bv192_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 192, 192, 4, 1, bool, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 192, 192, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd128_bv128_wm4_wn1_maskbfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 128, 128, 4, 1, bfloat16_t, float>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 128, 128, 4, 1, bfloat16_t, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd128_bv128_wm4_wn1_maskbfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 128, 128, 4, 1, bfloat16_t, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 128, 128, 4, 1, bfloat16_t, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd128_bv128_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 128, 128, 4, 1, bool, float>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 128, 128, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd128_bv128_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 128, 128, 4, 1, bool, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 128, 128, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd96_bv96_wm4_wn1_maskbfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 96, 4, 1, bfloat16_t, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 96, 4, 1, bfloat16_t, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd96_bv96_wm4_wn1_maskbfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 96, 4, 1, bfloat16_t, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 96, 4, 1, bfloat16_t, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd96_bv96_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 96, 4, 1, bool, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 96, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd96_bv96_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 96, 4, 1, bool, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 96, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd96_bv64_wm4_wn1_maskbfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 64, 4, 1, bfloat16_t, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 64, 4, 1, bfloat16_t, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd96_bv64_wm4_wn1_maskbfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 64, 4, 1, bfloat16_t, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 64, 4, 1, bfloat16_t, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd96_bv64_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 64, 4, 1, bool, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 64, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd96_bv64_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 64, 4, 1, bool, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 96, 64, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd80_bv80_wm4_wn1_maskbfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 80, 80, 4, 1, bfloat16_t, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 80, 80, 4, 1, bfloat16_t, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd80_bv80_wm4_wn1_maskbfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 80, 80, 4, 1, bfloat16_t, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 80, 80, 4, 1, bfloat16_t, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd80_bv80_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 80, 80, 4, 1, bool, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 80, 80, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd80_bv80_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 80, 80, 4, 1, bool, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 80, 80, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd72_bv72_wm4_wn1_maskbfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 72, 72, 4, 1, bfloat16_t, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 72, 72, 4, 1, bfloat16_t, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd72_bv72_wm4_wn1_maskbfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 72, 72, 4, 1, bfloat16_t, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 72, 72, 4, 1, bfloat16_t, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd72_bv72_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 72, 72, 4, 1, bool, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 72, 72, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd72_bv72_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 72, 72, 4, 1, bool, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 72, 72, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd64_bv64_wm4_wn1_maskbfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 64, 64, 4, 1, bfloat16_t, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 64, 64, 4, 1, bfloat16_t, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd64_bv64_wm4_wn1_maskbfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 64, 64, 4, 1, bfloat16_t, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 64, 64, 4, 1, bfloat16_t, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd64_bv64_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 64, 64, 4, 1, bool, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 64, 64, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd64_bv64_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 64, 64, 4, 1, bool, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 64, 64, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd256_bv256_wm4_wn2_maskbfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 256, 256, 4, 2, bfloat16_t, float>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 256, 256, 4, 2, bfloat16_t, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd256_bv256_wm4_wn2_maskbfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 256, 256, 4, 2, bfloat16_t, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 256, 256, 4, 2, bfloat16_t, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd256_bv256_wm4_wn2_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 256, 256, 4, 2, bool, float>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 256, 256, 4, 2, bool, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk16_bd256_bv256_wm4_wn2_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 16, 256, 256, 4, 2, bool, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 16, 256, 256, 4, 2, bool, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd256_bv256_wm4_wn2_maskbfloat16")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 256, 256, 4, 2, bfloat16_t, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 256, 256, 4, 2, bfloat16_t, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd256_bv256_wm4_wn2_maskbfloat16_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 256, 256, 4, 2, bfloat16_t, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 256, 256, 4, 2, bfloat16_t, float, true>;
 template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd256_bv256_wm4_wn2_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 256, 256, 4, 2, bool, float>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 256, 256, 4, 2, bool, float>;
+template [[host_name("nuvec_steel_attention_bfloat16_bq32_bk32_bd256_bv256_wm4_wn2_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<bfloat16_t, 32, 32, 256, 256, 4, 2, bool, float, true>) mlx::steel_attn::attention<bfloat16_t, 32, 32, 256, 256, 4, 2, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd192_bv192_wm4_wn1_maskfloat32")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 192, 192, 4, 1, float, float>) mlx::steel_attn::attention<float, 32, 16, 192, 192, 4, 1, float, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd192_bv192_wm4_wn1_maskfloat32_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 192, 192, 4, 1, float, float, true>) mlx::steel_attn::attention<float, 32, 16, 192, 192, 4, 1, float, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd192_bv192_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 192, 192, 4, 1, bool, float>) mlx::steel_attn::attention<float, 32, 16, 192, 192, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd192_bv192_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 192, 192, 4, 1, bool, float, true>) mlx::steel_attn::attention<float, 32, 16, 192, 192, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd128_bv128_wm4_wn1_maskfloat32")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 128, 128, 4, 1, float, float>) mlx::steel_attn::attention<float, 32, 16, 128, 128, 4, 1, float, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd128_bv128_wm4_wn1_maskfloat32_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 128, 128, 4, 1, float, float, true>) mlx::steel_attn::attention<float, 32, 16, 128, 128, 4, 1, float, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd128_bv128_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 128, 128, 4, 1, bool, float>) mlx::steel_attn::attention<float, 32, 16, 128, 128, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd128_bv128_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 128, 128, 4, 1, bool, float, true>) mlx::steel_attn::attention<float, 32, 16, 128, 128, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd96_bv96_wm4_wn1_maskfloat32")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 96, 96, 4, 1, float, float>) mlx::steel_attn::attention<float, 32, 32, 96, 96, 4, 1, float, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd96_bv96_wm4_wn1_maskfloat32_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 96, 96, 4, 1, float, float, true>) mlx::steel_attn::attention<float, 32, 32, 96, 96, 4, 1, float, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd96_bv96_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 96, 96, 4, 1, bool, float>) mlx::steel_attn::attention<float, 32, 32, 96, 96, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd96_bv96_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 96, 96, 4, 1, bool, float, true>) mlx::steel_attn::attention<float, 32, 32, 96, 96, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd96_bv64_wm4_wn1_maskfloat32")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 96, 64, 4, 1, float, float>) mlx::steel_attn::attention<float, 32, 32, 96, 64, 4, 1, float, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd96_bv64_wm4_wn1_maskfloat32_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 96, 64, 4, 1, float, float, true>) mlx::steel_attn::attention<float, 32, 32, 96, 64, 4, 1, float, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd96_bv64_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 96, 64, 4, 1, bool, float>) mlx::steel_attn::attention<float, 32, 32, 96, 64, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd96_bv64_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 96, 64, 4, 1, bool, float, true>) mlx::steel_attn::attention<float, 32, 32, 96, 64, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd80_bv80_wm4_wn1_maskfloat32")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 80, 80, 4, 1, float, float>) mlx::steel_attn::attention<float, 32, 32, 80, 80, 4, 1, float, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd80_bv80_wm4_wn1_maskfloat32_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 80, 80, 4, 1, float, float, true>) mlx::steel_attn::attention<float, 32, 32, 80, 80, 4, 1, float, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd80_bv80_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 80, 80, 4, 1, bool, float>) mlx::steel_attn::attention<float, 32, 32, 80, 80, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd80_bv80_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 80, 80, 4, 1, bool, float, true>) mlx::steel_attn::attention<float, 32, 32, 80, 80, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd72_bv72_wm4_wn1_maskfloat32")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 72, 72, 4, 1, float, float>) mlx::steel_attn::attention<float, 32, 32, 72, 72, 4, 1, float, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd72_bv72_wm4_wn1_maskfloat32_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 72, 72, 4, 1, float, float, true>) mlx::steel_attn::attention<float, 32, 32, 72, 72, 4, 1, float, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd72_bv72_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 72, 72, 4, 1, bool, float>) mlx::steel_attn::attention<float, 32, 32, 72, 72, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd72_bv72_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 72, 72, 4, 1, bool, float, true>) mlx::steel_attn::attention<float, 32, 32, 72, 72, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd64_bv64_wm4_wn1_maskfloat32")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 64, 64, 4, 1, float, float>) mlx::steel_attn::attention<float, 32, 32, 64, 64, 4, 1, float, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd64_bv64_wm4_wn1_maskfloat32_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 64, 64, 4, 1, float, float, true>) mlx::steel_attn::attention<float, 32, 32, 64, 64, 4, 1, float, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd64_bv64_wm4_wn1_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 64, 64, 4, 1, bool, float>) mlx::steel_attn::attention<float, 32, 32, 64, 64, 4, 1, bool, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk32_bd64_bv64_wm4_wn1_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 32, 64, 64, 4, 1, bool, float, true>) mlx::steel_attn::attention<float, 32, 32, 64, 64, 4, 1, bool, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd256_bv256_wm4_wn2_maskfloat32")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 256, 256, 4, 2, float, float>) mlx::steel_attn::attention<float, 32, 16, 256, 256, 4, 2, float, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd256_bv256_wm4_wn2_maskfloat32_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 256, 256, 4, 2, float, float, true>) mlx::steel_attn::attention<float, 32, 16, 256, 256, 4, 2, float, float, true>;
 template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd256_bv256_wm4_wn2_maskbool")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 256, 256, 4, 2, bool, float>) mlx::steel_attn::attention<float, 32, 16, 256, 256, 4, 2, bool, float>;
+template [[host_name("nuvec_steel_attention_float32_bq32_bk16_bd256_bv256_wm4_wn2_maskbool_w")]] [[kernel]] decltype(mlx::steel_attn::attention<float, 32, 16, 256, 256, 4, 2, bool, float, true>) mlx::steel_attn::attention<float, 32, 16, 256, 256, 4, 2, bool, float, true>;

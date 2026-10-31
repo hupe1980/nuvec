@@ -107,9 +107,9 @@ fn scratch_matches_the_documented_formulas() {
     // Quantized split-K: `split × M × N × 4`, `split = min(512 / tiles, K / max(group, 32))`
     // reduced until it divides `K` (here 16).
     let wq = pattern(&[256, 8192], DType::BF16, 7);
-    let (qw, qs, qb) = wq.quantize(64, 4);
+    let qw = wq.quantize(Quant::affine(64, 4));
     let xq = pattern(&[64, 8192], DType::BF16, 8);
-    eval(&[&qw, &qs, &qb, &xq]).unwrap();
+    eval(&(&qw, &xq)).unwrap();
     let qtiles = 256usize.div_ceil(32) * 64usize.div_ceil(32);
     let mut split = (512 / qtiles).clamp(1, 8192 / 64);
     while split > 1 && 8192 % (split * 64) != 0 {
@@ -117,18 +117,23 @@ fn scratch_matches_the_documented_formulas() {
     }
     within(
         "quantized split-K",
-        scratch(&xq.quantized_matmul(&qw, &qs, &qb, true, 64, 4)),
+        scratch(&xq.quantized_matmul(&qw, true)),
         split * 64 * 256 * 4,
     );
     // Sorted gather_qmm over many rows: the experts' counts and offsets (int32 each) and a
     // ones vector per row; a few bytes.
     let experts = pattern(&[8, 512, 1024], DType::BF16, 9);
-    let (eq, es, eb) = experts.quantize(64, 4);
+    let eq = experts.quantize(Quant::affine(64, 4));
     let ids: Vec<u32> = (0..512u32).map(|i| i * 8 / 512).collect();
     let ids = Array::from(ids);
     let xe = pattern(&[512, 1, 1024], DType::BF16, 10);
-    eval(&[&eq, &es, &eb, &xe, &ids]).unwrap();
-    let gathered = xe.gather_qmm(&eq, &es, &eb, None, Some(&ids), true, 64, 4, true);
+    eval(&(&eq, &xe, &ids)).unwrap();
+    let gathered = xe.gather_qmm(
+        &eq,
+        None,
+        Some(&ids),
+        GatherQmm::default().sorted_indices(true),
+    );
     let small = scratch(&gathered);
     assert!(small <= 64 << 10, "sorted gather_qmm: {small}");
 }

@@ -369,5 +369,16 @@ mod trees {
             after_plain, after,
             "the sequence advances as uncheckpointed"
         );
+        // The flat form too.
+        random::seed(7);
+        let flat = checkpoint_flat(move |xs: &[Array]| Ok(vec![noisy(&xs[0])]));
+        let flat_g =
+            grad(move |x: &Array| Ok(flat(std::slice::from_ref(x))?[0].sum(..)))(&x).unwrap();
+        assert_eq!(random::next_key().to_vec::<u32>().unwrap(), after_plain);
+        assert_eq!(
+            vals(&plain),
+            vals(&flat_g),
+            "flat: same mask on recomputation"
+        );
     }
 }

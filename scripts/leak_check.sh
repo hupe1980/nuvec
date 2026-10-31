@@ -29,7 +29,9 @@ fi
 
 leaked() {
     # "Process N: K leaks for B total leaked bytes."
-    leaks --atExit -- "$bin" --steps "$1" 2>/dev/null | sed -nE 's/^Process [0-9]+: ([0-9]+) leaks? for.*/\1/p' | tail -1
+    # `leaks` exits non-zero whenever it reports any; the counts decide here.
+    { leaks --atExit -- "$bin" --steps "$1" 2>/dev/null || true; } |
+        sed -nE 's/^Process [0-9]+: ([0-9]+) leaks? for.*/\1/p' | tail -1
 }
 echo "leaks --atExit: $short and $steps steps"
 few="$(leaked "$short")"

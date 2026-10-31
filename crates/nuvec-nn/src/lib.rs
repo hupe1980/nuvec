@@ -81,6 +81,8 @@ mod display;
 pub mod layers;
 pub mod losses;
 pub mod optim;
+mod rope_scaling;
+pub mod sharded;
 mod weights;
 
 pub use display::{ModuleDisplay, Summary, SummaryRow};
@@ -92,13 +94,17 @@ pub use layers::{
 /// crate documentation). Every tree is a [`Module`] (a blanket impl).
 pub use nuvec::macros::Module;
 pub use nuvec::{Param, Tree};
+pub use rope_scaling::{Llama3, LongRope, RopeScaling, Yarn};
 pub use weights::WeightSource;
 
-/// The Rust snippets of the user guide's neural-network page, run as doctests.
+/// The Rust snippets of the user guide's neural-network and distributed pages, run as
+/// doctests.
 #[cfg(doctest)]
 mod site_doctests {
     #[doc = include_str!("../../../site/content/docs/neural-networks.md")]
     pub struct NeuralNetworks;
+    #[doc = include_str!("../../../site/content/docs/distributed.md")]
+    pub struct Distributed;
 }
 
 /// The version of this crate.
@@ -341,7 +347,8 @@ pub fn silu(x: &Array) -> Array {
 /// `0.5 x (1 + tanh(√(2/π) (x + 0.044715 x³)))`.
 #[track_caller]
 pub fn gelu_approx(x: &Array) -> Array {
-    let cube = x.multiply(x).multiply(x);
+    // `x³` as MLX's `x**3` (one power, one rounding; not two products).
+    let cube = x.power(3.0);
     let inner = x
         .add(cube.multiply(0.044715))
         .multiply((2.0 / std::f64::consts::PI).sqrt());
@@ -352,4 +359,102 @@ pub fn gelu_approx(x: &Array) -> Array {
 #[track_caller]
 pub fn gelu_fast_approx(x: &Array) -> Array {
     x.multiply(x.multiply(1.702).sigmoid())
+}
+
+/// A compiled function of a tuple of arrays (traced once per input signature, element-wise
+/// chains fused into one kernel), as mlx-lm compiles its activations.
+type Compiled<T> = Box<dyn Fn(&T) -> Result<Array> + Send + Sync>;
+
+/// `x` as a 0-d array of `like`'s dtype: a weak scalar (MLX rounds a Python float to the
+/// array's dtype), passed to compiled functions as an input so one trace serves every value.
+fn weak(value: f32, like: &Array) -> Array {
+    Array::from(value).astype(like.dtype())
+}
+
+/// `silu(gate) · x` in one kernel, as mlx-lm's compiled `swiglu`.
+#[track_caller]
+pub fn swiglu(gate: &Array, x: &Array) -> Array {
+    static F: std::sync::LazyLock<Compiled<(Array, Array)>> = std::sync::LazyLock::new(|| {
+        Box::new(nuvec::compile(|(g, x): &(Array, Array)| {
+            silu(g).multiply(x)
+        }))
+    });
+    F(&(gate.clone(), x.clone())).unwrap_or_else(|_| silu(gate).multiply(x))
+}
+
+/// gpt-oss's clamped SwiGLU in one kernel, as mlx-lm's compiled `swiglu_oai`:
+/// `(clip(x, −limit, limit) + 1) · g · sigmoid(alpha · g)` with `g = min(gate, limit)`
+/// (gpt-oss: `alpha` 1.702, `limit` 7).
+///
+/// ```
+/// use nuvec::array;
+///
+/// let y = nuvec_nn::swiglu_oai(&array![10.0f32, -1.0], &array![9.0f32, 0.5], 1.702, 7.0);
+/// let v = y.to_vec::<f32>().unwrap();
+/// assert!((v[0] - 8.0 * 7.0 / (1.0 + (-1.702f32 * 7.0).exp())).abs() < 1e-4);
+/// ```
+#[track_caller]
+pub fn swiglu_oai(gate: &Array, x: &Array, alpha: f32, limit: f32) -> Array {
+    fn graph(g: &Array, x: &Array, alpha: &Array, limit: &Array) -> Array {
+        let g = g.minimum(limit);
+        let x = x.maximum(limit.negative()).minimum(limit);
+        x.add(1.0)
+            .multiply(g.multiply(alpha.multiply(&g).sigmoid()))
+    }
+    static F: std::sync::LazyLock<Compiled<(Array, Array, Array, Array)>> =
+        std::sync::LazyLock::new(|| {
+            Box::new(nuvec::compile(
+                |(g, x, a, l): &(Array, Array, Array, Array)| graph(g, x, a, l),
+            ))
+        });
+    let (a, l) = (weak(alpha, gate), weak(limit, gate));
+    F(&(gate.clone(), x.clone(), a.clone(), l.clone())).unwrap_or_else(|_| graph(gate, x, &a, &l))
+}
+
+/// `gelu_approx(gate) · x` in one kernel, as mlx-lm's compiled `geglu` (Gemma 4).
+#[track_caller]
+pub fn geglu(gate: &Array, x: &Array) -> Array {
+    static F: std::sync::LazyLock<Compiled<(Array, Array)>> = std::sync::LazyLock::new(|| {
+        Box::new(nuvec::compile(|(g, x): &(Array, Array)| {
+            gelu_approx(g).multiply(x)
+        }))
+    });
+    F(&(gate.clone(), x.clone())).unwrap_or_else(|_| gelu_approx(gate).multiply(x))
+}
+
+/// `tanh(x / cap) · cap` in one kernel, as mlx-lm's compiled `logit_softcap` (Gemma 4's
+/// final logits: cap 30). A cap that is not positive and finite gives a failed array.
+///
+/// No attention option caps scores; a soft-capped attention is composed from public ops:
+///
+/// ```
+/// use nuvec::{DType, ops, random};
+///
+/// let (q, k, v) = (random::normal([1, 2, 4, 8], DType::F32, 0.0, 1.0, None),
+///                  random::normal([1, 2, 6, 8], DType::F32, 0.0, 1.0, None),
+///                  random::normal([1, 2, 6, 8], DType::F32, 0.0, 1.0, None));
+/// let (scale, cap) = (8f32.sqrt().recip(), 50.0);
+/// let scores = q.matmul(&k.transpose([0, 1, 3, 2])).multiply(scale);
+/// let probs = nuvec_nn::logit_softcap(&scores, cap).softmax(-1); // precise for half types
+/// let out = probs.matmul(&v);
+/// assert_eq!(out.shape(), [1, 2, 4, 8]);
+/// ```
+#[track_caller]
+pub fn logit_softcap(x: &Array, cap: f32) -> Array {
+    if !(cap > 0.0 && cap.is_finite()) {
+        return Array::failure(
+            "logit_softcap",
+            nuvec::OpErrorKind::InvalidArgument(format!(
+                "the cap must be positive and finite, got {cap}"
+            )),
+        );
+    }
+    fn graph(x: &Array, cap: &Array) -> Array {
+        x.divide(cap).tanh().multiply(cap)
+    }
+    static F: std::sync::LazyLock<Compiled<(Array, Array)>> = std::sync::LazyLock::new(|| {
+        Box::new(nuvec::compile(|(x, c): &(Array, Array)| graph(x, c)))
+    });
+    let c = weak(cap, x);
+    F(&(x.clone(), c.clone())).unwrap_or_else(|_| graph(x, &c))
 }

@@ -242,7 +242,7 @@ fn value_and_grad_of_a_model_equals_the_flat_transform_and_training_learns() {
 #[test]
 fn quantized_linear_equals_mlx() {
     random::seed(0);
-    let q = QuantizedLinear::from_linear_with(&Linear::new(64, 3), 32, 4);
+    let q = QuantizedLinear::from_linear_with(&Linear::new(64, 3), nuvec::Quant::affine(32, 4));
     assert_eq!(q.weight.shape(), [3, 8]);
     assert_eq!(q.scales.shape(), [3, 2]);
     let x = ops::arange(0.0, 128.0, 1.0);
@@ -274,6 +274,14 @@ fn quantized_linear_equals_mlx() {
         "the bias was trainable already"
     );
     assert_eq!(names(q2.trainable_parameters()), ["bias"]);
+    // A floating-point mode: weight and uint8 scales, no biases; the tree gradient reaches
+    // the bias and gives the buffers zeros, without differentiating the product in them.
+    let fp = QuantizedLinear::from_linear_with(&Linear::new(64, 3), nuvec::QuantMode::Mxfp4);
+    assert!(fp.biases.is_none());
+    assert_eq!(names(fp.parameters()), ["weight", "scales", "bias"]);
+    let (_, grads) = value_and_grad(|m: &QuantizedLinear| m.forward(&x).sum(..))(&fp).unwrap();
+    assert_eq!(values(grads.bias.as_ref().unwrap()), vec![2.0; 3]);
+    assert!(values(&grads.weight).iter().all(|&v| v == 0.0));
     // An integer parameter is not unfrozen (counted as unchanged).
     let mut ints = (Param::frozen(Array::from_slice(&[1u32, 2], [2])),);
     assert_eq!(ints.unfreeze(|_| true).unwrap(), 0);
@@ -1074,4 +1082,25 @@ fn gradients_through_modules_check_out() {
             2e-2,
         );
     }
+}
+
+/// Fusing LoRA into a floating-point quantized base dequantizes to the adapters' dtype
+/// (float16 here), not to MLX's bfloat16 default; an affine base keeps its scales' dtype.
+#[test]
+fn lora_fuse_over_fp_base_keeps_the_adapter_dtype() {
+    let mut base = Linear::new(64, 8);
+    base.weight = Param::new(base.weight.astype(DType::F16));
+    let mut lora = LoraLinear::from_base(
+        QuantizedLinear::from_linear_with(&base, nuvec::QuantMode::Mxfp4),
+        4,
+    );
+    lora.lora_a = Param::new(lora.lora_a.astype(DType::F16));
+    lora.lora_b = Param::new(lora.lora_b.astype(DType::F16));
+    assert_eq!(lora.fuse().weight.dtype(), DType::F16);
+    let affine = LoraLinear::from_base(QuantizedLinear::from_linear(&base), 4);
+    assert_eq!(
+        affine.fuse().weight.dtype(),
+        DType::F16,
+        "the scales' dtype"
+    );
 }

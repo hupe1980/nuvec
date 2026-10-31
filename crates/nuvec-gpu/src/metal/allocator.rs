@@ -27,6 +27,21 @@ use crate::{GpuError, MemoryStats, Result};
 pub(crate) const PAGE: usize = 16 * 1024;
 /// Granularity of allocations up to one page.
 const SMALL: usize = 256;
+
+/// The largest buffer GPU work does not take from the latest committed command buffer:
+/// taking it would make the next command buffer wait for that one instead of overlapping
+/// it, so a new allocation is preferred (the cache then holds one buffer per command buffer
+/// in flight). Decode-sized work (activations, attention partials, softmax outputs) is
+/// latency-bound; larger buffers belong to GPU-bound work (long prefill), where waiting costs
+/// little and reusing them keeps the peak (D-100; raised from 4 MiB by D-102).
+const OVERLAP_MAX: usize = 64 << 20;
+
+/// Cached bytes past which smaller buffers are taken from the latest committed command
+/// buffer too: decode never holds that much it cannot take yet, while a long prefill's
+/// command buffers, each allocating its intermediates anew, would add up to gigabytes (a
+/// 27B model at 32K tokens ran out of GPU memory) (D-102).
+const OVERLAP_CACHE: usize = 1 << 30;
+
 /// Number of small size classes: 256 B steps up to one page.
 const SMALL_CLASSES: usize = PAGE / SMALL + 1;
 
@@ -47,12 +62,13 @@ struct Entry {
 
 impl Entry {
     /// Whether an allocation may take it: GPU work may take a buffer whose pending uses are
-    /// all committed (their fences order the new use after them); the CPU only an idle one.
-    fn takeable(&self, gpu: bool) -> bool {
+    /// all committed (their fences order the new use after them), from the latest committed
+    /// command buffer only with `latest`; the CPU only an idle one.
+    fn takeable(&self, gpu: bool, latest: bool) -> bool {
         match &self.busy {
             None => true,
             Some(g) if g.idle() => true,
-            Some(g) => gpu && g.committed_uses(),
+            Some(g) => gpu && g.committed_uses() && (latest || !g.in_latest_commit()),
         }
     }
 
@@ -114,14 +130,28 @@ impl State {
     /// A cached buffer of at least `size` bytes within MLX's slack (smaller than
     /// `min(2·size, size + 2 pages)`) that an allocation for the GPU (or the CPU) may take,
     /// its size and its pending hazard state.
+    /// A cached buffer of `size` bytes (up to the bucket limit). Idle buffers first: taking
+    /// one that committed work still uses orders the new work after that command buffer (a
+    /// fence wait), so consecutive command buffers could not overlap (MLX keeps buffers
+    /// until their command buffer completes). In-flight memory is reused only when no idle
+    /// buffer fits, which keeps memory bounded when the CPU runs ahead.
+    /// An idle buffer first, then (GPU work) one of an older command buffer, or one of the
+    /// latest above [`OVERLAP_MAX`] or with more than [`OVERLAP_CACHE`] cached.
     fn take(&mut self, size: usize, gpu: bool) -> Option<Allocation> {
+        if gpu && let Some(found) = self.take_from(size, false, false) {
+            return Some(found);
+        }
+        self.take_from(size, gpu, size > OVERLAP_MAX || self.cached > OVERLAP_CACHE)
+    }
+
+    fn take_from(&mut self, size: usize, gpu: bool, latest: bool) -> Option<Allocation> {
         let limit = size.saturating_mul(2).min(size.saturating_add(2 * PAGE));
         let found = if size <= PAGE {
             let last = ((limit - 1) / SMALL).min(SMALL_CLASSES - 1);
             (size / SMALL..=last).find_map(|c| {
                 let class = &mut self.small[c];
                 // The most recently freed first.
-                let i = class.iter().rposition(|(_, e)| e.takeable(gpu))?;
+                let i = class.iter().rposition(|(_, e)| e.takeable(gpu, latest))?;
                 let (raw, busy) = class.remove(i).1.into_parts();
                 Some((raw, c * SMALL, busy))
             })
@@ -129,7 +159,7 @@ impl State {
             let key = self
                 .large
                 .range((size, 0)..(limit, 0))
-                .find(|(_, e)| e.takeable(gpu))
+                .find(|(_, e)| e.takeable(gpu, latest))
                 .map(|(k, _)| *k);
             key.and_then(|k| {
                 let (raw, busy) = self.large.remove(&k)?.into_parts();
@@ -163,24 +193,24 @@ impl State {
         if self.cached <= target {
             return;
         }
-        if target == 0 {
-            for (_, e) in self.small.iter().flatten() {
-                self.residency.erase(&e.raw.0);
-            }
-            for e in self.large.values() {
-                self.residency.erase(&e.raw.0);
-            }
-            self.small.iter_mut().for_each(Vec::clear);
-            self.large.clear();
-            self.cached = 0;
-            return;
-        }
+        // Oldest first, and only buffers no GPU work uses: a busy buffer's memory is held
+        // by its command buffer until it completes, and leaves the residency set when idle.
+        let idle = |e: &Entry| e.busy.as_ref().is_none_or(|g| g.idle());
         let mut ages: Vec<(u64, usize)> = self
             .small
             .iter()
             .enumerate()
-            .flat_map(|(class, v)| v.iter().map(move |(stamp, _)| (*stamp, class * SMALL)))
-            .chain(self.large.keys().map(|&(size, stamp)| (stamp, size)))
+            .flat_map(|(class, v)| {
+                v.iter()
+                    .filter(|(_, e)| idle(e))
+                    .map(move |(stamp, _)| (*stamp, class * SMALL))
+            })
+            .chain(
+                self.large
+                    .iter()
+                    .filter(|(_, e)| idle(e))
+                    .map(|(&(size, stamp), _)| (stamp, size)),
+            )
             .collect();
         ages.sort_unstable();
         let mut evict = HashSet::new();

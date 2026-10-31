@@ -3,8 +3,9 @@
 //! a message when its model or its fixture (`scripts/lm_fixtures.py --cached`) is absent.
 //!
 //! Teacher-forced over mlx-lm's 32 greedy tokens: at every step mlx-lm's token is among
-//! nuvec's 5 most likely, with a log-probability within 0.1 of mlx-lm's (half-precision
-//! hybrid and mixture-of-experts models do not reproduce every argmax exactly).
+//! nuvec's 5 most likely, with a log-probability within 0.1 of mlx-lm's (0.6 for Gemma 4
+//! 26B-A4B, whose routers amplify an ulp; half-precision hybrid and mixture-of-experts
+//! models do not reproduce every argmax exactly).
 
 #![cfg(target_os = "macos")]
 
@@ -47,7 +48,19 @@ fn setup(repo: &str) -> Option<(PathBuf, Fixture)> {
     ))
 }
 
+/// One real checkpoint in memory at a time: the test harness runs tests on parallel
+/// threads, and two of these models can exhaust a machine's memory.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn agrees_with_mlx_lm(repo: &str) {
+    agrees_within(repo, 0.1);
+}
+
+/// [`agrees_with_mlx_lm`] with log-probabilities within `tol` of mlx-lm's.
+fn agrees_within(repo: &str, tol: f32) {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some((dir, f)) = setup(repo) else {
         return;
     };
@@ -83,7 +96,7 @@ fn agrees_with_mlx_lm(repo: &str) {
         );
         let diff = (row[want] - log_sum - f.greedy_logprob[step]).abs();
         assert!(
-            diff <= 0.1,
+            diff <= tol,
             "{repo} step {step}: log-probability differs by {diff}"
         );
     }
@@ -93,6 +106,9 @@ fn agrees_with_mlx_lm(repo: &str) {
 #[test]
 #[ignore = "needs mlx-community/Qwen3.8-27B-4bit in the Hugging Face cache"]
 fn qwen3_8_27b_loads_on_the_qwen3_5_path() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Ok(dir) = resolve("mlx-community/Qwen3.8-27B-4bit") else {
         eprintln!("skipped: mlx-community/Qwen3.8-27B-4bit is not in the Hugging Face cache");
         return;
@@ -114,4 +130,77 @@ fn qwen3_8_27b_agrees_with_mlx_lm() {
 #[ignore = "needs mlx-community/Meta-Llama-3.1-8B-Instruct-4bit and its fixture"]
 fn llama_3_1_8b_agrees_with_mlx_lm() {
     agrees_with_mlx_lm("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit");
+}
+
+#[test]
+#[ignore = "needs mlx-community/gpt-oss-20b-MXFP4-Q8 and its fixture"]
+fn gpt_oss_20b_agrees_with_mlx_lm() {
+    agrees_with_mlx_lm("mlx-community/gpt-oss-20b-MXFP4-Q8");
+}
+
+#[test]
+#[ignore = "needs lmstudio-community/gpt-oss-20b-MLX-8bit and its fixture"]
+fn gpt_oss_20b_8bit_agrees_with_mlx_lm() {
+    agrees_with_mlx_lm("lmstudio-community/gpt-oss-20b-MLX-8bit");
+}
+
+#[test]
+#[ignore = "needs mlx-community/gemma-4-e4b-it-4bit and its fixture"]
+fn gemma_4_e4b_agrees_with_mlx_lm() {
+    agrees_with_mlx_lm("mlx-community/gemma-4-e4b-it-4bit");
+}
+
+#[test]
+#[ignore = "needs mlx-community/gemma-4-26b-a4b-it-4bit and its fixture"]
+fn gemma_4_26b_a4b_agrees_with_mlx_lm() {
+    // 128 experts, top 8, over 30 layers: one ulp in a router moves the log-probabilities
+    // by tenths (mlx-lm's own precise router softmax moves them by up to 0.65).
+    agrees_within("mlx-community/gemma-4-26b-a4b-it-4bit", 0.6);
+}
+
+/// SentencePiece-style tokenizers (byte-fallback BPE: Gemma 4, Mistral v0.3's
+/// `Metaspace`, Mistral v0.2's `Prepend` and `Replace`) against Hugging Face `tokenizers`
+/// (`scripts/lm_fixtures.py --only spm`): the ids, the decoded text, and the same text
+/// streamed token by token. Only the tokenizer files are needed.
+#[test]
+#[ignore = "needs the tokenizers in the Hugging Face cache and their fixture"]
+fn sentencepiece_tokenizers_agree_with_tokenizers() {
+    use nuvec::io::json::{self, Json};
+    use nuvec_lm::{StreamDecoder, Tokenizer};
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cached/spm_tokenizers.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!("skipped: no fixture {}", path.display());
+        return;
+    };
+    let fixture = json::parse(&bytes).unwrap();
+    for (repo, cases) in fixture.as_object().unwrap() {
+        let Ok(dir) = resolve(repo) else {
+            eprintln!("skipped: {repo} is not in the Hugging Face cache");
+            continue;
+        };
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let text = case.get("text").and_then(Json::as_str).unwrap();
+            let want: Vec<u32> = case
+                .get("ids")
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .map(|i| i.as_i64().unwrap() as u32)
+                .collect();
+            let ids = tokenizer.encode_text(text);
+            assert_eq!(ids, want, "{repo}: ids of {text:?}");
+            let decoded = case.get("decoded").and_then(Json::as_str).unwrap();
+            assert_eq!(
+                tokenizer.decode(&ids),
+                decoded,
+                "{repo}: decode of {text:?}"
+            );
+            let mut stream = StreamDecoder::default();
+            let mut streamed: String = ids.iter().map(|&id| stream.push(&tokenizer, id)).collect();
+            streamed.push_str(&stream.finish());
+            assert_eq!(streamed, decoded, "{repo}: streamed decode of {text:?}");
+        }
+    }
 }

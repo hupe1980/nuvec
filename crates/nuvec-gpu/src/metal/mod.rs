@@ -8,12 +8,13 @@ mod residency;
 
 use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 
 use allocator::Pool;
 pub use buffer::Buffer;
 pub use command::{Arg, CommandBuffer, Pending, Submitted, Timeline};
-use nuvec_kernels::MetallibMode;
+use nuvec_kernels::{MetallibMode, NaxMode};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -22,7 +23,7 @@ use objc2_metal::{
     MTLFunctionConstantValues, MTLLibrary,
 };
 
-use crate::info::parse_architecture;
+use crate::info::{NaxOverride, NaxReason, NaxStatus, nax_status, parse_architecture};
 use crate::{DeviceInfo, GpuError, MemoryStats, Result};
 
 type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
@@ -31,26 +32,33 @@ type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 /// file, with the library of each kernel name.
 struct Libraries {
     libraries: Vec<Library>,
-    by_name: HashMap<String, usize>,
+    /// Kernel names, sorted, with their library (the first that defines each). A sorted
+    /// vector rather than a hash map: every allocation is referenced from its start, so
+    /// `leaks` never mistakes this lifelong index for leaked memory (a hash table is
+    /// referenced from inside its allocation).
+    by_name: Vec<(Box<str>, usize)>,
 }
 
 impl Libraries {
     fn new(libraries: Vec<Library>) -> Self {
-        let mut by_name = HashMap::new();
+        let mut by_name: Vec<(Box<str>, usize)> = Vec::new();
         for (i, library) in libraries.iter().enumerate() {
             for name in library.functionNames().iter() {
-                by_name.entry(name.to_string()).or_insert(i);
+                by_name.push((name.to_string().into_boxed_str(), i));
             }
         }
+        // Stable: the first library's entry of a name comes first and is kept.
+        by_name.sort_by(|a, b| a.0.cmp(&b.0));
+        by_name.dedup_by(|later, first| later.0 == first.0);
         Libraries { libraries, by_name }
     }
 
     /// The library that defines kernel `name`.
     fn get(&self, name: &str) -> Result<&Library> {
         self.by_name
-            .get(name)
-            .map(|&i| &self.libraries[i])
-            .ok_or_else(|| GpuError::MissingKernel(name.to_owned()))
+            .binary_search_by(|(n, _)| n.as_ref().cmp(name))
+            .map(|at| &self.libraries[self.by_name[at].1])
+            .map_err(|_| GpuError::MissingKernel(name.to_owned()))
     }
 }
 
@@ -77,6 +85,12 @@ struct Inner {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     info: DeviceInfo,
     library: OnceLock<Result<Libraries>>,
+    /// The Neural Accelerator (NAX) kernels' library, loaded on first use (macOS 26.2+).
+    nax_library: OnceLock<Result<Libraries>>,
+    /// The NAX decision, made once ([`Device::nax`]).
+    nax: OnceLock<NaxStatus>,
+    /// Set when a NAX pipeline failed to build: the existing kernels from then on.
+    nax_failed: AtomicBool,
     /// Compiled pipelines by key: library kernels by name (and function constants), source
     /// kernels by `src:{name}`. The map's lock is held only to find a key's slot; a slot's
     /// lock is held while that one pipeline compiles, so a thread asking for the same key
@@ -146,8 +160,9 @@ impl Device {
             class,
             recommended_working_set: device.recommendedMaxWorkingSetSize(),
             max_threads_per_threadgroup: device.maxThreadsPerThreadgroup().width,
+            physical_memory: objc2_foundation::NSProcessInfo::processInfo().physicalMemory(),
         };
-        let ram = objc2_foundation::NSProcessInfo::processInfo().physicalMemory();
+        let ram = info.physical_memory;
         let options = objc2_metal::MTLResourceOptions::StorageModeShared;
         let placeholder = device.newBufferWithLength_options(16, options);
         let residency = residency::Residency::new(residency::attach(&device, &queue));
@@ -163,6 +178,9 @@ impl Device {
                 queue,
                 info,
                 library: OnceLock::new(),
+                nax_library: OnceLock::new(),
+                nax: OnceLock::new(),
+                nax_failed: AtomicBool::new(false),
                 pipelines: Mutex::new(HashMap::new()),
                 pool,
                 in_flight: InFlight::default(),
@@ -257,6 +275,18 @@ impl Device {
         &self.inner.info
     }
 
+    /// The names of the kernels in nuvec's kernel library, sorted (loading the library on
+    /// first use).
+    pub fn kernel_names(&self) -> Result<Vec<String>> {
+        // Sorted already.
+        Ok(self
+            .library()?
+            .by_name
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect())
+    }
+
     /// The compute pipeline for the kernel `name` from nuvec's kernel library, compiled on
     /// first use and cached for the life of the device. The cache is keyed by kernel name
     /// and function constants, so it is bounded by the library's kernels times the constant
@@ -283,15 +313,62 @@ impl Device {
         name: &str,
         constants: &[(usize, Constant)],
     ) -> Result<Pipeline> {
-        let key = constants.iter().fold(name.to_owned(), |mut k, (i, v)| {
-            match v {
-                Constant::Bool(b) => k.push_str(&format!("#{i}={}", u8::from(*b))),
-                Constant::Int(n) => k.push_str(&format!("#{i}=i{n}")),
+        thread_local! {
+            /// The cache key being looked up, reused across calls (a hit allocates nothing).
+            static KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        let hit = KEY.with(|k| {
+            use std::fmt::Write;
+            let mut k = k.borrow_mut();
+            k.clear();
+            k.push_str(name);
+            for (i, v) in constants {
+                let _ = match v {
+                    Constant::Bool(b) => write!(k, "#{i}={}", u8::from(*b)),
+                    Constant::Int(n) => write!(k, "#{i}=i{n}"),
+                };
             }
-            k
+            let slot = {
+                let cache = self
+                    .inner
+                    .pipelines
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                cache.get(k.as_str()).cloned()
+            };
+            match slot.and_then(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner).clone())
+            {
+                Some(pipeline) => Ok(pipeline),
+                None => Err(k.clone()),
+            }
         });
-        // Loaded (or compiled, from runtime sources) before any cache lock is taken.
-        let library = self.library()?.get(name)?;
+        let key = match hit {
+            Ok(pipeline) => return Ok(pipeline),
+            Err(key) => key,
+        };
+        // Loaded (or compiled, from runtime sources) before any cache lock is taken. Any
+        // NAX failure while NAX is active (no library, a missing kernel, a pipeline error)
+        // turns it off for the process, so later products take the existing kernels.
+        let nax = name.starts_with("nuvec_nax_");
+        let built = match nax {
+            true => self.nax_library().and_then(|l| l.get(name)),
+            false => self.library().and_then(|l| l.get(name)),
+        }
+        .and_then(|library| self.build_pipeline(name, &key, library, constants));
+        if nax && built.is_err() && self.nax().is_active() {
+            self.inner.nax_failed.store(true, Ordering::Relaxed);
+        }
+        built
+    }
+
+    fn build_pipeline(
+        &self,
+        name: &str,
+        key: &str,
+        library: &Library,
+        constants: &[(usize, Constant)],
+    ) -> Result<Pipeline> {
+        let key = key.to_owned();
         self.cached(key.clone(), || {
             let ns_name = NSString::from_str(name);
             let function = if constants.is_empty() {
@@ -348,7 +425,8 @@ impl Device {
     /// source; `source` runs only on a cache miss). Source kernels have their own namespace:
     /// a source kernel named like one of nuvec's library kernels is a different pipeline.
     /// The source may include nuvec's headers (`#include "common.h"`); it is compiled as
-    /// nuvec's own kernels are, with Metal 3.2 and IEEE-conformant math.
+    /// MLX compiles its runtime kernels: Metal 3.2, safe math, Metal's default (fast)
+    /// math functions.
     ///
     /// The source is trusted code: the pipeline is run with the `unsafe`
     /// [`CommandBuffer::dispatch`] family, whose contract (in-bounds accesses only) the
@@ -364,6 +442,9 @@ impl Device {
                 message,
             };
             let source = inline_sources(&[("generated.metal", &source())]);
+            // As MLX compiles its runtime kernels (`mx.compile`, custom kernels): safe math
+            // with Metal's default, fast `metal::` functions (pow, exp, tanh, …), so their
+            // results can differ in the low bits from the precompiled kernels' (D-104).
             let options = objc2_metal::MTLCompileOptions::new();
             options.setMathMode(objc2_metal::MTLMathMode::Safe);
             options.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version3_2);
@@ -418,6 +499,38 @@ impl Device {
             .map_err(Clone::clone)
     }
 
+    fn nax_library(&self) -> Result<&Libraries> {
+        self.inner
+            .nax_library
+            .get_or_init(|| autoreleasepool(|_| load_nax_library(&self.inner.device)))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Whether products run on the Neural Accelerator kernels (Metal 4 TensorOps), and why
+    /// not: MLX's eligibility (an M5-class GPU on macOS 26.2 or later), the `NUVEC_NAX`
+    /// override (`auto`, `on`, `off`), and whether this build has the kernels. `auto` keeps
+    /// them off on eligible GPUs until an M5 measurement is recorded; `on` forces them on
+    /// any GPU with TensorOps (macOS 26.2), for testing. After a NAX pipeline fails to build,
+    /// [`NaxReason::PipelineError`].
+    pub fn nax(&self) -> NaxStatus {
+        if self.inner.nax_failed.load(Ordering::Relaxed) {
+            return NaxStatus::Off(NaxReason::PipelineError);
+        }
+        *self.inner.nax.get_or_init(|| {
+            let v = objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion();
+            let os = (v.majorVersion as u32, v.minorVersion as u32);
+            let info = &self.inner.info;
+            nax_status(
+                info.generation,
+                info.class,
+                os,
+                NaxOverride::from_env(),
+                nuvec_kernels::NAX_MODE != NaxMode::Absent,
+            )
+        })
+    }
+
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.inner.device
     }
@@ -467,6 +580,11 @@ fn load_library(device: &ProtocolObject<dyn MTLDevice>) -> Result<Libraries> {
                 source.push_str(&inline_sources(&[(path, text)]));
                 let options = objc2_metal::MTLCompileOptions::new();
                 options.setMathMode(objc2_metal::MTLMathMode::Safe);
+                // The build's `-fno-fast-math`: `metal::` functions (pow, exp, …) are the precise
+                // ones (the default is the fast ones).
+                options.setMathFloatingPointFunctions(
+                    objc2_metal::MTLMathFloatingPointFunctions::Precise,
+                );
                 options.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version3_2);
                 device
                     .newLibraryWithSource_options_error(
@@ -493,8 +611,47 @@ fn load_library(device: &ProtocolObject<dyn MTLDevice>) -> Result<Libraries> {
     }
 }
 
+/// Loads the precompiled NAX library, or compiles its embedded sources with Metal 4.0 (only
+/// called when [`Device::nax`] is active, so on macOS 26.2 or later).
+fn load_nax_library(device: &ProtocolObject<dyn MTLDevice>) -> Result<Libraries> {
+    match nuvec_kernels::NAX_MODE {
+        NaxMode::Precompiled => {
+            let bytes = nuvec_kernels::nax_metallib().ok_or(GpuError::NoKernels)?;
+            let library = device
+                .newLibraryWithData_error(&dispatch2::DispatchData::from_static_bytes(bytes))
+                .map_err(|e| GpuError::LibraryLoad(e.localizedDescription().to_string()))?;
+            Ok(Libraries::new(vec![library]))
+        }
+        NaxMode::RuntimeSource => {
+            let libraries = nuvec_kernels::nax_sources()
+                .iter()
+                .filter(|(p, _)| p.ends_with(".metal"))
+                .map(|(path, text)| {
+                    let options = objc2_metal::MTLCompileOptions::new();
+                    options.setMathMode(objc2_metal::MTLMathMode::Safe);
+                    options.setMathFloatingPointFunctions(
+                        objc2_metal::MTLMathFloatingPointFunctions::Precise,
+                    );
+                    options.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version4_0);
+                    device
+                        .newLibraryWithSource_options_error(
+                            &NSString::from_str(text),
+                            Some(&options),
+                        )
+                        .map_err(|e| {
+                            GpuError::LibraryLoad(format!("{path}: {}", e.localizedDescription()))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Libraries::new(libraries))
+        }
+        _ => Err(GpuError::NoKernels),
+    }
+}
+
 /// The `.metal` sources as one translation unit, each `#include "header.h"` of one of
-/// nuvec's headers replaced by the header's text on first use.
+/// nuvec's headers (in a source or in another header) replaced by the header's text on
+/// first use.
 fn inline_sources(sources: &[(&str, &str)]) -> String {
     let headers: HashMap<&str, &str> = nuvec_kernels::sources()
         .iter()
@@ -506,26 +663,35 @@ fn inline_sources(sources: &[(&str, &str)]) -> String {
     let mut included = HashSet::new();
     let mut out = String::new();
     for (_, source) in sources.iter().filter(|(p, _)| p.ends_with(".metal")) {
-        for line in source.lines() {
-            let header = line
-                .trim()
-                .strip_prefix("#include \"")
-                .and_then(|r| r.strip_suffix('"'));
-            match header.and_then(|h| headers.get(h).map(|text| (h, text))) {
-                Some((h, text)) => {
-                    if included.insert(h) {
-                        out.push_str(text);
-                        out.push('\n');
-                    }
-                }
-                None => {
-                    out.push_str(line);
+        inline_into(source, &headers, &mut included, &mut out);
+    }
+    out
+}
+
+fn inline_into<'a>(
+    source: &str,
+    headers: &HashMap<&'a str, &'a str>,
+    included: &mut HashSet<&'a str>,
+    out: &mut String,
+) {
+    for line in source.lines() {
+        let header = line
+            .trim()
+            .strip_prefix("#include \"")
+            .and_then(|r| r.strip_suffix('"'));
+        match header.and_then(|h| headers.get_key_value(h)) {
+            Some((&h, &text)) => {
+                if included.insert(h) {
+                    inline_into(text, headers, included, out);
                     out.push('\n');
                 }
             }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
         }
     }
-    out
 }
 
 /// A compiled compute kernel. Cheap to clone.
@@ -584,5 +750,21 @@ mod tests {
         assert_eq!(out.matches("inline int f();").count(), 1);
         assert!(out.contains("kernel A;") && out.contains("kernel B;"));
         assert!(!out.contains("#include \"h.h\""));
+    }
+
+    #[test]
+    fn inlines_headers_included_by_headers() {
+        let sources = [
+            (
+                "a.metal",
+                "#include \"outer.h\"\n#include \"inner.h\"\nkernel A;",
+            ),
+            ("outer.h", "#include \"inner.h\"\ninline int g();"),
+            ("inner.h", "inline int f();"),
+        ];
+        let out = inline_sources(&sources);
+        assert_eq!(out.matches("inline int f();").count(), 1);
+        assert!(out.find("inline int f();") < out.find("inline int g();"));
+        assert!(!out.contains("#include"));
     }
 }

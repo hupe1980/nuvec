@@ -1,13 +1,15 @@
 //! LLM runtime with mlx-lm's behaviour and speed:
 //!
-//! - **Models:** Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE and Qwen 3.5 (hybrid Gated
-//!   DeltaNet and attention, dense or mixture-of-experts), from Hugging Face or MLX
+//! - **Models:** Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE, Qwen 3.5 (hybrid Gated
+//!   DeltaNet and attention, dense or mixture-of-experts), gpt-oss and Gemma 4 (text), from
+//!   Hugging Face or MLX
 //!   checkpoints, including MLX's quantized ones. Aligned files are memory-mapped without a
 //!   copy; mlx-community checkpoints (unpadded headers) are read once at load, in parallel.
-//! - **Tokenizer:** byte-level BPE read from `tokenizer.json` (GPT-2, Llama 3, Qwen 2/3/3.5
-//!   and others with their split patterns). SentencePiece-style tokenizers (byte-fallback
-//!   BPE: Llama 2, Mistral v0.1–v0.3) are not supported, so [`load`] fails for those
-//!   models; [`load_model`] loads their weights.
+//! - **Tokenizer:** BPE read from `tokenizer.json`: byte-level (GPT-2, Llama 3, Qwen 2/3/3.5,
+//!   gpt-oss's o200k and others with their split patterns) and SentencePiece-style with
+//!   byte fallback (Gemma, Llama 2, Mistral v0.1–v0.3). Other split patterns (Mistral's
+//!   Tekken) are not supported, so [`load`] fails for those models; [`load_model`] loads
+//!   their weights.
 //! - **Generation:** chunked prefill, a pipelined decode loop with the KV cache updated in
 //!   place, stopping at the model's end-of-sequence tokens (`config.json` and
 //!   `generation_config.json`), mlx-lm's samplers (temperature, top-p, min-p, top-k), and [speculative
@@ -32,8 +34,8 @@
 //! # }
 //! ```
 //!
-//! A forward pass returns an array: nothing runs until a boundary (`check`, `eval`, `item`,
-//! `to_vec`) asks for it, and an error surfaces there.
+//! A forward pass returns an array: nothing runs until a boundary (`eval`, `item`,
+//! `to_vec`) asks for it; errors surface at `check` (without evaluating) or there.
 //!
 //! ```no_run
 //! use nuvec::Array;
@@ -60,7 +62,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use nuvec::{Array, Error, Result};
+use nuvec::{Array, Error, Quant, QuantMode, Result};
 use nuvec_nn::Module;
 
 pub mod batch;
@@ -69,18 +71,21 @@ pub mod generate;
 pub mod lora;
 pub mod model;
 pub mod paged;
+pub mod quant;
 pub mod sample;
 pub mod speculative;
+mod suffix;
 pub mod tokenizer;
 
 pub use batch::{Batcher, Event, FinishReason, RequestId};
-pub use config::Config;
+pub use config::{Activation, Config, Gemma4, LayerQuant, PackedFormat, Quantization};
 pub use generate::{GenerateOptions, Generation, WiredLimit, generate};
 pub use model::{KvCache, Model};
 pub use paged::{PagedCache, SeqId, decode_batch};
 pub use sample::Sampler;
 pub use speculative::{
-    Drafter, PromptLookup, SpeculativeGeneration, SpeculativeStats, speculative_generate,
+    Auto, Draft, DraftPolicy, Drafter, MtpDrafter, PromptLookup, SpeculativeGeneration,
+    SpeculativeStats, SuffixDecoding, speculative_generate, verify_rows,
 };
 pub use tokenizer::{StreamDecoder, Tokenizer};
 
@@ -102,15 +107,18 @@ mod site_doctests {
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The directory of `model`: a path, or a Hugging Face repository id (`org/name`) found
-/// in the local cache (`$HF_HOME/hub` or `~/.cache/huggingface/hub`): the snapshot
-/// `refs/main` names, or else the most recently modified one. Nothing is downloaded.
+/// in the local cache (`$HF_HUB_CACHE`, else `$HF_HOME/hub`, else
+/// `~/.cache/huggingface/hub`, as `huggingface_hub`): the snapshot `refs/main` names if it
+/// has a `config.json`, else the most recently modified complete one. Nothing is
+/// downloaded.
 pub fn resolve(model: &str) -> Result<PathBuf> {
     let path = Path::new(model);
     if path.is_dir() {
         return Ok(path.to_owned());
     }
-    let hub = std::env::var_os("HF_HOME")
-        .map(|h| PathBuf::from(h).join("hub"))
+    let hub = std::env::var_os("HF_HUB_CACHE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
         .or_else(|| {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/huggingface/hub"))
         })
@@ -123,7 +131,10 @@ pub fn resolve(model: &str) -> Result<PathBuf> {
         ))
     };
     if let Ok(revision) = std::fs::read_to_string(repo.join("refs/main")) {
-        return Ok(repo.join("snapshots").join(revision.trim()));
+        let snapshot = repo.join("snapshots").join(revision.trim());
+        if snapshot.join("config.json").exists() {
+            return Ok(snapshot);
+        }
     }
     // Caches filled without a ref (copied, or downloaded by revision).
     std::fs::read_dir(repo.join("snapshots"))
@@ -147,20 +158,63 @@ pub fn load(model: &str) -> Result<(Model, Tokenizer)> {
     Ok((load_model(dir)?, tokenizer))
 }
 
-/// Whether mlx-lm's `sanitize` drops a checkpoint weight: vision-tower and
-/// multi-token-prediction weights. [`load_model`] does not read them.
-fn dropped(name: &str) -> bool {
-    name.starts_with("vision_tower") || name.starts_with("model.visual") || name.contains("mtp.")
+/// Whether mlx-lm's `sanitize` drops a checkpoint weight: vision and audio weights, and
+/// Gemma 4's clipping ranges and the keys and values
+/// of its KV-shared layers. [`load_model`] does not read them.
+fn dropped(name: &str, config: &Config) -> bool {
+    const TOWERS: [&str; 7] = [
+        "vision_tower",
+        "multi_modal_projector",
+        "audio_tower",
+        "embed_audio",
+        "embed_vision",
+        "vision_embedder",
+        "visual",
+    ];
+    let bare = name.strip_prefix("model.").unwrap_or(name);
+    if TOWERS.iter().any(|t| bare.starts_with(t)) {
+        return true;
+    }
+    let Some(g) = &config.gemma4 else {
+        return false;
+    };
+    const CLIPS: [&str; 5] = [
+        "self_attn.rotary_emb",
+        "input_max",
+        "input_min",
+        "output_max",
+        "output_min",
+    ];
+    if CLIPS.iter().any(|c| name.contains(c)) {
+        return true;
+    }
+    let first_shared = g.first_shared(config.num_hidden_layers);
+    let layer = name
+        .split_once("layers.")
+        .and_then(|(_, rest)| rest.split('.').next())
+        .and_then(|i| i.parse::<usize>().ok());
+    layer.is_some_and(|i| i >= first_shared)
+        && [
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+            ".self_attn.k_norm",
+        ]
+        .iter()
+        .any(|s| name.contains(s))
 }
 
 /// mlx-lm's `sanitize` of hybrid and multimodal checkpoints: the language model's weights
 /// under their text-model names (vision and multi-token-prediction weights dropped) and, in
 /// Hugging Face checkpoints (convolutions stored `[C, 1, K]`), the convolutions as
 /// `[C, K, 1]` and the zero-centred norm weights plus one.
-fn sanitize(weights: BTreeMap<String, Array>) -> Result<BTreeMap<String, Array>> {
+fn sanitize(weights: BTreeMap<String, Array>, config: &Config) -> Result<BTreeMap<String, Array>> {
+    let weights = match config.model_type.as_str() {
+        "gpt_oss" => sanitize_gpt_oss(weights)?,
+        _ => weights,
+    };
     let mut weights: BTreeMap<String, Array> = weights
         .into_iter()
-        .filter(|(k, _)| !dropped(k))
+        .filter(|(k, _)| !dropped(k, config))
         .map(|(k, v)| {
             let k = match (
                 k.strip_prefix("model.language_model."),
@@ -173,6 +227,25 @@ fn sanitize(weights: BTreeMap<String, Array>) -> Result<BTreeMap<String, Array>>
             (k, v)
         })
         .collect();
+    // Gemma 4's Hugging Face experts: `experts.gate_up_proj` (`[E, 2·I, D]`, gate then up)
+    // and `experts.down_proj`, as mlx-lm's `switch_glu` weights.
+    if config.gemma4.is_some() {
+        let fused: Vec<String> = weights
+            .keys()
+            .filter(|k| k.ends_with(".experts.gate_up_proj") || k.ends_with(".experts.down_proj"))
+            .cloned()
+            .collect();
+        for key in fused {
+            let v = weights.remove(&key).expect("listed");
+            if let Some(base) = key.strip_suffix(".gate_up_proj") {
+                let [gate, up] = v.split_n::<2>(-2);
+                weights.insert(format!("{base}.switch_glu.gate_proj.weight"), gate.check()?);
+                weights.insert(format!("{base}.switch_glu.up_proj.weight"), up.check()?);
+            } else if let Some(base) = key.strip_suffix(".down_proj") {
+                weights.insert(format!("{base}.switch_glu.down_proj.weight"), v);
+            }
+        }
+    }
     // Hugging Face MoE checkpoints fuse each layer's expert gate and up projections
     // (`experts.gate_up_proj`, `[E, 2·I, D]`), as mlx-lm's `qwen3_5_moe.sanitize` splits.
     let fused: Vec<String> = weights
@@ -219,12 +292,15 @@ fn sanitize(weights: BTreeMap<String, Array>) -> Result<BTreeMap<String, Array>>
         .iter()
         .any(|(k, v)| k.contains("conv1d.weight") && v.shape().last() != Some(&1));
     if unsanitized {
-        const NORMS: [&str; 5] = [
+        const NORMS: [&str; 8] = [
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
         ];
         for (k, v) in &mut weights {
             if k.contains("conv1d.weight") && v.shape().last() != Some(&1) {
@@ -235,6 +311,84 @@ fn sanitize(weights: BTreeMap<String, Array>) -> Result<BTreeMap<String, Array>>
         }
     }
     Ok(weights)
+}
+
+/// gpt-oss's Hugging Face experts as mlx-lm's `SwitchGLU` (`experts.{gate,up,down}_proj`):
+/// the fused `gate_up_proj` interleaves gate and up rows. MXFP4 originals
+/// (`*_blocks`/`*_scales`, `[E, 2·I, D / 32, 16]`) keep their packing, as mlx-lm's
+/// `gpt_oss.sanitize` (blocks viewed as uint32 codes, E8M0 scales unchanged); full-precision
+/// ones (transformers' layout, `gate_up_proj` `[E, D, 2·I]`, `down_proj` `[E, I, D]`) are
+/// split along the last axis and transposed to MLX's `[E, out, in]`. Biases are split too.
+fn sanitize_gpt_oss(weights: BTreeMap<String, Array>) -> Result<BTreeMap<String, Array>> {
+    if weights.keys().any(|k| k.contains("experts.gate_proj.")) {
+        return Ok(weights); // converted already (mlx-community)
+    }
+    // Every other entry along `axis`, from `first` (`v[..., first::2, ...]`); errors are
+    // sticky and surface where the loader checks the weights.
+    let rows = |v: &Array, first: i32, axis: i32| -> Array {
+        let n = v.shape()[(axis + v.ndim() as i32) as usize];
+        v.take(&nuvec::ops::arange(first, n, 2), axis)
+    };
+    let mut out = BTreeMap::new();
+    for (k, v) in weights {
+        if let Some(prefix) = k.strip_suffix("gate_up_proj_bias") {
+            out.insert(format!("{prefix}gate_proj.bias"), rows(&v, 0, -1));
+            out.insert(format!("{prefix}up_proj.bias"), rows(&v, 1, -1));
+        } else if let Some(prefix) = k.strip_suffix("down_proj_bias") {
+            out.insert(format!("{prefix}down_proj.bias"), v);
+        } else if let Some(prefix) = k.strip_suffix("gate_up_proj_blocks") {
+            let codes = quant::mxfp4_from_hf_blocks(&v);
+            out.insert(format!("{prefix}gate_proj.weight"), rows(&codes, 0, -2));
+            out.insert(format!("{prefix}up_proj.weight"), rows(&codes, 1, -2));
+        } else if let Some(prefix) = k.strip_suffix("gate_up_proj_scales") {
+            out.insert(format!("{prefix}gate_proj.scales"), rows(&v, 0, -2));
+            out.insert(format!("{prefix}up_proj.scales"), rows(&v, 1, -2));
+        } else if let Some(prefix) = k.strip_suffix("down_proj_blocks") {
+            out.insert(
+                format!("{prefix}down_proj.weight"),
+                quant::mxfp4_from_hf_blocks(&v),
+            );
+        } else if let Some(prefix) = k.strip_suffix("down_proj_scales") {
+            out.insert(format!("{prefix}down_proj.scales"), v);
+        } else if let Some(prefix) = k.strip_suffix("experts.gate_up_proj") {
+            let t = |a: Array| a.transpose([0, 2, 1]);
+            out.insert(
+                format!("{prefix}experts.gate_proj.weight"),
+                t(rows(&v, 0, -1)),
+            );
+            out.insert(
+                format!("{prefix}experts.up_proj.weight"),
+                t(rows(&v, 1, -1)),
+            );
+        } else if let Some(prefix) = k.strip_suffix("experts.down_proj") {
+            out.insert(
+                format!("{prefix}experts.down_proj.weight"),
+                v.transpose([0, 2, 1]),
+            );
+        } else {
+            out.insert(k, v);
+        }
+    }
+    Ok(out)
+}
+
+/// The quantization a layer's tensors were packed with (mlx-lm's `infer_quant_config`):
+/// uint8 scales mean a floating-point mode, told apart by the packed codes per group (2 for
+/// nvfp4, 4 for mxfp4, 8 for mxfp8); other scales are affine with the config's settings.
+fn infer_quant(weight: &Array, scales: &Array, default: Quant) -> Quant {
+    if scales.dtype() != nuvec::DType::U8 {
+        return match default.mode {
+            QuantMode::Affine => default,
+            _ => Quant::default(),
+        };
+    }
+    let last = |a: &Array| a.shape().last().copied().unwrap_or(0);
+    let (packed, groups) = (last(weight), last(scales).max(1));
+    match packed / groups {
+        2 => Quant::new(QuantMode::Nvfp4),
+        8 => Quant::new(QuantMode::Mxfp8),
+        _ => Quant::new(QuantMode::Mxfp4),
+    }
 }
 
 /// Loads a model (without its tokenizer) from a directory with `config.json` and
@@ -268,9 +422,16 @@ pub fn load_model(dir: impl AsRef<Path>) -> Result<Model> {
     let mut weights: BTreeMap<String, Array> = BTreeMap::new();
     for file in &files {
         // Weights `sanitize` drops are not read (mlx-lm never evaluates them either).
-        weights.extend(nuvec::io::load_safetensors_filtered(file, |k| !dropped(k))?.tensors);
+        weights
+            .extend(nuvec::io::load_safetensors_filtered(file, |k| !dropped(k, &config))?.tensors);
     }
-    let mut weights = sanitize(weights)?;
+    let mut weights = sanitize(weights, &config)?;
+    // AWQ and GPTQ packings in MLX's affine layout.
+    if let Some(q) = &config.quantization
+        && let Some(format) = q.packed
+    {
+        weights = quant::convert_packed(weights, format, q.default)?;
+    }
     // Without `tie_word_embeddings` (Hugging Face's default is tied), a checkpoint
     // without an output head is tied.
     if !tie_set {
@@ -282,13 +443,30 @@ pub fn load_model(dir: impl AsRef<Path>) -> Result<Model> {
         weights.retain(|name, _| !name.starts_with("lm_head."));
     }
     let quantization = config.quantization.clone();
-    let quantized = |path: &str| {
+    // mlx-lm's rule: a layer the config names takes its entry; any other layer with scales is
+    // recognised from its tensors (`infer_quant_config`), with a global scale when the
+    // checkpoint has one.
+    let quantized = |path: &str| -> Option<LayerQuant> {
         let q = quantization.as_ref()?;
-        weights
-            .contains_key(&format!("{path}.scales"))
-            .then(|| q.for_layer(path))
+        if let Some(entry) = q.for_layer(path) {
+            return Some(entry.clone());
+        }
+        let scales = weights.get(&format!("{path}.scales"))?;
+        let weight = weights.get(&format!("{path}.weight"))?;
+        Some(LayerQuant {
+            path: path.to_owned(),
+            quant: Some(infer_quant(weight, scales, q.default)),
+            global_scale: weights.contains_key(&format!("{path}.global_scale")),
+        })
     };
     let mut model = Model::new(&config, &quantized)?;
+    // Multi-token-prediction weights (original checkpoints keep them): the head is built
+    // when they are present.
+    if config.mtp_layers > 0 && weights.contains_key("mtp.fc.weight") {
+        model.build_mtp(&quantized)?;
+    } else {
+        weights.retain(|k, _| !k.starts_with("mtp."));
+    }
     model.load_weights(weights)?;
     // Evaluation mode, as `mlx_lm.load` leaves models (dropout in LoRA layers is off;
     // `model.train(true)` switches it on for fine-tuning).

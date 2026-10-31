@@ -26,6 +26,15 @@
   "scales",
   "biases"
  ],
+ "QuantizedLinear_mxfp4": [
+  "weight",
+  "scales",
+  "bias"
+ ],
+ "QuantizedEmbedding_nvfp4": [
+  "weight",
+  "scales"
+ ],
  "RMSNorm": [
   "weight"
  ],

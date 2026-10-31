@@ -33,7 +33,9 @@ use smallvec::SmallVec;
 use crate::axes::{self, Axes, AxesSpec, Axis, IntoShape, ScanOptions, VarOptions};
 use crate::primitive::BinaryOp;
 use crate::scalar::{Scalar, ScalarOrArray};
-use crate::{Array, Category, DType, Error, Result, at_least_float};
+use crate::{
+    Array, Category, DType, Error, GatherQmm, Quant, QuantMode, Quantized, Result, at_least_float,
+};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -115,6 +117,8 @@ binary_ops! {
     maximum => Maximum,
     minimum => Minimum,
     logaddexp => LogAddExp,
+    floor_divide => FloorDivide,
+    power => Power,
     equal => Equal,
     not_equal => NotEqual,
     less => Less,
@@ -600,12 +604,7 @@ fn expand_dims_op(at: &'static Location<'static>, a: &Array, spec: AxesSpec) -> 
             ));
         };
         let out_ndim = a.ndim() + list.len();
-        let positions = spec.sorted(out_ndim)?;
-        let mut shape: crate::shape::Shape = a.dims().into();
-        for &p in &positions {
-            shape.insert(p, 1);
-        }
-        imp::reshape_to(a, shape)
+        imp::expand_dims_at(a, spec.sorted(out_ndim)?.to_vec())
     })
 }
 
@@ -870,96 +869,116 @@ pub fn slice_update(a: &Array, update: &Array, index: impl crate::ArrayIndex) ->
 
 // ── Quantization and convolution ────────────────────────────────────────────
 
-fn group_bits(op: &'static str, group_size: i32, bits: i32) -> Result<(usize, u32)> {
-    match (usize::try_from(group_size), u32::try_from(bits)) {
-        (Ok(g), Ok(b)) => Ok((g, b)),
-        _ => Err(Error::InvalidArgument(format!(
-            "{op}: group size {group_size} and bits {bits} must not be negative"
-        ))),
+/// `w` quantized along its last axis; see [`Array::quantize`].
+#[track_caller]
+pub fn quantize(w: &Array, quant: impl Into<Quant>) -> Quantized {
+    let quant = quant.into();
+    let affine = quant.mode == QuantMode::Affine;
+    let mut out = Array::sticky_vec(
+        "quantize",
+        Location::caller(),
+        &[w],
+        2 + usize::from(affine),
+        || {
+            let (q, s, b) = crate::quantized::quantize(w, quant)?;
+            let mut out = vec![q, s];
+            out.extend(b);
+            Ok(out)
+        },
+    );
+    let biases = affine.then(|| out.pop().expect("biases"));
+    let scales = out.pop().expect("scales");
+    Quantized {
+        weight: out.pop().expect("codes"),
+        scales,
+        biases,
+        quant,
     }
 }
 
-/// `w` quantized along its last axis: `(w_q, scales, biases)`; see [`Array::quantize`].
+/// The weights of [`quantize`] restored, in `dtype` (default: the scales' dtype for affine,
+/// bfloat16 for the floating-point modes); MLX's `dequantize`. See also
+/// [`Quantized::dequantize`].
 #[track_caller]
-pub fn quantize(w: &Array, group_size: i32, bits: i32) -> (Array, Array, Array) {
-    let [q, s, b] = Array::sticky_n("quantize", Location::caller(), &[w], || {
-        let (g, n) = group_bits("quantize", group_size, bits)?;
-        let (q, s, b) = crate::quantized::quantize(w, g, n)?;
-        Ok([q, s, b])
-    });
-    (q, s, b)
-}
-
-/// The weights of [`quantize`] restored; see [`Array::dequantize`].
-#[track_caller]
-pub fn dequantize(w: &Array, scales: &Array, biases: &Array, group_size: i32, bits: i32) -> Array {
-    Array::sticky(
-        "dequantize",
-        Location::caller(),
-        &[w, scales, biases],
-        || {
-            let (g, n) = group_bits("dequantize", group_size, bits)?;
-            crate::quantized::dequantize(w, scales, biases, g, n)
-        },
-    )
+pub fn dequantize(w: &Quantized, dtype: impl Into<Option<DType>>) -> Array {
+    let dtype = dtype.into();
+    let ins: SmallVec<[&Array; 3]> = w.arrays().collect();
+    Array::sticky("dequantize", Location::caller(), &ins, || {
+        crate::quantized::dequantize(&w.weight, &w.scales, w.biases.as_ref(), w.quant, dtype)
+    })
 }
 
 /// `x · dequantize(w)ᵀ` (or without the transpose); see [`Array::quantized_matmul`].
 #[track_caller]
-#[allow(clippy::too_many_arguments)]
-pub fn quantized_matmul(
-    x: &Array,
-    w: &Array,
-    scales: &Array,
-    biases: &Array,
-    transpose: bool,
-    group_size: i32,
-    bits: i32,
-) -> Array {
-    Array::sticky(
-        "quantized_matmul",
-        Location::caller(),
-        &[x, w, scales, biases],
-        || {
-            let (g, n) = group_bits("quantized_matmul", group_size, bits)?;
-            crate::quantized::quantized_matmul(x, w, scales, biases, transpose, g, n)
-        },
-    )
+pub fn quantized_matmul(x: &Array, w: &Quantized, transpose: bool) -> Array {
+    let mut ins: SmallVec<[&Array; 4]> = SmallVec::from_slice(&[x]);
+    ins.extend(w.arrays());
+    Array::sticky("quantized_matmul", Location::caller(), &ins, || {
+        crate::quantized::quantized_matmul(
+            x,
+            &w.weight,
+            &w.scales,
+            w.biases.as_ref(),
+            transpose,
+            w.quant,
+        )
+    })
 }
 
 /// Quantized products of gathered matrices (mixture-of-experts layers); see
 /// [`Array::gather_qmm`].
 #[track_caller]
-#[allow(clippy::too_many_arguments)]
 pub fn gather_qmm(
     x: &Array,
-    w: &Array,
-    scales: &Array,
-    biases: &Array,
+    w: &Quantized,
     lhs_indices: Option<&Array>,
     rhs_indices: Option<&Array>,
-    transpose: bool,
-    group_size: i32,
-    bits: i32,
-    sorted_indices: bool,
+    options: GatherQmm<'_>,
 ) -> Array {
-    let mut ins: SmallVec<[&Array; 6]> = SmallVec::from_slice(&[x, w, scales, biases]);
+    let mut ins: SmallVec<[&Array; 7]> = SmallVec::from_slice(&[x]);
+    ins.extend(w.arrays());
+    ins.extend(options.global_scale);
     ins.extend(lhs_indices);
     ins.extend(rhs_indices);
     Array::sticky("gather_qmm", Location::caller(), &ins, || {
-        let (g, n) = group_bits("gather_qmm", group_size, bits)?;
         crate::quantized::gather_qmm(
             x,
-            w,
-            scales,
-            biases,
+            &w.weight,
+            &w.scales,
+            w.biases.as_ref(),
             lhs_indices,
             rhs_indices,
-            transpose,
-            g,
-            n,
-            sorted_indices,
+            w.quant,
+            options,
         )
+    })
+}
+
+/// `x`'s bits as `dtype` (MLX's `view`); see [`Array::view`].
+#[track_caller]
+pub fn view(x: &Array, dtype: DType) -> Array {
+    Array::sticky("view", Location::caller(), &[x], || {
+        Ok(
+            Array::from_op(crate::primitive::Primitive::View(dtype), vec![x.clone()])?
+                .swap_remove(0),
+        )
+    })
+}
+
+/// Floats as E4M3 bytes (MLX's `to_fp8`); see [`Array::to_fp8`].
+#[track_caller]
+pub fn to_fp8(x: &Array) -> Array {
+    Array::sticky("to_fp8", Location::caller(), &[x], || {
+        Ok(Array::from_op(crate::primitive::Primitive::ToFp8, vec![x.clone()])?.swap_remove(0))
+    })
+}
+
+/// E4M3 bytes as `dtype` floats (MLX's `from_fp8`); see [`Array::from_fp8`].
+#[track_caller]
+pub fn from_fp8(x: &Array, dtype: DType) -> Array {
+    Array::sticky("from_fp8", Location::caller(), &[x], || {
+        let primitive = crate::primitive::Primitive::FromFp8(dtype);
+        Ok(Array::from_op(primitive, vec![x.clone()])?.swap_remove(0))
     })
 }
 
@@ -1227,6 +1246,30 @@ methods! {
         fn minimum(&self, other: impl Into<ScalarOrArray>) -> Array;
         /// Element-wise `log(exp(self) + exp(other))`, computed stably, in floating point.
         fn logaddexp(&self, other: impl Into<ScalarOrArray>) -> Array;
+        /// Element-wise `floor(self / other)` (MLX's `floor_divide`, Python's `//`): for
+        /// floats the floor of the quotient, for integers the quotient rounded toward
+        /// negative infinity, in the promoted dtype. An integer division by zero gives 0 (MLX
+        /// leaves it undefined). Not defined for bool or complex; no derivative.
+        ///
+        /// ```
+        /// use nuvec_core::array;
+        ///
+        /// assert_eq!(array![7, -7, 7].floor_divide(array![2, 2, -2]).to_vec::<i32>().unwrap(), [3, -4, -4]);
+        /// assert_eq!(array![7.5f32, -7.5].floor_divide(2.0).to_vec::<f32>().unwrap(), [3.0, -4.0]);
+        /// ```
+        fn floor_divide(&self, other: impl Into<ScalarOrArray>) -> Array;
+        /// Element-wise `self` to the power `other` (MLX's `power`, Python's `**`), in the
+        /// promoted dtype: `pow` for floats, repeated squaring for integers (wrapping; 0 for
+        /// a negative exponent, which MLX leaves undefined). Not defined for bool or complex.
+        /// The derivative in `other` is taken as 0 where `self ≤ 0`.
+        ///
+        /// ```
+        /// use nuvec_core::array;
+        ///
+        /// assert_eq!(array![2, 3, 2].power(array![3, 2, -1]).to_vec::<i32>().unwrap(), [8, 9, 0]);
+        /// assert_eq!(array![4.0f32, 2.0].power(array![0.5f32, 3.0]).to_vec::<f32>().unwrap(), [2.0, 8.0]);
+        /// ```
+        fn power(&self, other: impl Into<ScalarOrArray>) -> Array;
         /// Element-wise `self == other` as a bool array.
         ///
         /// ```
@@ -1534,6 +1577,9 @@ methods! {
         /// [`Array::argmin`] keeping the reduced axis (every axis for `..`).
         fn argmin_keepdims(&self, axis: impl Axis) -> Array;
         /// `exp(self) / sum(exp(self))` over `axes`, with the maximum subtracted first.
+        /// Always MLX's `softmax(..., precise=True)`: float16 and bfloat16 are computed in
+        /// float32 and rounded once to the input dtype, on every device and axis, so there is
+        /// no `precise` flag and no need to cast first.
         ///
         /// ```
         /// use nuvec_core::array;
@@ -1745,44 +1791,77 @@ methods! {
 
     /// # Quantization and convolution
     impl {
-        /// The matrix quantized along its last axis as MLX's affine quantization:
-        /// `(w_q, scales, biases)`.
+        /// The matrix quantized along its last axis (MLX's `quantize`): affine with
+        /// `Quant::affine(group_size, bits)`, or a floating-point mode (`QuantMode::Mxfp4`,
+        /// `Mxfp8`, `Nvfp4`, whose codes and scales equal MLX's Metal quantizer's).
         ///
         /// ```
-        /// use nuvec_core::{DType, ops::ones};
+        /// use nuvec_core::{DType, Quant, QuantMode, ops::ones};
         ///
-        /// let (wq, scales, biases) = ones([2, 64], DType::F32).quantize(64, 4);
-        /// assert_eq!((wq.shape(), scales.shape(), biases.shape()), (&[2, 8][..], &[2, 1][..], &[2, 1][..]));
+        /// let q = ones([2, 64], DType::F32).quantize(Quant::affine(64, 4));
+        /// assert_eq!((q.weight.shape(), q.scales.shape()), (&[2, 8][..], &[2, 1][..]));
+        /// assert_eq!(q.biases.unwrap().shape(), [2, 1]);
+        ///
+        /// // MXFP4: E2M1 codes, one uint8 E8M0 scale per 32 values, no biases.
+        /// let q = ones([2, 64], DType::F32).quantize(QuantMode::Mxfp4);
+        /// assert_eq!((q.weight.shape(), q.scales.shape()), (&[2, 8][..], &[2, 2][..]));
+        /// assert_eq!((q.scales.dtype(), q.biases.is_none()), (DType::U8, true));
+        /// let y = ones([1, 64], DType::F32).quantized_matmul(&q, true);
+        /// assert_eq!(y.to_vec::<f32>().unwrap(), [64.0, 64.0]);
         /// ```
-        fn quantize(&self, group_size: i32, bits: i32) -> (Array, Array, Array);
-        /// The weights of [`Array::quantize`] restored from `self` (the packed weights).
-        fn dequantize(&self, scales: &Array, biases: &Array, group_size: i32, bits: i32) -> Array;
+        fn quantize(&self, quant: impl Into<Quant>) -> Quantized;
         /// `self · dequantize(w)ᵀ` (`transpose`) or `self · dequantize(w)`. Up to
         /// [`ROW_INDEPENDENT_ROWS`](crate::ROW_INDEPENDENT_ROWS) rows run as
-        /// matrix-vector products, each row with the bits of its own product.
+        /// matrix-vector products, each row with the bits of its own product. Affine
+        /// promotes `self` and the scales to one dtype; the floating-point modes keep
+        /// `self`'s dtype.
         ///
         /// # Memory
         ///
         /// No scratch, except quantized split-K (many rows, transposed weights, one batch):
         /// `split × M × N × 4` bytes, `split = min(512 / tiles, K / max(group, 32))`
         /// reduced until it divides `K` (`tiles = ⌈M/32⌉·⌈N/32⌉`).
-        fn quantized_matmul(&self, w: &Array, scales: &Array, biases: &Array, transpose: bool, group_size: i32, bits: i32) -> Array;
+        fn quantized_matmul(&self, w: &Quantized, transpose: bool) -> Array;
         /// Quantized products of gathered matrices (MLX's `gather_qmm`). Up to
         /// `ROW_INDEPENDENT_ROWS` tokens of up to 8 experts run one product per row, sorted
         /// or not, each with the bits of its own product.
         ///
         /// # Memory
         ///
-        /// With sorted indices over many rows: the experts' row counts and offsets (int32,
-        /// two per expert) and an int32 per row; otherwise none.
-        fn gather_qmm(&self, w: &Array, scales: &Array, biases: &Array, lhs_indices: Option<&Array>, rhs_indices: Option<&Array>, transpose: bool, group_size: i32, bits: i32, sorted_indices: bool) -> Array;
+        /// With sorted indices over many rows: where each expert's rows start (an int32 per
+        /// expert); otherwise none.
+        fn gather_qmm(&self, w: &Quantized, lhs_indices: Option<&Array>, rhs_indices: Option<&Array>, options: GatherQmm<'_>) -> Array;
+        /// The bits reinterpreted as `dtype` (MLX's `view`): the same shape when the element
+        /// sizes agree, else the last dimension scaled by their ratio (it must divide). Shares
+        /// the buffer when the array is row-contiguous (or the sizes agree); copies otherwise.
+        ///
+        /// ```
+        /// use nuvec_core::{DType, array};
+        ///
+        /// let bytes = array![[1u8, 0, 0, 0, 2, 0, 0, 0]];
+        /// assert_eq!(bytes.view(DType::U32).to_vec::<u32>().unwrap(), [1, 2]);
+        /// ```
+        fn view(&self, dtype: DType) -> Array;
+        /// The floats as E4M3 bytes (uint8; MLX's `to_fp8`): rounded to nearest even,
+        /// saturating at ±448. There is no fp8 dtype; [`Array::from_fp8`] restores floats.
+        ///
+        /// ```
+        /// use nuvec_core::{DType, array};
+        ///
+        /// let codes = array![1.0, 448.0, 500.0, -3.3].to_fp8();
+        /// assert_eq!(codes.to_vec::<u8>().unwrap(), [56, 126, 126, 197]);
+        /// assert_eq!(codes.from_fp8(DType::F32).to_vec::<f32>().unwrap()[1], 448.0);
+        /// ```
+        fn to_fp8(&self) -> Array;
+        /// E4M3 bytes (uint8) as `dtype` floats (MLX's `from_fp8`).
+        fn from_fp8(&self, dtype: DType) -> Array;
         /// Products of gathered matrices (MLX's `gather_mm`). One row per output batch
         /// (up to `ROW_INDEPENDENT_ROWS` tokens of up to 8 experts) runs MLX's gathered
         /// matrix-vector kernels, each row with the bits of its own product.
         ///
         /// # Memory
         ///
-        /// As [`Array::gather_qmm`]: the sorted path's counts and offsets; otherwise none
+        /// As [`Array::gather_qmm`]: the sorted path's offsets; otherwise none
         /// (operands that are not row-major are copied first).
         fn gather_mm(&self, b: &Array, lhs_indices: Option<&Array>, rhs_indices: Option<&Array>, sorted_indices: bool) -> Array;
         /// A 1-D convolution of `self` (`[N, L, C_in]`) with `weight` (`[C_out, K, C_in /

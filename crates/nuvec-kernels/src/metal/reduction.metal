@@ -1891,3 +1891,11 @@ template [[host_name("nuvec_col_reduce_small_5_min_float32")]] [[kernel]] declty
 template [[host_name("nuvec_col_reduce_longcolumn_5_min_float32")]] [[kernel]] decltype(mlx::red::col_reduce_longcolumn<float, float, mlx::red::Min<float>, int, 5>) mlx::red::col_reduce_longcolumn<float, float, mlx::red::Min<float>, int, 5>;
 template [[host_name("nuvec_col_reduce_looped_5_32_32_min_float32")]] [[kernel]] decltype(mlx::red::col_reduce_looped<float, float, mlx::red::Min<float>, int, 5, 32, 32>) mlx::red::col_reduce_looped<float, float, mlx::red::Min<float>, int, 5, 32, 32>;
 template [[host_name("nuvec_col_reduce_2pass_5_32_32_min_float32")]] [[kernel]] decltype(mlx::red::col_reduce_2pass<float, float, mlx::red::Min<float>, int, 5, 32, 32>) mlx::red::col_reduce_2pass<float, float, mlx::red::Min<float>, int, 5, 32, 32>;
+
+// Half-precision sums accumulated in the input type, as MLX's own instantiations: the column
+// reductions of the split-K matrix-vector products' partials (`qvm_split_k`), which must
+// round as MLX's.
+template [[host_name("nuvec_col_reduce_small_1_sum_in_float16")]] [[kernel]] decltype(mlx::red::col_reduce_small<half, half, mlx::red::Sum<half>, int, 1>) mlx::red::col_reduce_small<half, half, mlx::red::Sum<half>, int, 1>;
+template [[host_name("nuvec_col_reduce_looped_1_32_32_sum_in_float16")]] [[kernel]] decltype(mlx::red::col_reduce_looped<half, half, mlx::red::Sum<half>, int, 1, 32, 32>) mlx::red::col_reduce_looped<half, half, mlx::red::Sum<half>, int, 1, 32, 32>;
+template [[host_name("nuvec_col_reduce_small_1_sum_in_bfloat16")]] [[kernel]] decltype(mlx::red::col_reduce_small<bfloat16_t, bfloat16_t, mlx::red::Sum<bfloat16_t>, int, 1>) mlx::red::col_reduce_small<bfloat16_t, bfloat16_t, mlx::red::Sum<bfloat16_t>, int, 1>;
+template [[host_name("nuvec_col_reduce_looped_1_32_32_sum_in_bfloat16")]] [[kernel]] decltype(mlx::red::col_reduce_looped<bfloat16_t, bfloat16_t, mlx::red::Sum<bfloat16_t>, int, 1, 32, 32>) mlx::red::col_reduce_looped<bfloat16_t, bfloat16_t, mlx::red::Sum<bfloat16_t>, int, 1, 32, 32>;

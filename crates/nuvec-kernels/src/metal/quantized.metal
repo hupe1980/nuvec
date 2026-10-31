@@ -23,8 +23,20 @@
     NUVEC_Q(qmv_fast, iname, T, gs, b, "_batch1_pr1", true, true)                         \
     NUVEC_Q(qmv, iname, T, gs, b, "_batch0", false)                                       \
     NUVEC_Q(qmv, iname, T, gs, b, "_batch1", true)                                        \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv1_batch0", 1, 8, false)                         \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv1_batch1", 1, 8, true)                          \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv2_batch0", 2, 8, false)                         \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv2_batch1", 2, 8, true)                          \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv3_batch0", 3, 8, false)                         \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv3_batch1", 3, 8, true)                          \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv4_batch0", 4, 8, false)                         \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv4_batch1", 4, 8, true)                          \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv5_batch0", 5, 8, false)                         \
+    NUVEC_Q(qmv_wide, iname, T, gs, b, "_nv5_batch1", 5, 8, true)                          \
     NUVEC_Q(qvm, iname, T, gs, b, "_batch0", false)                                       \
     NUVEC_Q(qvm, iname, T, gs, b, "_batch1", true)                                        \
+    NUVEC_Q(qvm_split_k, iname, T, gs, b, "_spk8", 8)                                     \
+    NUVEC_Q(qvm_split_k, iname, T, gs, b, "_spk32", 32)                                   \
     NUVEC_Q(qmm_t, iname, T, gs, b, "_al0_batch0", false, false)                          \
     NUVEC_Q(qmm_t, iname, T, gs, b, "_al0_batch1", false, true)                           \
     NUVEC_Q(qmm_t, iname, T, gs, b, "_al1_batch0", true, false)                           \

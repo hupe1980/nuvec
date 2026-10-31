@@ -144,6 +144,33 @@ fn invalid_arguments_are_rejected() {
 mod gpu {
     use super::*;
 
+    /// Softmax is MLX's precise softmax on every path: half precision equals the float32
+    /// softmax rounded once, bit for bit, on both devices (the fused kernel over the last
+    /// axis, the composition over others).
+    #[test]
+    fn half_precision_softmax_is_precise() {
+        let mut devices = vec![Device::cpu()];
+        if crate::common::require_gpu().is_some() {
+            devices.push(Device::gpu(0));
+        }
+        let mut rng = Rng::new(0x5f7);
+        for device in devices {
+            with_stream(device, || {
+                for dtype in [DType::F16, DType::BF16] {
+                    for shape in [vec![4, 300], vec![3, 4096], vec![6, 33]] {
+                        let x = random(&mut rng, &shape, dtype).multiply(8.0);
+                        for axis in [-1, 0] {
+                            let got = x.softmax(axis).view(DType::U16).to_vec::<u16>().unwrap();
+                            let want = x.astype(DType::F32).softmax(axis).astype(dtype);
+                            let want = want.view(DType::U16).to_vec::<u16>().unwrap();
+                            assert!(got == want, "{device:?} {dtype} {shape:?} axis {axis}");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     fn on<R>(device: Device, f: impl FnOnce() -> R) -> R {
         with_stream(device, f)
     }
@@ -638,6 +665,127 @@ mod gpu {
         (kc, vc, Array::from_slice(&table, [b, per]))
     }
 
+    /// Paged attention with a window, sinks and head size 512 equals contiguous attention
+    /// with the same options (bit for bit on one pass), and never reads the blocks wholly
+    /// before a sequence's window (filled with NaN here).
+    #[test]
+    fn paged_windows_and_sinks_equal_contiguous_attention() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x6c);
+        type Case = (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            &'static [usize],
+            i32,
+        );
+        let cases: &[Case] = &[
+            (2, 8, 1, 1, 64, 16, &[40, 300], 128),
+            (2, 4, 2, 4, 64, 16, &[9, 77], 5),
+            (1, 4, 1, 1, 512, 16, &[600], 64),
+            (2, 8, 2, 1, 128, 32, &[1500, 3000], 128),
+            (1, 4, 4, 1, 256, 8, &[513], 512),
+        ];
+        for &(b, hq, hkv, lq, d, bs, lengths, w) in cases {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                for sinks in [false, true] {
+                    let n = *lengths.iter().max().unwrap();
+                    let keys = random(&mut rng, &[b, hkv, n, d], dtype);
+                    let values = random(&mut rng, &[b, hkv, n, d], dtype);
+                    let q = random(&mut rng, &[b, hq, lq, d], dtype);
+                    let s = random(&mut rng, &[hq], dtype);
+                    let (mut kc, mut vc, table) = paged(&keys, &values, bs, &mut rng);
+                    // Blocks wholly before each sequence's window hold NaN.
+                    let ids: Vec<i32> = table.to_vec::<i32>().unwrap();
+                    let per = table.shape()[1] as usize;
+                    for (seq, &len) in lengths.iter().enumerate() {
+                        let first = (len as i32 - lq as i32 - w + 1).max(0) as usize;
+                        for j in 0..first / bs {
+                            let block = ids[seq * per + j];
+                            let nan = ops::full([1, hkv as i32, bs as i32, d as i32], f32::NAN)
+                                .astype(dtype);
+                            kc = kc.slice_update(&nan, (block..block + 1, .., .., ..));
+                            vc = vc.slice_update(&nan, (block..block + 1, .., .., ..));
+                        }
+                    }
+                    let lens: Array = lengths.iter().map(|&l| l as i32).collect();
+                    let scale = (d as f32).powf(-0.5);
+                    let name = format!(
+                        "{dtype} {:?} sinks {sinks}",
+                        (b, hq, hkv, lq, d, bs, lengths, w)
+                    );
+                    let opts = fast::AttentionOptions::causal()
+                        .window(w)
+                        .sinks(sinks.then_some(&s));
+                    on(Device::gpu(0), || {
+                        let got = fast::paged_attention(&q, &kc, &vc, &table, &lens, scale, &opts);
+                        for (i, &len) in lengths.iter().enumerate() {
+                            let pick = |a: &Array, end: usize| a.i((i..i + 1, .., 0..end, ..));
+                            let want = fast::scaled_dot_product_attention(
+                                &pick(&q, lq),
+                                &pick(&keys, len),
+                                &pick(&values, len),
+                                scale,
+                                &opts,
+                            );
+                            // Contiguous head-size-512 attention composes below MLX's vector rule (GQA 8,
+                            // 1,024 keys); one pass is the same kernel otherwise.
+                            let exact = lengths.iter().all(|&l| l < 1024) && d != 512;
+                            let tol = if exact { 0.0 } else { tolerance(dtype) };
+                            assert_close(&format!("{name} seq {i}"), &pick(&got, lq), &want, tol);
+                        }
+                    });
+                    // The CPU composition gives the same within tolerance.
+                    let cpu = on(Device::cpu(), || {
+                        let f = |a: &Array| a.astype(DType::F32);
+                        let s32 = f(&s);
+                        let o = fast::AttentionOptions::causal()
+                            .window(w)
+                            .sinks(sinks.then_some(&s32));
+                        fast::paged_attention(&f(&q), &f(&kc), &f(&vc), &table, &lens, scale, &o)
+                            .astype(dtype)
+                    });
+                    let gpu = on(Device::gpu(0), || {
+                        fast::paged_attention(&q, &kc, &vc, &table, &lens, scale, &opts)
+                    });
+                    assert_close(
+                        &format!("{name} vs cpu"),
+                        &gpu,
+                        &cpu,
+                        tolerance(dtype) * 4.0,
+                    );
+                }
+            }
+        }
+        let c = ops::zeros([4, 2, 8, 64], DType::F32);
+        let q = random(&mut rng, &[1, 4, 1, 64], DType::F32);
+        let m = ops::ones([1, 16], DType::Bool);
+        let bad = |o: &fast::AttentionOptions<'_>| {
+            fast::paged_attention(&q, &c, &c, &array![[0, 1]], &array![9], 1.0, o)
+        };
+        assert!(
+            bad(&fast::AttentionOptions::default().mask(&m))
+                .check()
+                .is_err()
+        );
+        assert!(
+            bad(&fast::AttentionOptions::causal().window(0))
+                .check()
+                .is_err()
+        );
+        let s3 = ops::zeros([3], DType::F32);
+        assert!(
+            bad(&fast::AttentionOptions::causal().sinks(Some(&s3)))
+                .check()
+                .is_err()
+        );
+    }
+
     #[test]
     fn paged_attention_equals_contiguous_attention() {
         if crate::common::require_gpu().is_none() {
@@ -667,7 +815,15 @@ mod gpu {
                 let scale = (d as f32).powf(-0.5);
                 let name = format!("{dtype} {:?}", (b, hq, hkv, lq, d, bs, lengths));
                 on(Device::gpu(0), || {
-                    let got = fast::paged_attention(&q, &kc, &vc, &vtable, &lens, scale);
+                    let got = fast::paged_attention(
+                        &q,
+                        &kc,
+                        &vc,
+                        &vtable,
+                        &lens,
+                        scale,
+                        &fast::AttentionOptions::causal(),
+                    );
                     for (s, &len) in lengths.iter().enumerate() {
                         let pick = |a: &Array, end: usize| a.i((s..s + 1, .., 0..end, ..));
                         let mask = if lq > 1 {
@@ -698,7 +854,13 @@ mod gpu {
                     || {
                         let f = |xs: &[Array]| {
                             Ok(vec![fast::paged_attention(
-                                &xs[0], &xs[1], &xs[2], &vtable, &lens, scale,
+                                &xs[0],
+                                &xs[1],
+                                &xs[2],
+                                &vtable,
+                                &lens,
+                                scale,
+                                &fast::AttentionOptions::causal(),
                             )])
                         };
                         with_grads(f, &[q.clone(), kc.clone(), vc.clone()], &g)
@@ -712,26 +874,26 @@ mod gpu {
         let t = array![[0, 1]];
         let l = array![9];
         assert!(
-            fast::paged_attention(&q, &c, &c, &t, &l, 1.0)
+            fast::paged_attention(&q, &c, &c, &t, &l, 1.0, &fast::AttentionOptions::causal())
                 .check()
                 .is_ok()
         );
         let c3 = ops::zeros([4, 3, 8, 64], DType::F32);
         assert!(
-            fast::paged_attention(&q, &c3, &c3, &t, &l, 1.0)
+            fast::paged_attention(&q, &c3, &c3, &t, &l, 1.0, &fast::AttentionOptions::causal())
                 .check()
                 .is_err(),
             "4 heads over 3"
         );
         assert!(
-            fast::paged_attention(&q, &c, &c, &l, &l, 1.0)
+            fast::paged_attention(&q, &c, &c, &l, &l, 1.0, &fast::AttentionOptions::causal())
                 .check()
                 .is_err(),
             "1-D table"
         );
         let lf = array![9.0];
         assert!(
-            fast::paged_attention(&q, &c, &c, &t, &lf, 1.0)
+            fast::paged_attention(&q, &c, &c, &t, &lf, 1.0, &fast::AttentionOptions::causal())
                 .check()
                 .is_err(),
             "float lengths"
@@ -850,12 +1012,26 @@ mod gpu {
                 tolerance(DType::F32) * 4.0,
                 || {
                     Ok(vec![fast::paged_attention(
-                        &q, &kc, &vc, &table, &lens, 0.125,
+                        &q,
+                        &kc,
+                        &vc,
+                        &table,
+                        &lens,
+                        0.125,
+                        &fast::AttentionOptions::causal(),
                     )])
                 },
             );
             let got = on(Device::gpu(0), || {
-                fast::paged_attention(&q, &kc, &vc, &table, &lens, 0.125)
+                fast::paged_attention(
+                    &q,
+                    &kc,
+                    &vc,
+                    &table,
+                    &lens,
+                    0.125,
+                    &fast::AttentionOptions::causal(),
+                )
             });
             assert!(values(&got).iter().all(|v| v.is_finite()), "{name}");
         }
@@ -1777,4 +1953,567 @@ mod capped_attention {
             }
         });
     }
+}
+
+/// Sliding windows on the fused kernels (vector one- and two-pass, tiled): the kernel the
+/// plan names, the same bits as the equivalent boolean mask where both take the same
+/// kernel (nuvec's boolean path is MLX's), and the float32 composition within tolerance,
+/// with keys as a slice of a larger cache, sinks, grouped heads and windows below, at and
+/// above the keys.
+#[cfg(target_os = "macos")]
+mod windowed_kernels {
+    use super::*;
+    use nuvec_core::fast::{self, AttentionKernel, AttentionOptions};
+
+    fn band(lq: usize, lk: usize, w: usize) -> Array {
+        let pos = ops::arange((lk - lq) as i32, lk as i32, 1).reshape([-1, 1]);
+        let keys = ops::arange(0, lk as i32, 1).reshape([1, -1]);
+        pos.greater_equal(&keys)
+            .multiply(pos.less(keys.add(w as i32)))
+    }
+
+    fn bits(a: &Array) -> Vec<u32> {
+        a.astype(DType::F32)
+            .view(DType::U32)
+            .to_vec::<u32>()
+            .unwrap()
+    }
+
+    /// Windows run fused and equal the float32 CPU reference. The vector kernels give each
+    /// row the bits of an unmasked one-query call over exactly its window's keys (so any
+    /// cache layout holding them, compacted or paged, gives the same bits); the tiled kernel
+    /// equals the boolean mask bit for bit wherever both plan it.
+    #[test]
+    fn windows_run_fused_and_equal_the_boolean_mask() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x56);
+        // (Lq, Lk, D, Hq, Hkv, window): decode (one and two passes), the serial rule's
+        // rows, and tiled prefill chunks.
+        let cases = [
+            (1, 300, 64, 8, 1, 128),
+            (1, 4096, 64, 8, 8, 128),
+            (1, 9000, 128, 8, 1, 3),
+            (1, 2000, 256, 4, 1, 1024),
+            (4, 600, 128, 4, 2, 7),
+            (8, 1500, 64, 4, 4, 128),
+            (40, 300, 64, 4, 2, 7),
+            (97, 400, 128, 2, 1, 33),
+            (64, 640, 64, 2, 2, 1),
+            (300, 700, 256, 2, 1, 128),
+            (33, 45, 64, 4, 2, 100),
+            // Decode over long caches: the partitions follow the window, not the keys.
+            (1, 4000, 64, 8, 1, 128),
+            (1, 9000, 128, 16, 2, 300),
+            (2, 5000, 256, 4, 2, 1024),
+        ];
+        with_stream(Device::gpu(0), || {
+            for (lq, lk, d, hq, hkv, w) in cases {
+                for dt in [DType::F32, DType::F16, DType::BF16] {
+                    for sinks in [false, true] {
+                        let q = random(&mut rng, &[1, hq, lq, d], dt);
+                        // Keys and values: a slice of a larger cache (the op reads the view).
+                        let big = random(&mut rng, &[1, hkv, lk + 17, d], dt);
+                        let k = big.i((.., .., 5..5 + lk as i32, ..));
+                        let v = big.i((.., .., 9..9 + lk as i32, ..)).multiply(0.5);
+                        let s = random(&mut rng, &[hq], dt);
+                        let scale = 1.0 / (d as f32).sqrt();
+                        let name =
+                            format!("{dt} Lq {lq} Lk {lk} D {d} {hq}/{hkv} W {w} sinks {sinks}");
+                        let win = AttentionOptions::causal()
+                            .window(w as i32)
+                            .sinks(sinks.then_some(&s));
+                        let mask = band(lq, lk, w);
+                        let masked = AttentionOptions::default()
+                            .mask(&mask)
+                            .sinks(sinks.then_some(&s));
+                        let shape = |a: &Array| a.shape().to_vec();
+                        let plan =
+                            fast::plan_attention(&shape(&q), &shape(&k), &shape(&v), dt, &win)
+                                .unwrap();
+                        let plan_mask =
+                            fast::plan_attention(&shape(&q), &shape(&k), &shape(&v), dt, &masked)
+                                .unwrap();
+                        let fused = matches!(
+                            plan.kernel,
+                            AttentionKernel::Vector { .. } | AttentionKernel::Tiled
+                        );
+                        let expect_fused = lq <= 8 || d != 256 || lk > w + lq;
+                        assert!(fused || !expect_fused, "{name}: planned {:?}", plan.kernel);
+                        let got = fast::scaled_dot_product_attention(&q, &k, &v, scale, &win);
+                        if matches!(plan.kernel, AttentionKernel::Vector { .. }) {
+                            let plain = AttentionOptions::default().sinks(sinks.then_some(&s));
+                            for r in 0..lq {
+                                let last = lk - lq + r;
+                                // Rows whose window is full plan their passes as the call
+                                // over the window's keys does.
+                                if last + 1 < w {
+                                    continue;
+                                }
+                                let (lo, hi) = ((last + 1 - w) as i32, last as i32 + 1);
+                                let one = fast::scaled_dot_product_attention(
+                                    &q.i((.., .., r as i32..r as i32 + 1, ..)),
+                                    &k.i((.., .., lo..hi, ..)),
+                                    &v.i((.., .., lo..hi, ..)),
+                                    scale,
+                                    &plain,
+                                );
+                                assert!(
+                                    bits(&got.i((.., .., r as i32..r as i32 + 1, ..)))
+                                        == bits(&one),
+                                    "{name}: row {r} differs from its window's keys alone"
+                                );
+                            }
+                        } else if plan.kernel == plan_mask.kernel {
+                            let want =
+                                fast::scaled_dot_product_attention(&q, &k, &v, scale, &masked);
+                            assert!(
+                                bits(&got) == bits(&want),
+                                "{name}: differs from the boolean mask on {:?}",
+                                plan.kernel
+                            );
+                        }
+                        let reference = with_stream(Device::cpu(), || {
+                            let f = |a: &Array| a.astype(DType::F32);
+                            let s32 = f(&s);
+                            let o = AttentionOptions::causal()
+                                .window(w as i32)
+                                .sinks(sinks.then_some(&s32));
+                            fast::scaled_dot_product_attention(&f(&q), &f(&k), &f(&v), scale, &o)
+                                .astype(dt)
+                        });
+                        let tol = match dt {
+                            DType::F32 => 1e-4,
+                            DType::F16 => 1e-2,
+                            _ => 5e-2,
+                        };
+                        assert_close(&name, &got, &reference, tol);
+                        assert!(
+                            values(&got).iter().all(|x| x.is_finite()),
+                            "{name}: not finite"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Invalid windows are errors (sticky, never a panic); empty queries or keys give what
+    /// they give without a window; a window of at least the keys is plain causal attention,
+    /// bit for bit.
+    #[test]
+    fn window_errors_empty_inputs_and_full_windows() {
+        for device in [Device::cpu(), Device::gpu(0)] {
+            if device == Device::gpu(0) && crate::common::require_gpu().is_none() {
+                continue;
+            }
+            with_stream(device, || {
+                let mut rng = Rng::new(0x57);
+                let q = random(&mut rng, &[1, 2, 5, 64], DType::F32);
+                let k = random(&mut rng, &[1, 2, 9, 64], DType::F32);
+                let attend = |o: &AttentionOptions<'_>| {
+                    fast::scaled_dot_product_attention(&q, &k, &k, 0.125, o)
+                };
+                assert!(
+                    attend(&AttentionOptions::causal().window(0))
+                        .check()
+                        .is_err()
+                );
+                assert!(
+                    attend(&AttentionOptions::default().window(3))
+                        .check()
+                        .is_err()
+                );
+                let m = ops::ones([5, 9], DType::Bool);
+                assert!(
+                    attend(&AttentionOptions::default().mask(&m).window(3))
+                        .check()
+                        .is_err()
+                );
+                let full = attend(&AttentionOptions::causal().window(9));
+                let causal = attend(&AttentionOptions::causal());
+                assert!(bits(&full) == bits(&causal), "{device:?}: full window");
+                let empty_q = random(&mut rng, &[1, 2, 0, 64], DType::F32);
+                let o = fast::scaled_dot_product_attention(
+                    &empty_q,
+                    &k,
+                    &k,
+                    0.125,
+                    &AttentionOptions::causal().window(3),
+                );
+                assert_eq!(o.shape(), [1, 2, 0, 64]);
+                let _ = o.check().unwrap();
+                // No keys: zeros (with a window, a causal mask and sinks too).
+                let q = random(&mut rng, &[1, 2, 3, 64], DType::F32);
+                let none = random(&mut rng, &[1, 2, 0, 64], DType::F32);
+                let sinks = random(&mut rng, &[2], DType::F32);
+                for options in [
+                    AttentionOptions::default(),
+                    AttentionOptions::causal(),
+                    AttentionOptions::causal().window(3).sinks(Some(&sinks)),
+                ] {
+                    let o = fast::scaled_dot_product_attention(&q, &none, &none, 0.125, &options);
+                    assert_eq!(
+                        o.to_vec::<f32>().unwrap(),
+                        vec![0.0; 3 * 2 * 64],
+                        "{device:?}"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Gradients and batching of windowed attention (fused on the GPU) equal those of the
+    /// equivalent boolean mask: the vjp runs the windowed composition.
+    #[test]
+    fn windowed_attention_derivatives_and_vmap() {
+        let devices: Vec<Device> = match crate::common::require_gpu() {
+            Some(_) => vec![Device::cpu(), Device::gpu(0)],
+            None => vec![Device::cpu()],
+        };
+        for device in devices {
+            with_stream(device, || {
+                let mut rng = Rng::new(0x58);
+                let (lq, lk, w) = (6, 20, 5);
+                let q = random(&mut rng, &[1, 4, lq, 64], DType::F32);
+                let k = random(&mut rng, &[1, 2, lk, 64], DType::F32);
+                let v = random(&mut rng, &[1, 2, lk, 64], DType::F32);
+                let mask = band(lq, lk, w);
+                let f = |o: AttentionOptions<'static>| {
+                    move |xs: &[Array]| -> Result<Array> {
+                        Ok(
+                            fast::scaled_dot_product_attention(&xs[0], &xs[1], &xs[2], 0.2, &o)
+                                .sum(..),
+                        )
+                    }
+                };
+                let mask: &'static Array = Box::leak(Box::new(mask));
+                let windowed =
+                    grad_flat(f(AttentionOptions::causal().window(w as i32)), &[0, 1, 2])(&[
+                        q.clone(),
+                        k.clone(),
+                        v.clone(),
+                    ])
+                    .unwrap();
+                let masked = grad_flat(f(AttentionOptions::default().mask(mask)), &[0, 1, 2])(&[
+                    q.clone(),
+                    k.clone(),
+                    v.clone(),
+                ])
+                .unwrap();
+                for (i, (a, b)) in windowed.iter().zip(&masked).enumerate() {
+                    assert_close(&format!("{device:?} grad {i}"), a, b, 1e-5);
+                }
+                // vmap over a leading batch of queries.
+                let qs = random(&mut rng, &[3, 1, 4, lq, 64], DType::F32);
+                let one = |xs: &[Array]| -> Result<Vec<Array>> {
+                    Ok(vec![fast::scaled_dot_product_attention(
+                        &xs[0],
+                        &xs[1],
+                        &xs[2],
+                        0.2,
+                        &AttentionOptions::causal().window(w as i32),
+                    )])
+                };
+                let batched = vmap_flat(one, &[Some(0), None, None], &[0])(&[
+                    qs.clone(),
+                    k.clone(),
+                    v.clone(),
+                ])
+                .unwrap();
+                for i in 0..3 {
+                    let single = one(&[qs.i(i), k.clone(), v.clone()]).unwrap();
+                    assert_close(
+                        &format!("{device:?} vmap {i}"),
+                        &batched[0].i(i),
+                        &single[0],
+                        1e-6,
+                    );
+                }
+            });
+        }
+    }
+
+    /// Gemma 4's K = V preparation: K = norm and rotation, V = the weightless norm, each
+    /// bit for bit the composition on the GPU, from a strided view of the projection, with
+    /// and without caches (a held cache keeps its values).
+    #[test]
+    fn norm_rope_kv_equals_the_composition() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        with_stream(Device::gpu(0), || {
+            let mut rng = Rng::new(0x59);
+            for (dt, d, l) in [
+                (DType::BF16, 512, 3),
+                (DType::F16, 256, 1),
+                (DType::F32, 64, 5),
+                (DType::F32, 64, 0),
+            ] {
+                // The projection `[B, L, H, D]` viewed as `[B, H, L, D]`.
+                let proj = random(&mut rng, &[1, l, 2, d], dt).multiply(4.0);
+                let x = proj.transpose([0, 2, 1, 3]);
+                let w = random(&mut rng, &[d], dt).add(1.0);
+                let freqs = ops::arange(1.0, (d / 4 + 1) as f64, 1.0).astype(DType::F32);
+                let rot = fast::Rotation {
+                    dims: d as i32 / 2,
+                    traditional: false,
+                    base: None,
+                    scale: 1.0,
+                    freqs: Some(&freqs),
+                };
+                let (k, v) = fast::norm_rope_kv(&x, Some((&w, 1e-6)), 1e-6, rot, 7, None);
+                let want_k = fast::rope(
+                    &fast::rms_norm(&x, &w, 1e-6),
+                    d as i32 / 2,
+                    false,
+                    None,
+                    1.0,
+                    &Array::from(7),
+                    Some(&freqs),
+                );
+                let want_v = fast::rms_norm(&x, None, 1e-6);
+                let name = format!("{dt} D {d} L {l}");
+                assert!(bits(&k) == bits(&want_k), "{name}: K");
+                assert!(bits(&v) == bits(&want_v), "{name}: V");
+                // Into caches at position 7: a held K cache keeps its values.
+                let kc = ops::zeros([1, 2, 16, d as i32], dt).add(0.5);
+                let vc = ops::zeros([1, 2, 16, d as i32], dt);
+                kc.eval().unwrap();
+                let (k2, v2) = fast::norm_rope_kv(&x, Some((&w, 1e-6)), 1e-6, rot, 7, (&kc, &vc));
+                let at = (.., .., 7..7 + l as i32, ..);
+                assert!(bits(&k2.i(at.clone())) == bits(&want_k), "{name}: K cache");
+                assert!(bits(&v2.i(at)) == bits(&want_v), "{name}: V cache");
+                assert!(
+                    values(&kc).iter().all(|&x| x == 0.5),
+                    "{name}: held cache changed"
+                );
+            }
+        });
+    }
+}
+
+/// `gated_delta_steps_with` stores each step's state in the storage dtype: every
+/// `states[t]` and the outputs equal `t + 1` serial `gated_delta` calls on a state kept in
+/// that dtype, bit for bit, on the CPU and the GPU; float32 storage is
+/// `gated_delta_steps`; a non-float storage fails.
+#[test]
+fn gated_delta_steps_with_rounds_each_state_to_its_storage() {
+    let bits = |a: &Array| -> Vec<u32> {
+        a.astype(DType::F32)
+            .view(DType::U32)
+            .to_vec::<u32>()
+            .unwrap()
+    };
+    let mut devices = vec![Device::cpu()];
+    if cfg!(target_os = "macos") && !cfg!(miri) {
+        set_default_stream(Stream::default_for(Device::gpu(0)));
+        if (&Array::from(1.0f32) + 1.0).eval().is_ok() {
+            devices.push(Device::gpu(0));
+        }
+    }
+    let mut rng = Rng::new(41);
+    for device in devices {
+        set_default_stream(Stream::default_for(device));
+        for (t_len, dk) in [(1usize, 32usize), (5, 64), (9, 128)] {
+            let (b, hk, hv, dv) = (1, 2, 4, 16);
+            let q = random(&mut rng, &[b, t_len, hk, dk], DType::BF16);
+            let k = random(&mut rng, &[b, t_len, hk, dk], DType::BF16).multiply(0.1);
+            let v = random(&mut rng, &[b, t_len, hv, dv], DType::BF16);
+            let g = random(&mut rng, &[b, t_len, hv], DType::F32)
+                .abs()
+                .negative()
+                .exp();
+            let beta = random(&mut rng, &[b, t_len, hv], DType::F32).sigmoid();
+            let state = random(&mut rng, &[b, hv, dv, dk], DType::F32);
+            for storage in [DType::F16, DType::BF16, DType::F32] {
+                let opts = fast::StepOptions::default().storage(storage);
+                let (y, states) =
+                    fast::gated_delta_steps_with(&q, &k, &v, &g, &beta, &state, &opts);
+                let mut s = state.astype(storage);
+                for t in 0..t_len as i32 {
+                    let at = |a: &Array| a.i((.., t..t + 1));
+                    let (yt, next) =
+                        fast::gated_delta(&at(&q), &at(&k), &at(&v), &at(&g), &at(&beta), &s);
+                    let name = format!("{device:?} T {t_len} Dk {dk} {} step {t}", storage.name());
+                    assert_eq!(bits(&y.i((.., t..t + 1))), bits(&yt), "{name}: output");
+                    assert_eq!(bits(&states.i((.., t))), bits(&next), "{name}: state");
+                    assert_eq!(states.dtype(), storage, "{name}");
+                    s = next;
+                }
+                if storage == DType::F32 {
+                    let (y2, s2) = fast::gated_delta_steps(&q, &k, &v, &g, &beta, &state);
+                    assert_eq!((bits(&y), bits(&states)), (bits(&y2), bits(&s2)));
+                }
+            }
+        }
+        let (q, s) = (
+            ops::ones([1, 1, 1, 32], DType::F32),
+            ops::zeros([1, 1, 4, 32], DType::F32),
+        );
+        let (v, g) = (
+            ops::ones([1, 1, 1, 4], DType::F32),
+            ops::ones([1, 1, 1], DType::F32),
+        );
+        let opts = fast::StepOptions::default().storage(DType::I32);
+        let (y, _) = fast::gated_delta_steps_with(&q, &q, &v, &g, &g, &s, &opts);
+        assert!(y.check().is_err());
+    }
+}
+
+/// Gradients and `vmap` through `gated_delta_steps_with` (bfloat16 storage): equal to the
+/// same serial `gated_delta` calls written out, bit for bit.
+#[test]
+fn gated_delta_steps_with_composes_with_grad_and_vmap() {
+    set_default_stream(Stream::default_for(Device::cpu()));
+    let mut rng = Rng::new(43);
+    let (b, t, hk, hv, dk, dv) = (2usize, 3usize, 1usize, 2usize, 32usize, 8usize);
+    let q = random(&mut rng, &[b, t, hk, dk], DType::F32);
+    let k = random(&mut rng, &[b, t, hk, dk], DType::F32).multiply(0.1);
+    let v = random(&mut rng, &[b, t, hv, dv], DType::F32);
+    let g = random(&mut rng, &[b, t, hv], DType::F32)
+        .abs()
+        .negative()
+        .exp();
+    let beta = random(&mut rng, &[b, t, hv], DType::F32).sigmoid();
+    let state = random(&mut rng, &[b, hv, dv, dk], DType::F32);
+    let opts = fast::StepOptions::default().storage(DType::BF16);
+    let loss = |q: &Array| {
+        let (y, s) = fast::gated_delta_steps_with(q, &k, &v, &g, &beta, &state, &opts);
+        y.sum(..).add(s.astype(DType::F32).sum(..))
+    };
+    let manual = |q: &Array| {
+        let mut s = state.astype(DType::BF16);
+        let mut total = Array::from(0.0f32);
+        for i in 0..t as i32 {
+            let at = |a: &Array| a.i((.., i..i + 1));
+            let (y, next) = fast::gated_delta(&at(q), &at(&k), &at(&v), &at(&g), &at(&beta), &s);
+            total = total.add(y.sum(..)).add(next.astype(DType::F32).sum(..));
+            s = next;
+        }
+        total
+    };
+    let ga = grad(loss)(&q).unwrap();
+    let gb = grad(manual)(&q).unwrap();
+    assert_eq!(values(&ga), values(&gb));
+    // vmap over the batch axis: each sequence as alone.
+    let one = |x: &(Array, Array)| {
+        let (q, s) = x;
+        let (y, _) = fast::gated_delta_steps_with(
+            &q.reshape([1, t as i32, hk as i32, dk as i32]),
+            &k.i(0..1),
+            &v.i(0..1),
+            &g.i(0..1),
+            &beta.i(0..1),
+            &s.reshape([1, hv as i32, dv as i32, dk as i32]),
+            &opts,
+        );
+        y.reshape([t as i32, hv as i32, dv as i32])
+    };
+    let batched = vmap(one).call(&(q.clone(), state.clone())).unwrap();
+    let first = one(&(q.i(0), state.i(0)));
+    assert_eq!(values(&batched.i(0)), values(&first));
+}
+
+/// `gated_delta_steps_with` (float16 storage): the forward and reverse derivatives agree,
+/// `<jvp(t), c> = <t, vjp(c)>` for the queries, values and gate.
+#[test]
+fn gated_delta_steps_with_jvp_and_vjp_agree() {
+    set_default_stream(Stream::default_for(Device::cpu()));
+    let mut rng = Rng::new(47);
+    let (b, t, hk, hv, dk, dv) = (1usize, 3usize, 1usize, 2usize, 32usize, 8usize);
+    let q = random(&mut rng, &[b, t, hk, dk], DType::F32);
+    let k = random(&mut rng, &[b, t, hk, dk], DType::F32).multiply(0.1);
+    let v = random(&mut rng, &[b, t, hv, dv], DType::F32);
+    let g = random(&mut rng, &[b, t, hv], DType::F32)
+        .abs()
+        .negative()
+        .exp();
+    let beta = random(&mut rng, &[b, t, hv], DType::F32).sigmoid();
+    let state = random(&mut rng, &[b, hv, dv, dk], DType::F32);
+    let opts = fast::StepOptions::default().storage(DType::F16);
+    let f = |xs: &[Array]| -> Result<Vec<Array>> {
+        let (y, _) = fast::gated_delta_steps_with(&xs[0], &k, &xs[1], &xs[2], &beta, &state, &opts);
+        Ok(vec![y])
+    };
+    let primals = [q.clone(), v.clone(), g.clone()];
+    let tangents = [
+        random(&mut rng, &[b, t, hk, dk], DType::F32),
+        random(&mut rng, &[b, t, hv, dv], DType::F32),
+        random(&mut rng, &[b, t, hv], DType::F32),
+    ];
+    let (y, jv) = jvp_flat(f, &primals, &tangents).unwrap();
+    let c = random(
+        &mut rng,
+        &y[0].shape().iter().map(|&d| d as usize).collect::<Vec<_>>(),
+        DType::F32,
+    );
+    let (_, vj) = vjp_flat(f, &primals, std::slice::from_ref(&c)).unwrap();
+    let lhs = jv[0].multiply(&c).sum(..).item::<f32>().unwrap() as f64;
+    let rhs: f64 = vj
+        .iter()
+        .zip(&tangents)
+        .map(|(g, t)| g.multiply(t).sum(..).item::<f32>().unwrap() as f64)
+        .sum();
+    assert!(
+        (lhs - rhs).abs() <= 1e-3 * (1.0 + lhs.abs()),
+        "{lhs} vs {rhs}"
+    );
+}
+
+/// Batched attention gives every batch item the bits of that item alone, on every path:
+/// tiled prefill, head-512 blocked prefill, windows and sinks (prompts of the same length
+/// are prefilled together by the `Batcher`).
+#[test]
+fn attention_batch_items_equal_each_item_alone() {
+    let bits = |a: &Array| {
+        a.astype(DType::F32)
+            .view(DType::U32)
+            .to_vec::<u32>()
+            .unwrap()
+    };
+    if crate::common::require_gpu().is_none() {
+        return;
+    }
+    let mut rng = Rng::new(0x5b0);
+    // (Hq, Hkv, Lq, Lk, D, window)
+    let cases = [
+        (8, 2, 300, 300, 128, None),
+        (8, 2, 600, 600, 512, None),
+        (8, 2, 600, 600, 256, Some(128)),
+        (16, 8, 512, 512, 512, None),
+    ];
+    with_stream(Device::gpu(0), || {
+        for (hq, hkv, lq, lk, d, window) in cases {
+            for dtype in [DType::BF16, DType::F16] {
+                for sinks in [false, true] {
+                    let b = 3;
+                    let q = random(&mut rng, &[b, hq, lq, d], dtype);
+                    let k = random(&mut rng, &[b, hkv, lk, d], dtype);
+                    let v = random(&mut rng, &[b, hkv, lk, d], dtype);
+                    let s = random(&mut rng, &[hq], dtype);
+                    let mut o = fast::AttentionOptions::causal().sinks(sinks.then_some(&s));
+                    if let Some(w) = window {
+                        o = o.window(w);
+                    }
+                    let scale = 1.0 / (d as f32).sqrt();
+                    let all = fast::scaled_dot_product_attention(&q, &k, &v, scale, &o);
+                    for i in 0..b as i32 {
+                        let one = fast::scaled_dot_product_attention(
+                            &q.i(i..i + 1),
+                            &k.i(i..i + 1),
+                            &v.i(i..i + 1),
+                            scale,
+                            &o,
+                        );
+                        assert!(
+                            bits(&all.i(i..i + 1)) == bits(&one),
+                            "{dtype} D {d} {hq}/{hkv} L {lq} window {window:?} sinks {sinks}: item {i}"
+                        );
+                    }
+                }
+            }
+        }
+    });
 }

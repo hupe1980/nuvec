@@ -78,6 +78,86 @@ fn elementwise_matches_cpu_on_random_layouts() {
         same_on_both::<f32>(&ctx("where"), || x.greater(&y).select(&x, &y));
         same_on_both::<i8>(&ctx("cast"), || x.astype(DType::I8));
         same_on_both::<f32>(&ctx("copy"), || x.t().reshape([-1]));
+        same_on_both::<f32>(&ctx("floor_divide"), || x.floor_divide(&y));
+        same_on_both::<f16>(&ctx("floor_divide f16"), || h.floor_divide(h.t().t()));
+        same_on_both::<i32>(&ctx("floor_divide i32"), || i.floor_divide(i.t().t()));
+    }
+}
+
+/// Integer `floor_divide` where MLX leaves it undefined, the same on both devices: 0 for a
+/// zero divisor, `MIN // -1` wraps; and rounding toward negative infinity for every type.
+#[test]
+fn floor_divide_edges_match_cpu() {
+    if crate::common::require_gpu().is_none() {
+        return;
+    }
+    let a = Array::from_slice(&[i32::MIN, i32::MIN, 7, -7, 0, 5, -5], [7]);
+    let b = Array::from_slice(&[-1, 1, 0, 0, 0, -3, 3], [7]);
+    same_on_both::<i32>("i32 edges", || a.floor_divide(&b));
+    let got = on(Device::gpu(0), || {
+        a.floor_divide(&b).to_vec::<i32>().unwrap()
+    });
+    assert_eq!(got, [i32::MIN, i32::MIN, 0, 0, 0, -2, -2]);
+    for dtype in [DType::I8, DType::U8, DType::I16, DType::U32, DType::I64] {
+        let x = Array::from_slice(&[-9i32, -8, 0, 7, 9, 100], [6]).astype(dtype);
+        let y = Array::from_slice(&[2i32, -3, 0, 4, -2, 7], [6]).astype(dtype);
+        same_on_both::<i64>(&format!("{dtype}"), || {
+            x.floor_divide(&y).astype(DType::I64)
+        });
+    }
+}
+
+/// `power` on both devices: integers exactly (squaring, wrapping, 0 for a negative
+/// exponent), floats within a few ulps (both `pow`, each its library's) over random layouts
+/// with negative bases, zeros, fractional and negative exponents.
+#[test]
+fn power_matches_cpu() {
+    if crate::common::require_gpu().is_none() {
+        return;
+    }
+    let a = Array::from_slice(&[2, -3, 0, 7, -1, 3, 5], [7]);
+    let b = Array::from_slice(&[10, 3, 0, 1, 7, -2, 13], [7]);
+    same_on_both::<i32>("i32", || a.power(&b));
+    let got = on(Device::gpu(0), || a.power(&b).to_vec::<i32>().unwrap());
+    assert_eq!(got, [1024, -27, 1, 7, -1, 0, 1_220_703_125]);
+    for dtype in [DType::I8, DType::U8, DType::U32, DType::I64] {
+        same_on_both::<i64>(&format!("{dtype}"), || {
+            a.abs()
+                .astype(dtype)
+                .power(b.abs().astype(dtype))
+                .astype(DType::I64)
+        });
+    }
+    let mut rng = Rng::new(0x90);
+    for _ in 0..20 {
+        let shape: Vec<usize> = (0..1 + rng.below(3)).map(|_| 1 + rng.below(30)).collect();
+        let n = common::size(&shape);
+        let xs: Vec<f32> = (0..n).map(|_| rng.range(-40, 40) as f32 / 8.0).collect();
+        let ys: Vec<f32> = (0..n).map(|_| rng.range(-24, 24) as f32 / 8.0).collect();
+        let (x, _) = random_layout(&mut rng, &shape, xs);
+        let (y, _) = random_layout(&mut rng, &shape, ys);
+        for (dtype, ulps) in [(DType::F32, 4.0), (DType::F16, 1.0), (DType::BF16, 1.0)] {
+            let run = |d| {
+                on(d, || {
+                    x.astype(dtype)
+                        .power(y.astype(dtype))
+                        .astype(DType::F32)
+                        .to_vec::<f32>()
+                        .unwrap()
+                })
+            };
+            let eps = match dtype {
+                DType::F32 => f32::EPSILON,
+                DType::F16 => 2f32.powi(-10),
+                _ => 2f32.powi(-7),
+            };
+            for (c, g) in run(Device::cpu()).iter().zip(run(Device::gpu(0))) {
+                let ok = c.to_bits() == g.to_bits()
+                    || (c.is_nan() && g.is_nan())
+                    || (c - g).abs() <= ulps * eps * c.abs().max(f32::MIN_POSITIVE);
+                assert!(ok, "{dtype}: cpu {c}, gpu {g}");
+            }
+        }
     }
 }
 

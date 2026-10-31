@@ -93,8 +93,10 @@ fn in_block(path: &str) -> Option<(usize, &str)> {
 /// quantized bases work, and each base is frozen. A key equal to a top-level path
 /// (`lm_head`) adapts that projection too. Returns how many projections were adapted.
 ///
-/// The new layers take the model's train/eval mode. Mixture-of-experts expert layers are
-/// not supported: selecting one is an error naming the layer type (nothing changes).
+/// The new layers take the model's train/eval mode. Mixture-of-experts expert layers have
+/// no LoRA layer: without `keys` they are left as they are, and naming one in `keys` is an
+/// error naming it. A layer that is LoRA already is an error too. On an error nothing
+/// changes.
 pub fn linear_to_lora_layers(
     model: &mut Model,
     num_layers: usize,
@@ -108,17 +110,33 @@ pub fn linear_to_lora_layers(
         Some((i, rel)) => i >= first && keys.as_ref().is_none_or(|k| k.contains(rel)),
         None => keys.as_ref().is_some_and(|k| k.contains(path)),
     };
-    // Mixture-of-experts experts have no LoRA layer here: reject before changing anything.
+    // Checked before changing anything: experts named explicitly, and layers that are LoRA
+    // already.
     let mut experts = Vec::new();
-    model.map_modules(selected, |path, _: &mut SwitchProjection| {
-        experts.push(path.to_owned());
-        Ok(())
-    })?;
+    if keys.is_some() {
+        model.map_modules(selected, |path, _: &mut SwitchProjection| {
+            experts.push(path.to_owned());
+            Ok(())
+        })?;
+    }
     if !experts.is_empty() {
         return Err(Error::InvalidArgument(format!(
             "linear_to_lora_layers: LoRA on mixture-of-experts layers (SwitchProjection) is not \
              supported: {}",
             experts.join(", ")
+        )));
+    }
+    let mut lora = Vec::new();
+    model.map_modules(selected, |path, proj: &mut Projection| {
+        if matches!(proj, Projection::Lora(_)) {
+            lora.push(path.to_owned());
+        }
+        Ok(())
+    })?;
+    if !lora.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "linear_to_lora_layers: LoRA layers already: {}",
+            lora.join(", ")
         )));
     }
     let training = model.training();
@@ -130,12 +148,7 @@ pub fn linear_to_lora_layers(
         let base: LoraBase = match std::mem::replace(proj, placeholder) {
             Projection::Dense(l) => l.into(),
             Projection::Quantized(q) => q.into(),
-            Projection::Lora(l) => {
-                *proj = Projection::Lora(l);
-                return Err(Error::InvalidArgument(format!(
-                    "linear_to_lora_layers: {path} is a LoRA layer already"
-                )));
-            }
+            Projection::Lora(_) => unreachable!("checked above: {path}"),
         };
         let mut lora = LoraLinear::from_base(base, params.rank)
             .scale(params.scale)
@@ -216,10 +229,11 @@ pub fn load_adapters(dir: impl AsRef<Path>, model: &mut Model) -> Result<Adapter
             "fine_tune_type {kind:?} is not supported (only \"lora\")"
         )));
     }
+    // mlx-lm writes -1 for every layer.
     let num_layers = json
         .get("num_layers")
         .and_then(Json::as_i64)
-        .and_then(|n| usize::try_from(n).ok())
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
         .ok_or_else(|| invalid("num_layers is missing or invalid"))?;
     let lp = json
         .get("lora_parameters")

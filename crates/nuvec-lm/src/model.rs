@@ -8,12 +8,17 @@
 use std::sync::LazyLock;
 
 use nuvec::fast::{self, AttentionMask};
-use nuvec::{Array, DType, OpErrorKind, Param, Result, ops};
+use nuvec::{Array, DType, GatherQmm, OpErrorKind, Param, Quant, QuantMode, Result, ops};
 use nuvec_nn::{
     Embedding, Linear, LoraLinear, Module, QuantizedEmbedding, QuantizedLinear, RmsNorm, silu,
 };
 
-use crate::config::{Config, LayerType, LinearAttention, MixtureOfExperts, RopeScaling};
+use crate::config::{
+    Activation, Config, LayerQuant, LayerType, LinearAttention, MixtureOfExperts, RopeScaling,
+};
+
+mod gemma;
+mod mtp;
 
 /// A stand-in of `shape` and `dtype` for a weight not loaded yet (no memory): a failed
 /// array, so a forward pass or `save_weights` before the weights load reports it.
@@ -42,21 +47,7 @@ type Compiled2 = Box<dyn Fn(&(Array, Array)) -> Result<Array> + Send + Sync>;
 /// [`Compiled2`] of three arrays.
 type Compiled3 = Box<dyn Fn(&(Array, Array, Array)) -> Result<Array> + Send + Sync>;
 
-/// `silu(gate) · x`, uncompiled.
-#[track_caller]
-fn swiglu_graph(gate: &Array, x: &Array) -> Array {
-    silu(gate).multiply(x)
-}
-
-/// `silu(gate) · x` in one kernel, as mlx-lm's compiled `swiglu`.
-#[track_caller]
-fn swiglu(gate: &Array, x: &Array) -> Array {
-    static SWIGLU: LazyLock<Compiled2> =
-        LazyLock::new(|| Box::new(nuvec::compile(|(g, x): &(Array, Array)| swiglu_graph(g, x))));
-    // A failed replay (not expected for valid inputs) falls back to the graph, which
-    // carries the error.
-    SWIGLU(&(gate.clone(), x.clone())).unwrap_or_else(|_| swiglu_graph(gate, x))
-}
+use nuvec_nn::swiglu;
 
 /// A linear layer, full precision or quantized. Variants are transparent in parameter
 /// names (`q_proj.weight`).
@@ -119,13 +110,44 @@ fn groups(path: &str, features: usize, group_size: usize) -> Result<usize> {
         .ok_or_else(|| nuvec::Error::InvalidArgument(format!("{path}: quantization group size 0")))
 }
 
-/// Builds layers with placeholder parameters; `quantized(path)` gives the group size and
-/// bits of quantized layers.
+/// Builds layers with placeholder parameters; `quantized(path)` gives the quantization of
+/// quantized layers.
 struct Builder<'a> {
-    quantized: &'a dyn Fn(&str) -> Option<(usize, u32)>,
+    quantized: &'a dyn Fn(&str) -> Option<LayerQuant>,
+}
+
+/// Placeholders of a quantized layer with `rows` outputs over `input` values: the codes,
+/// the scales (affine: float; floating-point modes: uint8) and, for affine, the biases.
+fn quantized_placeholders(
+    path: &str,
+    batch: &[usize],
+    rows: usize,
+    input: usize,
+    quant: Quant,
+) -> Result<(Array, Array, Option<Array>)> {
+    let shape = |last: usize| {
+        let mut s = batch.to_vec();
+        s.extend([rows, last]);
+        s
+    };
+    let bits = usize::try_from(quant.bits).unwrap_or(0);
+    let group_size = usize::try_from(quant.group_size).unwrap_or(0);
+    let groups = groups(path, input, group_size)?;
+    let weight = placeholder(&shape(input * bits / 32), DType::U32);
+    if quant.mode == QuantMode::Affine {
+        let scales = placeholder(&shape(groups), DType::F32);
+        return Ok((weight, scales.clone(), Some(scales)));
+    }
+    Ok((weight, placeholder(&shape(groups), DType::U8), None))
 }
 
 impl Builder<'_> {
+    /// The settings of the quantized layer at `path` and whether it has a global scale.
+    fn quant(&self, path: &str) -> Option<(Quant, bool)> {
+        let l = (self.quantized)(path)?;
+        l.quant.map(|q| (q, l.global_scale))
+    }
+
     fn projection(
         &self,
         path: &str,
@@ -134,15 +156,18 @@ impl Builder<'_> {
         bias: bool,
     ) -> Result<Projection> {
         let bias = bias.then(|| param(&[output], DType::F32));
-        Ok(match (self.quantized)(path) {
-            Some((group_size, bits)) => Projection::Quantized(QuantizedLinear {
-                weight: placeholder(&[output, input * bits as usize / 32], DType::U32),
-                scales: placeholder(&[output, groups(path, input, group_size)?], DType::F32),
-                biases: placeholder(&[output, groups(path, input, group_size)?], DType::F32),
-                bias,
-                group_size: int(path, group_size)?,
-                bits: int(path, bits as usize)?,
-            }),
+        Ok(match self.quant(path) {
+            Some((quant, _)) => {
+                let (weight, scales, biases) =
+                    quantized_placeholders(path, &[], output, input, quant)?;
+                Projection::Quantized(QuantizedLinear {
+                    weight,
+                    scales,
+                    biases,
+                    bias,
+                    quant,
+                })
+            }
             None => Projection::Dense(Linear {
                 weight: param(&[output, input], DType::F32),
                 bias,
@@ -156,33 +181,41 @@ impl Builder<'_> {
         input: usize,
         output: usize,
         experts: usize,
+        bias: bool,
     ) -> Result<SwitchProjection> {
-        Ok(match (self.quantized)(path) {
-            Some((group_size, bits)) => {
-                let groups = groups(path, input, group_size)?;
+        let bias = bias.then(|| param(&[experts, output], DType::F32));
+        Ok(match self.quant(path) {
+            Some((quant, global)) => {
+                let (weight, scales, biases) =
+                    quantized_placeholders(path, &[experts], output, input, quant)?;
                 SwitchProjection::Quantized {
-                    weight: placeholder(&[experts, output, input * bits as usize / 32], DType::U32),
-                    scales: placeholder(&[experts, output, groups], DType::F32),
-                    biases: placeholder(&[experts, output, groups], DType::F32),
-                    group_size: int(path, group_size)?,
-                    bits: int(path, bits as usize)?,
+                    weight,
+                    scales,
+                    biases,
+                    global_scale: global.then(|| placeholder(&[experts], DType::F32)),
+                    quant,
+                    bias,
                 }
             }
             None => SwitchProjection::Dense {
                 weight: param(&[experts, output, input], DType::F32),
+                bias,
             },
         })
     }
 
     fn embedding(&self, path: &str, count: usize, dims: usize) -> Result<TokenEmbedding> {
-        Ok(match (self.quantized)(path) {
-            Some((group_size, bits)) => TokenEmbedding::Quantized(QuantizedEmbedding {
-                weight: placeholder(&[count, dims * bits as usize / 32], DType::U32),
-                scales: placeholder(&[count, groups(path, dims, group_size)?], DType::F32),
-                biases: placeholder(&[count, groups(path, dims, group_size)?], DType::F32),
-                group_size: int(path, group_size)?,
-                bits: int(path, bits as usize)?,
-            }),
+        Ok(match self.quant(path) {
+            Some((quant, _)) => {
+                let (weight, scales, biases) =
+                    quantized_placeholders(path, &[], count, dims, quant)?;
+                TokenEmbedding::Quantized(QuantizedEmbedding {
+                    weight,
+                    scales,
+                    biases,
+                    quant,
+                })
+            }
             None => TokenEmbedding::Dense(Embedding {
                 weight: param(&[count, dims], DType::F32),
             }),
@@ -197,77 +230,33 @@ impl Builder<'_> {
     }
 }
 
-/// The rotary embedding of every head's features (no parameters).
+/// The rotary embedding of every head's features (nuvec-nn's `Rope`, no parameters), with
+/// the fused norm, rotation and cache write nuvec-lm uses.
 #[derive(Debug, Clone, Module)]
 struct Rope {
-    #[tree(skip)]
-    dims: i32,
-    #[tree(skip)]
-    traditional: bool,
-    #[tree(skip)]
-    base: f32,
-    #[tree(skip)]
-    scale: f32,
-    /// Per-pair frequencies (Llama 3 scaling) instead of `base`: computed from the
-    /// configuration, not in checkpoints (mlx-lm's `_freqs`).
-    #[tree(skip)]
-    freqs: Option<Array>,
+    rope: nuvec_nn::Rope,
 }
 
 impl Rope {
     fn new(dims: usize, config: &Config) -> Result<Self> {
-        let base = config.rope_theta;
-        let mut rope = Self {
-            dims: int("rope dims", dims)?,
-            traditional: config.rope_traditional,
-            base,
-            scale: 1.0,
-            freqs: None,
-        };
-        match config.rope_scaling {
-            RopeScaling::None => {}
-            RopeScaling::Linear { factor } => rope.scale = 1.0 / factor,
-            RopeScaling::Llama3 {
-                factor,
-                low_freq_factor,
-                high_freq_factor,
-                original_max_position_embeddings: old,
-            } => {
-                // mlx-lm's `Llama3RoPE`.
-                let (low_wavelen, high_wavelen) = (old / low_freq_factor, old / high_freq_factor);
-                let freqs: Vec<f32> = (0..dims)
-                    .step_by(2)
-                    .map(|i| {
-                        let freq = base.powf(i as f32 / dims as f32);
-                        let wavelen = 2.0 * std::f32::consts::PI * freq;
-                        let scaled = if wavelen > low_wavelen {
-                            freq * factor
-                        } else {
-                            freq
-                        };
-                        if wavelen > high_wavelen && wavelen < low_wavelen {
-                            let smooth = (old / wavelen - low_freq_factor)
-                                / (high_freq_factor - low_freq_factor);
-                            scaled / ((1.0 - smooth) / factor + smooth)
-                        } else {
-                            scaled
-                        }
-                    })
-                    .collect();
-                rope.freqs = Some(Array::from(freqs));
-            }
+        Self::with(
+            dims,
+            (config.rope_theta, &config.rope_scaling),
+            config.rope_traditional,
+        )
+    }
+
+    /// Over `dims` features with a base and scaling.
+    fn with(dims: usize, (base, scaling): (f32, &RopeScaling), traditional: bool) -> Result<Self> {
+        let mut rope = nuvec_nn::Rope::scaled(int("rope dims", dims)?, base, scaling);
+        if traditional {
+            rope = rope.traditional();
         }
-        Ok(rope)
+        Ok(Self { rope })
     }
 
     fn rotation(&self) -> fast::Rotation<'_> {
-        fast::Rotation {
-            dims: self.dims,
-            traditional: self.traditional,
-            base: self.freqs.is_none().then_some(self.base),
-            scale: self.scale,
-            freqs: self.freqs.as_ref(),
-        }
+        self.rope.rotation()
     }
 
     /// `x` (`[B, H, L, D]`) normalised by `norm` (if any) and rotated at positions
@@ -309,10 +298,20 @@ const HEADS_FIRST: [i32; 4] = [0, 2, 1, 3];
 /// each step's keys and values are written into it (in place), so buffers keep their
 /// size between growths. Gated DeltaNet layers keep the convolution's last inputs and the
 /// recurrent state instead, as mlx-lm's `ArraysCache`.
+///
+/// A sliding-window layer (window `W`) keeps only what later queries read: when its
+/// buffer is full (or holds a long prefill), it drops the positions before the last
+/// `W − 1` plus a slack of 256, which [`trim`](Self::trim) can still roll back into. Its
+/// positions stay in temporal order (no ring, unlike mlx-lm's `RotatingKVCache`), so
+/// attention reads one contiguous view of the last `W − 1 + L` positions.
 #[derive(Debug, Clone, Default)]
 pub struct KvCache {
     keys: Option<Array>,
     values: Option<Array>,
+    /// A sliding-window layer's window.
+    window: Option<i32>,
+    /// The position of the buffers' first entry (dropped positions before it).
+    start: i32,
     /// The convolution's last `kernel - 1` inputs, `[B, kernel - 1, channels]`.
     conv: Option<Array>,
     /// The recurrent state, `[B, value_heads, value_head_dim, key_head_dim]` (float32).
@@ -329,10 +328,26 @@ pub struct KvCache {
 /// Positions added to a cache's capacity at a time.
 const CACHE_STEP: i32 = 256;
 
+/// Positions a sliding-window cache keeps beyond its window, for [`KvCache::trim`].
+const WINDOW_SLACK: i32 = 256;
+
 impl KvCache {
+    /// An empty cache for a layer attending to a sliding window of `window` keys.
+    pub(crate) fn windowed(window: i32) -> Self {
+        Self {
+            window: Some(window),
+            ..Self::default()
+        }
+    }
+
     /// Positions cached.
     pub fn offset(&self) -> usize {
         usize::try_from(self.offset).unwrap_or_default()
+    }
+
+    /// The first position the cache still holds (0 but for sliding-window layers).
+    pub(crate) fn start(&self) -> usize {
+        usize::try_from(self.start).unwrap_or_default()
     }
 
     /// Writes `keys` and `values` (`[B, kv_heads, L, head_dim]`) after the cached positions,
@@ -346,28 +361,52 @@ impl KvCache {
         keys: &Array,
         values: &Array,
     ) -> (Array, Array) {
-        let prev = self.offset;
-        let end = prev + values.shape().get(2).copied().unwrap_or_default();
-        let fits = self.keys.as_ref().is_some_and(|k| end <= k.shape()[2]);
-        let (k, v) = if fits {
+        let (prev, start) = (self.offset, self.start);
+        let l = values.shape().get(2).copied().unwrap_or_default();
+        let end = prev + l;
+        let fits = self
+            .keys
+            .as_ref()
+            .is_some_and(|k| end - start <= k.shape()[2]);
+        // A window keeps the last `W − 1` positions (what the next queries read) and the slack.
+        let keep = self.window.map(|w| w - 1 + WINDOW_SLACK);
+        let excess = keep.is_some_and(|keep| prev - start > keep + 2 * CACHE_STEP);
+        let (k, v) = if fits && !excess {
             // Each write takes the cache's only handle, so it is done in place.
-            let k = rope.norm_rope(keys, norm, prev, self.keys.take().as_ref());
             let all = self.values.take().expect("allocated with the keys");
-            (k, all.at((.., .., prev..end)).set(values))
+            let at = prev - start..end - start;
+            let k = if start == 0 {
+                rope.norm_rope(keys, norm, prev, self.keys.take().as_ref())
+            } else {
+                let rotated = rope.norm_rope(keys, norm, prev, None);
+                let cached = self.keys.take().expect("allocated with the values");
+                cached.at((.., .., at.clone())).set(&rotated)
+            };
+            (k, all.at((.., .., at)).set(values))
         } else {
-            // Grown by whole steps (mlx-lm's rule), written in one concatenation: the cached
+            // Grown by whole steps (mlx-lm's rule), written in one concatenation: the kept
             // positions, the new ones, then zeros up to the step (no copy of the grown cache
-            // to update it).
-            let l = end - prev;
-            let pad = (l + CACHE_STEP - 1) / CACHE_STEP * CACHE_STEP - l;
+            // to update it). A window drops what no later query reads and keeps a step of
+            // room, so it compacts once per step.
+            let from = keep.map_or(start, |keep| (prev - keep).max(start));
+            let n = prev - from + l;
+            let room = if keep.is_some() { CACHE_STEP } else { 0 };
+            let pad = (n + CACHE_STEP - 1) / CACHE_STEP * CACHE_STEP - n + room;
             let keys = rope.norm_rope(keys, norm, prev, None);
-            let k = grow(self.keys.take(), prev, &keys, pad);
-            (k, grow(self.values.take(), prev, values, pad))
+            let kept = (from - start, prev - start);
+            let k = grow(self.keys.take(), kept, &keys, pad);
+            self.start = from;
+            (k, grow(self.values.take(), kept, values, pad))
         };
         self.offset = end;
         self.keys = Some(k.clone());
         self.values = Some(v.clone());
-        (positions(&k, end), positions(&v, end))
+        // Attention reads the last `W − 1 + L` positions (all of them without a window).
+        let first = self
+            .window
+            .map_or(self.start, |w| (prev - (w - 1)).max(self.start));
+        let view = |a: &Array| between(a, first - self.start, end - self.start);
+        (view(&k), view(&v))
     }
 
     /// Makes Gated DeltaNet layers keep the state after every position of the following
@@ -415,23 +454,34 @@ impl KvCache {
             self.offset -= t - kept;
             return Ok(());
         }
-        match i32::try_from(n).ok().filter(|&n| n <= self.offset) {
-            Some(n) => {
-                self.offset -= n;
-                Ok(())
-            }
-            None => Err(invalid(format!(
+        let Some(n) = i32::try_from(n).ok().filter(|&n| n <= self.offset) else {
+            return Err(invalid(format!(
                 "cannot trim {n} of {} cached positions",
                 self.offset
-            ))),
+            )));
+        };
+        // A window's next queries read the `W − 1` positions before the new offset.
+        if let Some(w) = self.window
+            && self.start > 0
+            && self.offset - n - (w - 1) < self.start
+        {
+            return Err(invalid(format!(
+                "cannot trim {n} positions: a sliding-window cache keeps {WINDOW_SLACK} \
+                 beyond its window ({} cached from position {})",
+                self.offset - self.start,
+                self.start
+            )));
         }
+        self.offset -= n;
+        Ok(())
     }
 
-    /// The cached keys and values of an attention layer, `[B, kv_heads, offset, head_dim]`
-    /// (views), if any.
+    /// The cached keys and values of an attention layer, `[B, kv_heads, offset − start,
+    /// head_dim]` (views of positions [`start`](Self::start)`..offset`), if any.
     pub(crate) fn keys_values(&self) -> Option<(Array, Array)> {
+        let n = self.offset - self.start;
         match (&self.keys, &self.values) {
-            (Some(k), Some(v)) => Some((positions(k, self.offset), positions(v, self.offset))),
+            (Some(k), Some(v)) => Some((positions(k, n), positions(v, n))),
             _ => None,
         }
     }
@@ -449,6 +499,8 @@ impl KvCache {
         KvCache {
             keys: row(&self.keys),
             values: row(&self.values),
+            window: self.window,
+            start: self.start,
             conv: row(&self.conv),
             recurrent: row(&self.recurrent),
             offset: self.offset,
@@ -476,13 +528,24 @@ fn positions(a: &Array, n: i32) -> Array {
     a.i((.., .., ..n))
 }
 
-/// `old`'s first `prev` positions (axis 2), then `new`, then `pad` positions of zeros, in
-/// one concatenation.
+/// Positions `from..to` (axis 2) of a cache array, as a view.
 #[track_caller]
-fn grow(old: Option<Array>, prev: i32, new: &Array, pad: i32) -> Array {
+fn between(a: &Array, from: i32, to: i32) -> Array {
+    if from == 0 {
+        return positions(a, to);
+    }
+    a.i((.., .., from..to))
+}
+
+/// `old`'s positions `kept.0..kept.1` (axis 2), then `new`, then `pad` positions of zeros,
+/// in one concatenation.
+#[track_caller]
+fn grow(old: Option<Array>, kept: (i32, i32), new: &Array, pad: i32) -> Array {
     let mut parts = Vec::with_capacity(3);
-    if let Some(old) = old {
-        parts.push(positions(&old, prev));
+    if let Some(old) = old
+        && kept.1 > kept.0
+    {
+        parts.push(between(&old, kept.0, kept.1));
     }
     parts.push(new.clone());
     if pad > 0 {
@@ -498,8 +561,10 @@ fn grow(old: Option<Array>, prev: i32, new: &Array, pad: i32) -> Array {
 #[derive(Debug, Clone, Module)]
 struct Attention {
     q_proj: Projection,
-    k_proj: Projection,
-    v_proj: Projection,
+    /// `None` in KV-shared layers (Gemma 4), which read another layer's keys and values.
+    k_proj: Option<Projection>,
+    /// `None` also with K = V (Gemma 4's full layers: the keys' projection is the values').
+    v_proj: Option<Projection>,
     o_proj: Projection,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
@@ -513,28 +578,96 @@ struct Attention {
     /// The query projection also yields a gate of the output (`o · sigmoid(gate)`).
     #[tree(skip)]
     gate: bool,
+    /// Learned attention sinks, one logit per query head (gpt-oss).
+    sinks: Option<Param>,
+    /// A sliding window of this many keys.
+    #[tree(skip)]
+    window: Option<i32>,
+    /// The RoPE scaling's input scale (YaRN's mscale; 1 otherwise), folded into the
+    /// attention scale.
+    #[tree(skip)]
+    mscale: f32,
+    /// The values' RMS normalisation without a weight (Gemma 4's `v_norm`), its epsilon.
+    #[tree(skip)]
+    v_norm: Option<f32>,
 }
 
 impl Attention {
-    fn new(b: &Builder<'_>, path: &str, c: &Config) -> Result<Self> {
+    fn new(b: &Builder<'_>, path: &str, c: &Config, window: Option<usize>) -> Result<Self> {
         let (d, hd) = (c.hidden_size, c.head_dim);
         let (q, kv) = (c.num_attention_heads * hd, c.num_key_value_heads * hd);
         let p = |name: &str| format!("{path}.{name}");
         let norm = || c.qk_norm.then(|| Builder::norm(hd, c.rms_norm_eps));
         let gate = c.attn_output_gate;
+        let rope = Rope::new(c.rope_dims, c)?;
+        // mlx-lm multiplies the rotated features of q and k by the scaling's mscale (YaRN):
+        // the scores scale by mscale², folded into the attention scale (both rotations stay
+        // one fused kernel each).
+        let mscale = rope.rope.mscale();
+        if mscale != 1.0 && c.rope_dims != hd {
+            return Err(nuvec::Error::InvalidArgument(format!(
+                "{path}: a RoPE scaling with an input scale over {} of {hd} features is not \
+                 supported",
+                c.rope_dims
+            )));
+        }
         Ok(Self {
             q_proj: b.projection(&p("q_proj"), d, q * (1 + usize::from(gate)), c.qkv_bias)?,
-            k_proj: b.projection(&p("k_proj"), d, kv, c.qkv_bias)?,
-            v_proj: b.projection(&p("v_proj"), d, kv, c.qkv_bias)?,
+            k_proj: Some(b.projection(&p("k_proj"), d, kv, c.qkv_bias)?),
+            v_proj: Some(b.projection(&p("v_proj"), d, kv, c.qkv_bias)?),
             o_proj: b.projection(&p("o_proj"), q, d, c.o_bias)?,
             q_norm: norm(),
             k_norm: norm(),
             heads: int(path, c.num_attention_heads)?,
             kv_heads: int(path, c.num_key_value_heads)?,
             scale: (hd as f32).powf(-0.5),
-            rope: Rope::new(c.rope_dims, c)?,
+            mscale,
+            rope,
             gate,
+            sinks: c
+                .attention_sinks
+                .then(|| param(&[c.num_attention_heads], DType::F32)),
+            window: window.map(|w| int(path, w)).transpose()?,
+            v_norm: None,
         })
+    }
+
+    /// The key projection (layers that project keys).
+    fn k_proj(&self) -> &Projection {
+        self.k_proj.as_ref().expect("a layer with its own keys")
+    }
+
+    /// Whether the mscale is applied to q and k explicitly (mlx-lm's multiply, rounded per
+    /// element in half precision) rather than folded into the attention scale (float32:
+    /// the same up to rounding, without the two multiplications).
+    fn explicit_mscale(&self, dtype: DType) -> bool {
+        self.mscale != 1.0 && dtype != DType::F32
+    }
+
+    /// `x` (queries or keys before the rotation) times the mscale, where it is explicit.
+    #[track_caller]
+    fn input_scale(&self, x: Array) -> Array {
+        match self.explicit_mscale(x.dtype()) {
+            true => x.multiply(self.mscale),
+            false => x,
+        }
+    }
+
+    /// The attention scale for activations of `dtype` (with the folded mscale²).
+    fn scale(&self, dtype: DType) -> f32 {
+        match self.mscale == 1.0 || self.explicit_mscale(dtype) {
+            true => self.scale,
+            false => self.scale * self.mscale * self.mscale,
+        }
+    }
+
+    /// The attention options: the layer's window (causal) and sinks.
+    fn options<'a>(&'a self, mask: AttentionMask<'a>) -> fast::AttentionOptions<'a> {
+        let options = match self.window {
+            Some(w) => fast::AttentionOptions::causal().window(w),
+            None => mask.into(),
+        };
+        options.sinks(self.sinks.as_ref().map(Param::value))
     }
 
     /// The queries `[B, L, H, D]` and, with an output gate, the gate `[B, L, H·D]` (each
@@ -561,19 +694,53 @@ impl Attention {
 
     #[track_caller]
     fn forward(&self, x: &Array, mask: AttentionMask<'_>, cache: &mut KvCache) -> Array {
+        self.forward_kv(x, mask, cache, None).0
+    }
+
+    /// [`Attention::forward`], also giving the keys and values attended to; a KV-shared
+    /// layer attends to `shared` (another layer's, with the position of its first query)
+    /// and leaves its own cache's arrays empty (its offset advances).
+    #[track_caller]
+    fn forward_kv(
+        &self,
+        x: &Array,
+        mask: AttentionMask<'_>,
+        cache: &mut KvCache,
+        shared: Option<(&(Array, Array), i32)>,
+    ) -> (Array, (Array, Array)) {
         let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
         let (q, gate) = self.query(x, [b, l]);
+        let at = shared.map_or(cache.offset, |(_, at)| at);
         // The query and key (written into the cache) normalised and rotated in one kernel.
-        let q = q.transpose(HEADS_FIRST);
-        let q = self
-            .rope
-            .norm_rope(&q, self.q_norm.as_ref(), cache.offset, None);
-        let heads = [b, l, self.kv_heads, -1];
-        let k = self.k_proj.forward(x).reshape(heads).transpose(HEADS_FIRST);
-        let v = self.v_proj.forward(x).reshape(heads).transpose(HEADS_FIRST);
-        let (k, v) = cache.update(&self.rope, self.k_norm.as_ref(), &k, &v);
-        let o = fast::scaled_dot_product_attention(&q, &k, &v, self.scale, &mask.into());
-        self.output(&o, gate, [b, l])
+        let q = self.input_scale(q.transpose(HEADS_FIRST));
+        let q = self.rope.norm_rope(&q, self.q_norm.as_ref(), at, None);
+        let (k, v) = match shared {
+            Some((kv, _)) => {
+                cache.offset += l;
+                kv.clone()
+            }
+            None => {
+                let heads = [b, l, self.kv_heads, -1];
+                let k = self
+                    .k_proj()
+                    .forward(x)
+                    .reshape(heads)
+                    .transpose(HEADS_FIRST);
+                let v = match &self.v_proj {
+                    Some(v) => v.forward(x).reshape(heads).transpose(HEADS_FIRST),
+                    None => k.clone(),
+                };
+                let v = match self.v_norm {
+                    Some(eps) => fast::rms_norm(&v, None, eps),
+                    None => v,
+                };
+                let k = self.input_scale(k);
+                cache.update(&self.rope, self.k_norm.as_ref(), &k, &v)
+            }
+        };
+        let scale = self.scale(q.dtype());
+        let o = fast::scaled_dot_product_attention(&q, &k, &v, scale, &self.options(mask));
+        (self.output(&o, gate, [b, l]), (k, v))
     }
 }
 
@@ -591,18 +758,43 @@ pub(crate) struct PagedLayer {
     /// (Gated DeltaNet layers): pools not allocated yet are created as zeros.
     pub(crate) pool_size: (i32, i32),
     pub(crate) state_slots: i32,
+    /// The block group of an attention layer (its step's slots and tables).
+    pub(crate) group: usize,
 }
 
-/// What one batched decoding step writes and reads, per sequence (`[B]`, int32): the slot
-/// of its new position, its position (for RoPE), its length after the step, its block
-/// table (`[B, max_blocks]`) and its Gated DeltaNet state slot.
+/// What one batched decoding step writes and reads, per sequence (`[B]`, int32): its
+/// position (for RoPE), its length after the step and its Gated DeltaNet state slot; per
+/// block group, the slot of its new position and its block table.
 #[derive(Debug, Clone)]
 pub(crate) struct PagedStep {
-    pub(crate) slots: Array,
     pub(crate) positions: Array,
     pub(crate) lengths: Array,
-    pub(crate) tables: Array,
     pub(crate) state_slots: Array,
+    pub(crate) groups: Vec<GroupStep>,
+    /// Each sequence's length after the step, and the positions per block, on the host.
+    pub(crate) host_lengths: Vec<usize>,
+    pub(crate) block_size: usize,
+}
+
+/// What a layer keeps in a paged cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PagedKind {
+    /// Keys and values: every position (`None`) or a window of `W` keys.
+    Keys(Option<usize>),
+    /// A Gated DeltaNet layer's states, at the sequence's slot.
+    States,
+    /// A KV-shared layer: its source layer's keys and values.
+    Shared,
+}
+
+/// A block group's part of a [`PagedStep`]: each sequence's new slot (`[B]`) and block
+/// table (`[B, max_blocks]`).
+#[derive(Debug, Clone)]
+pub(crate) struct GroupStep {
+    pub(crate) slots: Array,
+    pub(crate) tables: Array,
+    /// Each sequence's block table, on the host.
+    pub(crate) host_tables: Vec<Vec<u32>>,
 }
 
 impl PagedLayer {
@@ -649,16 +841,108 @@ impl Attention {
     /// written into their slots, then attention through the block tables.
     #[track_caller]
     fn forward_paged(&self, x: &Array, layer: &mut PagedLayer, step: &PagedStep) -> Array {
+        self.forward_paged_kv(x, layer, step, None).0
+    }
+
+    /// [`Attention::forward_paged`], also giving the pools attended to (and the group of
+    /// their tables); a KV-shared layer attends to `shared` (its source layer's).
+    #[track_caller]
+    fn forward_paged_kv(
+        &self,
+        x: &Array,
+        layer: &mut PagedLayer,
+        step: &PagedStep,
+        shared: Option<&(Array, Array, usize)>,
+    ) -> (Array, (Array, Array, usize)) {
         let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
         let (q, gate) = self.query(x, [b, l]);
-        let q = self.rotate_at(q, self.q_norm.as_ref(), &step.positions);
-        let k = self.k_proj.forward(x).reshape([b, l, self.kv_heads, -1]);
-        let k = self.rotate_at(k, self.k_norm.as_ref(), &step.positions);
-        let v = self.v_proj.forward(x);
-        let rows = [b, self.kv_heads, -1];
-        let (keys, values) = layer.write_kv(&k.reshape(rows), &v.reshape(rows), &step.slots);
-        let o = fast::paged_attention(&q, &keys, &values, &step.tables, &step.lengths, self.scale);
-        self.output(&o, gate, [b, l])
+        let q = self.rotate_at(self.input_scale(q), self.q_norm.as_ref(), &step.positions);
+        let (keys, values, group) = match shared {
+            Some(kv) => kv.clone(),
+            None => {
+                let g = &step.groups[layer.group];
+                let k = self.k_proj().forward(x).reshape([b, l, self.kv_heads, -1]);
+                // K = V: the values are the keys' projection, before its norm and rotation.
+                let v = match &self.v_proj {
+                    Some(v) => v.forward(x).reshape([b, l, self.kv_heads, -1]),
+                    None => k.clone(),
+                };
+                let v = match self.v_norm {
+                    Some(eps) => fast::rms_norm(&v, None, eps),
+                    None => v,
+                };
+                let k = self.rotate_at(self.input_scale(k), self.k_norm.as_ref(), &step.positions);
+                let rows = [b, self.kv_heads, -1];
+                let (keys, values) = layer.write_kv(&k.reshape(rows), &v.reshape(rows), &g.slots);
+                (keys, values, layer.group)
+            }
+        };
+        let scale = self.scale(q.dtype());
+        let o = fast::paged_attention(
+            &q,
+            &keys,
+            &values,
+            &step.groups[group].tables,
+            &step.lengths,
+            scale,
+            &self.options(AttentionMask::Causal),
+        );
+        let o = self.as_contiguous_decode(o, &q, (&keys, &values), step, group, scale);
+        (self.output(&o, gate, [b, l]), (keys, values, group))
+    }
+
+    /// At head size 512, one-token decode over the contiguous cache runs MLX's composition
+    /// below 1,024 keys (or without 8 query heads per key head), not the vector kernel the
+    /// paged kernel equals: row-exact ([`nuvec::with_row_exact`], a batch-invariant
+    /// `Batcher`), those rows are computed as that decode computes them, over their keys
+    /// gathered from the pools, so a sequence keeps its solo bits.
+    #[track_caller]
+    fn as_contiguous_decode(
+        &self,
+        paged: Array,
+        q: &Array,
+        (keys, values): (&Array, &Array),
+        step: &PagedStep,
+        group: usize,
+        scale: f32,
+    ) -> Array {
+        let d = q.shape().get(3).copied().unwrap_or(0);
+        let vector = |n: usize| self.heads == 8 * self.kv_heads && n >= 1024;
+        if !nuvec::row_exact()
+            || d != 512
+            || q.shape().get(2) != Some(&1)
+            || step.host_lengths.iter().all(|&n| vector(n))
+        {
+            return paged;
+        }
+        let tables = &step.groups[group].host_tables;
+        let rows: Vec<Array> = step
+            .host_lengths
+            .iter()
+            .enumerate()
+            .map(|(r, &n)| {
+                let r = r as i32;
+                if vector(n) {
+                    return paged.i(r..r + 1);
+                }
+                let blocks = &tables[r as usize][..n.div_ceil(step.block_size)];
+                let blocks = Array::from_slice(blocks, [blocks.len() as i32]);
+                let gather = |pool: &Array| {
+                    pool.take(&blocks, 0)
+                        .transpose([1, 0, 2, 3])
+                        .reshape([1, self.kv_heads, -1, d])
+                        .i((.., .., 0..n as i32, ..))
+                };
+                fast::scaled_dot_product_attention(
+                    &q.i(r..r + 1),
+                    &gather(keys),
+                    &gather(values),
+                    scale,
+                    &self.options(AttentionMask::None),
+                )
+            })
+            .collect();
+        ops::concatenate(&rows, 0)
     }
 }
 
@@ -911,6 +1195,9 @@ struct Mlp {
     gate_proj: Projection,
     up_proj: Projection,
     down_proj: Projection,
+    /// `gelu_approx(gate) · up` (Gemma) instead of SwiGLU.
+    #[tree(skip)]
+    geglu: bool,
 }
 
 impl Mlp {
@@ -920,12 +1207,17 @@ impl Mlp {
             gate_proj: b.projection(&p("gate_proj"), input, hidden, bias)?,
             up_proj: b.projection(&p("up_proj"), input, hidden, bias)?,
             down_proj: b.projection(&p("down_proj"), hidden, input, bias)?,
+            geglu: false,
         })
     }
 
     #[track_caller]
     fn forward(&self, x: &Array) -> Array {
-        let gated = swiglu(&self.gate_proj.forward(x), &self.up_proj.forward(x));
+        let (gate, up) = (self.gate_proj.forward(x), self.up_proj.forward(x));
+        let gated = match self.geglu {
+            true => nuvec_nn::geglu(&gate, &up),
+            false => swiglu(&gate, &up),
+        };
         self.down_proj.forward(&gated)
     }
 }
@@ -934,49 +1226,70 @@ impl Mlp {
 /// expert (mlx-lm's `SwitchLinear` and `QuantizedSwitchLinear`).
 #[derive(Debug, Clone, Module)]
 pub(crate) enum SwitchProjection {
-    /// Full precision: [`Array::gather_mm`].
-    Dense { weight: Param },
-    /// MLX's affine quantization: [`Array::gather_qmm`]; the packed weights are buffers.
+    /// Full precision: [`Array::gather_mm`]; a bias per expert (`[E, out]`, gpt-oss).
+    Dense { weight: Param, bias: Option<Param> },
+    /// Quantized experts: [`Array::gather_qmm`]; the packed weights are buffers.
     Quantized {
+        /// A bias per expert (`[E, out]`, gpt-oss).
+        bias: Option<Param>,
         #[tree(buffer)]
         weight: Array,
         #[tree(buffer)]
         scales: Array,
         #[tree(buffer)]
-        biases: Array,
+        biases: Option<Array>,
+        /// nvfp4: one float32 scale per expert (mlx-lm's `global_scale`).
+        #[tree(buffer)]
+        global_scale: Option<Array>,
         #[tree(skip)]
-        group_size: i32,
-        #[tree(skip)]
-        bits: i32,
+        quant: Quant,
     },
 }
 
 impl SwitchProjection {
+    /// Whether a batch of `b` items of `pairs` (token, expert) pairs each takes the
+    /// kernels each item takes alone, so every row keeps its bits: the sorted path from 64
+    /// pairs on (`SwitchGlu::forward`) and the grouped gather (quantized experts; dense
+    /// ones are not batched).
+    fn batches_like_items(&self, b: usize, pairs: usize) -> bool {
+        let Self::Quantized { weight, .. } = self else {
+            return false;
+        };
+        let experts = weight.shape().first().copied().unwrap_or(1).max(1) as usize;
+        let path = |n: usize| (n >= 64, n >= 64 && GatherQmm::groups(n, experts));
+        path(pairs) == path(b * pairs)
+    }
+
     /// `x` (`[..., 1, in]`) through expert `indices` (broadcast with `x`'s batch); rows
     /// sorted by expert if `sorted`.
     #[track_caller]
     fn forward(&self, x: &Array, indices: &Array, sorted: bool) -> Array {
-        match self {
-            Self::Dense { weight } => {
-                x.gather_mm(&weight.transpose([0, 2, 1]), None, Some(indices), sorted)
-            }
+        let (y, bias) = match self {
+            Self::Dense { weight, bias } => (
+                x.gather_mm(&weight.transpose([0, 2, 1]), None, Some(indices), sorted),
+                bias,
+            ),
             Self::Quantized {
                 weight,
                 scales,
                 biases,
-                group_size,
-                bits,
-            } => x.gather_qmm(
-                weight,
-                scales,
-                biases,
-                None,
-                Some(indices),
-                true,
-                *group_size,
-                *bits,
-                sorted,
-            ),
+                global_scale,
+                quant,
+                bias,
+            } => {
+                let mut options = GatherQmm::default().sorted_indices(sorted);
+                if let Some(g) = global_scale {
+                    options = options.global_scale(g);
+                }
+                let q =
+                    nuvec::Quantized::new(weight.clone(), scales.clone(), biases.clone(), *quant);
+                (x.gather_qmm(&q, None, Some(indices), options), bias)
+            }
+        };
+        // mlx-lm's `SwitchLinear`: each row's expert's bias (`bias[indices]`, `[.., 1, out]`).
+        match bias {
+            Some(b) => y.add(b.value().take(indices, 0).expand_dims(-2)),
+            None => y,
         }
     }
 }
@@ -987,6 +1300,8 @@ struct SwitchGlu {
     gate_proj: SwitchProjection,
     up_proj: SwitchProjection,
     down_proj: SwitchProjection,
+    #[tree(skip)]
+    activation: Activation,
 }
 
 impl SwitchGlu {
@@ -995,7 +1310,14 @@ impl SwitchGlu {
     fn through(&self, x: &Array, idx: &Array, sorted: bool) -> Array {
         let up = self.up_proj.forward(x, idx, sorted);
         let gate = self.gate_proj.forward(x, idx, sorted);
-        self.down_proj.forward(&swiglu(&gate, &up), idx, sorted)
+        let h = match self.activation {
+            Activation::SwiGluOai { alpha, limit } => {
+                nuvec_nn::swiglu_oai(&gate, &up, alpha, limit)
+            }
+            Activation::GeGlu => nuvec_nn::geglu(&gate, &up),
+            _ => swiglu(&gate, &up),
+        };
+        self.down_proj.forward(&h, idx, sorted)
     }
 
     /// `x` (`[B, L, D]`) through each token's experts `indices` (`[B, L, k]`):
@@ -1004,7 +1326,23 @@ impl SwitchGlu {
     #[track_caller]
     fn forward(&self, x: &Array, indices: &Array) -> Array {
         let [b, l, d] = x.shape_n::<3>().unwrap_or_default();
+        // Several prompts prefilled together by a batch-invariant `Batcher`: where an item
+        // alone would take other kernels (sorting and the grouped kernels depend on the
+        // number of rows), each item goes through the experts alone, so it keeps its bits
+        // (D-101, D-103).
         let k = indices.shape().get(2).copied().unwrap_or_default();
+        if b > 1
+            && l > 1
+            && nuvec::row_exact()
+            && !self
+                .gate_proj
+                .batches_like_items(b as usize, (l * k) as usize)
+        {
+            let items: Vec<Array> = (0..b)
+                .map(|i| self.forward(&x.i(i..i + 1), &indices.i(i..i + 1)))
+                .collect();
+            return ops::concatenate(&items, 0);
+        }
         if indices.size() < 64 {
             let x = x.expand_dims([-3, -2]); // [B, L, 1, 1, D]
             return self.through(&x, indices, false).squeeze(-2);
@@ -1043,14 +1381,10 @@ struct MoeMlp {
 impl MoeMlp {
     fn new(b: &Builder<'_>, path: &str, d: usize, moe: &MixtureOfExperts) -> Result<Self> {
         let p = |name: &str| format!("{path}.{name}");
-        let (e, i) = (moe.experts, moe.intermediate_size);
+        let e = moe.experts;
         Ok(Self {
             gate: b.projection(&p("gate"), d, e, false)?,
-            switch_mlp: SwitchGlu {
-                gate_proj: b.switch(&p("switch_mlp.gate_proj"), d, i, e)?,
-                up_proj: b.switch(&p("switch_mlp.up_proj"), d, i, e)?,
-                down_proj: b.switch(&p("switch_mlp.down_proj"), i, d, e)?,
-            },
+            switch_mlp: SwitchGlu::new(b, &p("switch_mlp"), d, moe)?,
             shared_expert: moe
                 .shared_intermediate_size
                 .map(|size| Mlp::new(b, &p("shared_expert"), d, size, false))
@@ -1067,26 +1401,72 @@ impl MoeMlp {
     #[track_caller]
     fn forward(&self, x: &Array) -> Array {
         let k = self.experts_per_token;
-        // The best `k` experts by router logit (as by probability: softmax is monotonic) and
-        // their weights: the probabilities, or renormalised over the chosen experts, the
-        // softmax of their logits (`p_i / Σ_top p_j` with `p = softmax(logits)`).
-        let logits = self.gate.forward(x);
-        let top = logits.argpartition(-k, -1).i((.., .., -k..));
-        // In float32, as mlx-lm's `softmax(…, precise=True)`.
-        let logits = logits.astype(DType::F32);
-        let scores = match self.norm_topk_prob {
-            true => logits.take_along_axis(&top, -1).softmax(-1),
-            false => logits.softmax(-1).take_along_axis(&top, -1),
-        };
-        // The weighted sum of the experts' outputs as one product (`[1, k] · [k, D]` per
-        // token) in float32, rounded once to the activations' type, as mlx-lm.
+        // As mlx-lm's MoE blocks (`Qwen3MoeSparseMoeBlock`, `Qwen3NextSparseMoeBlock`): the
+        // router's probabilities (a precise softmax, in the activations' type), the best `k`
+        // by probability, renormalised over them if configured, and the experts' outputs
+        // weighted and summed in the activations' type.
+        let gates = self.gate.forward(x).softmax(-1);
+        let top = gates.argpartition(-k, -1).i((.., .., -k..));
+        #[cfg(feature = "diagnostics")]
+        ROUTES.with(|r| {
+            if let Some(routes) = r.borrow_mut().as_mut() {
+                routes.push(top.clone());
+            }
+        });
+        let mut scores = gates.take_along_axis(&top, -1);
+        if self.norm_topk_prob {
+            scores = scores.divide(scores.sum_keepdims(-1));
+        }
         let experts = self.switch_mlp.forward(x, &top);
-        let y = scores.expand_dims(-2).matmul(&experts).squeeze(-2);
-        let y = y.astype(experts.dtype());
+        let y = experts.multiply(scores.expand_dims(-1)).sum(-2);
         let (Some(expert), Some(gate)) = (&self.shared_expert, &self.shared_expert_gate) else {
             return y;
         };
         y.add(gate.forward(x).sigmoid().multiply(expert.forward(x)))
+    }
+}
+
+impl SwitchGlu {
+    fn new(b: &Builder<'_>, path: &str, d: usize, moe: &MixtureOfExperts) -> Result<Self> {
+        let p = |name: &str| format!("{path}.{name}");
+        let (e, i, bias) = (moe.experts, moe.intermediate_size, moe.expert_bias);
+        Ok(Self {
+            gate_proj: b.switch(&p("gate_proj"), d, i, e, bias)?,
+            up_proj: b.switch(&p("up_proj"), d, i, e, bias)?,
+            down_proj: b.switch(&p("down_proj"), i, d, e, bias)?,
+            activation: moe.activation,
+        })
+    }
+}
+
+/// gpt-oss's mixture of experts (mlx-lm's `MLPBlock`): a biased router, the softmax of
+/// the best `k` logits (precise), biased experts with the clamped SwiGLU, and their outputs
+/// weighted and summed in the activations' dtype, as mlx-lm.
+#[derive(Debug, Clone, Module)]
+struct GptOssMlp {
+    router: Projection,
+    experts: SwitchGlu,
+    #[tree(skip)]
+    experts_per_token: i32,
+}
+
+impl GptOssMlp {
+    fn new(b: &Builder<'_>, path: &str, d: usize, moe: &MixtureOfExperts) -> Result<Self> {
+        Ok(Self {
+            router: b.projection(&format!("{path}.router"), d, moe.experts, moe.router_bias)?,
+            experts: SwitchGlu::new(b, &format!("{path}.experts"), d, moe)?,
+            experts_per_token: int(path, moe.experts_per_token)?,
+        })
+    }
+
+    #[track_caller]
+    fn forward(&self, x: &Array) -> Array {
+        let k = self.experts_per_token;
+        let logits = self.router.forward(x);
+        let top = logits.argpartition(-k, -1).i((.., .., -k..));
+        let weights = logits.take_along_axis(&top, -1).softmax(-1);
+        let y = self.experts.forward(x, &top);
+        y.multiply(weights.expand_dims(-1)).sum(-2)
     }
 }
 
@@ -1095,6 +1475,7 @@ impl MoeMlp {
 enum BlockMlp {
     Dense(Box<Mlp>),
     Moe(Box<MoeMlp>),
+    GptOss(Box<GptOssMlp>),
 }
 
 impl BlockMlp {
@@ -1103,6 +1484,7 @@ impl BlockMlp {
         match self {
             Self::Dense(m) => m.forward(x),
             Self::Moe(m) => m.forward(x),
+            Self::GptOss(m) => m.forward(x),
         }
     }
 }
@@ -1115,6 +1497,10 @@ struct Block {
     mlp: BlockMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
+    /// Gemma 4's further norms, per-layer input and experts (transparent: named as
+    /// mlx-lm's decoder layer).
+    #[tree(rename = "")]
+    gemma: Option<Box<gemma::Parts>>,
 }
 
 /// `x + r` and its normalisation, in one kernel ([`fast::add_rms_norm`]); `x` alone
@@ -1173,6 +1559,9 @@ struct Body {
     embed_tokens: TokenEmbedding,
     layers: Vec<Block>,
     norm: RmsNorm,
+    /// Gemma 4's per-layer inputs (transparent: named as mlx-lm's text model).
+    #[tree(rename = "")]
+    per_layer: Option<Box<gemma::PerLayer>>,
 }
 
 /// A causal language model of the Llama family. A [`Module`] with Hugging Face's
@@ -1188,15 +1577,21 @@ pub struct Model {
     pub config: Config,
     model: Body,
     lm_head: Option<Projection>,
+    /// The multi-token-prediction head (Qwen 3.5–3.8), when its weights are loaded.
+    mtp: Option<mtp::MtpHead>,
 }
 
 impl Model {
     /// The model's structure with placeholder parameters (no memory), to be filled by
-    /// [`Module::load_weights`] (until then, a forward pass gives a failed array). `quantized(path)` gives the group size and bits of each
-    /// quantized layer (`None` for full precision).
-    pub fn new(config: &Config, quantized: &dyn Fn(&str) -> Option<(usize, u32)>) -> Result<Self> {
+    /// [`Module::load_weights`] (until then, a forward pass gives a failed array).
+    /// `quantized(path)` gives each quantized layer's settings (`None`, or an entry without
+    /// settings, for full precision).
+    pub fn new(config: &Config, quantized: &dyn Fn(&str) -> Option<LayerQuant>) -> Result<Self> {
         let b = Builder { quantized };
         let c = config;
+        if let Some(g) = &c.gemma4 {
+            return gemma::model(&b, c, g);
+        }
         let layers = (0..c.num_hidden_layers)
             .map(|i| {
                 let path = |s: &str| format!("model.layers.{i}.{s}");
@@ -1204,11 +1599,19 @@ impl Model {
                     (LayerType::Linear, Some(sizes)) => {
                         Mixer::Linear(GatedDeltaNet::new(&b, &path("linear_attn"), c, sizes)?)
                     }
-                    _ => Mixer::Attention(Attention::new(&b, &path("self_attn"), c)?),
+                    _ => Mixer::Attention(Attention::new(
+                        &b,
+                        &path("self_attn"),
+                        c,
+                        c.layer_windows.get(i).copied().flatten(),
+                    )?),
                 };
                 Ok(Block {
                     mixer,
                     mlp: match c.moe.as_ref().filter(|m| m.is_sparse(i)) {
+                        Some(moe) if c.model_type == "gpt_oss" => BlockMlp::GptOss(Box::new(
+                            GptOssMlp::new(&b, &path("mlp"), c.hidden_size, moe)?,
+                        )),
                         Some(moe) => BlockMlp::Moe(Box::new(MoeMlp::new(
                             &b,
                             &path("mlp"),
@@ -1225,6 +1628,7 @@ impl Model {
                     },
                     input_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps),
                     post_attention_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps),
+                    gemma: None,
                 })
             })
             .collect::<Result<_>>()?;
@@ -1235,10 +1639,12 @@ impl Model {
                 embed_tokens: b.embedding("model.embed_tokens", c.vocab_size, c.hidden_size)?,
                 layers,
                 norm: Builder::norm(c.hidden_size, c.rms_norm_eps),
+                per_layer: None,
             },
             lm_head: (!c.tie_word_embeddings)
                 .then(|| b.projection("lm_head", c.hidden_size, c.vocab_size, false))
                 .transpose()?,
+            mtp: None,
         })
     }
 
@@ -1253,9 +1659,31 @@ impl Model {
         self.forward(&token, &mut self.new_cache()).eval()
     }
 
+    /// Per layer, what a paged cache keeps.
+    pub(crate) fn paged_layers(&self) -> Vec<PagedKind> {
+        self.model
+            .layers
+            .iter()
+            .map(|b| match &b.mixer {
+                Mixer::Attention(a) if a.k_proj.is_some() => {
+                    PagedKind::Keys(a.window.map(|w| usize::try_from(w).unwrap_or(0)))
+                }
+                Mixer::Attention(_) => PagedKind::Shared,
+                Mixer::Linear(_) => PagedKind::States,
+            })
+            .collect()
+    }
+
     /// An empty cache per layer.
     pub fn new_cache(&self) -> Vec<KvCache> {
-        vec![KvCache::default(); self.model.layers.len()]
+        self.model
+            .layers
+            .iter()
+            .map(|b| match &b.mixer {
+                Mixer::Attention(a) => a.window.map_or_else(KvCache::default, KvCache::windowed),
+                Mixer::Linear(_) => KvCache::default(),
+            })
+            .collect()
     }
 
     /// The logits `[B, L, vocab]` for tokens `[B, L]` (integers) following the cached
@@ -1269,6 +1697,28 @@ impl Model {
         if cache.len() != self.model.layers.len() {
             return mismatched_layers(cache.len(), self.model.layers.len());
         }
+        if self.config.gemma4.is_some() {
+            return gemma::forward(self, tokens, cache);
+        }
+        self.forward_hidden(tokens, cache).0
+    }
+
+    /// [`Model::forward`], also giving the final hidden states `[B, L, hidden_size]` (after
+    /// the final norm: what the output head reads, and what the MTP head takes). Not for
+    /// Gemma 4 (a failed array).
+    #[track_caller]
+    pub fn forward_hidden(&self, tokens: &Array, cache: &mut [KvCache]) -> (Array, Array) {
+        if cache.len() != self.model.layers.len() {
+            let e = mismatched_layers(cache.len(), self.model.layers.len());
+            return (e.clone(), e);
+        }
+        if self.config.gemma4.is_some() {
+            let e = Array::failure(
+                "forward_hidden",
+                OpErrorKind::InvalidArgument("not available for Gemma 4".into()),
+            );
+            return (e.clone(), e);
+        }
         let mut h = self.model.embed_tokens.forward(tokens);
         // Causal (aligned to the last positions) for several tokens; one token sees all.
         let mask = match tokens.shape().get(1) {
@@ -1281,7 +1731,14 @@ impl Model {
             (h, pending) = (next, Some(mlp));
         }
         let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
-        self.head(&h)
+        (self.head(&h), h)
+    }
+
+    /// The logits of final hidden states `[..., hidden_size]` ([`Model::forward_hidden`],
+    /// [`Model::mtp_forward`]): the output head alone.
+    #[track_caller]
+    pub fn logits(&self, hidden: &Array) -> Array {
+        self.head(hidden)
     }
 
     /// The output head on the final hidden states.
@@ -1344,6 +1801,9 @@ impl Model {
         layers: &mut [PagedLayer],
         step: &PagedStep,
     ) -> Array {
+        if self.config.gemma4.is_some() {
+            return gemma::forward_paged(self, tokens, layers, step);
+        }
         let mut h = self.model.embed_tokens.forward(tokens);
         let mut pending = None;
         for (layer, pages) in self.model.layers.iter().zip(layers) {
@@ -1454,4 +1914,21 @@ pub(crate) mod tests {
         cache.rollback(reservation);
         assert_eq!(cache.free_blocks(), 7);
     }
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The experts each mixture-of-experts layer chose, while [`record_routes`] runs.
+    static ROUTES: std::cell::RefCell<Option<Vec<Array>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f`, recording on this thread the experts every mixture-of-experts layer chose
+/// (`[B, L, k]` indices per layer call, in order), for routing studies
+/// (`examples/route_overlap.rs`). Only with the `diagnostics` feature.
+#[cfg(feature = "diagnostics")]
+pub fn record_routes<R>(f: impl FnOnce() -> R) -> (R, Vec<Array>) {
+    ROUTES.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    let out = f();
+    let routes = ROUTES.with(|r| r.borrow_mut().take()).unwrap_or_default();
+    (out, routes)
 }

@@ -83,6 +83,13 @@ pub enum BinaryOp {
     Minimum,
     /// `log(exp(a) + exp(b))`, computed stably (MLX's `logaddexp`); NaN propagates.
     LogAddExp,
+    /// `floor(a / b)` (MLX's `floor_divide`): for floats the floor of the rounded quotient,
+    /// for integers the quotient rounded toward negative infinity (0 for a zero divisor,
+    /// which MLX leaves undefined).
+    FloorDivide,
+    /// `a` to the power `b` (MLX's `power`): `pow` for floats, repeated squaring for
+    /// integers (0 for a negative exponent, which MLX leaves undefined).
+    Power,
     /// `a == b`.
     Equal,
     /// `a != b`.
@@ -120,6 +127,8 @@ impl BinaryOp {
             Self::Maximum => "maximum",
             Self::Minimum => "minimum",
             Self::LogAddExp => "logaddexp",
+            Self::FloorDivide => "floor_divide",
+            Self::Power => "power",
             Self::Equal => "equal",
             Self::NotEqual => "not_equal",
             Self::Less => "less",
@@ -232,6 +241,13 @@ pub enum Primitive {
     AsType(DType),
     /// The same elements in another shape. A view when the layout permits, else a copy.
     Reshape(Vec<usize>),
+    /// The input without its size-1 dimensions at `axes` (sorted, unique). A view. Unlike
+    /// `Reshape`, the output shape follows the input's (MLX's `Squeeze`, which shapeless
+    /// `compile` replays on any shape).
+    Squeeze(Vec<usize>),
+    /// The input with size-1 dimensions inserted at the output's `axes` (sorted, unique). A
+    /// view (MLX's `ExpandDims`).
+    ExpandDims(Vec<usize>),
     /// Axes reordered: output axis `i` is input axis `axes[i]`. A view.
     Transpose(Vec<usize>),
     /// A normalised slice per dimension. A view.
@@ -247,6 +263,22 @@ pub enum Primitive {
     Broadcast(Vec<usize>),
     /// The input unchanged, but no gradient flows through it. A view.
     StopGradient,
+    /// The input's bytes reinterpreted as `dtype` (MLX's `view`): the same shape when the
+    /// element sizes agree, else the last dimension scaled by their ratio. A view of a
+    /// row-contiguous input (or of equal element sizes); otherwise a copy, reinterpreted.
+    View(DType),
+    /// Floats as E4M3 bytes (uint8), rounding to nearest even and saturating at ±448 (MLX's
+    /// `to_fp8`).
+    ToFp8,
+    /// E4M3 bytes (uint8) as `dtype` floats (MLX's `from_fp8`).
+    FromFp8(DType),
+    /// Sorted `uint32` indices `[..., M]` to int32 `[..., groups]`: where each group's rows
+    /// start along the last axis (the lower bound of `g`; MLX's `gather_mm_offsets`), which
+    /// the grouped gather kernels walk.
+    SortedOffsets {
+        /// The number of groups (weight batches).
+        groups: usize,
+    },
     /// `(base, update)`: a copy of `base` whose region selected as by `Slice` is replaced by
     /// `update` (of shape `len`).
     SliceUpdate {
@@ -326,28 +358,27 @@ pub enum Primitive {
         /// `f32::to_bits` of beta.
         beta: u32,
     },
-    /// Affine quantization of the last axis in groups (MLX's `quantize`). Outputs the packed
-    /// codes (uint32, `bits` per value), the scales and the biases (the input's dtype).
+    /// Quantization of the last axis in groups (MLX's `quantize`). Outputs the packed codes
+    /// (uint32, `bits` per value) and the scales: for affine, scales and biases in the
+    /// input's dtype; for the floating-point modes, uint8 scale codes.
     Quantize {
-        /// Values per scale and bias: 32, 64 or 128.
-        group_size: usize,
-        /// Bits per value: 1–6 or 8.
-        bits: u8,
+        /// The mode, group size and bits.
+        quant: crate::Quant,
     },
-    /// `(w, scales, biases)`: `code · scale + bias` per value, in the scales' dtype.
+    /// `(w, scales[, biases])`: the packed values restored in `dtype` (affine: `code · scale +
+    /// bias` in the scales' dtype, which `dtype` equals; the floating-point modes have no
+    /// biases).
     Dequantize {
-        /// Values per scale and bias.
-        group_size: usize,
-        /// Bits per value.
-        bits: u8,
+        /// The mode, group size and bits.
+        quant: crate::Quant,
+        /// The output dtype.
+        dtype: DType,
     },
-    /// `(x, w, scales, biases)`: `x · dequantize(w)ᵀ` (`transpose`) or `x · dequantize(w)`.
-    /// `w` is two-dimensional, or has `x`'s batch dimensions.
+    /// `(x, w, scales[, biases])`: `x · dequantize(w)ᵀ` (`transpose`) or `x · dequantize(w)`.
+    /// `w` is two-dimensional, or has `x`'s batch dimensions. Biases exist for affine only.
     QuantizedMatmul {
-        /// Values per scale and bias.
-        group_size: usize,
-        /// Bits per value.
-        bits: u8,
+        /// The mode, group size and bits.
+        quant: crate::Quant,
         /// Whether the dequantized matrix is used transposed (MLX's default).
         transpose: bool,
     },
@@ -381,6 +412,13 @@ pub enum Primitive {
         /// The number of dependencies after `x`.
         n_deps: usize,
     },
+    /// A collective over a distributed group (by id; [`crate::distributed`]).
+    Collective {
+        /// The operation and its parameters.
+        op: crate::distributed::CollectiveOp,
+        /// The group's id.
+        group: usize,
+    },
     /// Test-only two-output primitive: `(a + b, a * b)`.
     #[cfg(test)]
     AddMultiply,
@@ -412,10 +450,16 @@ impl Primitive {
             Self::Select => "where",
             Self::AsType(_) => "astype",
             Self::Reshape(_) => "reshape",
+            Self::Squeeze(_) => "squeeze",
+            Self::ExpandDims(_) => "expand_dims",
             Self::Transpose(_) => "transpose",
             Self::Slice { .. } => "slice",
             Self::Broadcast(_) => "broadcast_to",
             Self::StopGradient => "stop_gradient",
+            Self::View(_) => "view",
+            Self::ToFp8 => "to_fp8",
+            Self::SortedOffsets { .. } => "sorted_offsets",
+            Self::FromFp8(_) => "from_fp8",
             Self::SliceUpdate { .. } => "slice_update",
             Self::Reduce { op, .. } => op.name(),
             Self::ArgReduce { op, .. } => op.name(),
@@ -441,8 +485,105 @@ impl Primitive {
             Self::MetalKernel(_) => "metal_kernel",
             Self::Copy => "copy",
             Self::Depends { .. } => "depends",
+            Self::Collective { op, .. } => op.name(),
             #[cfg(test)]
             Self::AddMultiply => "add_multiply",
+        }
+    }
+
+    /// Whether the parameters hold sizes taken from the traced shapes, so a replay on other
+    /// shapes would be wrong (MLX's primitives without `output_shapes`): shapeless `compile`
+    /// rejects these. `Broadcast` is listed; shapeless `compile` re-derives its shape from
+    /// the operands it was broadcast against. `Attention` keeps kernel choices made for the
+    /// traced lengths.
+    pub fn fixes_shape(&self) -> bool {
+        use crate::fast::imp::FastOp;
+        match self {
+            Self::Reshape(_)
+            | Self::Slice { .. }
+            | Self::SliceUpdate { .. }
+            | Self::Broadcast(_)
+            | Self::RandomBits { .. }
+            | Self::MetalKernel(_)
+            | Self::Fast(FastOp::Attention { .. } | FastOp::CausalSoftmax { .. })
+            | Self::Collective {
+                op: crate::distributed::CollectiveOp::Recv { .. },
+                ..
+            } => true,
+            Self::Unary(_)
+            | Self::Binary(_)
+            | Self::Select
+            | Self::AsType(_)
+            | Self::Transpose(_)
+            | Self::Squeeze(_)
+            | Self::ExpandDims(_)
+            | Self::StopGradient
+            | Self::View(_)
+            | Self::ToFp8
+            | Self::FromFp8(_)
+            | Self::SortedOffsets { .. }
+            | Self::Reduce { .. }
+            | Self::ArgReduce { .. }
+            | Self::GatherAxis { .. }
+            | Self::ScatterAxis { .. }
+            | Self::Sort { .. }
+            | Self::ArgSort { .. }
+            | Self::Scan { .. }
+            | Self::Concatenate { .. }
+            | Self::Matmul
+            | Self::AddMM { .. }
+            | Self::Quantize { .. }
+            | Self::Dequantize { .. }
+            | Self::QuantizedMatmul { .. }
+            | Self::Fast(_)
+            | Self::Compiled(_)
+            | Self::Custom(_)
+            | Self::Copy
+            | Self::Collective { .. }
+            | Self::Depends { .. } => false,
+            #[cfg(test)]
+            Self::AddMultiply => false,
+        }
+    }
+
+    /// The output shape of a `Squeeze` or `ExpandDims` of an input of shape `dims`.
+    pub(crate) fn unit_axes_shape(&self, dims: &[usize]) -> Result<Vec<usize>> {
+        let sorted = |axes: &[usize], n: usize| {
+            axes.windows(2).all(|w| w[0] < w[1]) && axes.last().is_none_or(|&a| a < n)
+        };
+        match self {
+            Self::Squeeze(axes) => {
+                if !sorted(axes, dims.len()) || axes.iter().any(|&a| dims[a] != 1) {
+                    return Err(Error::InvalidArgument(format!(
+                        "squeeze: cannot remove axes {axes:?} of shape {dims:?}"
+                    )));
+                }
+                Ok(dims
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !axes.contains(i))
+                    .map(|(_, &d)| d)
+                    .collect())
+            }
+            Self::ExpandDims(axes) => {
+                let n = dims.len() + axes.len();
+                if !sorted(axes, n) {
+                    return Err(Error::InvalidArgument(format!(
+                        "expand_dims: invalid axes {axes:?} for {n} dimensions"
+                    )));
+                }
+                let mut rest = dims.iter();
+                Ok((0..n)
+                    .map(|i| {
+                        if axes.contains(&i) {
+                            1
+                        } else {
+                            *rest.next().expect("n")
+                        }
+                    })
+                    .collect())
+            }
+            _ => unreachable!("not a unit-axes view"),
         }
     }
 
@@ -477,6 +618,9 @@ impl Primitive {
                 let category = a.dtype().category();
                 let unsupported = match op {
                     BinaryOp::LogAddExp => category != Category::Float,
+                    BinaryOp::FloorDivide | BinaryOp::Power => {
+                        matches!(category, Category::Bool | Category::Complex)
+                    }
                     BinaryOp::Divide => !matches!(category, Category::Float | Category::Complex),
                     BinaryOp::Maximum
                     | BinaryOp::Minimum
@@ -511,6 +655,38 @@ impl Primitive {
             Self::AsType(dtype) => {
                 let [a] = self.arity::<1>(inputs)?;
                 computed(*dtype, a.dims())
+            }
+            Self::Collective { op, group } => {
+                use crate::distributed::CollectiveOp;
+                match op {
+                    CollectiveOp::Recv { shape, dtype, .. } => {
+                        self.arity::<0>(inputs)?;
+                        computed(*dtype, shape)
+                    }
+                    CollectiveOp::Gather => {
+                        let [a] = self.arity::<1>(inputs)?;
+                        let n = crate::distributed::group_size(*group)?;
+                        let mut shape = a.dims().to_vec();
+                        match shape.first_mut() {
+                            Some(d) => *d *= n,
+                            None => shape.push(n),
+                        }
+                        computed(a.dtype(), &shape)
+                    }
+                    CollectiveOp::Reduce(_) | CollectiveOp::Send { .. } => {
+                        let [a] = self.arity::<1>(inputs)?;
+                        computed(a.dtype(), a.dims())
+                    }
+                }
+            }
+            Self::Squeeze(_) | Self::ExpandDims(_) => {
+                let [a] = self.arity::<1>(inputs)?;
+                let shape = self.unit_axes_shape(a.dims())?;
+                OutputSpec {
+                    dtype: a.dtype(),
+                    strides: view::nocopy_reshape(a.dims(), a.strides(), &shape),
+                    shape: shape.as_slice().into(),
+                }
             }
             Self::Reshape(shape) => {
                 let [a] = self.arity::<1>(inputs)?;
@@ -585,6 +761,77 @@ impl Primitive {
                     dtype: a.dtype(),
                     shape: a.dims().into(),
                     strides: Some(a.strides().into()),
+                }
+            }
+            Self::SortedOffsets { groups } => {
+                let [a] = self.arity::<1>(inputs)?;
+                if a.dtype() != DType::U32 || a.ndim() == 0 {
+                    return Err(Error::InvalidArgument(format!(
+                        "sorted_offsets: indices must be uint32 with at least one axis, got {} {:?}",
+                        a.dtype(),
+                        a.dims()
+                    )));
+                }
+                let mut shape = a.dims()[..a.ndim() - 1].to_vec();
+                shape.push(*groups);
+                computed(DType::I32, &shape)
+            }
+            Self::ToFp8 => {
+                let [a] = self.arity::<1>(inputs)?;
+                if a.dtype().category() != Category::Float {
+                    return Err(Error::unsupported_dtype("to_fp8", a.dtype()));
+                }
+                computed(DType::U8, a.dims())
+            }
+            Self::FromFp8(dtype) => {
+                let [a] = self.arity::<1>(inputs)?;
+                if a.dtype() != DType::U8 {
+                    return Err(Error::InvalidArgument(format!(
+                        "from_fp8: E4M3 bytes must be uint8, got {}",
+                        a.dtype()
+                    )));
+                }
+                if dtype.category() != Category::Float {
+                    return Err(Error::unsupported_dtype("from_fp8", *dtype));
+                }
+                computed(*dtype, a.dims())
+            }
+            Self::View(dtype) => {
+                let [a] = self.arity::<1>(inputs)?;
+                let (from, to) = (a.dtype().size(), dtype.size());
+                if from == to {
+                    OutputSpec {
+                        dtype: *dtype,
+                        shape: a.dims().into(),
+                        strides: Some(a.strides().into()),
+                    }
+                } else {
+                    let n = a.ndim();
+                    let last = a.dims().last().copied();
+                    let scaled = match last {
+                        Some(d) if (d * from) % to == 0 => d * from / to,
+                        _ => {
+                            return Err(Error::InvalidArgument(match last {
+                                None => format!(
+                                    "view: a scalar of {} cannot be viewed as {dtype} (another size)",
+                                    a.dtype()
+                                ),
+                                Some(d) => format!(
+                                    "view: the last dimension ({d}) times {from} bytes does not                                      divide into {dtype} values of {to} bytes"
+                                ),
+                            }));
+                        }
+                    };
+                    let mut shape: Shape = a.dims().into();
+                    shape[n - 1] = scaled;
+                    // A row-contiguous input stays shared (when its offset divides); others
+                    // are copied first, row-contiguous as well.
+                    let row = crate::shape::flags_for(a.dims(), a.strides()).row_contiguous;
+                    OutputSpec {
+                        dtype: *dtype,
+                        strides: row.then(|| crate::shape::row_contiguous_strides(&shape)),
+                        shape,
+                    }
                 }
             }
             Self::SliceUpdate { len, .. } => {
@@ -824,9 +1071,9 @@ impl Primitive {
                     .map(|d| computed(d, shape))
                     .collect());
             }
-            Self::Quantize { group_size, bits } => {
+            Self::Quantize { quant } => {
                 let [w] = self.arity::<1>(inputs)?;
-                crate::quantized::check_params(self.name(), *group_size, u32::from(*bits))?;
+                let (group_size, bits) = quant.checked(self.name())?;
                 let n = w.ndim();
                 if !matches!(w.dtype(), DType::F16 | DType::BF16 | DType::F32) {
                     return Err(Error::unsupported_dtype("quantize", w.dtype()));
@@ -844,26 +1091,34 @@ impl Primitive {
                     s[n - 1] = d;
                     s
                 };
-                let packed = computed(DType::U32, &with_last(last * usize::from(*bits) / 32));
+                let packed = computed(DType::U32, &with_last(last * bits / 32));
+                if quant.mode != crate::QuantMode::Affine {
+                    return Ok(smallvec![
+                        packed,
+                        computed(DType::U8, &with_last(last / group_size))
+                    ]);
+                }
                 let groups = computed(w.dtype(), &with_last(last / group_size));
                 return Ok(smallvec![packed, groups.clone(), groups]);
             }
-            Self::Dequantize { group_size, bits } => {
-                let [w, scales, _] = self.arity::<3>(inputs)?;
-                crate::quantized::check_params(self.name(), *group_size, u32::from(*bits))?;
+            Self::Dequantize { quant, dtype } => {
+                let affine = quant.mode == crate::QuantMode::Affine;
+                let w = self.quantized_arity(inputs, 2 + usize::from(affine))?;
                 let mut shape: Shape = w.dims().into();
                 let n = shape.len();
-                shape[n - 1] = self.quantized_columns(w, &inputs[1..], *group_size, *bits)?;
-                computed(scales.dtype(), &shape)
+                shape[n - 1] = self.quantized_columns(w, &inputs[1..], *quant)?;
+                if (affine && *dtype != inputs[1].dtype())
+                    || !matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
+                {
+                    return Err(Error::unsupported_dtype("dequantize", *dtype));
+                }
+                computed(*dtype, &shape)
             }
-            Self::QuantizedMatmul {
-                group_size,
-                bits,
-                transpose,
-            } => {
-                let [x, w, scales, _] = self.arity::<4>(inputs)?;
-                crate::quantized::check_params(self.name(), *group_size, u32::from(*bits))?;
-                let columns = self.quantized_columns(w, &inputs[2..], *group_size, *bits)?;
+            Self::QuantizedMatmul { quant, transpose } => {
+                let affine = quant.mode == crate::QuantMode::Affine;
+                let x = self.quantized_arity(inputs, 3 + usize::from(affine))?;
+                let (w, scales) = (&inputs[1], &inputs[2]);
+                let columns = self.quantized_columns(w, &inputs[2..], *quant)?;
                 let rows = w.dims()[w.ndim() - 2];
                 let (inner, outer) = if *transpose {
                     (columns, rows)
@@ -879,12 +1134,15 @@ impl Primitive {
                         w.dims(),
                     ));
                 }
-                if x.dtype() != scales.dtype() {
+                if affine && x.dtype() != scales.dtype() {
                     return Err(Error::dtype_mismatch(
                         "quantized_matmul",
                         x.dtype(),
                         scales.dtype(),
                     ));
+                }
+                if !matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32) {
+                    return Err(Error::unsupported_dtype("quantized_matmul", x.dtype()));
                 }
                 let mut shape: Shape = x.dims().into();
                 shape[xn - 1] = outer;
@@ -945,33 +1203,55 @@ impl Primitive {
         }
     }
 
+    /// The first input of a quantized primitive with `arity` inputs (affine has one more:
+    /// the biases).
+    fn quantized_arity<'a>(&self, inputs: &'a [Array], arity: usize) -> Result<&'a Array> {
+        if inputs.len() != arity {
+            return Err(Error::InvalidArgument(format!(
+                "{}: {arity} inputs expected, got {}",
+                self.name(),
+                inputs.len()
+            )));
+        }
+        Ok(&inputs[0])
+    }
+
     /// The number of values per row of packed codes `w` (uint32, at least 2-D), after
-    /// validating it against `[scales, biases]` (one float dtype, equal shapes, one value per
-    /// group), as MLX's `validate_quantized_input`.
-    fn quantized_columns(
+    /// validating it against `[scales[, biases]]` (affine: one float dtype, equal shapes;
+    /// floating-point modes: uint8 scales), one value per group, as MLX's
+    /// `validate_quantized_input`.
+    pub(crate) fn quantized_columns(
         &self,
         w: &Array,
         groups: &[Array],
-        group_size: usize,
-        bits: u8,
+        quant: crate::Quant,
     ) -> Result<usize> {
-        let (scales, biases) = (&groups[0], &groups[1]);
+        let (group_size, bits) = quant.checked(self.name())?;
+        let scales = &groups[0];
         let n = w.ndim();
         let invalid =
             |what: String| Err(Error::InvalidArgument(format!("{}: {what}", self.name())));
         if w.dtype() != DType::U32 {
             return invalid(format!("packed weights must be uint32, got {}", w.dtype()));
         }
-        if !matches!(scales.dtype(), DType::F16 | DType::BF16 | DType::F32)
-            || biases.dtype() != scales.dtype()
-            || biases.dims() != scales.dims()
-        {
+        if quant.mode == crate::QuantMode::Affine {
+            let biases = &groups[1];
+            if !matches!(scales.dtype(), DType::F16 | DType::BF16 | DType::F32)
+                || biases.dtype() != scales.dtype()
+                || biases.dims() != scales.dims()
+            {
+                return invalid(format!(
+                    "scales and biases must share a float dtype and shape, got {} {:?} and {} {:?}",
+                    scales.dtype(),
+                    scales.dims(),
+                    biases.dtype(),
+                    biases.dims()
+                ));
+            }
+        } else if scales.dtype() != DType::U8 {
             return invalid(format!(
-                "scales and biases must share a float dtype and shape, got {} {:?} and {} {:?}",
-                scales.dtype(),
-                scales.dims(),
-                biases.dtype(),
-                biases.dims()
+                "scale type must be uint8 but received type {}",
+                scales.dtype()
             ));
         }
         let packed = w.dims().last().copied().unwrap_or(0) * 32;
@@ -979,7 +1259,7 @@ impl Primitive {
         if n < 2
             || scales.ndim() != n
             || w.dims()[..n - 1] != scales.dims()[..n - 1]
-            || packed != groups * usize::from(bits)
+            || packed != groups * bits
         {
             return invalid(format!(
                 "packed weights {:?} and scales {:?} do not match group size {group_size} \

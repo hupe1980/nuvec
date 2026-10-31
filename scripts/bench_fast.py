@@ -10,7 +10,7 @@ method (operations submitted back to back with `async_eval` after a warm-up, bes
 bursts, one or eight operations per `async_eval`), alternating the two programs twice,
 then prints microseconds per operation, the nuvec/MLX time ratio and its geometric mean.
 
-Usage: `just bench-fast [filter]` (cases whose name contains `filter`).
+Usage: `just bench-fast [filter]` (cases whose name contains `filter`; `a|b` for either).
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # (name, shape), as in crates/nuvec-core/benches/fast.rs
 CASES = [
     ("rms_norm-decode", (1, 4096)),
+    ("rms_norm-e4b", (1, 2560)),
     ("rms_norm-prefill", (2048, 4096)),
     ("layer_norm-prefill", (2048, 4096)),
     ("rope-decode", (1, 32, 1, 128)),
@@ -44,21 +45,56 @@ CASES = [
     ("sdpa-prefill64", (1, 16, 16, 2048, 2048, 64)),
     ("sdpa-chunk2048", (1, 16, 8, 2048, 2048, 128)),
     ("sdpa-chunk1793", (1, 16, 8, 1793, 3841, 128)),
+    ("sdpa-chunk-q36-32k", (1, 16, 2, 2048, 32768, 256)),
     ("sdpa-verify2-1k", (1, 32, 8, 2, 1025, 128)),
     ("sdpa-verify4-4k", (1, 32, 8, 4, 4096, 128)),
     ("sdpa-verify8-4k", (1, 32, 8, 8, 4096, 128)),
     ("sdpa-verify4-q36", (1, 16, 2, 4, 8194, 256)),
     ("sdpa-verify8-q36", (1, 16, 2, 8, 32768, 256)),
+    # Sliding windows (`-w<keys>`): gpt-oss (D 64, W 128) and Gemma 4 sliding layers
+    # (D 256, W 1024), MLX with the equivalent boolean mask (as mlx-lm builds it).
+    ("sdpa-wdecode-w128", (1, 64, 8, 1, 4096, 64)),
+    ("sdpa-wprefill64-w128", (1, 64, 8, 2048, 2175, 64)),
+    ("sdpa-wdecode256-w1024", (1, 16, 8, 1, 8192, 256)),
+    ("sdpa-wprefill256-w1024", (1, 16, 8, 2048, 3071, 256)),
+    # Decode over exactly the window's keys: MLX without a mask, as mlx-lm's rotating cache
+    # calls it (the SC-002 baseline); nuvec with its window option.
+    ("sdpa-wsdecode-w128", (1, 64, 8, 1, 128, 64)),
+    ("sdpa-wsdecode256-w1024", (1, 16, 8, 1, 1024, 256)),
+    # The same without a window (plain causal decode at head size 256).
+    ("sdpa-decode256-1k", (1, 16, 8, 1, 1024, 256)),
+    # Gemma 4 global layers (D 512): decode, and MLX's blocked causal prefill.
+    ("sdpa-d512-decode4k", (1, 32, 4, 1, 4096, 512)),
+    ("sdpa-d512-decode32k", (1, 32, 4, 1, 32768, 512)),
+    ("sdpa-d512-prefill", (1, 16, 2, 2048, 2048, 512)),
+    # Gemma 4 E4B's decode: sliding layers (D 256, 512 keys) and global layers (D 512 with
+    # 4 query heads per key head: the composition in both engines).
+    ("sdpa-e4b-d256-512", (1, 8, 2, 1, 512, 256)),
+    ("sdpa-e4b-d512-1k", (1, 8, 2, 1, 1024, 512)),
+    ("sdpa-e4b-d512-4k", (1, 8, 2, 1, 4096, 512)),
 ]
+# The boolean window masks, built once per shape (mlx-lm's `create_causal_mask`).
+WINDOWS: dict[tuple[int, int, int], mx.array] = {}
+
+
+def window_mask(lq: int, lk: int, window: int) -> mx.array:
+    pos = mx.arange(lk - lq, lk)[:, None]
+    keys = mx.arange(lk)[None]
+    return (pos >= keys) & (pos < keys + window)
+
+
 DTYPES = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 FILTER = sys.argv[1] if len(sys.argv) > 1 else ""
-CASES = [c for c in CASES if FILTER in c[0]]
+CASES = [c for c in CASES if any(f in c[0] for f in FILTER.split("|"))]
 
 
 def op(name: str, x: mx.array, w: mx.array, targets: mx.array) -> mx.array:
     kind = name.split("-")[0]
     if kind == "sdpa":
         mask = "causal" if x.shape[2] > 1 else None
+        if "-w" in name and not name.startswith("sdpa-ws"):
+            window = int(name.rsplit("-w", 1)[1])
+            mask = WINDOWS[(x.shape[2], w.shape[2], window)]
         return mx.fast.scaled_dot_product_attention(x, w, w, scale=0.088, mask=mask)
     if kind == "rms_norm":
         return mx.fast.rms_norm(x, w, 1e-5)
@@ -83,6 +119,10 @@ def mlx_results() -> dict[tuple[str, str], tuple[float, float]]:
                 x = mx.random.uniform(-1, 1, (b, hq, lq, d)).astype(dtype)
                 w = mx.random.uniform(-1, 1, (b, hkv, lk, d)).astype(dtype)
                 shape = (b * hq * lq, d)
+                if "-w" in name and not name.startswith("sdpa-ws"):
+                    window = int(name.rsplit("-w", 1)[1])
+                    WINDOWS[(lq, lk, window)] = window_mask(lq, lk, window)
+                    mx.eval(WINDOWS[(lq, lk, window)])
             else:
                 x = mx.random.uniform(-1, 1, shape).astype(dtype)
                 w = mx.random.uniform(-1, 1, shape[-1:]).astype(dtype)

@@ -19,6 +19,11 @@ const SHAPES: &[(&str, usize, usize, usize, usize, bool)] = &[
     ("tallk", 1, 256, 8192, 256, false),
     ("wide", 1, 4096, 512, 4096, false),
     ("batch8", 8, 512, 512, 512, false),
+    // Prefill projections (Qwen3-8B, 2,048 and 8,192 tokens): the NAX report's shapes.
+    ("pf2048-qkv", 1, 2048, 4096, 4096, true),
+    ("pf2048-up", 1, 2048, 12288, 4096, true),
+    ("pf2048-down", 1, 2048, 4096, 12288, true),
+    ("pf8192-qkv", 1, 8192, 4096, 4096, true),
     ("mnist", 1, 256, 784, 32, true),
     ("vec4096", 1, 1, 4096, 4096, true),
     ("vecup", 1, 1, 4096, 11008, true),
