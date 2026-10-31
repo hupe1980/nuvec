@@ -195,6 +195,8 @@ All notable changes to nuvec are documented here. The format follows
   float32.
 - Kernels compiled at runtime (`NUVEC_METALLIB=off`) used Metal's fast math functions; they
   now use the precise ones, as the precompiled library.
+- A compiled function with literal constants (`x * 0.5`, as in GELU) failed when its fused
+  kernel ran on the CPU, or was differentiated or vmapped.
 
 ## [0.4.1] - 2026-10-24
 

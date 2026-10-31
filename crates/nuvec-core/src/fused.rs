@@ -186,15 +186,20 @@ impl Fused {
     /// The same computation recorded as ordinary operations.
     pub(crate) fn expand(&self, inputs: &[Array]) -> Result<Vec<Array>> {
         let mut results: Vec<Array> = Vec::with_capacity(self.0.steps.len());
+        let shape = inputs.first().map_or(&[][..], Array::dims);
         for (primitive, args) in &self.0.steps {
             let args = args
                 .iter()
                 .map(|r| match *r {
-                    FusedRef::Input(i) => inputs[i].clone(),
-                    FusedRef::Step(j) => results[j].clone(),
-                    FusedRef::Constant(c) => constant_array(self.0.constants[c]),
+                    FusedRef::Input(i) => Ok(inputs[i].clone()),
+                    FusedRef::Step(j) => Ok(results[j].clone()),
+                    // The steps take operands of one shape, the inputs' (the kernel writes
+                    // the constant as a literal).
+                    FusedRef::Constant(c) => {
+                        crate::ops::imp::broadcast_to(&constant_array(self.0.constants[c]), shape)
+                    }
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             results.push(Array::from_op(primitive.clone(), args)?.swap_remove(0));
         }
         Ok(self.0.outputs.iter().map(|&o| results[o].clone()).collect())
@@ -507,6 +512,35 @@ mod tests {
         let out = Array::from_op(Primitive::Compiled(fused.clone()), vec![xt, y.clone()]).unwrap();
         assert_eq!(out.len(), 2);
         assert_close(&values(&out), &values(&fused.expand(&[x, y]).unwrap()));
+    }
+
+    #[test]
+    fn expands_its_constants_to_the_inputs_shape() {
+        crate::set_default_stream(crate::Stream::default_for(crate::Device::cpu()));
+        // x * 0.5 + x
+        let fused = Fused::with_constants(
+            &[DType::BF16],
+            &[(DType::BF16, u64::from(crate::bf16::from_f32(0.5).to_bits()))],
+            vec![
+                (
+                    Primitive::Binary(BinaryOp::Multiply),
+                    vec![FusedRef::Input(0), FusedRef::Constant(0)],
+                ),
+                (
+                    Primitive::Binary(BinaryOp::Add),
+                    vec![FusedRef::Step(0), FusedRef::Input(0)],
+                ),
+            ],
+            &[1],
+        )
+        .unwrap();
+        let x = Array::from_slice(&[2.0f32, -4.0, 1.0, 6.0], [2, 2]).astype(DType::BF16);
+        let f = |xs: &[Array]| Array::from_op(Primitive::Compiled(fused.clone()), xs.to_vec());
+        let out = f(std::slice::from_ref(&x)).unwrap()[0].astype(DType::F32);
+        assert_eq!(out.to_vec::<f32>().unwrap(), [3.0, -6.0, 1.5, 9.0]);
+        let ones = crate::ops::ones_like(&x);
+        let (_, g) = crate::vjp_flat(f, &[x], &[ones]).unwrap();
+        assert_eq!(g[0].astype(DType::F32).to_vec::<f32>().unwrap(), [1.5; 4]);
     }
 
     #[test]
