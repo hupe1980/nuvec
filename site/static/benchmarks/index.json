@@ -8,11 +8,6 @@
      "machine": "m4-pro-48gb",
      "path": "0.5.0/m4-pro-48gb.json",
      "kind": "parity"
-    },
-    {
-     "machine": "m4-pro-48gb",
-     "path": "0.5.0/m4-pro-48gb-quick.json",
-     "kind": "parity-quick"
     }
    ]
   },
