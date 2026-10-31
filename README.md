@@ -35,26 +35,25 @@ nuvec brings [MLX](https://github.com/ml-explore/mlx)'s programming model to Rus
 
 ## 📊 Performance
 
-nuvec-lm against mlx-lm 0.32.2 with the same token ids on an Apple M4 Pro (48 GB), measured on 2026-10-27 with nuvec 0.5.0 (`just bench-parity --tier full`). Decoding is greedy; ratios above 1 favour nuvec.
+nuvec-lm against mlx-lm 0.32.2 with the same token ids on an Apple M4 Pro (48 GB), measured on 2026-10-31 with nuvec 0.5.0 (`just bench-parity --tier full`). Decoding is greedy; ratios above 1 favour nuvec.
 
 | Model | Kind | Decode (25 / 961 / 3,841-token prompt) | Time to first token (2K / 32K tokens) | 4 requests |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B 4-bit | dense | 1.09× / 1.08× / 1.06× | 1.03× / 1.02× | 0.96× |
-| Llama 3.2 3B 4-bit | dense | 1.00× / 1.00× / 1.00× | 1.00× / 1.01× | 1.02× |
-| Llama 3.1 8B 4-bit | dense | 1.00× / 1.00× / 1.00× | 1.00× / 1.00× | 1.01× |
-| Qwen3-8B 4-bit | dense | 1.01× / 1.02× / 1.01× | 1.00× / 1.01× | 1.01× |
-| Qwen3.5-9B 4-bit | hybrid | 0.99× / 0.99× / 0.99× | 1.00× / 1.00× | 1.00× |
-| Qwen3.8-27B 4-bit | hybrid | 1.00× / 1.00× / 1.01× | 1.01× / 1.00× | 1.01× |
-| Qwen3-30B-A3B 4-bit | MoE | 1.03× / 1.03× / 1.04× | 0.98× / 1.01× | 0.99× |
-| Qwen3.6-35B-A3B 4-bit | hybrid MoE | 1.00× / 1.00× / 1.00× | 1.00× / 0.98× | 0.98× |
-| gpt-oss-20b MXFP4 | MoE, sliding window | 0.99× / 0.98× / 0.98× | 1.04× / 1.04× | 1.00× |
-| gpt-oss-20b 8-bit | MoE, sliding window | 1.01× / 1.00× / 1.00× | 1.03× / 1.02× | 1.01× |
-| Gemma 4 E4B 4-bit | dense, sliding window | 0.97× / 0.97× / 0.97× | 1.06× / 1.07× | 0.99× |
-| Gemma 4 26B-A4B 4-bit | MoE, sliding window | 0.98× / 0.98× / 0.98× | 1.07× / 1.08× | 0.98× |
+| Qwen3-0.6B 4-bit | dense | 1.10× / 1.10× / 1.06× | 1.01× / 1.01× | 0.98× |
+| Llama 3.2 3B 4-bit | dense | 0.99× / 1.00× / 1.00× | 1.00× / 1.01× | 1.00× |
+| Llama 3.1 8B 4-bit | dense | 1.01× / 1.00× / 1.00× | 1.00× / 1.00× | 1.01× |
+| Qwen3-8B 4-bit | dense | 1.00× / 1.01× / 1.01× | 1.00× / 1.01× | 1.01× |
+| Qwen3.5-9B 4-bit | hybrid | 1.00× / 1.00× / 1.00× | 1.00× / 0.99× | 1.00× |
+| Qwen3.8-27B 4-bit | hybrid | 1.00× / 1.01× / 1.05× | 1.01× / 1.00× | 1.00× |
+| Qwen3-30B-A3B 4-bit | MoE | 1.00× / 1.00× / 1.00× | 0.99× / 1.00× | 0.98× |
+| Qwen3.6-35B-A3B 4-bit | hybrid MoE | 0.99× / 1.00× / 1.00× | 1.01× / 0.98× | 0.98× |
+| gpt-oss-20b MXFP4 | MoE, sliding window | 0.99× / 0.99× / 0.98× | 1.04× / 1.03× | 1.00× |
+| gpt-oss-20b 8-bit | MoE, sliding window | 1.01× / 1.01× / 1.00× | 1.02× / 1.02× | 1.08× |
+| Gemma 4 E4B 4-bit | dense, sliding window | 0.98× / 1.00× / 1.00× | 1.07× / 1.07× | 1.02× |
+| Gemma 4 26B-A4B 4-bit | MoE, sliding window | 1.01× / 1.01× / 1.01× | 1.06× / 1.08× | 0.99× |
 
-- **Geometric means:** decode 1.01×, time to first token 1.02× at 2K and 32K tokens, peak memory 1.02× (slightly below mlx-lm's), warm load to the first token 1.74× faster, 1 / 4 / 8 concurrent requests 1.01× / 1.00× / 1.00×.
-- **Longest contexts:** Qwen3.6-35B-A3B's first token at 64K tokens is 0.97×; at 261,952 tokens (0.4.0 record) nuvec prefills it in 20.5 minutes, where mlx-lm runs out of GPU memory on the same 48 GB machine.
-- **No regression:** the quick tier (4 models, about 45 minutes) runs nuvec 0.4.1 in the same session: 1.00× of 0.5.0 over 24 cells.
+- **Geometric means:** decode 1.01×, time to first token 1.02× at 2K and 32K tokens, peak memory 1.02× (slightly below mlx-lm's), warm load to the first token 1.80× faster, 1 / 4 / 8 concurrent requests 1.01× / 1.00× / 1.00×.
+- **Longest contexts:** Qwen3.6-35B-A3B's first token at 64K tokens is 0.98×; at 261,952 tokens nuvec prefills it in 20.4 minutes, where mlx-lm runs out of GPU memory on the same 48 GB machine.
 
 The full record (JSON) and the method are on the [benchmarks](https://hupe1980.github.io/nuvec/docs/benchmarks/) page. Speculative decoding with the model's own multi-token-prediction head decodes Qwen3.8-27B 1.66× and Qwen3.5-9B 1.36× faster on natural text, with output identical to plain decoding.
 

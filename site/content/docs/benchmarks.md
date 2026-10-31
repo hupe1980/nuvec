@@ -1,12 +1,12 @@
 +++
 title = "Benchmarks"
-description = "nuvec-lm against mlx-lm on the same Mac: decode, time to first token up to 256K tokens, peak memory, load time and concurrency for eight models from 0.6B to 35B parameters, with the machine-readable record."
+description = "nuvec-lm against mlx-lm on the same Mac: decode, time to first token up to 256K tokens, peak memory, load time and concurrency for twelve models from 0.6B to 35B parameters, with the machine-readable record."
 weight = 120
 [extra]
 group = "Project"
 +++
 
-nuvec's performance target is MLX on the same machine. Every number here comes from one command in the repository, `just bench-parity`, which runs both engines on the same Mac on the same day and reports losses as well as wins. The latest records, with every sample: [0.5.0 full tier, M4 Pro 48 GB (JSON)](/nuvec/benchmarks/0.5.0/m4-pro-48gb.json) and [0.5.0 quick tier (JSON)](/nuvec/benchmarks/0.5.0/m4-pro-48gb-quick.json). Each record is validated against its [schema](/nuvec/benchmarks/parity-record-v1.schema.json), and [index.json](/nuvec/benchmarks/index.json) lists all of them.
+nuvec's performance target is MLX on the same machine. Every number here comes from one command in the repository, `just bench-parity`, which runs both engines on the same Mac on the same day and reports losses as well as wins. The latest record, with every sample: [0.5.0 full tier, M4 Pro 48 GB (JSON)](/nuvec/benchmarks/0.5.0/m4-pro-48gb.json). Each record is validated against its [schema](/nuvec/benchmarks/parity-record-v1.schema.json), and [index.json](/nuvec/benchmarks/index.json) lists all of them.
 
 ## Method
 
@@ -22,24 +22,24 @@ nuvec's performance target is MLX on the same machine. Every number here comes f
 
 ## Results: 0.5.0 (full tier)
 
-Apple M4 Pro, 48 GB, macOS 26.6.2; nuvec 0.5.0, mlx 0.32.4, mlx-lm 0.32.2; 2026-10-27. nuvec / mlx-lm, above 1.00× favours nuvec; ⚠️ marks cells below the 0.98× gate.
+Apple M4 Pro, 48 GB, macOS 26.6.2; nuvec 0.5.0, mlx 0.32.4, mlx-lm 0.32.2; 2026-10-31, with 16 GB of swap in use at the start. nuvec / mlx-lm, above 1.00× favours nuvec; ⚠️ marks cells below the 0.98× gate.
 
-The geometric means are **decode 1.01×, prefill 1.01×, time to first token 1.02× at 2,048 and 32,768 tokens (0.97× at 65,536, Qwen3.6-35B-A3B), warm load 1.74×, peak memory 1.02×, and concurrent serving 1.01× / 1.00× / 1.00× at 1 / 4 / 8 requests.**
+The geometric means are **decode 1.01×, prefill 1.01×, time to first token 1.02× at 2,048 and 32,768 tokens (0.98× at 65,536, Qwen3.6-35B-A3B), warm load 1.80×, peak memory 1.02×, and concurrent serving 1.01× / 1.00× / 1.00× at 1 / 4 / 8 requests.** At 261,952 tokens nuvec prefills Qwen3.6-35B-A3B in 1,224 s; mlx-lm ran out of GPU memory.
 
 | model | kind | decode (25 / 961 / 3,841 tokens) | prefill (961 / 3,841) | TTFT 2K / 32K | peak memory | warm load |
 |---|---|---:|---:|---:|---:|---:|
-| Qwen3-0.6B | dense | 1.09× / 1.08× / 1.06× | 1.05× / 1.03× | 1.03× / 1.02× | 0.99× | 2.67× |
-| Llama-3.2-3B | dense | 1.00× / 1.00× / 1.00× | 1.00× / 1.00× | 1.00× / 1.01× | 1.09× | 2.28× |
-| Llama-3.1-8B | dense | 1.00× / 1.00× / 1.00× | 1.01× / 1.00× | 1.00× / 1.00× | 1.03× | 1.68× |
-| Qwen3-8B | dense | 1.01× / 1.02× / 1.01× | 1.01× / 1.00× | 1.00× / 1.01× | 1.03× | 1.31× |
-| Qwen3.5-9B | hybrid | 0.99× / 0.99× / 0.99× | 1.00× / 1.00× | 1.00× / 1.00× | 1.01× | 1.86× |
-| Qwen3.8-27B | hybrid | 1.00× / 1.00× / 1.01× | 1.01× / 1.00× | 1.01× / 1.00× | 0.98× | 1.25× |
-| Qwen3-30B-A3B | moe | 1.03× / 1.03× / 1.04× | 0.99× / 0.99× | 0.98× / 1.01× | 1.01× | 1.14× |
-| Qwen3.6-35B-A3B | hybrid-moe | 1.00× / 1.00× / 1.00× | 0.98× / 0.98× ⚠️ | 1.00× / 0.98× ⚠️ | 1.00× | 1.13× |
-| gpt-oss-20b MXFP4 | moe | 0.99× / 0.98× / 0.98× | 1.02× / 1.04× | 1.04× / 1.04× | 1.02× | 1.50× |
-| gpt-oss-20b 8-bit | moe | 1.01× / 1.00× / 1.00× | 1.00× / 1.02× | 1.03× / 1.02× | 1.01× | 3.30× |
-| Gemma 4 E4B | dense | 0.97× ⚠️ / 0.97× ⚠️ / 0.97× ⚠️ | 1.01× / 1.05× | 1.06× / 1.07× | 1.06× | 2.56× |
-| Gemma 4 26B-A4B | moe | 0.98× / 0.98× / 0.98× | 1.00× / 1.07× | 1.07× / 1.08× | 1.01× | 1.53× |
+| Qwen3-0.6B | dense | 1.10× / 1.10× / 1.06× | 1.05× / 1.03× | 1.01× / 1.01× | 1.00× | 2.71× |
+| Llama-3.2-3B | dense | 0.99× / 1.00× / 1.00× | 1.01× / 1.00× | 1.00× / 1.01× | 1.09× | 2.39× |
+| Llama-3.1-8B | dense | 1.01× / 1.00× / 1.00× | 1.01× / 1.00× | 1.00× / 1.00× | 1.03× | 1.66× |
+| Qwen3-8B | dense | 1.00× / 1.01× / 1.01× | 1.01× / 1.00× | 1.00× / 1.01× | 1.03× | 1.31× |
+| Qwen3.5-9B | hybrid | 1.00× / 1.00× / 1.00× | 1.00× / 1.00× | 1.00× / 0.99× | 1.01× | 1.83× |
+| Qwen3.8-27B | hybrid | 1.00× / 1.01× / 1.05× | 1.00× / 1.01× | 1.01× / 1.00× | 0.98× | 1.25× |
+| Qwen3-30B-A3B | moe | 1.00× / 1.00× / 1.00× | 1.00× / 1.00× | 0.99× / 1.00× | 1.01× | 1.20× |
+| Qwen3.6-35B-A3B | hybrid-moe | 0.99× / 1.00× / 1.00× | 0.99× / 0.99× | 1.01× / 0.98× | 1.00× | 1.46× |
+| gpt-oss-20b MXFP4 | moe | 0.99× / 0.99× / 0.98× | 1.02× / 1.04× | 1.04× / 1.03× | 1.02× | 1.47× |
+| gpt-oss-20b 8-bit | moe | 1.01× / 1.01× / 1.00× | 1.01× / 1.02× | 1.02× / 1.02× | 1.01× | 3.60× |
+| Gemma 4 E4B | dense | 0.98× / 1.00× / 1.00× | 1.03× / 1.07× | 1.07× / 1.07× | 1.06× | 2.55× |
+| Gemma 4 26B-A4B | moe | 1.01× / 1.01× / 1.01× | 1.01× / 1.08× | 1.06× / 1.08× | 1.01× | 1.49× |
 
 Peak memory is the geometric mean over a model's phases (load, decode, prefill at 2,048 and 32,768 tokens); warm load is the time to the first token.
 
@@ -49,35 +49,20 @@ Aggregate throughput of nuvec's `Batcher` against mlx-lm's `BatchGenerator`, 512
 
 | model | 1 request | 4 requests | 8 requests |
 |---|---:|---:|---:|
-| Qwen3-0.6B | 1.04× | 0.96× ⚠️ | 0.98× |
-| Llama-3.2-3B | 1.00× | 1.02× | 0.99× |
+| Qwen3-0.6B | 1.06× | 0.98× ⚠️ | 0.99× |
+| Llama-3.2-3B | 1.00× | 1.00× | 1.00× |
 | Llama-3.1-8B | 1.01× | 1.01× | 1.00× |
-| Qwen3-8B | 1.01× | 1.01× | 1.01× |
-| Qwen3.5-9B | 0.99× | 1.00× | 1.01× |
-| Qwen3.8-27B | 1.00× | 1.01× | 1.01× |
-| Qwen3-30B-A3B | 1.02× | 0.99× | 1.00× |
-| Qwen3.6-35B-A3B | 0.99× | 0.98× ⚠️ | 0.98× |
+| Qwen3-8B | 1.00× | 1.01× | 1.01× |
+| Qwen3.5-9B | 1.00× | 1.00× | 1.01× |
+| Qwen3.8-27B | 1.01× | 1.00× | 1.01× |
+| Qwen3-30B-A3B | 1.00× | 0.98× | 1.01× |
+| Qwen3.6-35B-A3B | 0.99× | 0.98× ⚠️ | 0.99× |
 | gpt-oss-20b MXFP4 | 1.00× | 1.00× | 1.00× |
-| gpt-oss-20b 8-bit | 1.02× | 1.01× | 1.01× |
-| Gemma 4 E4B | 0.99× | 0.99× | 0.99× |
-| Gemma 4 26B-A4B | 0.99× | 0.98× | 1.00× |
+| gpt-oss-20b 8-bit | 1.03× | 1.08× | 1.01× |
+| Gemma 4 E4B | 1.02× | 1.02× | 1.01× |
+| Gemma 4 26B-A4B | 1.02× | 0.99× | 1.00× |
 
 Products route as MLX's (D-103), so a request's batched tokens may differ in their low bits from its tokens alone, as mlx-lm's do; `Batcher::batch_invariant(true)` serves each request its solo tokens.
-
-## Results: 0.5.0 (quick tier)
-
-Same machine and versions, 2026-10-26, after D-102 and D-103, with nuvec 0.4.1 as the baseline in the same session (8 GB of swap in use at the start). Against 0.4.1: **1.00× over 24 cells (0.975–1.016×), no regression.** gpt-oss-20b has no baseline (new in 0.5).
-
-The geometric means against mlx-lm are **decode 1.04×, time to first token 0.99× at 2,048 tokens, prefill 0.99×, warm load 1.78×, peak memory 1.02×, and 4 concurrent requests 1.02×.**
-
-| model | decode (25 / 961 / 3,841 tokens) | prefill (961 / 3,841) | TTFT 2,048 | 4 requests |
-|---|---:|---:|---:|---:|
-| Qwen3-8B 4-bit | 1.01× / 1.00× / 1.03× | 0.90× / 0.94× ⚠️ | 1.01× | 1.15× |
-| Qwen3.5-9B 4-bit | 1.02× / 0.98× / 1.00× | 1.02× / 1.06× | 0.98× | 1.00× |
-| Qwen3-30B-A3B 4-bit | 1.41× / 1.06× / 1.02× | 0.99× / 0.98× | 0.99× | 0.97× ⚠️ |
-| gpt-oss-20b MXFP4 | 0.99× / 1.00× / 0.97× ⚠️ | 1.02× / 1.04× | 1.00× | 0.99× |
-
-Qwen3-8B's prefill cells are at 1.05–1.08× in the full record and unchanged against 0.4.1 here (0.99–1.02×): in this session mlx-lm's prefill ran faster. Qwen3-30B-A3B's 1.41× at 25 tokens is an mlx-lm outlier of the same kind.
 
 ## Earlier results
 
@@ -107,4 +92,4 @@ just bench-compare base.json candidate.json        # fails on a ratio drop above
 just bench-quant gqmm                              # kernel benchmarks take a name filter
 ```
 
-Swap in use makes the numbers noisy. Each record stores the swap in use at its start, and the tables above were taken without swap.
+Swap in use makes the numbers noisy. Each record stores the swap in use at its start; the 0.5.0 record started with 16 GB in use (every model fit beside it).
