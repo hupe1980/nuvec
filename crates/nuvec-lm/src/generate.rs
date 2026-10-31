@@ -243,24 +243,10 @@ pub(crate) fn prefill_rows(
         let chunk = Array::from_slice(&chunk, [b, n as i32]);
         let _ = model.forward(&chunk, cache).check()?;
         eval(&cache.iter().flat_map(KvCache::state).collect::<Vec<_>>())?;
-        clear_cache();
         start += n;
     }
     Ok(())
 }
-
-/// Releases the GPU's cached buffers, as mlx-lm's `mx.clear_cache()` after each prefill
-/// chunk and every [`CLEAR_EVERY`] tokens: a chunk's scores and activations (sized by the
-/// keys it attends to, so the next chunk's are larger) would otherwise stay cached beside
-/// the next chunk's.
-pub(crate) fn clear_cache() {
-    if let Some(d) = nuvec::gpu::Device::shared() {
-        d.clear_cache();
-    }
-}
-
-/// Tokens between [`clear_cache`] calls while decoding, as mlx-lm's `generate_step`.
-pub(crate) const CLEAR_EVERY: usize = 256;
 
 impl Generation<'_> {
     /// The token following `input` (`[L]` ids), not evaluated.
@@ -316,10 +302,6 @@ impl Iterator for Generation<'_> {
                 let _ = eval(std::slice::from_ref(&step));
             }
             return None;
-        }
-        // mlx-lm clears after the first token (the prompt's last buffers) and every 256th.
-        if (self.produced - 1).is_multiple_of(CLEAR_EVERY) {
-            clear_cache();
         }
         self.next = next;
         Some(Ok(token))

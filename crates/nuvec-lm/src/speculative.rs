@@ -437,7 +437,6 @@ pub fn speculative_generate<'a, D: Drafter>(
         }
         states.extend(cache.iter().flat_map(KvCache::state));
         eval(&states)?;
-        crate::generate::clear_cache();
         start += n;
     }
     Ok(SpeculativeGeneration {

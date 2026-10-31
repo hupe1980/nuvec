@@ -139,10 +139,6 @@ All notable changes to nuvec are documented here. The format follows
 - Tensors read from misaligned checkpoints (mlx-community's) kept their file offsets in one
   buffer; a quantized product ran up to 4% slower depending on where its weights fell. They
   now start at multiples of 256 bytes: Gemma 4 E4B decode 0.99× → 1.00× mlx-lm.
-- nuvec-lm never released the GPU's cached buffers while generating, so a prefill chunk's
-  scores stayed cached beside the next chunk's. It now clears the cache where mlx-lm does:
-  after each prefill chunk, after the first and every 256th token, and every 512 batch
-  steps.
 - Operations on arrays of 2^32 elements or more ran on the CPU (40 s instead of 0.8 for
   attention over 8 GiB of scores) and were never written in place. Element-wise operations,
   row softmax and log-sum-exp, and matrix products on the tiled kernel now run on the GPU

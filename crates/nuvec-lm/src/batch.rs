@@ -45,10 +45,6 @@ use crate::paged::{PagedCache, Reservation, SeqId, forward_reserved};
 /// in one batch (more than every quantized product's matrix-vector limit, 33 rows).
 const BATCHED_PREFILL_MIN: usize = 64;
 
-/// Decoding steps between releases of the GPU's cached buffers, as mlx-lm's
-/// `BatchGenerator`.
-const CLEAR_EVERY_STEPS: usize = 512;
-
 /// A request of a [`Batcher`].
 pub type RequestId = usize;
 
@@ -138,8 +134,6 @@ pub struct Batcher<'a> {
     cancelled: Vec<RequestId>,
     /// The step submitted and not read yet.
     in_flight: Option<InFlight>,
-    /// Decoding steps read so far.
-    steps: usize,
     /// A fault hook: the forward pass fails whenever it includes this request.
     #[cfg(test)]
     fault: Option<RequestId>,
@@ -184,7 +178,6 @@ impl<'a> Batcher<'a> {
             preemptions: 0,
             cancelled: Vec::new(),
             in_flight: None,
-            steps: 0,
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
@@ -513,13 +506,8 @@ impl<'a> Batcher<'a> {
         };
         let mut failed = Vec::new();
         let next = self.look_ahead(&flight, &mut failed);
-        self.read(flight, next, failed, &mut events)?;
-        // As mlx-lm's `BatchGenerator` (prefills clear after each chunk).
-        self.steps += 1;
-        if self.steps.is_multiple_of(CLEAR_EVERY_STEPS) {
-            crate::generate::clear_cache();
-        }
-        Ok(events)
+        self.read(flight, next, failed, &mut events)
+            .map(|()| events)
     }
 
     /// Submits a step for every running request, fed with their `next` tokens; when the
