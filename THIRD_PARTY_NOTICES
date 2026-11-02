@@ -6,7 +6,8 @@ require this notice in copies and substantial portions of their code.
 --------------------------------------------------------------------------------
 MLX
 https://github.com/ml-explore/mlx (version 0.32.4)
-Used in: nuvec-core, nuvec-compile, nuvec-gpu, nuvec-kernels (Metal kernels), nuvec-nn
+Used in: nuvec-core, nuvec-compile, nuvec-distributed (JACCL), nuvec-gpu, nuvec-kernels (Metal
+kernels), nuvec-nn
 SPDX-License-Identifier: MIT
 
 --------------------------------------------------------------------------------

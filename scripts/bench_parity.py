@@ -101,7 +101,15 @@ GATE, GOAL = 0.98, 1.0
 MIN_DECODE_TOKENS, MIN_DECODE_S = 8, 0.010
 CONC_PROMPT, CONC_TOKENS = 512, 128
 LOAD_SAMPLES = 3
-SECTIONS = ["decode", "ttft", "memory", "load", "concurrency"]
+SECTIONS = ["decode", "ttft", "memory", "load", "concurrency", "speculative"]
+# Speculative decoding (beyond mlx-lm, so not gated): nuvec's drafters against mlx-lm's
+# plain decode of the same prompt. MTP drafts need the original checkpoint's `mtp.*`
+# tensors (`scripts/extract_mtp.py`), found as `<dir>/<name>.safetensors` in
+# `NUVEC_MTP_DIR` (default `~/.cache/nuvec/mtp`).
+SPEC_DRAFTERS = {"lookup": ["--draft", "4", "--drafter", "lookup", "--policy", "adaptive"]}
+MTP_WEIGHTS = {"mlx-community/Qwen3.5-9B-4bit": "Qwen--Qwen3.5-9B",
+               "mlx-community/Qwen3.8-27B-4bit": "Qwen--Qwen3.8-27B",
+               "mlx-community/Qwen3.6-35B-A3B-4bit": "Qwen--Qwen3.6-35B-A3B"}
 # The quick tier (the default): one model per architecture and the cells that move with
 # kernel and scheduler changes, in about 45 minutes with the baseline. The full tier adds
 # the long contexts, cold loads and the whole roster.
@@ -695,6 +703,38 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
                        [x["total_tokens"] / x["wall_s"] for x in bl], True)
         entry["concurrency"] = rows
 
+    if "speculative" in sections:
+        drafters = dict(SPEC_DRAFTERS)
+        mtp_dir = Path(os.environ.get("NUVEC_MTP_DIR", Path.home() / ".cache/nuvec/mtp"))
+        if model in MTP_WEIGHTS and (w := mtp_dir / f"{MTP_WEIGHTS[model]}.safetensors").is_file():
+            drafters["mtp"] = ["--draft", "1", "--drafter", "mtp", "--mtp-weights", str(w)]
+        theirs: list[dict] = []
+        ours: dict[str, list[dict]] = {d: [] for d in drafters}
+        for p in passes:
+            # One mlx-lm plain decode per pass, then each drafter (fresh processes).
+            key = f"spec-plain-p{p}"
+            b = r.job(model, key, "mlx", ["decode", s, "1", str(r.args.runs)],
+                      not r.cached(model, key))
+            if b["error"]:
+                problems.append(f"speculative mlx-lm: {b['error']}")
+            theirs += b["lines"]
+            for d, extra in drafters.items():
+                key = f"spec-{d}-p{p}"
+                a = r.job(model, key, "nuvec",
+                          [*text, "--repeats", "1", "--runs", str(r.args.runs), "--max-tokens",
+                           str(MAX_TOKENS), "--ignore-eos", *extra], not r.cached(model, key))
+                if a["error"]:
+                    problems.append(f"speculative {d}: {a['error']}")
+                ours[d] += [x for x in a["lines"] if x.get("repeats") == 1]
+        tn, twhy = side(theirs, "decode", decode_check)
+        cells = []
+        for d in drafters:
+            on, owhy = side(ours[d], "decode", decode_check)
+            why = "; ".join(f"{e}: {w}" for e, w in (("nuvec", owhy), ("mlx-lm", twhy)) if w)
+            cells.append({"drafter": d, "tok_s": pair(on, tn, "tok/s", True, gated=False,
+                                                       reason=why or None)})
+        entry["speculative"] = cells
+
     if problems:
         entry["status"] = "partial"
         entry["reason"] = "; ".join(problems)[:2000]
@@ -718,6 +758,8 @@ def pairs_of(entry: dict):
         yield f"load_{mode}", cell["first_token_s"]
     for row in entry.get("concurrency", []):
         yield f"concurrency_{row['level']}", row["aggregate_tok_s"]
+    for row in entry.get("speculative", []):
+        yield f"speculative_{row['drafter']}", row["tok_s"]
 
 
 def baseline_cells(entry: dict):
@@ -789,6 +831,10 @@ def summary(models: list[dict], threshold: float = REGRESSION) -> dict:
             if k.startswith("concurrency_")}
     if conc:
         out["concurrency_geomean"] = conc
+    spec = {k.removeprefix("speculative_"): geomean(v) for k, v in groups.items()
+            if k.startswith("speculative_")}
+    if spec:
+        out["speculative_geomean"] = spec
     return out
 
 
@@ -870,10 +916,20 @@ def markdown(record: dict) -> str:
                 out.append(f"| {slug(m['id'])} | {c['level']} | {med(p, 'nuvec')} / "
                            f"{med(p, 'mlx_lm')} | {fmt_ratio(p)} | {c['nuvec_matches_solo']} |")
         out.append("")
+    rows = [m for m in record["models"] if m.get("speculative")]
+    if rows:
+        out += ["| model | drafter | nuvec / mlx-lm plain decode (tok/s) | ratio |",
+                "|---|---|---:|---:|"]
+        for m in rows:
+            for c in m["speculative"]:
+                p = c["tok_s"]
+                out.append(f"| {slug(m['id'])} | {c['drafter']} | {med(p, 'nuvec')} / "
+                           f"{med(p, 'mlx_lm')} | {fmt_ratio(p)} |")
+        out.append("")
     s = record["summary"]
     parts = [f"{k}: {v['value']:.2f}× (n={v['n']})" for k, v in s.items()
              if isinstance(v, dict) and "value" in v and k != "baseline_geomean"]
-    for k in ("ttft_geomean", "concurrency_geomean"):
+    for k in ("ttft_geomean", "concurrency_geomean", "speculative_geomean"):
         parts += [f"{k} {n}: {v['value']:.2f}×" for n, v in s.get(k, {}).items() if v]
     out.append("Geometric means: " + "; ".join(parts))
     if base := record["settings"].get("regression_baseline"):

@@ -8,7 +8,8 @@
 //! ```
 //!
 //! Each prompt is `text` repeated; generation is greedy and stops at an end-of-sequence
-//! token or after `--max-tokens` (`--ignore-eos` always runs to `--max-tokens`). With
+//! token or after `--max-tokens` (`--ignore-eos` always runs to `--max-tokens`;
+//! `--stops N` adds `N` stop strings that never match, to time matching). With
 //! `NUVEC_PROFILE=1`, the GPU time per kernel of each prompt length's last run goes to
 //! stderr (every dispatch then runs alone, so throughput drops; `--max-tokens 1` profiles
 //! prefill). `--draft N` decodes speculatively with drafts of up to `N` tokens and adds
@@ -27,7 +28,7 @@
 //! - `--phase load --first-token-ids F`: seconds to a loaded model and to the first token.
 //! - `--batch N --ids-file F`: the first `N` lines served together by a `Batcher`
 //!   (128 tokens each, end-of-sequence ignored), compared with each prompt alone;
-//!   `--batch-invariant` serves them row-exact (`Batcher::batch_invariant`).
+//!   `--batch-invariant` serves them row-exact (`BatcherOptions::batch_invariant`).
 //!
 //! `--trace FILE` replays a multi-turn trace (turns separated by `---` lines; each turn's
 //! prompt is the history so far, earlier outputs included, plus the turn) with plain
@@ -38,8 +39,8 @@
 use std::time::Instant;
 
 use nuvec_lm::{
-    Batcher, DraftPolicy, Drafter, Event, GenerateOptions, MtpDrafter, PromptLookup,
-    SuffixDecoding, WiredLimit, generate, load, speculative_generate,
+    Batcher, BatcherOptions, DraftPolicy, Drafter, Event, GenerateOptions, MtpDrafter,
+    PromptLookup, Stop, SuffixDecoding, WiredLimit, generate, load, speculative_generate,
 };
 
 /// The prompts of an ids file: one per line, comma-separated token ids.
@@ -78,9 +79,9 @@ fn main() -> nuvec::Result<()> {
                 .unwrap_or_else(|_| fail(&format!("{flag}: not a number")))
         })
     };
-    let Some(device) = nuvec::gpu::Device::shared() else {
+    if !nuvec::metal::is_available() {
         fail("no Metal device");
-    };
+    }
     let model_id = value("--model").unwrap_or_else(|| "mlx-community/Qwen3-8B-4bit".into());
     let text = match value("--text-file") {
         Some(f) => std::fs::read_to_string(&f).unwrap_or_else(|e| fail(&format!("{f}: {e}"))),
@@ -100,10 +101,11 @@ fn main() -> nuvec::Result<()> {
     let draft = number("--draft", 0);
     let ignore_eos = args.iter().any(|a| a == "--ignore-eos");
     let phase = value("--phase");
-    let options = GenerateOptions {
+    let mut options = GenerateOptions {
         max_tokens: number("--max-tokens", 128),
         ..Default::default()
     };
+    let stops = number("--stops", 0);
 
     let load_start = Instant::now();
     let (mut model, tokenizer) = load(&model_id)?;
@@ -111,6 +113,11 @@ fn main() -> nuvec::Result<()> {
         model.attach_mtp(&path)?;
     }
     let model_ready = load_start.elapsed().as_secs_f64();
+    if stops > 0 {
+        // Stop strings that never match, to time matching itself (`--stops N`).
+        let strings: Vec<String> = (0..stops).map(|i| format!("\u{1}stop {i}\u{2}")).collect();
+        options.stop = Stop::strings(&tokenizer, &strings)?;
+    }
     if ignore_eos || value("--batch").is_some() || phase.is_some() {
         model.config.eos_token_ids.clear();
     }
@@ -160,7 +167,7 @@ fn main() -> nuvec::Result<()> {
         }
         Ok((first_seconds, decode_seconds, count))
     };
-    let warm_up = || run(&tokenizer.encode(&text), options);
+    let warm_up = || run(&tokenizer.encode(&text), options.clone());
 
     match phase.as_deref() {
         Some("load") => {
@@ -183,7 +190,7 @@ fn main() -> nuvec::Result<()> {
                 let path = value("--ids-file").unwrap_or_else(|| fail("--ids-file"));
                 let ids = &read_ids(&path)[0];
                 warm_up()?;
-                device.reset_peak();
+                nuvec::memory::reset_peak_memory();
                 let max_tokens = if p == "memory-decode" {
                     options.max_tokens
                 } else {
@@ -197,7 +204,7 @@ fn main() -> nuvec::Result<()> {
                     },
                 )?;
             }
-            let m = device.memory();
+            let m = nuvec::memory::stats();
             println!(
                 "{{\"phase\": \"{p}\", \"peak_with_mapped_bytes\": {}, \"peak_bytes\": {}, \
                  \"active_bytes\": {}, \"mapped_bytes\": {}}}",
@@ -232,18 +239,18 @@ fn main() -> nuvec::Result<()> {
                 let mut speculative = None;
                 let mut plain = None;
                 let generation: &mut dyn Iterator<Item = nuvec::Result<u32>> = match which {
-                    "plain" => plain.insert(generate(&model, &context, options)?),
+                    "plain" => plain.insert(generate(&model, &context, options.clone())?),
                     "lookup" => speculative.insert(speculative_generate(
                         &model,
                         &context,
-                        options,
+                        options.clone(),
                         Box::new(PromptLookup::default()) as Box<dyn Drafter>,
                         DraftPolicy::Auto,
                     )?),
                     _ => speculative.insert(speculative_generate(
                         &model,
                         &context,
-                        options,
+                        options.clone(),
                         Box::new(&mut suffix) as Box<dyn Drafter + '_>,
                         DraftPolicy::Auto,
                     )?),
@@ -300,13 +307,22 @@ fn main() -> nuvec::Result<()> {
         let block_size = 16;
         let blocks = n * (longest + options.max_tokens).div_ceil(block_size) + n;
         let invariant = args.iter().any(|a| a == "--batch-invariant");
-        let mut batcher = Batcher::new(&model, blocks, block_size, n)?.batch_invariant(invariant);
-        nuvec::gpu::profile::reset();
+        let mut batcher = Batcher::new(
+            &model,
+            BatcherOptions {
+                blocks: Some(blocks),
+                block_size,
+                max_batch: n,
+                batch_invariant: invariant,
+                ..Default::default()
+            },
+        )?;
+        nuvec::metal::profile::reset();
         let start = Instant::now();
         let mut outputs = vec![Vec::new(); n];
         let mut ids = Vec::new();
         for p in &prompts {
-            ids.push(batcher.submit(p.clone(), options)?);
+            ids.push(batcher.submit(p.clone(), options.clone())?);
         }
         let mut finished = 0;
         let mut first_tokens = 0;
@@ -334,14 +350,14 @@ fn main() -> nuvec::Result<()> {
         let wall = start.elapsed().as_secs_f64();
         let decode_wall = decode_start.elapsed().as_secs_f64();
         drop(batcher);
-        if nuvec::gpu::profile::enabled() {
+        if nuvec::metal::profile::enabled() {
             print_profile(&format!("{n} requests"));
         }
         let total: usize = outputs.iter().map(Vec::len).sum();
         let mut matches = true;
         for (prompt, out) in prompts.iter().zip(&outputs) {
             let solo: Vec<u32> =
-                generate(&model, prompt, options)?.collect::<nuvec::Result<_>>()?;
+                generate(&model, prompt, options.clone())?.collect::<nuvec::Result<_>>()?;
             matches &= &solo == out;
         }
         println!(
@@ -355,18 +371,18 @@ fn main() -> nuvec::Result<()> {
 
     // Warm-up (kernel compilation, first faults of the weights).
     warm_up()?;
-    device.reset_peak();
+    nuvec::memory::reset_peak_memory();
     if let Some(files) = value("--ids-file") {
         let one = GenerateOptions {
             max_tokens: 1,
-            ..options
+            ..options.clone()
         };
         for path in files.split(',') {
             let ids = &read_ids(path)[0];
             for _ in 0..runs {
-                nuvec::gpu::profile::reset();
-                let (first, _, _) = run(ids, one)?;
-                let peak = device.memory().peak_with_mapped;
+                nuvec::metal::profile::reset();
+                let (first, _, _) = run(ids, one.clone())?;
+                let peak = nuvec::memory::stats().peak_with_mapped;
                 println!(
                     "{{\"ids_file\": \"{}\", \"prompt_tokens\": {}, \"ttft_s\": {first:.4}, \
                      \"prefill\": {:.2}, \"peak_bytes\": {peak}}}",
@@ -377,7 +393,7 @@ fn main() -> nuvec::Result<()> {
                     ids.len() as f64 / first
                 );
             }
-            if nuvec::gpu::profile::enabled() {
+            if nuvec::metal::profile::enabled() {
                 print_profile(&format!("{} prompt tokens", ids.len()));
             }
         }
@@ -385,13 +401,13 @@ fn main() -> nuvec::Result<()> {
     for &r in &repeats {
         let ids = tokenizer.encode(&text.repeat(r));
         for _ in 0..runs {
-            nuvec::gpu::profile::reset();
-            let (first, decode_seconds, tokens) = run(&ids, options)?;
+            nuvec::metal::profile::reset();
+            let (first, decode_seconds, tokens) = run(&ids, options.clone())?;
             let prefill = ids.len() as f64 / first;
             let decode = (tokens.max(2) - 1) as f64 / decode_seconds;
             // The one peak metric: allocator memory plus mapped weights (MLX's
             // `get_peak_memory` counts its copied weights).
-            let peak = device.memory().peak_with_mapped;
+            let peak = nuvec::memory::stats().peak_with_mapped;
             println!(
                 "{{\"repeats\": {r}, \"prompt_tokens\": {}, \"prefill\": {prefill:.2}, \
                  \"ttft_s\": {first:.4}, \"decode\": {decode:.2}, \"decode_s\": \
@@ -402,7 +418,7 @@ fn main() -> nuvec::Result<()> {
                 drafts.get().1
             );
         }
-        if nuvec::gpu::profile::enabled() {
+        if nuvec::metal::profile::enabled() {
             print_profile(&format!("{} prompt tokens", ids.len()));
         }
     }
@@ -411,7 +427,7 @@ fn main() -> nuvec::Result<()> {
 
 /// The profiler's GPU time per kernel since the last report (the top 25), to stderr.
 fn print_profile(what: &str) {
-    let rows = nuvec::gpu::profile::report();
+    let rows = nuvec::metal::profile::report();
     let total: f64 = rows.iter().map(|r| r.2).sum();
     let dispatches: u64 = rows.iter().map(|r| r.1).sum();
     eprintln!(

@@ -46,6 +46,7 @@ impl MtpHead {
                     },
                     input_layernorm: Builder::norm(d, c.rms_norm_eps),
                     post_attention_layernorm: Builder::norm(d, c.rms_norm_eps),
+                    group: None,
                     gemma: None,
                 })
             })

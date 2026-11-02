@@ -157,6 +157,26 @@ unary_ops!(
     copy
 );
 
+/// `x`, evaluated only after `deps` (MLX's `depends`): evaluating the result evaluates the
+/// dependencies first, without using their values. Its gradient goes to `x`.
+///
+/// ```
+/// use nuvec_core::{array, ops};
+///
+/// let x = array![1.0, 2.0];
+/// let side = array![3.0];
+/// assert_eq!(ops::depends(&x, &[side]).to_vec::<f32>().unwrap(), [1.0, 2.0]);
+/// ```
+#[track_caller]
+pub fn depends(x: &Array, deps: &[Array]) -> Array {
+    let mut ins: SmallVec<[&Array; 4]> = SmallVec::new();
+    ins.push(x);
+    ins.extend(deps.iter());
+    Array::sticky("depends", Location::caller(), &ins, || {
+        crate::primitive::depends(x, deps)
+    })
+}
+
 /// Element-wise selection: `a` where `condition` is true, else `b` (MLX's `where`); see
 /// [`Array::select`]. Any operand may be a weak Rust number.
 #[track_caller]

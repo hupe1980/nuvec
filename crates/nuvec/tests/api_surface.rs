@@ -21,8 +21,14 @@ mod spec_062 {
         const _: fn(&Error) -> Option<&OpErrorKind> = Error::kind;
         const _: fn(&Error) -> Option<&'static Location<'static>> = Error::location;
         const _: fn(&Error) -> Option<&'static str> = Error::op_name;
+        const _: fn(&Error) -> bool = Error::is_oom;
 
-        fn fields(e: Error) -> Option<(&'static str, &'static Location<'static>, OpErrorKind)> {
+        type Fields = (
+            &'static str,
+            Option<&'static Location<'static>>,
+            OpErrorKind,
+        );
+        fn fields(e: Error) -> Option<Fields> {
             match e {
                 Error::Op { op, at, kind } => Some((op, at, kind)),
                 _ => None,
@@ -645,8 +651,8 @@ mod spec_063 {
     /// The Neural Accelerator status (spec 059).
     #[test]
     fn nax_status_is_pinned() {
-        use nuvec::gpu::{NaxReason, NaxStatus};
-        let _: fn(&nuvec::gpu::Device) -> NaxStatus = nuvec::gpu::Device::nax;
+        use nuvec::metal::{NaxReason, NaxStatus};
+        let _: fn() -> NaxStatus = nuvec::metal::nax;
         let s = NaxStatus::Off(NaxReason::Unmeasured);
         assert!(!s.is_active());
         assert!(NaxStatus::Active { forced: true }.is_active());
@@ -656,12 +662,13 @@ mod spec_063 {
             NaxReason::Generation,
             NaxReason::NoLibrary,
             NaxReason::PipelineError,
+            NaxReason::NoDevice,
         ];
     }
 
-    /// `distributed`: the group, the collectives and the ring's entry points.
+    /// `distributed`: the group, the collectives and the backends' entry points.
     mod distributed {
-        use nuvec::distributed::{self, Group, Options};
+        use nuvec::distributed::{self, Backend, Group, Options};
         use nuvec::{Array, DType, Result};
 
         #[test]
@@ -669,6 +676,8 @@ mod spec_063 {
             let g: Group = Group::single();
             let _: (usize, usize) = (g.rank(), g.size());
             let _: Result<Group> = g.split(0, 0);
+            let _: Result<()> = g.health();
+            g.close();
             let _: Group = distributed::default_group();
             let x = Array::from(1.0f32);
             let _: Array = distributed::all_sum(&x, None);
@@ -676,12 +685,46 @@ mod spec_063 {
             let _: Array = distributed::all_min(&x, None);
             let _: Array = distributed::all_gather(&x, None);
             let _: Array = distributed::sum_gradients(&x, None);
+            let _: Array = distributed::sum_scatter(&x, None);
             const _: fn(&Array, usize, Option<&Group>) -> Array = distributed::send;
             const _: fn(&Array, usize, Option<&Group>) -> Array = distributed::recv_like;
             let _: Array = distributed::recv([2], DType::F32, 1, None);
             const _: fn(bool) -> Result<Group> = distributed::init;
             const _: fn(&[Vec<String>], usize, &Options) -> Result<Group> = distributed::init_with;
-            let _: Options = Options::default().timeout(std::time::Duration::from_secs(1));
+            let _: Options = Options::default()
+                .timeout(std::time::Duration::from_secs(1))
+                .key("a secret of sixteen bytes");
+            const _: fn(bool, Backend) -> Result<Group> = distributed::init_backend;
+            const _: fn(Backend) -> bool = distributed::is_available;
+            let _: Backend = "ring".parse::<Backend>()?;
+            let _ = [Backend::Any, Backend::Ring, Backend::Jaccl];
+            Ok(())
+        }
+
+        /// The experimental JACCL backend (feature `jaccl`).
+        #[cfg(feature = "jaccl")]
+        #[test]
+        fn jaccl_pinned() -> Result<()> {
+            use nuvec::distributed::jaccl::{
+                self, Config, Options, PortState, RdmaDevice, Topology, parse_devices,
+            };
+            let devices = parse_devices(r#"[[null, "rdma_en2"], ["rdma_en2", null]]"#)?;
+            let c: Config = Config::new(0, devices)?
+                .coordinator("127.0.0.1:5000")
+                .prefer_ring(false);
+            let _: (usize, usize) = (c.rank(), c.size());
+            let _: Topology = c.topology()?;
+            const _: fn() -> Result<Option<Config>> = Config::from_env;
+            let _: Options = Options::default()
+                .timeout(std::time::Duration::from_secs(1))
+                .side_channel(|d: &[u8]| Ok(d.to_vec()))
+                .key("a secret of sixteen bytes");
+            const _: fn(&Config, &Options) -> Result<Group> = jaccl::init_with;
+            const _: fn() -> bool = jaccl::is_available;
+            const _: fn() -> Result<Vec<RdmaDevice>> = jaccl::devices;
+            let _ = |d: RdmaDevice| -> (String, PortState, Option<std::net::Ipv4Addr>) {
+                (d.name, d.port_state, d.ipv4)
+            };
             Ok(())
         }
     }
@@ -779,16 +822,94 @@ mod spec_063 {
 
     /// nuvec-lm: LoRA by path and mlx-lm adapter directories.
     mod lm {
-        use nuvec_lm::Model;
         use nuvec_lm::lora::{
             AdapterConfig, LoraParams, linear_to_lora_layers, load_adapters, save_adapters,
         };
         use nuvec_lm::model::Projection;
+        use nuvec_lm::{Batcher, Model, Split, Stage, load_model_pipelined};
 
         use super::*;
 
         const _: fn(&mut Model, usize, Option<&[&str]>, LoraParams) -> Result<usize> =
             linear_to_lora_layers;
+
+        /// Pipeline parallelism (spec 071).
+        fn pipeline(m: &mut Model, g: &nuvec::distributed::Group) -> Result<()> {
+            m.pipeline(g, Split::Even)?;
+            let _ = load_model_pipelined("dir", g, Split::memory());
+            let _ = [
+                Split::Layers(vec![1]),
+                Split::Memory { reserve: 0.1 },
+                Split::Budgets(vec![1], 0.1),
+            ];
+            if let Some(s) = m.stage() {
+                let s: &Stage = s;
+                let _: (std::ops::Range<usize>, bool, bool) =
+                    (s.layers(), s.is_first(), s.is_last());
+                let _: &nuvec::distributed::Group = s.group();
+            }
+            let _: Array = m.share_tokens(&Array::from(1u32));
+            // Tensor parallelism (spec 072).
+            m.shard(g)?;
+            let _: Option<&nuvec::distributed::Group> = m.sharding();
+            let _ = nuvec_lm::load_model_sharded("dir", g);
+            let options = nuvec_lm::BatcherOptions {
+                micro_batches: Some(2),
+                ..Default::default()
+            };
+            let _: Result<Batcher<'_>> = Batcher::new(m, options);
+            Ok(())
+        }
+
+        /// Generation controls and batcher options (spec 074).
+        fn controls(m: &Model, t: &nuvec_lm::Tokenizer) -> Result<()> {
+            use nuvec_lm::{
+                BatcherOptions, FinishReason, GenerateOptions, Stop, Stopped, TextStream,
+            };
+            let stop: Stop = Stop::strings(t, ["\n\n"])?.with_tokens([7]);
+            let _: (&[u32], bool) = (stop.stop_tokens(), stop.is_empty());
+            let _ = Stop::tokens([1, 2]);
+            let options = GenerateOptions {
+                stop,
+                ignore_eos: true,
+                min_tokens: 4,
+                ..Default::default()
+            };
+            options.validate()?;
+            let mut stream = TextStream::new(t, &options);
+            let _: String = stream.push(1) + &stream.finish();
+            let mut g = nuvec_lm::generate(m, &[1], options.clone())?;
+            let _ = g.next();
+            let reason: Option<&FinishReason> = g.finish_reason();
+            let _ = match reason {
+                Some(FinishReason::Stop(Stopped::String { index, cut })) => index + cut,
+                Some(FinishReason::Stop(Stopped::Token(t))) => *t as usize,
+                Some(FinishReason::Error(e)) => usize::from(e.is_oom()),
+                Some(
+                    FinishReason::EndOfSequence
+                    | FinishReason::Length
+                    | FinishReason::CacheFull
+                    | FinishReason::Cancelled,
+                ) => 0,
+                Some(_) | None => 0,
+            };
+            let b = BatcherOptions {
+                blocks: Some(64),
+                block_size: 16,
+                max_batch: 8,
+                micro_batches: None,
+                batch_invariant: true,
+                memory_fraction: 0.9,
+            };
+            b.validate()?;
+            let _: Batcher<'_> = Batcher::new(m, b)?;
+            let _: usize = m.kv_bytes_per_position();
+            let _ = (
+                nuvec_lm::stop::MAX_STOP_STRINGS,
+                nuvec_lm::stop::MAX_STOP_BYTES,
+            );
+            Ok(())
+        }
         fn adapters(dir: &str, m: &mut Model, c: &AdapterConfig) -> Result<AdapterConfig> {
             save_adapters(dir, m, c)?;
             load_adapters(dir, m)
@@ -852,6 +973,8 @@ mod spec_055 {
         let q = Quantized::new(w, s, None, QuantMode::Mxfp4);
         let _: (&Array, &Array, &Option<Array>, Quant) = (&q.weight, &q.scales, &q.biases, q.quant);
         let _: Array = q.dequantize(DType::BF16);
+        const _: fn(Array, Array, Array, i32, i32) -> Quantized = Quantized::affine;
+        const _: fn(Array, Array, QuantMode) -> Quantized = Quantized::fp;
         q.check()
     }
 
@@ -1153,11 +1276,12 @@ mod engine_surface {
     const _: fn(u64) -> Array = random::key;
     const _: fn(&Array, &Array) -> Array = |l, k| random::categorical(l, -1, k);
 
-    // Memory controls and statistics, device facts.
-    #[cfg(target_os = "macos")]
-    fn device(d: &nuvec::gpu::Device) -> nuvec::gpu::Result<()> {
-        let _: Option<&'static nuvec::gpu::Device> = nuvec::gpu::Device::shared();
-        let m: nuvec::gpu::MemoryStats = d.memory();
+    // Memory controls and statistics, device facts, captures, the kernel profile.
+    #[allow(dead_code)]
+    fn memory_and_metal() -> Result<()> {
+        use nuvec::memory::{self, MemoryStats};
+        use nuvec::metal::{self, DeviceInfo};
+        let m: MemoryStats = memory::stats();
         let _: [usize; 12] = [
             m.active,
             m.peak,
@@ -1172,20 +1296,36 @@ mod engine_surface {
             m.wired_mapped,
             m.system_allocations as usize,
         ];
-        let _: usize = d.set_memory_limit(1);
-        let _: usize = d.set_cache_limit(1);
-        let _: usize = d.set_wired_limit(0)?;
-        let _: bool = d.can_wire();
-        d.clear_cache();
-        d.reset_peak();
-        let info = d.info();
-        let _: (&str, Option<u32>, Option<char>, u64, u64) = (
-            &info.name,
-            info.generation,
-            info.class,
-            info.recommended_working_set,
-            info.physical_memory,
-        );
+        let _: [usize; 3] = [
+            memory::active_memory(),
+            memory::peak_memory(),
+            memory::cache_memory(),
+        ];
+        let _: usize = memory::set_memory_limit(1);
+        let _: usize = memory::set_cache_limit(1);
+        let _: usize = memory::set_wired_limit(0)?;
+        let _: bool = memory::can_wire();
+        let _: u64 = memory::physical_memory();
+        memory::clear_cache();
+        memory::reset_peak_memory();
+        let _: bool = metal::is_available();
+        let info: Option<&'static DeviceInfo> = metal::device_info();
+        if let Some(info) = info {
+            let _: (&str, &str, Option<u32>, Option<char>, u64, u64, usize) = (
+                &info.name,
+                &info.architecture,
+                info.generation,
+                info.class,
+                info.recommended_working_set,
+                info.physical_memory,
+                info.max_threads_per_threadgroup,
+            );
+        }
+        metal::start_capture("run.gputrace")?;
+        metal::stop_capture();
+        let _: bool = metal::profile::enabled();
+        let _: Vec<(String, u64, f64)> = metal::profile::report();
+        metal::profile::reset();
         Ok(())
     }
 
@@ -1193,11 +1333,19 @@ mod engine_surface {
     const _: fn(&str) -> Result<SafeTensors> = |p| io::load_safetensors(p);
     const _: fn(&str, fn(&str) -> bool) -> Result<SafeTensors> =
         |p, keep| io::load_safetensors_filtered(p, keep);
+    const _: fn(&str, &str) -> Result<()> = |s, d| io::align_safetensors(s, d);
+    const _: fn(&str, &str, fn(&str) -> bool) -> Result<SafeTensors> =
+        |p, c, keep| io::load_safetensors_cached(p, c, keep);
     const _: fn(&str, &[(&str, &Array)], &[(&str, &str)]) -> Result<()> =
         |p, t, m| io::save_safetensors(p, t, m);
     const _: fn(&str) -> Result<Footprint> = |p| io::safetensors_footprint(p);
     const _: fn(&str, fn(&str) -> bool) -> Result<Footprint> =
         |p, keep| io::safetensors_footprint_filtered(p, keep);
+    const _: fn(&str) -> Result<Vec<io::TensorInfo>> = |p| io::safetensors_tensors(p);
+    const _: fn(io::TensorInfo) -> (String, DType, Vec<usize>, usize) =
+        |t| (t.name, t.dtype, t.shape, t.bytes);
+    // MLX's `depends`.
+    const _: fn(&Array, &[Array]) -> Array = |x, d| nuvec::ops::depends(x, d);
     // Storage identity (aliasing checks) and floor division (Python's `//`).
     const _: fn(&Array) -> Option<usize> = Array::buffer_id;
     const _: fn(&Array, &Array) -> Array = |a, b| a.floor_divide(b);
@@ -1237,5 +1385,59 @@ mod engine_surface {
             QUANT, DEQUANT, QMM, GQMM, GMM, NORMS, ADD_NORM, ROPE, kernels, footprint,
         );
         let _ = (options, template_args, compiled, error, element::<f32>);
+    }
+}
+
+/// Spec 076 (paged serving): `norm_rope_at` with and without a pool, and `paged_write` of
+/// several sequences' rows.
+mod spec_076 {
+    use nuvec::Array;
+    use nuvec::fast::{self, Rotation};
+
+    fn norm_rope_at(x: &Array, w: &Array, r: Rotation<'_>, at: &Array, pool: &Array) -> Array {
+        let q = fast::norm_rope_at(x, Some((w, 1e-6)), r, at, None);
+        let slots = at.reshape([-1, 1]);
+        let _: Array = fast::norm_rope_at(x, None, r, at, (pool, &slots));
+        q
+    }
+
+    const _: fn(&Array, &Array, &Array) -> Array = fast::paged_write;
+
+    #[test]
+    fn the_items_exist() {
+        let _ = norm_rope_at;
+    }
+}
+
+mod spec_077 {
+    use nuvec::{Array, fast};
+
+    const _: fn(&Array, i32, bool) -> (Array, Array) = fast::moe_route;
+    const _: fn(&Array, &Array) -> Array = fast::weighted_sum;
+
+    #[test]
+    fn the_items_exist() {}
+}
+
+mod spec_078 {
+    use nuvec::{Array, fast};
+
+    const _: fn(&Array, &Array, &Array, &Array, bool) -> (Array, Array) = fast::causal_conv1d_slots;
+
+    #[test]
+    fn the_items_exist() {}
+}
+
+mod spec_079 {
+    use nuvec::{Array, fast};
+
+    fn residual(h: &Array, x: &Array, w: &Array, scale: &Array) -> (Array, Option<Array>) {
+        let _: (Array, Option<Array>) = fast::residual_rms_norm(h, x, (w, 1e-6), None, None);
+        fast::residual_rms_norm(h, x, (w, 1e-6), scale, Some((w, 1e-6)))
+    }
+
+    #[test]
+    fn the_items_exist() {
+        let _ = residual;
     }
 }

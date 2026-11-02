@@ -924,3 +924,60 @@ fn windowed_decode_plans_from_the_window_keys() {
     // A window covering every key plans as plain causal attention.
     assert_eq!(plan(&causal.window(4096)), plan(&causal));
 }
+
+/// Decode shapes (dtype, head size) at 16 query heads over 2 key heads and 4,096 keys
+/// (two passes on every GPU class), and whether the first pass takes one key per step.
+const ONE_KEY: [(DType, i32, bool); 5] = [
+    (DType::BF16, 512, true),
+    (DType::F16, 512, true),
+    (DType::F32, 512, true),
+    (DType::F32, 256, true),
+    (DType::BF16, 128, false),
+];
+
+/// Profiled first-pass kernels per [`ONE_KEY`] case, as `@@case` then `@@kernel` lines.
+#[test]
+#[ignore = "run by wide_heads_decode_one_key_per_step in a profiled child"]
+fn child_profile_one_key() {
+    if std::env::var_os("NUVEC_PLAN_CHILD").is_none() {
+        return;
+    }
+    set_default_stream(Stream::default_for(Device::gpu(0)));
+    for (dtype, d, _) in ONE_KEY {
+        let q = ops::zeros([1, 16, 1, d], dtype) + 0.01;
+        let k = ops::zeros([1, 2, 4096, d], dtype) + 0.02;
+        nuvec_core::eval(&[&q, &k]).unwrap();
+        nuvec_gpu::profile::reset();
+        fast::scaled_dot_product_attention(&q, &k, &k, 0.0625, &Default::default())
+            .eval()
+            .unwrap();
+        println!("\n@@case");
+        for (kernel, _, _) in nuvec_gpu::profile::report() {
+            println!("@@kernel {kernel}");
+        }
+    }
+}
+
+/// At head size 512 (and 256 in float32) the two-pass decode kernel reads one key per
+/// step: MLX's four-key prefetch spills registers there, and the bits are the same
+/// (`sdpa-d512-decode-*` in the GPU fixtures).
+#[test]
+fn wide_heads_decode_one_key_per_step() {
+    if common::require_gpu().is_none() {
+        return;
+    }
+    let stdout = run_child("child_profile_one_key", true);
+    let cases: Vec<&str> = stdout.split("@@case").skip(1).collect();
+    assert_eq!(
+        cases.len(),
+        ONE_KEY.len(),
+        "one profile per case:\n{stdout}"
+    );
+    for ((dtype, d, one_key), kernels) in ONE_KEY.into_iter().zip(cases) {
+        let first = kernels
+            .lines()
+            .find(|l| l.contains("sdpa_vector_2pass_1"))
+            .unwrap_or_else(|| panic!("{dtype} head {d}: no first pass in {kernels}"));
+        assert_eq!(first.contains("_tk1"), one_key, "{dtype} head {d}: {first}");
+    }
+}

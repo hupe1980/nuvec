@@ -15,6 +15,16 @@ pub(crate) const CHILD: &str = "NUVEC_TEST_CHILD";
 /// standard outputs (in rank order) once all succeed; in a rank, runs `body` and returns
 /// `None`.
 pub(crate) fn ranks(test: &str, n: usize, body: impl FnOnce(Group)) -> Option<Vec<String>> {
+    ranks_with(test, n, &[], body)
+}
+
+/// [`ranks`] with `env` set in every rank's environment.
+pub(crate) fn ranks_with(
+    test: &str,
+    n: usize,
+    env: &[(&str, &str)],
+    body: impl FnOnce(Group),
+) -> Option<Vec<String>> {
     if let Ok(name) = std::env::var(CHILD) {
         if name == test {
             body(nuvec_distributed::init(true).expect("init"));
@@ -43,6 +53,7 @@ pub(crate) fn ranks(test: &str, n: usize, body: impl FnOnce(Group)) -> Option<Ve
                 .env("MLX_HOSTFILE", &hostfile)
                 .env("MLX_RANK", rank.to_string())
                 .env("NUVEC_DISTRIBUTED_TIMEOUT", "20")
+                .envs(env.iter().copied())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -99,4 +110,15 @@ pub(crate) fn agree(outputs: &[String]) {
     for (rank, o) in outputs.iter().enumerate() {
         assert_eq!(bits(o), first, "rank {rank} differs from rank 0");
     }
+}
+
+/// `n` free loopback addresses.
+pub(crate) fn free_addresses(n: usize) -> Vec<String> {
+    let listeners: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    listeners
+        .iter()
+        .map(|l| format!("127.0.0.1:{}", l.local_addr().unwrap().port()))
+        .collect()
 }

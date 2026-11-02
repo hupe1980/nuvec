@@ -469,7 +469,7 @@ fn case(rng: &mut SplitMix64) -> (Primitive, Vec<Array>) {
 /// A random fast operation and its usual input count.
 fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (FastOp, usize) {
     let eps = float(rng);
-    match rng.below(20) {
+    match rng.below(23) {
         0 => (FastOp::RmsNorm { eps }, 2),
         1 => (FastOp::AddRmsNorm { eps }, 3),
         2 => (FastOp::RmsNormVjp { eps }, 3),
@@ -486,7 +486,8 @@ fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (Fas
             (op, 2 + rng.below(2))
         }
         6 => {
-            let cache = rng.coin();
+            // `paged` indexes a pool with its slots' values (see `PagedWrite` below).
+            let (cache, positions) = (rng.coin(), rng.coin());
             let op = FastOp::NormRope {
                 eps: rng.coin().then_some(eps),
                 dims: rng.size(),
@@ -495,8 +496,13 @@ fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (Fas
                 scale: float(rng),
                 offset: rng.size(),
                 cache,
+                positions,
+                paged: false,
             };
-            (op, 2 + usize::from(cache) + rng.below(2))
+            (
+                op,
+                2 + usize::from(cache) + usize::from(positions) + rng.below(2),
+            )
         }
         7 => {
             let op = FastOp::DepthwiseConv1d {
@@ -506,8 +512,9 @@ fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (Fas
             };
             (op, 2)
         }
-        // `PagedAttention` and `PagedWrite` index caches with their inputs' values; their
-        // bounds rules (skip and clamp) are tested on hostile values in `tests/fast.rs`.
+        // `PagedAttention`, `PagedWrite` and `ConvSlots` index caches with their inputs'
+        // values; their bounds rules (skip and clamp) are tested on hostile values in
+        // `tests/fast.rs`.
         8 => (FastOp::Softmax, 1),
         9 => (FastOp::LogSumExp, 1),
         10 => (FastOp::CrossEntropy, 2),
@@ -530,6 +537,23 @@ fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (Fas
         14 => (FastOp::GatedDelta { steps: rng.coin() }, 6),
         15 => (FastOp::GatedDeltaSlots, 7),
         16 => (FastOp::GatherMm, 4 + rng.below(2)),
+        17 => {
+            let op = FastOp::MoeRoute {
+                k: rng.size(),
+                normalize: rng.coin(),
+            };
+            (op, 1)
+        }
+        18 => (FastOp::WeightedSum, 2),
+        19 => {
+            let (scaled, next) = (rng.coin(), rng.coin());
+            let op = FastOp::ResidualRmsNorm {
+                eps,
+                scaled,
+                next: next.then(|| float(rng)),
+            };
+            (op, 3 + usize::from(scaled) + usize::from(next))
+        }
         _ => {
             let modes = [QuantMode::Affine, QuantMode::Mxfp4, QuantMode::Nvfp4];
             let mode = modes[rng.below(3)];

@@ -49,8 +49,8 @@ impl Router {
         let x = fast::rms_norm(h, Some(&weight), self.eps);
         let scores = self.proj.forward(&x);
         let k = self.k;
-        let top = scores.argpartition(-k, -1).i((.., .., -k..));
-        let weights = scores.take_along_axis(&top, -1).softmax(-1);
+        let (top, best) = fast::moe_route(&scores, k, false);
+        let weights = best.softmax(-1);
         let weights = weights.multiply(self.per_expert_scale.value().take(&top, 0));
         (top, weights)
     }
@@ -202,6 +202,7 @@ pub(super) fn model(b: &Builder<'_>, c: &Config, g: &Gemma4) -> Result<Model> {
                 mlp: BlockMlp::Dense(Box::new(mlp)),
                 input_layernorm: norm(d),
                 post_attention_layernorm: norm(d),
+                group: None,
                 gemma: Some(Box::new(parts)),
             })
         })
@@ -239,24 +240,42 @@ pub(super) fn model(b: &Builder<'_>, c: &Config, g: &Gemma4) -> Result<Model> {
             .then(|| b.projection("lm_head", d, c.vocab_size, false))
             .transpose()?,
         mtp: None,
+        stage: None,
+        sharding: None,
+        vocab_sharded: false,
     })
 }
 
+/// `(h + norm(x)) · scale` and, with `next`, its normalisation, in one kernel
+/// ([`fast::residual_rms_norm`]).
+#[track_caller]
+fn residual(
+    h: &Array,
+    x: &Array,
+    norm: &RmsNorm,
+    scale: Option<&Array>,
+    next: Option<&RmsNorm>,
+) -> (Array, Option<Array>) {
+    let next = next.map(|n| (&*n.weight, n.eps));
+    fast::residual_rms_norm(h, x, (&norm.weight, norm.eps), scale, next)
+}
+
 /// A layer's work after its attention output `o`: the sandwich norms around the MLP (and
-/// the experts), the per-layer input and the layer scalar.
+/// the experts), the per-layer input and the layer scalar. Returns the residual stream and
+/// its normalisation by `next` (the next layer's input norm, or the final norm), each
+/// chain of norms, additions and the scalar one kernel.
 #[track_caller]
 fn after_attention(
     layer: &Block,
     p: &Parts,
-    h: &Array,
-    o: &Array,
+    (h, o): (&Array, &Array),
     per_layer: Option<&Array>,
     i: usize,
-) -> Array {
-    let o = layer.post_attention_layernorm.forward(o);
-    // `h + o` and the MLP's input norm in one kernel.
-    let (h1, n) = add_norm(h, Some(&o), &p.pre_feedforward_layernorm);
-    let mut f = layer.mlp.forward(&n);
+    next: &RmsNorm,
+) -> (Array, Array) {
+    let post = &layer.post_attention_layernorm;
+    let (h1, n) = residual(h, o, post, None, Some(&p.pre_feedforward_layernorm));
+    let mut f = layer.mlp.forward(&n.expect("a next norm"));
     if let (Some(router), Some(experts), Some(post1), Some(post2), Some(pre2)) = (
         &p.router,
         &p.experts,
@@ -266,21 +285,26 @@ fn after_attention(
     ) {
         let (top, weights) = router.forward(&h1);
         let y = experts.switch_glu.forward(&pre2.forward(&h1), &top);
-        let y = y.multiply(weights.expand_dims(-1)).sum(-2);
-        f = post1.forward(&f).add(post2.forward(&y));
+        let y = fast::weighted_sum(&y, &weights);
+        f = residual(&post1.forward(&f), &y, post2, None, None).0;
     }
-    let mut h = h1.add(p.post_feedforward_layernorm.forward(&f));
-    if let (Some(inputs), Some(gate), Some(proj), Some(norm)) = (
+    let scalar = p.layer_scalar.value();
+    let post = &p.post_feedforward_layernorm;
+    let (h, n) = match (
         per_layer,
         &p.per_layer_input_gate,
         &p.per_layer_projection,
         &p.post_per_layer_input_norm,
     ) {
-        let input = inputs.i((.., .., i as i32));
-        let g = nuvec_nn::geglu(&gate.forward(&h), &input);
-        h = h.add(norm.forward(&proj.forward(&g)));
-    }
-    h.multiply(p.layer_scalar.value())
+        (Some(inputs), Some(gate), Some(proj), Some(norm)) => {
+            let h = residual(&h1, &f, post, None, None).0;
+            let input = inputs.i((.., .., i as i32));
+            let g = nuvec_nn::geglu(&gate.forward(&h), &input);
+            residual(&h, &proj.forward(&g), norm, Some(scalar), Some(next))
+        }
+        _ => residual(&h1, &f, post, Some(scalar), Some(next)),
+    };
+    (h, n.expect("a next norm"))
 }
 
 /// The scaled embedding and the per-layer inputs of `tokens`.
@@ -296,10 +320,10 @@ fn embed(m: &Model, tokens: &Array) -> (Array, Option<Array>) {
     (h, per_layer)
 }
 
-/// The final norm, head and soft cap.
+/// The head and soft cap on the final norm's output.
 #[track_caller]
-fn logits(m: &Model, h: &Array) -> Array {
-    let logits = m.head(&m.model.norm.forward(h));
+fn logits(m: &Model, normed: &Array) -> Array {
+    let logits = m.head(normed);
     match m.config.gemma4.as_ref().and_then(|g| g.final_logit_softcap) {
         Some(cap) => nuvec_nn::logit_softcap(&logits, cap),
         None => logits,
@@ -324,6 +348,8 @@ pub(super) fn forward(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array
     };
     // Each layer's keys and values and its first query's position, for KV-shared layers.
     let mut kvs: Vec<Option<((Array, Array), i32)>> = vec![None; m.model.layers.len()];
+    // The previous layer's output under this layer's input norm.
+    let mut normed = None;
     for (i, (layer, c)) in m.model.layers.iter().zip(cache).enumerate() {
         let (attention, p) = parts(layer);
         let at = c.offset;
@@ -331,12 +357,15 @@ pub(super) fn forward(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array
             .kv_source
             .and_then(|s| kvs[s].as_ref())
             .map(|(kv, at)| (kv, *at));
-        let n = layer.input_layernorm.forward(&h);
+        let n = normed
+            .take()
+            .unwrap_or_else(|| layer.input_layernorm.forward(&h));
         let (o, kv) = attention.forward_kv(&n, mask, c, shared);
         kvs[i] = Some((kv, shared.map_or(at, |(_, at)| at)));
-        h = after_attention(layer, p, &h, &o, per_layer.as_ref(), i);
+        let (next, n) = after_attention(layer, p, (&h, &o), per_layer.as_ref(), i, next_norm(m, i));
+        (h, normed) = (next, Some(n));
     }
-    logits(m, &h)
+    logits(m, &normed.unwrap_or_else(|| m.model.norm.forward(&h)))
 }
 
 /// [`Model::forward_paged`] of a Gemma 4 model: KV-shared layers attend to their source
@@ -350,13 +379,25 @@ pub(super) fn forward_paged(
 ) -> Array {
     let (mut h, per_layer) = embed(m, tokens);
     let mut pools: Vec<Option<(Array, Array, usize)>> = vec![None; m.model.layers.len()];
+    let mut normed = None;
     for (i, (layer, pages)) in m.model.layers.iter().zip(layers).enumerate() {
         let (attention, p) = parts(layer);
         let shared = p.kv_source.and_then(|s| pools[s].as_ref());
-        let n = layer.input_layernorm.forward(&h);
+        let n = normed
+            .take()
+            .unwrap_or_else(|| layer.input_layernorm.forward(&h));
         let (o, kv) = attention.forward_paged_kv(&n, pages, step, shared);
         pools[i] = Some(kv);
-        h = after_attention(layer, p, &h, &o, per_layer.as_ref(), i);
+        let (next, n) = after_attention(layer, p, (&h, &o), per_layer.as_ref(), i, next_norm(m, i));
+        (h, normed) = (next, Some(n));
     }
-    logits(m, &h)
+    logits(m, &normed.unwrap_or_else(|| m.model.norm.forward(&h)))
+}
+
+/// The norm after layer `i`: the next layer's input norm, or the final norm.
+fn next_norm(m: &Model, i: usize) -> &RmsNorm {
+    m.model
+        .layers
+        .get(i + 1)
+        .map_or(&m.model.norm, |l| &l.input_layernorm)
 }

@@ -6,7 +6,7 @@
 /// `get_peak_memory()` (which counts MLX's copied weights), each reset after loading, in a
 /// fresh process per phase, cross-checked by the operating system's peak resident size.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MemoryStats {
     /// Bytes in live allocator buffers (rounded allocation sizes), weights copied from
     /// checkpoints included; mapped files not included. MLX: `get_active_memory`.
@@ -42,6 +42,9 @@ pub struct MemoryStats {
     pub mapped: usize,
     /// The part of `wired` that belongs to memory-mapped files.
     pub wired_mapped: usize,
+    /// Residency sets holding the wired buffers (MLX's capped sets: at most 5% of the
+    /// working set each, `MLX_RESIDENCY_SET_MAX_PCT`; 0 without residency-set support).
+    pub residency_sets: usize,
 }
 
 /// The virtual-memory page size of Apple silicon (the allocator's large-buffer granule).
@@ -62,6 +65,11 @@ pub fn allocation_size(len: usize) -> Option<usize> {
 /// to the system's pages.
 pub fn mapping_size(len: usize) -> usize {
     len.div_ceil(page()) * page()
+}
+
+/// The system's page size: the granularity of file mappings (`map_file_range` offsets).
+pub fn page_size() -> usize {
+    page()
 }
 
 /// The system's page size.

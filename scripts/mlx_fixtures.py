@@ -1313,6 +1313,13 @@ for dt, (hq, hkv, lq, lk) in [("bfloat16", (2, 1, 1024, 1030)), ("float16", (1, 
                for h, n in [(hq, lq), (hkv, lk), (hkv, lk)])
     case_gpu(f"sdpa-d512-{dt}-{lq}x{lk}", "sdpa", [q, k, v], scale=round(512 ** -0.5, 6),
              mask="causal")
+# Head-512 decode (Gemma 4 26B-A4B's full layers): MLX's two-pass vector kernel from 1,024
+# keys at 8 query heads per key head, which nuvec runs one key per step (the same bits).
+dv = np.random.default_rng(SEED + 59)
+for dt, lk in [("bfloat16", 1100), ("float16", 1030), ("float32", 1030)]:
+    q, k, v = (mx.array(dv.standard_normal((1, h, n, 512)).astype(np.float32)).astype(getattr(mx, dt))
+               for h, n in [(8, 1), (1, lk), (1, lk)])
+    case_gpu(f"sdpa-d512-decode-{dt}-{lk}", "sdpa", [q, k, v], scale=round(512 ** -0.5, 6))
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

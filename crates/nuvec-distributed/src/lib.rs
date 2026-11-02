@@ -1,10 +1,13 @@
-//! Distributed backends for nuvec: MLX's TCP ring.
+//! Distributed backends for nuvec: MLX's TCP ring, and MLX's JACCL (RDMA over
+//! Thunderbolt 5; experimental, feature `jaccl`).
 //!
-//! [`init`] reads MLX's launch environment (`MLX_HOSTFILE`, a JSON list with one entry per
-//! rank of `"host:port"` addresses, and `MLX_RANK`), connects the ring and makes it the
-//! default group of `nuvec::distributed`'s collectives. Every rank runs the same program;
-//! the processes may share one Mac (over loopback) or run on several (over Ethernet or
-//! Thunderbolt IP).
+//! [`init`] reads MLX's launch environment, connects a backend and makes it the default
+//! group of `nuvec::distributed`'s collectives, as `mx.distributed.init()`. The ring reads
+//! `MLX_HOSTFILE` (a JSON list with one entry per rank of `"host:port"` addresses) and
+//! `MLX_RANK`; JACCL reads the variables `mlx.launch --backend jaccl` writes
+//! (`jaccl::Config::from_env`). [`init_backend`] names the backend. Every rank runs the
+//! same program; the processes may share one Mac (over loopback) or run on several (over
+//! Ethernet or Thunderbolt IP for the ring, Thunderbolt 5 cables for JACCL).
 //!
 //! ```no_run
 //! use nuvec_core::{array, distributed};
@@ -21,16 +24,26 @@
 //! **Stability:** no promise when this crate is depended on directly; depend on `nuvec`,
 //! whose re-exports are semver-tracked.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+mod auth;
+mod backend;
 mod hostfile;
+#[cfg(feature = "jaccl")]
+pub mod jaccl;
+mod json;
+mod keepalive;
+mod pool;
+mod reduce;
 mod ring;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use nuvec_core::distributed::{Group, set_default_group};
-use nuvec_core::{Error, Result};
+use nuvec_core::Result;
+use nuvec_core::distributed::Group;
+
+pub use backend::{Backend, init_backend, is_available};
 
 /// Options of [`init_with`].
 #[derive(Clone, Debug)]
@@ -40,12 +53,14 @@ pub struct Options {
     /// error naming it. Default 30 s (`NUVEC_DISTRIBUTED_TIMEOUT`, in seconds, for
     /// [`init`]).
     pub timeout: Duration,
+    key: auth::Secret,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            key: auth::Secret::default(),
         }
     }
 }
@@ -56,43 +71,21 @@ impl Options {
         self.timeout = timeout;
         self
     }
+
+    /// Authenticates every connection with this pre-shared secret (at least 16 bytes, the
+    /// same on every rank; `NUVEC_DISTRIBUTED_KEY` for [`init`]): a host without it cannot
+    /// join the group. The traffic itself is not encrypted; on an untrusted network, run the
+    /// group over a VPN.
+    pub fn key(mut self, secret: impl AsRef<[u8]>) -> Self {
+        self.key = auth::Secret(Some(secret.as_ref().to_vec()));
+        self
+    }
 }
 
-/// Initialises the ring from MLX's environment (`MLX_HOSTFILE`, `MLX_RANK`) and makes it
-/// the default group, as `mx.distributed.init()`. Without the environment: an error if
-/// `strict`, else the group of this process alone.
+/// Initialises a backend from MLX's environment and makes it the default group, as
+/// `mx.distributed.init()`: [`init_backend`] with [`Backend::Any`].
 pub fn init(strict: bool) -> Result<Group> {
-    let (hostfile, rank) = (std::env::var("MLX_HOSTFILE"), std::env::var("MLX_RANK"));
-    let (Ok(hostfile), Ok(rank)) = (hostfile, rank) else {
-        if strict {
-            return Err(Error::InvalidArgument(
-                "distributed: MLX_HOSTFILE and MLX_RANK are not set".into(),
-            ));
-        }
-        return Ok(Group::single());
-    };
-    let text = std::fs::read_to_string(&hostfile)
-        .map_err(|e| Error::Io(format!("distributed: reading {hostfile}: {e}")))?;
-    let rank = rank
-        .trim()
-        .parse()
-        .map_err(|_| Error::InvalidArgument(format!("distributed: MLX_RANK {rank:?}")))?;
-    let mut options = Options::default();
-    if let Ok(secs) = std::env::var("NUVEC_DISTRIBUTED_TIMEOUT") {
-        let invalid = || {
-            Error::InvalidArgument(format!(
-                "distributed: NUVEC_DISTRIBUTED_TIMEOUT {secs:?} (seconds, a positive number)"
-            ))
-        };
-        let parsed: f64 = secs.trim().parse().map_err(|_| invalid())?;
-        options.timeout = Duration::try_from_secs_f64(parsed)
-            .ok()
-            .filter(|d| !d.is_zero())
-            .ok_or_else(invalid)?;
-    }
-    let group = init_with(&hostfile::parse(&text)?, rank, &options)?;
-    set_default_group(group.clone());
-    Ok(group)
+    init_backend(strict, Backend::Any)
 }
 
 /// Connects rank `rank` of the ring over `nodes` (per rank its addresses, one connection
@@ -102,6 +95,7 @@ pub fn init_with(nodes: &[Vec<String>], rank: usize, options: &Options) -> Resul
     if nodes.len() <= 1 {
         return Ok(Group::single());
     }
-    let ring = ring::Ring::connect(nodes, rank, options.timeout)?;
+    let key = options.key.key()?;
+    let ring = ring::Ring::connect(nodes, rank, options.timeout, key.as_ref())?;
     Ok(Group::new(Arc::new(ring)))
 }

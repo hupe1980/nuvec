@@ -20,8 +20,9 @@ pub enum Error {
     Op {
         /// The public operation the caller invoked (MLX's name).
         op: &'static str,
-        /// Where the caller invoked it.
-        at: &'static Location<'static>,
+        /// Where the caller invoked it; `None` for an error built inside nuvec that no
+        /// public operation has located (see [`Error::location`]).
+        at: Option<&'static Location<'static>>,
         /// Why it failed.
         kind: OpErrorKind,
     },
@@ -85,22 +86,11 @@ pub enum OpErrorKind {
 /// `Result` with [`Error`] as the error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The location of op errors created inside nuvec, before the public op that serves the
-/// caller attaches the caller's location (see [`Error::locate`]).
-#[inline(never)]
-fn unlocated() -> &'static Location<'static> {
-    Location::caller()
-}
-
 impl Error {
     /// An op error without a caller location yet: the outermost public op attaches its
     /// name and the caller's location.
     pub(crate) fn op(op: &'static str, kind: OpErrorKind) -> Self {
-        Self::Op {
-            op,
-            at: unlocated(),
-            kind,
-        }
+        Self::Op { op, at: None, kind }
     }
 
     /// Incompatible operand shapes.
@@ -151,15 +141,19 @@ impl Error {
     /// carry a location (from a failed input) are returned unchanged: the first error wins.
     pub(crate) fn locate(self, op: &'static str, at: &'static Location<'static>) -> Self {
         match self {
-            Self::Op { at: here, kind, .. } if *here == *unlocated() => Self::Op { op, at, kind },
+            Self::Op { at: None, kind, .. } => Self::Op {
+                op,
+                at: Some(at),
+                kind,
+            },
             Self::InvalidArgument(msg) => Self::Op {
                 op,
-                at,
+                at: Some(at),
                 kind: OpErrorKind::InvalidArgument(msg),
             },
             Self::OutOfMemory(n) => Self::Op {
                 op,
-                at,
+                at: Some(at),
                 kind: OpErrorKind::OutOfMemory(n),
             },
             other => other,
@@ -177,9 +171,22 @@ impl Error {
     /// Where the failing op was called, for op errors raised by a public operation.
     pub fn location(&self) -> Option<&'static Location<'static>> {
         match self {
-            Self::Op { at, .. } if **at != *unlocated() => Some(at),
+            Self::Op { at, .. } => *at,
             _ => None,
         }
+    }
+
+    /// Whether memory ran out: [`Error::OutOfMemory`], or an op error of kind
+    /// [`OpErrorKind::OutOfMemory`] (an allocation that failed while an op was recorded).
+    pub fn is_oom(&self) -> bool {
+        matches!(
+            self,
+            Self::OutOfMemory(_)
+                | Self::Op {
+                    kind: OpErrorKind::OutOfMemory(_),
+                    ..
+                }
+        )
     }
 
     /// The name of the failing op, for op errors.
@@ -225,8 +232,12 @@ impl fmt::Display for OpErrorKind {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Op { op, at, kind } if **at == *unlocated() => write!(f, "{op}: {kind}"),
-            Self::Op { op, at, kind } => write!(
+            Self::Op { op, at: None, kind } => write!(f, "{op}: {kind}"),
+            Self::Op {
+                op,
+                at: Some(at),
+                kind,
+            } => write!(
                 f,
                 "{op} at {}:{}:{}: {kind}",
                 at.file(),
@@ -283,5 +294,22 @@ mod tests {
         assert_eq!(e.kind(), Some(&OpErrorKind::InvalidArgument("bad".into())));
         let io = Error::Io("x".into()).locate("split", at);
         assert_eq!(io, Error::Io("x".into()));
+    }
+
+    #[test]
+    fn out_of_memory_in_either_form() {
+        let at = Location::caller();
+        assert!(Error::OutOfMemory(8).is_oom());
+        assert!(Error::OutOfMemory(8).locate("zeros", at).is_oom());
+        for e in [
+            Error::Backend("x".into()),
+            Error::Io("x".into()),
+            Error::InvalidArgument("x".into()),
+            Error::UnsupportedDevice(Device::cpu()),
+            Error::unsupported_dtype("exp", DType::Complex64),
+            Error::InvalidArgument("x".into()).locate("split", at),
+        ] {
+            assert!(!e.is_oom(), "{e}");
+        }
     }
 }

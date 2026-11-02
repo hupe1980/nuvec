@@ -497,7 +497,8 @@ impl Primitive {
             Self::Copy => one(Ok(g.clone())),
             // MLX's rules: the reductions pass the cotangent through (each rank's loss is
             // its own); a gather's input gets the cotangent's rows of this rank; a send's
-            // output is its input.
+            // output is its input. MLX defines none for `sum_scatter`; nuvec's follows the
+            // reductions'.
             Self::Collective { op, group } => match op {
                 crate::distributed::CollectiveOp::Gather => {
                     let rank = crate::distributed::group_rank(*group)?;
@@ -518,6 +519,20 @@ impl Primitive {
                         0 => one(record(Self::Squeeze(vec![0]), vec![rows])),
                         _ => one(Ok(rows)),
                     }
+                }
+                // Each rank's loss is its own (as the reductions): the input's cotangent is
+                // the output's in this rank's rows, zero in the other ranks' rows.
+                crate::distributed::CollectiveOp::SumScatter => {
+                    let rank = crate::distributed::group_rank(*group)?;
+                    let k = g.dims()[0];
+                    let mut start = vec![0; x.ndim()];
+                    start[0] = rank * k;
+                    let update = Self::SliceUpdate {
+                        start,
+                        step: vec![1; x.ndim()],
+                        len: g.dims().to_vec(),
+                    };
+                    one(record(update, vec![zeros_like(x)?, g.clone()]))
                 }
                 _ => one(Ok(g.clone())),
             },

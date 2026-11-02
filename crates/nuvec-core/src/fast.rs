@@ -85,6 +85,49 @@ pub fn add_rms_norm<'a>(
     (h, normed)
 }
 
+/// A normalised residual branch: `s = (h + rms_norm(x, weight, eps)) · scale` (no multiply
+/// without a scale) and, with `next = (weight, eps)`, [`rms_norm`] of `s`, returned as
+/// `(s, normed)`. Gemma 4's sandwich norm, residual add and layer scalar, and the next
+/// layer's input norm. On the GPU it is one kernel equal to that composition bit for bit
+/// when every input has `h`'s floating-point dtype, the weights are 1-D and the scale has
+/// one element (otherwise the composition, with MLX's type promotion).
+///
+/// ```
+/// use nuvec_core::{array, fast};
+///
+/// let (h, x, w) = (array![[1.0f32, 1.0]], array![[3.0f32, 3.0]], array![1.0f32, 2.0]);
+/// let (s, normed) = fast::residual_rms_norm(&h, &x, (&w, 0.0), None, Some((&w, 0.0)));
+/// assert_eq!(s.to_vec::<f32>().unwrap(), [2.0, 3.0]);
+/// assert!(normed.is_some());
+/// ```
+#[track_caller]
+pub fn residual_rms_norm<'a>(
+    h: &Array,
+    x: &Array,
+    norm: (&Array, f32),
+    scale: impl Into<Option<&'a Array>>,
+    next: impl Into<Option<(&'a Array, f32)>>,
+) -> (Array, Option<Array>) {
+    let (scale, next) = (scale.into(), next.into());
+    let ins = operands(&[h, x, norm.0], &[scale, next.map(|(w, _)| w)]);
+    let at = Location::caller();
+    match next {
+        Some(_) => {
+            let [s, n] = Array::sticky_n("residual_rms_norm", at, &ins, || {
+                let (s, n) = imp::residual_rms_norm(h, x, norm, scale, next)?;
+                Ok([s, n.expect("a next norm")])
+            });
+            (s, Some(n))
+        }
+        None => {
+            let s = Array::sticky("residual_rms_norm", at, &ins, || {
+                Ok(imp::residual_rms_norm(h, x, norm, scale, None)?.0)
+            });
+            (s, None)
+        }
+    }
+}
+
 /// Layer normalisation over the last axis, `(x - mean) / sqrt(var + eps) · weight + bias`,
 /// as MLX's `fast.layer_norm`: statistics in float32, the result in the promoted type.
 #[track_caller]
@@ -169,6 +212,54 @@ pub fn norm_rope<'a>(
             ))
         })?;
         imp::norm_rope(x, norm, rotation, offset, cache)
+    })
+}
+
+/// [`norm_rope`] for sequences at their own positions (a batched decoding step): each
+/// `[b, h, l]` row of `x` (`[B, H, L, D]`, any strides) optionally normalised as
+/// [`rms_norm`] with `norm = (weight, eps)`, then rotated as [`rope`] at position
+/// `positions[b] + l` (`positions`: `[B]` integers).
+///
+/// Without `pool`, the result is a new `[B, H, L, D]` array. With `pool = (pool, slots)`
+/// (`[blocks, H, block_size, D]` and `[B, L]` integers), the result is the pool with each
+/// row written at its slot as [`paged_write`] writes it (in place when the evaluation owns
+/// the pool; out-of-range slots skipped), so keys go into a paged cache without a separate
+/// write.
+///
+/// The results equal [`rms_norm`], [`rope`] and [`paged_write`] composed (on the GPU, bit
+/// for bit); differing dtypes, other ranks and head sizes over 1024 run that composition.
+///
+/// ```
+/// use nuvec_core::{Array, DType, fast::{self, Rotation}, ops};
+///
+/// let x = ops::ones([2, 1, 1, 8], DType::F32);
+/// let rotation = Rotation { dims: 8, traditional: false, base: Some(1e4), scale: 1.0, freqs: None };
+/// let pool = ops::zeros([4, 1, 4, 8], DType::F32);
+/// let slots = Array::from_slice(&[5i32, 9], [2, 1]);
+/// let at = Array::from([5i32, 9]);
+/// let pool = fast::norm_rope_at(&x, None, rotation, &at, (&pool, &slots));
+/// assert_eq!(pool.shape(), &[4, 1, 4, 8]);
+/// ```
+#[track_caller]
+pub fn norm_rope_at<'a>(
+    x: &Array,
+    norm: Option<(&Array, f32)>,
+    rotation: Rotation<'_>,
+    positions: &Array,
+    pool: impl Into<Option<(&'a Array, &'a Array)>>,
+) -> Array {
+    let pool = pool.into();
+    let ins = operands(
+        &[x, positions],
+        &[
+            norm.map(|n| n.0),
+            rotation.freqs,
+            pool.map(|p| p.0),
+            pool.map(|p| p.1),
+        ],
+    );
+    Array::sticky("norm_rope_at", Location::caller(), &ins, || {
+        imp::norm_rope_at(x, norm, rotation, positions, pool)
     })
 }
 
@@ -277,10 +368,12 @@ pub fn paged_attention(
 }
 
 /// `cache` (`[blocks, kv_heads, block_size, D]`) with the positions `new` holds
-/// (`[T, kv_heads, D]`) written into their slots: `slots[t]` (integers, `[T]`) is block
-/// `slots[t] / block_size`, position `slots[t] % block_size`. Slots must be distinct;
-/// out-of-range slots (negative, or at least `blocks · block_size`) are skipped. In place
-/// when the evaluation owns the cache.
+/// (`[T, kv_heads, D]`, or `[B, T, kv_heads, D]` for several sequences) written into their
+/// slots: `slots` (integers, `new`'s leading shape) holds block `slot / block_size`,
+/// position `slot % block_size` of each. Slots must be distinct; out-of-range slots
+/// (negative, or at least `blocks · block_size`) are skipped. In place when the evaluation
+/// owns the cache; on the GPU, `new` is read through its strides (a transposed view of a
+/// contiguous cache needs no copy).
 #[track_caller]
 pub fn paged_write(cache: &Array, new: &Array, slots: &Array) -> Array {
     Array::sticky(
@@ -549,6 +642,94 @@ pub fn scaled_dot_product_attention(
         &ins,
         || imp::scaled_dot_product_attention(q, k, v, scale, options),
     )
+}
+
+/// A mixture of experts' routing from its router's probabilities `probs` (`[..., E]`): the
+/// indices (uint32) of each row's `k` largest probabilities and those probabilities
+/// (`[..., k]` each), divided by their sum with `normalize` (mlx-lm's `norm_topk_prob`).
+///
+/// The indices are `argpartition(probs, -k)[..., -k:]`, in its order (ascending, equal
+/// probabilities by index), and the scores `take_along_axis` of them; on the GPU it is one
+/// kernel equal to that composition bit for bit (up to 1,024 experts, and 64 renormalised
+/// scores; otherwise the composition).
+///
+/// ```
+/// use nuvec_core::{array, fast};
+///
+/// let p = array![[0.1f32, 0.4, 0.2, 0.3]];
+/// let (top, scores) = fast::moe_route(&p, 2, true);
+/// assert_eq!(top.to_vec::<u32>().unwrap(), [3, 1]);
+/// let s = scores.to_vec::<f32>().unwrap();
+/// assert!((s[0] - 0.3 / 0.7).abs() < 1e-6 && (s[1] - 0.4 / 0.7).abs() < 1e-6);
+/// ```
+#[track_caller]
+pub fn moe_route(probs: &Array, k: i32, normalize: bool) -> (Array, Array) {
+    let [top, scores] = Array::sticky_n("moe_route", Location::caller(), &[probs], || {
+        let (top, scores) = imp::moe_route(probs, k, normalize)?;
+        Ok([top, scores])
+    });
+    (top, scores)
+}
+
+/// A causal depthwise convolution for a batch of sequences whose last inputs live in a
+/// pool (Gated DeltaNet's convolution state): sequence `b`'s window is `pool[slots[b]]`
+/// (`pool` is `[slots, K − 1, C]`, `slots` `[B]` distinct integers in range) followed by its
+/// new inputs `x[b]` (`x` is `[B, L, C]`), convolved with `w` (`[C, K, 1]`, one filter per
+/// channel) and, with `silu`, passed through `silu`. Returns the outputs (`[B, L, C]`) and
+/// the pool with each slot holding its window's last `K − 1` inputs, written in place when
+/// the evaluation owns it.
+///
+/// The results equal `take`, `concatenate`, `conv1d` (`groups = C`), `silu` and
+/// `put_along_axis` composed; on the GPU it is one kernel, bit for bit (up to 64 positions
+/// per window; longer windows and mixed dtypes run the composition).
+///
+/// ```
+/// use nuvec_core::{Array, DType, fast, ops};
+///
+/// let x = ops::ones([1, 1, 2], DType::F32);
+/// let w = ops::ones([2, 3, 1], DType::F32);
+/// let pool = ops::full([2, 2, 2], 2.0f32);
+/// let (y, pool) = fast::causal_conv1d_slots(&x, &w, &pool, &Array::from([1i32]), false);
+/// assert_eq!(y.to_vec::<f32>().unwrap(), [5.0, 5.0]);
+/// assert_eq!(pool.to_vec::<f32>().unwrap(), [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 1.0, 1.0]);
+/// ```
+#[track_caller]
+pub fn causal_conv1d_slots(
+    x: &Array,
+    w: &Array,
+    pool: &Array,
+    slots: &Array,
+    silu: bool,
+) -> (Array, Array) {
+    let [y, pool] = Array::sticky_n(
+        "causal_conv1d_slots",
+        Location::caller(),
+        &[x, w, pool, slots],
+        || {
+            let (y, pool) = imp::causal_conv1d_slots(x, w, pool, slots, silu)?;
+            Ok([y, pool])
+        },
+    );
+    (y, pool)
+}
+
+/// The experts' outputs `x` (`[..., k, D]`) weighted by `w` (`[..., k]`) and summed over the
+/// `k` experts: `(x * w[..., None]).sum(-2)`, products and sum in `x`'s dtype as mlx-lm's
+/// MoE blocks compute them. On the GPU it is one kernel equal to that composition bit for
+/// bit when both have one floating-point dtype and `k < 32` (otherwise the composition).
+///
+/// ```
+/// use nuvec_core::{array, fast};
+///
+/// let x = array![[[1.0f32, 2.0], [3.0, 4.0]]];
+/// let w = array![[0.5f32, 2.0]];
+/// assert_eq!(fast::weighted_sum(&x, &w).to_vec::<f32>().unwrap(), [6.5, 9.0]);
+/// ```
+#[track_caller]
+pub fn weighted_sum(x: &Array, w: &Array) -> Array {
+    Array::sticky("weighted_sum", Location::caller(), &[x, w], || {
+        imp::weighted_sum(x, w)
+    })
 }
 
 /// The gated delta rule, Gated DeltaNet's recurrence (as mlx-lm's `gated_delta_update`

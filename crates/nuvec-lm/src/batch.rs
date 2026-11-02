@@ -9,14 +9,16 @@
 //!
 //! Products route as MLX routes them, so a request's tokens can depend in their low bits
 //! on the requests batched with it, as in mlx-lm. With
-//! [`batch_invariant`](Batcher::batch_invariant), every step runs row-exact
+//! [`batch_invariant`](BatcherOptions::batch_invariant), every step runs row-exact
 //! ([`nuvec::with_row_exact`]): each request gets the tokens it gets alone, at some cost in
 //! throughput.
 //!
 //! Decoding is pipelined as [`generate`](crate::generate()): a step submits the next
 //! decoding step, fed with the tokens of the step before, then reads those tokens (one
 //! host read per step, every row sampled on the GPU), so the GPU never waits for the host.
-//! At most one step is in flight. A request that ends while its next step is in flight
+//! At most one step is in flight (on a pipeline stage, one micro-batch of the running
+//! requests per stage, so every stage works on a different one). A request that ends while
+//! its next step is in flight
 //! (end-of-sequence, cancellation) emits nothing from it; that step's work is dropped with
 //! the request. Admitting requests, preemption and cancellation wait for the step in
 //! flight (the following step runs without lookahead).
@@ -37,9 +39,11 @@ use std::collections::VecDeque;
 
 use nuvec::{Array, Error, Result, async_eval, eval, ops};
 
-use crate::generate::{GenerateOptions, Keys, prefill_rows};
-use crate::model::{KvCache, Model};
+pub use crate::generate::FinishReason;
+use crate::generate::{GenerateOptions, Keys, judge, prefill_rows};
+use crate::model::Model;
 use crate::paged::{PagedCache, Reservation, SeqId, forward_reserved};
+use crate::stop::StopState;
 
 /// Tokens to prefill from which prompts of the same length admitted together are prefilled
 /// in one batch (more than every quantized product's matrix-vector limit, 33 rows).
@@ -67,22 +71,6 @@ pub enum Event {
     },
 }
 
-/// Why a request finished.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FinishReason {
-    /// The model produced an end-of-sequence token (not emitted).
-    EndOfSequence,
-    /// It produced its `max_tokens`.
-    Length,
-    /// Its prompt and tokens no longer fit in the cache, even alone.
-    CacheFull,
-    /// It was cancelled ([`Batcher::cancel`]).
-    Cancelled,
-    /// Admitting or decoding it failed (the error's message); other requests go on.
-    Error(String),
-}
-
 #[derive(Debug, Clone)]
 struct Waiting {
     id: RequestId,
@@ -92,6 +80,8 @@ struct Waiting {
     produced: usize,
     /// Its sampling keys (from its seed), continued across preemptions.
     keys: Keys,
+    /// Its progress through its stop strings, continued across preemptions.
+    stops: StopState,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +110,98 @@ enum Failed {
     Sample(Error),
 }
 
+/// How a [`Batcher`] is sized and run. Start from the defaults and set what differs:
+/// `BatcherOptions { max_batch: 4, ..Default::default() }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatcherOptions {
+    /// Blocks per full-attention layer. `None` (the default) sizes the cache from memory:
+    /// `memory_fraction` of what the GPU's recommended working set leaves after the memory
+    /// in use (the weights), at least one block per request and at most room for
+    /// `max_batch` sequences of 131,072 positions. Without a Metal device, room for
+    /// `max_batch` sequences of 4,096 positions.
+    pub blocks: Option<usize>,
+    /// Positions per block, a power of two (16, as vLLM).
+    pub block_size: usize,
+    /// Requests decoded together at most (32, as mlx-lm's `BatchGenerator`).
+    pub max_batch: usize,
+    /// On a pipelined model, the micro-batches the running requests are split into, each
+    /// with its own step in flight. `None` (the default): one per stage, so every stage
+    /// works on a different one; 1 steps them as one batch. No effect on a whole model.
+    pub micro_batches: Option<usize>,
+    /// Whether each request gets the tokens it gets alone ([`crate::generate()`]), whatever
+    /// it is batched with: every step then runs row-exact ([`nuvec::with_row_exact`]), at
+    /// some cost in throughput. Off by default (MLX's routing, as mlx-lm's
+    /// `BatchGenerator`).
+    pub batch_invariant: bool,
+    /// The share of the free memory a default block count takes (0.9).
+    pub memory_fraction: f64,
+}
+
+/// The positions per request a default block count holds at most.
+const MAX_DEFAULT_POSITIONS: usize = 131_072;
+
+impl Default for BatcherOptions {
+    fn default() -> Self {
+        Self {
+            blocks: None,
+            block_size: 16,
+            max_batch: 32,
+            micro_batches: None,
+            batch_invariant: false,
+            memory_fraction: 0.9,
+        }
+    }
+}
+
+impl BatcherOptions {
+    /// Checks every field, naming the one that is invalid.
+    pub fn validate(&self) -> Result<()> {
+        let invalid = |msg: &str| Err(Error::InvalidArgument(format!("batcher: {msg}")));
+        if !self.block_size.is_power_of_two() {
+            return invalid(&format!(
+                "block_size must be a power of two, not {}",
+                self.block_size
+            ));
+        }
+        if self.max_batch == 0 {
+            return invalid("max_batch must be at least 1");
+        }
+        if self.blocks == Some(0) {
+            return invalid("blocks must be at least 1");
+        }
+        if self.micro_batches == Some(0) {
+            return invalid("micro_batches must be at least 1");
+        }
+        if !(self.memory_fraction > 0.0 && self.memory_fraction <= 1.0) {
+            return invalid(&format!(
+                "memory_fraction must be in (0, 1], not {}",
+                self.memory_fraction
+            ));
+        }
+        Ok(())
+    }
+
+    /// The block count: `blocks`, or sized from memory (see [`Self::blocks`]).
+    fn block_count(&self, model: &Model) -> usize {
+        if let Some(blocks) = self.blocks {
+            return blocks;
+        }
+        let per_block = (model.kv_bytes_per_position() * self.block_size).max(1);
+        let blocks = match nuvec::metal::device_info() {
+            Some(info) => {
+                let free = (info.recommended_working_set as usize)
+                    .saturating_sub(nuvec::memory::active_memory());
+                (free as f64 * self.memory_fraction) as usize / per_block
+            }
+            None => self.max_batch * 4096 / self.block_size,
+        };
+        blocks.clamp(
+            self.max_batch,
+            self.max_batch * MAX_DEFAULT_POSITIONS / self.block_size,
+        )
+    }
+}
+
 /// Requests served together over one [`PagedCache`] (see the [module documentation](self)).
 #[derive(Debug)]
 pub struct Batcher<'a> {
@@ -132,23 +214,29 @@ pub struct Batcher<'a> {
     preemptions: usize,
     /// Requests to finish as cancelled at the next step.
     cancelled: Vec<RequestId>,
-    /// The step submitted and not read yet.
-    in_flight: Option<InFlight>,
+    /// The steps submitted and not read yet, oldest first: one, or on a pipeline stage one
+    /// micro-batch per stage.
+    in_flight: VecDeque<InFlight>,
     /// A fault hook: the forward pass fails whenever it includes this request.
     #[cfg(test)]
     fault: Option<RequestId>,
     /// Batched prefills so far.
     #[cfg(test)]
     batched: usize,
-    /// Whether steps run row-exact ([`Batcher::batch_invariant`]).
+    /// Whether steps run row-exact ([`BatcherOptions::batch_invariant`]).
     invariant: bool,
+    /// Micro-batches kept in flight ([`BatcherOptions::micro_batches`]); `None`: one per
+    /// stage.
+    micro: Option<usize>,
+    /// Steps read so far (the allocator's cache is emptied every 512, as mlx-lm's).
+    steps: usize,
 }
 
 impl Drop for Batcher<'_> {
     /// Waits for the step in flight (its errors are moot).
     fn drop(&mut self) {
-        if let Some(f) = self.in_flight.take() {
-            let invariant = self.invariant;
+        let invariant = self.invariant;
+        for f in std::mem::take(&mut self.in_flight) {
             let wait = || eval(std::slice::from_ref(&f.tokens));
             let _ = if invariant {
                 nuvec::with_row_exact(wait)
@@ -160,38 +248,30 @@ impl Drop for Batcher<'_> {
 }
 
 impl<'a> Batcher<'a> {
-    /// A batcher decoding up to `max_batch` requests at a time over `blocks` blocks of
-    /// `block_size` positions per attention layer.
-    pub fn new(
-        model: &'a Model,
-        blocks: usize,
-        block_size: usize,
-        max_batch: usize,
-    ) -> Result<Self> {
+    /// A batcher for `model` as `options` say ([`BatcherOptions`]); the options are
+    /// checked first.
+    pub fn new(model: &'a Model, options: BatcherOptions) -> Result<Self> {
+        options.validate()?;
+        let blocks = options.block_count(model);
+        let max_batch = options.max_batch;
         Ok(Self {
             model,
-            cache: PagedCache::new(model, blocks, block_size, max_batch)?,
+            cache: PagedCache::new(model, blocks, options.block_size, max_batch)?,
             max_batch,
             waiting: VecDeque::new(),
             running: Vec::new(),
             next_id: 0,
             preemptions: 0,
             cancelled: Vec::new(),
-            in_flight: None,
+            in_flight: VecDeque::new(),
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
             batched: 0,
-            invariant: false,
+            invariant: options.batch_invariant,
+            micro: options.micro_batches,
+            steps: 0,
         })
-    }
-
-    /// Whether each request gets the tokens it gets alone (`generate`), whatever it is
-    /// batched with: every step then runs row-exact ([`nuvec::with_row_exact`]), at some
-    /// cost in throughput. Off by default (MLX's routing, as mlx-lm's `BatchGenerator`).
-    pub fn batch_invariant(mut self, on: bool) -> Self {
-        self.invariant = on;
-        self
     }
 
     /// Queues a request and returns its id. The prompt must have at least one token and
@@ -202,7 +282,7 @@ impl<'a> Batcher<'a> {
         if prompt.is_empty() {
             return invalid("empty prompt".into());
         }
-        options.sampler.validate()?;
+        options.validate()?;
         if !self.fits(prompt.len()) {
             return invalid(format!(
                 "a prompt of {} tokens never fits in {} blocks of {} positions",
@@ -213,14 +293,16 @@ impl<'a> Batcher<'a> {
         }
         let id = self.next_id;
         self.next_id += 1;
+        let nothing = options.max_tokens == 0;
         let request = Waiting {
             id,
             tokens: prompt,
+            keys: Keys::new(options.seed),
             options,
             produced: 0,
-            keys: Keys::new(options.seed),
+            stops: StopState::default(),
         };
-        if options.max_tokens == 0 {
+        if nothing {
             // Nothing to produce: finished at the next step.
             self.waiting.push_front(request);
         } else {
@@ -387,7 +469,7 @@ impl<'a> Batcher<'a> {
                 }
                 Err(e) => events.push(Event::Finished {
                     id: request.id,
-                    reason: FinishReason::Error(e.to_string()),
+                    reason: FinishReason::Error(e.clone()),
                 }),
             }
         }
@@ -403,7 +485,8 @@ impl<'a> Batcher<'a> {
     }
 
     /// Prefills requests' tokens but the last (prompts of the same length, nothing for
-    /// one-token prompts) into the paged cache, together; all are inserted or none.
+    /// one-token prompts) into the paged cache, together; all are inserted (in one write
+    /// per pool) or none.
     fn prefill_group(&mut self, requests: &[&Waiting]) -> Result<Vec<SeqId>> {
         let heads: Vec<&[u32]> = requests
             .iter()
@@ -420,24 +503,7 @@ impl<'a> Batcher<'a> {
         if requests.len() > 1 {
             self.batched += 1;
         }
-        let mut ids = Vec::with_capacity(requests.len());
-        for i in 0..requests.len() {
-            let row: Vec<KvCache> = if requests.len() == 1 {
-                std::mem::take(&mut kv)
-            } else {
-                kv.iter().map(|c| c.row(i as i32)).collect()
-            };
-            match self.cache.insert(&row) {
-                Ok(id) => ids.push(id),
-                Err(e) => {
-                    for id in ids {
-                        self.cache.remove(id)?;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        Ok(ids)
+        self.cache.insert_many(&kv)
     }
 
     /// Frees the most recently admitted request's blocks and queues it again first (its
@@ -486,35 +552,61 @@ impl<'a> Batcher<'a> {
     fn step_now(&mut self) -> Result<Vec<Event>> {
         let mut events = Vec::new();
         self.finish_cancelled(&mut events)?;
-        if let Some(f) = &self.in_flight
-            && !f.rows.iter().any(|&id| self.index(id).is_some())
-        {
-            // Every request of it has finished: only its work is left.
-            let f = self.in_flight.take().expect("in flight");
+        // Steps whose requests have all finished: only their work is left.
+        let (live, done): (Vec<InFlight>, Vec<InFlight>) = std::mem::take(&mut self.in_flight)
+            .into_iter()
+            .partition(|f| f.rows.iter().any(|&id| self.index(id).is_some()));
+        self.in_flight = live.into();
+        for f in done {
             let _ = eval(std::slice::from_ref(&f.tokens));
         }
-        if self.in_flight.is_none() {
+        if self.in_flight.is_empty() {
             self.admit(&mut events);
             self.make_room(&mut events)?;
             if self.running.is_empty() {
                 return Ok(events);
             }
-            self.in_flight = self.submit_all(&mut events)?;
+            // One micro-batch per pipeline stage (one batch otherwise), by request, each
+            // submitted before any is read, so every stage runs a different one.
+            let ids: Vec<RequestId> = self.running.iter().map(|r| r.request.id).collect();
+            let parts = self.depth().min(ids.len());
+            for part in 0..parts {
+                let (from, to) = (ids.len() * part / parts, ids.len() * (part + 1) / parts);
+                let rows: Vec<usize> = ids[from..to]
+                    .iter()
+                    .filter_map(|&id| self.index(id))
+                    .collect();
+                if let Some(f) = self.submit_rows(&rows, &mut events)? {
+                    self.in_flight.push_back(f);
+                }
+            }
         }
-        let Some(flight) = self.in_flight.take() else {
+        let Some(flight) = self.in_flight.pop_front() else {
             return Ok(events);
         };
         let mut failed = Vec::new();
         let next = self.look_ahead(&flight, &mut failed);
-        self.read(flight, next, failed, &mut events)
-            .map(|()| events)
+        self.read(flight, next, failed, &mut events)?;
+        self.steps += 1;
+        if self.steps.is_multiple_of(512) {
+            nuvec::memory::clear_cache();
+        }
+        Ok(events)
     }
 
-    /// Submits a step for every running request, fed with their `next` tokens; when the
+    /// The steps kept in flight: one per stage on a pipeline stage (or as set), else one.
+    fn depth(&self) -> usize {
+        match self.model.stage() {
+            Some(s) => self.micro.unwrap_or(s.group().size()).max(1),
+            None => 1,
+        }
+    }
+
+    /// Submits a step for running requests `rows`, fed with their `next` tokens; when the
     /// batched forward pass fails, each request is run alone and those failing alone
     /// finish with an error.
-    fn submit_all(&mut self, events: &mut Vec<Event>) -> Result<Option<InFlight>> {
-        let all: Vec<usize> = (0..self.running.len()).collect();
+    fn submit_rows(&mut self, rows: &[usize], events: &mut Vec<Event>) -> Result<Option<InFlight>> {
+        let all: Vec<usize> = rows.to_vec();
         let tokens = |b: &Self, rows: &[usize]| {
             Array::from(
                 rows.iter()
@@ -526,12 +618,10 @@ impl<'a> Batcher<'a> {
         let flight = match self.launch(&all, &tokens(self, &all)) {
             Ok(f) => Some(f),
             Err(Failed::Sample(e)) => {
-                finished.extend(all.iter().map(|&i| {
-                    (
-                        self.running[i].request.id,
-                        FinishReason::Error(e.to_string()),
-                    )
-                }));
+                finished.extend(
+                    all.iter()
+                        .map(|&i| (self.running[i].request.id, FinishReason::Error(e.clone()))),
+                );
                 None
             }
             Err(Failed::Forward(_)) => {
@@ -539,10 +629,8 @@ impl<'a> Batcher<'a> {
                 for i in all {
                     match self.launch(&[i], &tokens(self, &[i])) {
                         Ok(f) => parts.push(f),
-                        Err(Failed::Forward(e) | Failed::Sample(e)) => finished.push((
-                            self.running[i].request.id,
-                            FinishReason::Error(e.to_string()),
-                        )),
+                        Err(Failed::Forward(e) | Failed::Sample(e)) => finished
+                            .push((self.running[i].request.id, FinishReason::Error(e.clone()))),
                     }
                 }
                 (!parts.is_empty()).then(|| InFlight {
@@ -565,7 +653,7 @@ impl<'a> Batcher<'a> {
     fn look_ahead(
         &mut self,
         flight: &InFlight,
-        failed: &mut Vec<(RequestId, String)>,
+        failed: &mut Vec<(RequestId, Error)>,
     ) -> Option<InFlight> {
         if self.admissible() {
             return None;
@@ -596,7 +684,7 @@ impl<'a> Batcher<'a> {
             Err(Failed::Sample(e)) => {
                 failed.extend(
                     rows.iter()
-                        .map(|&i| (self.running[i].request.id, e.to_string())),
+                        .map(|&i| (self.running[i].request.id, e.clone())),
                 );
                 None
             }
@@ -609,7 +697,7 @@ impl<'a> Batcher<'a> {
         &mut self,
         flight: InFlight,
         next: Option<InFlight>,
-        failed: Vec<(RequestId, String)>,
+        failed: Vec<(RequestId, Error)>,
         events: &mut Vec<Event>,
     ) -> Result<()> {
         let tokens = match flight.tokens.to_vec::<u32>() {
@@ -624,7 +712,7 @@ impl<'a> Batcher<'a> {
                     .rows
                     .iter()
                     .filter(|&&id| self.index(id).is_some())
-                    .map(|&id| (id, FinishReason::Error(e.to_string())))
+                    .map(|&id| (id, FinishReason::Error(e.clone())))
                     .collect();
                 return self.finish(finished, events);
             }
@@ -635,17 +723,16 @@ impl<'a> Batcher<'a> {
             let Some(i) = self.running.iter().position(|r| r.request.id == id) else {
                 continue;
             };
-            let r = &mut self.running[i];
-            r.request.produced += 1;
-            if eos.contains(&token) {
-                finished.push((id, FinishReason::EndOfSequence));
-                continue;
+            let r = &mut self.running[i].request;
+            r.produced += 1;
+            let (emit, reason) = judge(&r.options, eos, &mut r.stops, token, r.produced);
+            if emit {
+                r.tokens.push(token);
+                self.running[i].next = token;
+                events.push(Event::Token { id, token });
             }
-            r.request.tokens.push(token);
-            r.next = token;
-            events.push(Event::Token { id, token });
-            if r.request.produced == r.request.options.max_tokens {
-                finished.push((id, FinishReason::Length));
+            if let Some(reason) = reason {
+                finished.push((id, reason));
             }
         }
         for (id, e) in failed {
@@ -653,7 +740,9 @@ impl<'a> Batcher<'a> {
                 finished.push((id, FinishReason::Error(e)));
             }
         }
-        self.in_flight = next;
+        if let Some(next) = next {
+            self.in_flight.push_back(next);
+        }
         self.finish(finished, events)
     }
 
@@ -722,10 +811,12 @@ impl<'a> Batcher<'a> {
     /// each other row's sampler with its own keys (as `generate` samples alone, so a seeded
     /// request gets the same tokens).
     fn sample(&mut self, rows: &[usize], logits: &Array) -> Result<Array> {
+        let logits = &self.masked(rows, logits);
         let greedy = logits.argmax(-1);
         let sampled = |i: usize| self.running[i].request.options.sampler.temperature != 0.0;
         if !rows.iter().any(|&i| sampled(i)) {
-            return greedy.check();
+            // A pipeline stage yields rank 0's tokens (the only rank that runs the head).
+            return self.model.share_sampled(&greedy, true).check();
         }
         let mut parts = Vec::with_capacity(rows.len());
         for (j, &i) in rows.iter().enumerate() {
@@ -747,7 +838,43 @@ impl<'a> Batcher<'a> {
                     .astype(greedy.dtype()),
             );
         }
-        ops::concatenate(&parts, 0).check()
+        let seeded = rows.iter().all(|&i| {
+            let o = &self.running[i].request.options;
+            o.sampler.temperature == 0.0 || o.seed.is_some()
+        });
+        self.model
+            .share_sampled(&ops::concatenate(&parts, 0), seeded)
+            .check()
+    }
+
+    /// `logits` with each row's end tokens masked while the token it samples is within
+    /// the request's `min_tokens` ([`GenerateOptions::min_tokens`]).
+    fn masked(&self, rows: &[usize], logits: &Array) -> Array {
+        let eos = &self.model.config.eos_token_ids;
+        // The token a row samples now: those read, those in flight, then this one.
+        let n = |i: usize| {
+            let r = &self.running[i].request;
+            let pending = self.in_flight.iter().filter(|f| f.rows.contains(&r.id));
+            r.produced + pending.count() + 1
+        };
+        if !rows
+            .iter()
+            .any(|&i| n(i) <= self.running[i].request.options.min_tokens)
+        {
+            return logits.clone();
+        }
+        let parts: Vec<Array> = rows
+            .iter()
+            .enumerate()
+            .map(|(j, &i)| {
+                let j = j as i32;
+                self.running[i]
+                    .request
+                    .options
+                    .mask(logits.i(j..j + 1), eos, n(i))
+            })
+            .collect();
+        ops::concatenate(&parts, 0)
     }
 }
 
@@ -756,6 +883,79 @@ mod tests {
     use super::*;
     use crate::generate;
     use crate::model::tests::fixture_model;
+
+    /// Each invalid field is named; the defaults size the cache from memory and serve.
+    #[test]
+    fn options_are_checked_and_the_default_cache_fits_memory() {
+        let Some(model) = fixture_model("qwen3_f32") else {
+            return;
+        };
+        let d = BatcherOptions::default;
+        for (options, field) in [
+            (
+                BatcherOptions {
+                    block_size: 12,
+                    ..d()
+                },
+                "block_size",
+            ),
+            (
+                BatcherOptions {
+                    max_batch: 0,
+                    ..d()
+                },
+                "max_batch",
+            ),
+            (
+                BatcherOptions {
+                    blocks: Some(0),
+                    ..d()
+                },
+                "blocks",
+            ),
+            (
+                BatcherOptions {
+                    micro_batches: Some(0),
+                    ..d()
+                },
+                "micro_batches",
+            ),
+            (
+                BatcherOptions {
+                    memory_fraction: 0.0,
+                    ..d()
+                },
+                "memory_fraction",
+            ),
+            (
+                BatcherOptions {
+                    memory_fraction: 1.5,
+                    ..d()
+                },
+                "memory_fraction",
+            ),
+        ] {
+            let e = Batcher::new(&model, options).unwrap_err().to_string();
+            assert!(e.contains(field), "{field}: {e}");
+        }
+        let mut b = Batcher::new(&model, d()).unwrap();
+        let blocks = b.cache.total_blocks();
+        let per_block = model.kv_bytes_per_position() * 16;
+        let free = nuvec::metal::device_info().unwrap().recommended_working_set as usize;
+        assert!(blocks >= 32 && blocks * per_block <= free, "{blocks}");
+        assert!(blocks <= 32 * MAX_DEFAULT_POSITIONS / 16, "{blocks}");
+        let id = b.submit(vec![1, 2, 3], greedy(4)).unwrap();
+        let mut done = None;
+        while b.is_busy() {
+            for e in b.step().unwrap() {
+                if let Event::Finished { id: f, reason } = e {
+                    assert_eq!(f, id);
+                    done = Some(reason);
+                }
+            }
+        }
+        assert!(done.is_some());
+    }
 
     fn greedy(max_tokens: usize) -> GenerateOptions {
         GenerateOptions {
@@ -810,9 +1010,17 @@ mod tests {
             };
             let prompt = [3u32, 17, 92, 5, 64, 33, 101, 8, 77];
             let prompts = [&prompt[..5], &prompt[2..9], &prompt[1..4]];
-            let mut batcher = Batcher::new(&model, 32, 4, 3)
-                .unwrap()
-                .batch_invariant(true);
+            let mut batcher = Batcher::new(
+                &model,
+                BatcherOptions {
+                    blocks: Some(32),
+                    block_size: 4,
+                    max_batch: 3,
+                    batch_invariant: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             for p in prompts {
                 batcher.submit(p.to_vec(), greedy(8)).unwrap();
             }
@@ -823,7 +1031,7 @@ mod tests {
                 }
             });
             assert!(
-                matches!(&finished[1], Some(FinishReason::Error(m)) if m.contains("injected")),
+                matches!(&finished[1], Some(FinishReason::Error(m)) if m.to_string().contains("injected")),
                 "{name}: {:?}",
                 finished[1]
             );
@@ -866,9 +1074,17 @@ mod tests {
             let base = [3u32, 17, 92, 5, 64, 33, 101, 8, 77, 2, 45, 120, 9, 56];
             let prompt = |n: usize| base.iter().cycle().take(n).copied().collect::<Vec<_>>();
             // 10 blocks of 4 positions, three requests at a time.
-            let mut batcher = Batcher::new(&model, 10, 4, 3)
-                .unwrap()
-                .batch_invariant(true);
+            let mut batcher = Batcher::new(
+                &model,
+                BatcherOptions {
+                    blocks: Some(10),
+                    block_size: 4,
+                    max_batch: 3,
+                    batch_invariant: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             assert!(batcher.submit(prompt(40), greedy(1)).is_err(), "never fits");
             let requests = [
                 (prompt(1), 6),  // 0: one token
@@ -957,16 +1173,24 @@ mod tests {
                 (cycled(3, n - 3), greedy(8)),
                 (cycled(4, n), greedy(8)),
             ];
-            let mut batcher = Batcher::new(&model, 256, 4, requests.len())
-                .unwrap()
-                .batch_invariant(true);
+            let mut batcher = Batcher::new(
+                &model,
+                BatcherOptions {
+                    blocks: Some(256),
+                    block_size: 4,
+                    max_batch: requests.len(),
+                    batch_invariant: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             for (p, o) in &requests {
-                batcher.submit(p.clone(), *o).unwrap();
+                batcher.submit(p.clone(), o.clone()).unwrap();
             }
             let (tokens, _) = run(&mut batcher, requests.len(), 100, |_, _| {});
             assert_eq!(batcher.batched > 0, batched, "{name} ({n} tokens)");
             for (i, (p, o)) in requests.iter().enumerate() {
-                let want: Vec<u32> = generate(&model, p, *o)
+                let want: Vec<u32> = generate(&model, p, o.clone())
                     .unwrap()
                     .collect::<Result<_>>()
                     .unwrap();

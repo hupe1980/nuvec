@@ -22,6 +22,7 @@ fn failed_here(a: &Array, op: &str, line: u32, kind: fn(&OpErrorKind) -> bool) {
         panic!("{op}: not an op error: {e}");
     };
     assert_eq!(*name, op, "{e}");
+    let at = at.unwrap_or_else(|| panic!("{op}: no location: {e}"));
     assert!(at.file().ends_with("tests/errors.rs"), "{e}");
     // The call starts on the line of `case!` or, when formatted over several lines, just
     // below it.

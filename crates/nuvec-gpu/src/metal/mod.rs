@@ -2,7 +2,9 @@
 
 mod allocator;
 mod buffer;
+mod capture;
 mod command;
+mod event;
 pub mod profile;
 mod residency;
 
@@ -14,6 +16,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use allocator::Pool;
 pub use buffer::Buffer;
 pub use command::{Arg, CommandBuffer, Pending, Submitted, Timeline};
+pub use event::Event;
 use nuvec_kernels::{MetallibMode, NaxMode};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
@@ -165,13 +168,35 @@ impl Device {
         let ram = info.physical_memory;
         let options = objc2_metal::MTLResourceOptions::StorageModeShared;
         let placeholder = device.newBufferWithLength_options(16, options);
-        let residency = residency::Residency::new(residency::attach(&device, &queue));
+        let residency = residency::Residency::new(
+            residency::metal(&device, &queue),
+            info.recommended_working_set,
+        );
         let pool = Arc::new(Pool::new(
             info.recommended_working_set,
             ram,
             placeholder,
             residency,
         ));
+        // MLX's residency refresh (`MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS`, off by default).
+        let interval = std::env::var("MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0);
+        if let Some(ms) = interval {
+            let pool = Arc::downgrade(&pool);
+            let refresh = move || {
+                while let Some(pool) = {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    pool.upgrade()
+                } {
+                    pool.refresh_residency();
+                }
+            };
+            let _ = std::thread::Builder::new()
+                .name("nuvec-residency".into())
+                .spawn(refresh);
+        }
         Some(Device {
             inner: Arc::new(Inner {
                 device,
@@ -233,6 +258,13 @@ impl Device {
             )));
         }
         Ok(autoreleasepool(|_| self.inner.pool.set_wired_limit(bytes)))
+    }
+
+    /// Sets the residency sets' per-set cap for later wired buffers (0: one set), as MLX's
+    /// `set_max_bytes_per_set`. A test hook.
+    #[doc(hidden)]
+    pub fn __set_residency_set_cap(&self, bytes: usize) {
+        self.inner.pool.set_residency_cap(bytes);
     }
 
     /// Whether buffers can be wired on this system (residency sets: a Metal 3 GPU).

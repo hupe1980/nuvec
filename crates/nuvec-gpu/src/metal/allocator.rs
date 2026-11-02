@@ -371,6 +371,7 @@ impl Pool {
             wired: s.residency.wired(),
             mapped: s.mapped,
             wired_mapped: s.residency.wired_mapped(),
+            residency_sets: s.residency.sets(),
         }
     }
 
@@ -400,6 +401,16 @@ impl Pool {
     /// Whether buffers can be wired on this system (residency sets: a Metal 3 GPU).
     pub(crate) fn can_wire(&self) -> bool {
         self.lock().residency.supported()
+    }
+
+    /// Sets the residency sets' per-set cap for later placements (0: one set).
+    pub(crate) fn set_residency_cap(&self, bytes: usize) {
+        self.lock().residency.set_cap(bytes);
+    }
+
+    /// Renews the residency requests of the non-empty residency sets.
+    pub(crate) fn refresh_residency(&self) {
+        self.lock().residency.refresh();
     }
 
     pub(crate) fn set_wired_limit(&self, limit: usize) -> usize {
@@ -449,7 +460,12 @@ mod tests {
 
     #[test]
     fn default_limits_follow_mlx() {
-        let pool = Pool::new(40_000_000_000, 48_000_000_000, None, Residency::new(None));
+        let pool = Pool::new(
+            40_000_000_000,
+            48_000_000_000,
+            None,
+            Residency::new(None, 0),
+        );
         let stats = pool.stats();
         assert_eq!(stats.memory_limit, 45_600_000_000); // min(1.5 * 40e9, 0.95 * 48e9)
         assert_eq!(stats.cache_limit, stats.memory_limit);

@@ -136,6 +136,32 @@ impl Header {
     }
 }
 
+impl Header {
+    /// The byte ranges of the file a filtered load of an aligned file maps: each kept
+    /// tensor's range rounded out to whole pages of `page` bytes, merged where they touch,
+    /// as `(offset, length)` in file order. Keeping every tensor maps the whole file
+    /// (header included) as one range. Empty tensors take no range.
+    fn runs(&self, file_len: usize, page: u64, keep: &dyn Fn(&str) -> bool) -> Vec<(u64, u64)> {
+        let up = |x: u64| x.div_ceil(page) * page;
+        if self.ranges.iter().all(|(_, _, name, _, _)| keep(name)) {
+            return vec![(0, up(file_len as u64))];
+        }
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for (begin, end, name, _, _) in &self.ranges {
+            if begin == end || !keep(name) {
+                continue;
+            }
+            let lo = (self.start + begin) as u64 / page * page;
+            let hi = up((self.start + end) as u64);
+            match runs.last_mut() {
+                Some((at, len)) if lo <= *at + *len => *len = hi.max(*at + *len) - *at,
+                _ => runs.push((lo, hi - lo)),
+            }
+        }
+        runs
+    }
+}
+
 /// The reads loading a misaligned file makes ([`Header::plan`]).
 #[derive(Default)]
 struct ReadPlan {
@@ -280,7 +306,8 @@ fn named(path: &Path, e: Error) -> Error {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Footprint {
-    /// Kept mapped: the page-rounded whole files (header included) of aligned files.
+    /// Kept mapped: of aligned files, the page-rounded ranges of the kept tensors (the whole
+    /// file, header included, when every tensor is kept).
     pub mapped: u64,
     /// Read into allocator memory: the size-class-rounded tensors of files whose tensors are
     /// not aligned (as MLX writes them; mlx-community checkpoints). Such files are not
@@ -296,7 +323,8 @@ impl Footprint {
     /// `keep` accepts.
     fn of(header: &Header, file_len: usize, keep: &dyn Fn(&str) -> bool) -> Self {
         if header.aligned() {
-            let mapping = nuvec_core::MappedFile::mapping_size(file_len as u64);
+            let page = nuvec_core::MappedRanges::page_size() as u64;
+            let mapping = header.runs(file_len, page, keep).iter().map(|r| r.1).sum();
             Footprint {
                 mapped: mapping,
                 copied: 0,
@@ -341,7 +369,7 @@ pub fn safetensors_footprint(path: impl AsRef<Path>) -> Result<Footprint> {
 
 /// What [`load_safetensors_filtered`] with `keep` will hold, as [`safetensors_footprint`]
 /// (a file, or every `*.safetensors` file of a directory): `copied` counts only the kept
-/// tensors of misaligned files; aligned files are mapped whole whatever is kept.
+/// tensors of misaligned files, and only the kept tensors' pages of aligned files.
 ///
 /// ```
 /// # fn main() -> nuvec_core::Result<()> {
@@ -352,7 +380,7 @@ pub fn safetensors_footprint(path: impl AsRef<Path>) -> Result<Footprint> {
 /// nuvec_io::save_safetensors(&path, &[("a", &array![1.0]), ("b", &array![2.0])], &[])?;
 /// let all = nuvec_io::safetensors_footprint(&path)?;
 /// let some = nuvec_io::safetensors_footprint_filtered(&path, |name| name == "b")?;
-/// assert_eq!(some, all); // aligned: mapped whole
+/// assert_eq!(some, all); // a tiny file: both tensors share its one page
 /// # Ok(())
 /// # }
 /// ```
@@ -360,6 +388,7 @@ pub fn safetensors_footprint_filtered(
     path: impl AsRef<Path>,
     keep: impl Fn(&str) -> bool,
 ) -> Result<Footprint> {
+    let keep = |name: &str| !name.starts_with(PAD) && keep(name);
     let path = path.as_ref();
     let files = if path.is_dir() {
         let mut files: Vec<_> = std::fs::read_dir(path)
@@ -381,6 +410,51 @@ pub fn safetensors_footprint_filtered(
     }
     total.transient = total.mapped + total.copied;
     Ok(total)
+}
+
+/// A tensor of a safetensors header ([`safetensors_tensors`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TensorInfo {
+    /// The tensor's name.
+    pub name: String,
+    /// Its dtype.
+    pub dtype: DType,
+    /// Its shape.
+    pub shape: Vec<usize>,
+    /// Its bytes in the file.
+    pub bytes: usize,
+}
+
+/// The tensors of a safetensors file, from its header alone (no tensor data is read or
+/// mapped), in file order.
+///
+/// ```
+/// # fn main() -> nuvec_core::Result<()> {
+/// # if cfg!(miri) { return Ok(()); }
+/// use nuvec_core::array;
+///
+/// let path = std::env::temp_dir().join("nuvec-tensors-doc.safetensors");
+/// nuvec_io::save_safetensors(&path, &[("w", &array![[1.0, 2.0]])], &[])?;
+/// let t = nuvec_io::safetensors_tensors(&path)?;
+/// assert_eq!((t[0].name.as_str(), t[0].shape.as_slice(), t[0].bytes), ("w", &[1, 2][..], 8));
+/// # Ok(())
+/// # }
+/// ```
+pub fn safetensors_tensors(path: impl AsRef<Path>) -> Result<Vec<TensorInfo>> {
+    let path = path.as_ref();
+    let (header, _) = read_header(path)?;
+    Ok(header
+        .ranges
+        .into_iter()
+        .filter(|(_, _, name, _, _)| !name.starts_with(PAD))
+        .map(|(begin, end, name, dtype, shape)| TensorInfo {
+            name,
+            dtype,
+            shape,
+            bytes: end - begin,
+        })
+        .collect())
 }
 
 /// Loads a safetensors file. The tensors are views of the memory-mapped file or, if they
@@ -419,13 +493,16 @@ pub fn load_safetensors_filtered(
     path: impl AsRef<Path>,
     keep: impl Fn(&str) -> bool,
 ) -> Result<SafeTensors> {
+    let keep = |name: &str| !name.starts_with(PAD) && keep(name);
     let path = path.as_ref();
     let (header, len) = read_header(path)?;
     let aligned = header.aligned();
     let plan = (!aligned).then(|| header.plan(&keep));
+    let page = nuvec_core::MappedRanges::page_size() as u64;
+    let runs = header.runs(len, page, &keep);
     let need = match &plan {
         Some(plan) => nuvec_core::MappedFile::copy_size(plan.len as u64),
-        None => Footprint::of(&header, len, &|_| true).transient,
+        None => runs.iter().map(|r| r.1).sum(),
     };
     if let Some(room) = nuvec_core::MappedFile::headroom()
         && need > room
@@ -455,6 +532,29 @@ pub fn load_safetensors_filtered(
             for (index, offset) in plan.tensors {
                 let (_, _, name, dtype, shape) = ranges[index].take().expect("kept once");
                 out.tensors.insert(name, data.array(offset, dtype, &shape)?);
+            }
+        }
+        // Some tensors dropped: only the kept tensors' pages are mapped.
+        None if runs != [(0, len.div_ceil(page as usize) as u64 * page)] => {
+            // Within page-rounded ranges of a file of `len` bytes: the last range may end
+            // past it, inside its last page; map it to the file's end.
+            let ranges: Vec<(u64, u64)> = runs
+                .iter()
+                .map(|&(o, n)| (o, n.min(len as u64 - o)))
+                .collect();
+            let file = nuvec_core::MappedRanges::open(path, &ranges).map_err(oom)?;
+            for (begin, end, name, dtype, shape) in header.ranges {
+                if keep(&name) {
+                    let tensor = if begin == end {
+                        nuvec_core::ops::zeros(
+                            shape.iter().map(|&d| d as i32).collect::<Vec<_>>(),
+                            dtype,
+                        )
+                    } else {
+                        file.array(header.start + begin, dtype, &shape)?
+                    };
+                    out.tensors.insert(name, tensor);
+                }
             }
         }
         None => {
@@ -543,6 +643,144 @@ fn encode(tensors: &[(&str, &Array)], metadata: &[(&str, &str)]) -> Result<Vec<u
     out.extend(header);
     out.extend(data);
     Ok(out)
+}
+
+/// The name prefix of the padding tensors [`align_safetensors`] writes between tensors
+/// (safetensors allows no gaps): never loaded or listed.
+const PAD: &str = "__nuvec_pad_";
+
+/// Writes a copy of the safetensors file `src` at `dst` in which every tensor starts at a
+/// multiple of 256 bytes of the file (the placement D-106 measured fastest), with the same
+/// tensors, bit for bit, in the same order, and the same metadata. Gaps are filled with
+/// padding tensors that nuvec never loads, so `dst` is a valid safetensors file that nuvec
+/// maps without a copy. Tensors are streamed with positioned reads (no whole-file copy in
+/// memory); `dst` is written through a temporary file and a rename.
+pub fn align_safetensors(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
+    use std::io::Write;
+    let (src, dst) = (src.as_ref(), dst.as_ref());
+    let (header, _) = read_header(src)?;
+    let mut entries = Vec::new();
+    if !header.metadata.is_empty() {
+        entries.push(format!(
+            "\"__metadata__\":{}",
+            json::object(&header.metadata)
+        ));
+    }
+    // (file offset in src, length, offset in dst's data section) of each tensor.
+    let mut copies = Vec::new();
+    let mut at = 0usize;
+    for (i, (begin, end, name, dtype, shape)) in header.ranges.iter().enumerate() {
+        let pad = at.next_multiple_of(TENSOR_ALIGN) - at;
+        if pad > 0 {
+            entries.push(format!(
+                "\"{PAD}{i}\":{{\"dtype\":\"U8\",\"shape\":[{pad}],\"data_offsets\":[{at},{}]}}",
+                at + pad
+            ));
+            at += pad;
+        }
+        let n = end - begin;
+        let dims: Vec<String> = shape.iter().map(usize::to_string).collect();
+        entries.push(format!(
+            "{}:{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{at},{}]}}",
+            json::quote(name),
+            name_of(*dtype),
+            dims.join(","),
+            at + n
+        ));
+        copies.push(((header.start + begin) as u64, n, at));
+        at += n;
+    }
+    // The data section starts at a multiple of 256 too.
+    let mut json = format!("{{{}}}", entries.join(",")).into_bytes();
+    json.resize((8 + json.len()).next_multiple_of(TENSOR_ALIGN) - 8, b' ');
+    fn io(p: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
+        move |e| Error::Io(format!("{}: {e}", p.display()))
+    }
+    let tmp = dst.with_extension("safetensors.tmp");
+    let input = std::fs::File::open(src).map_err(io(src))?;
+    let mut out =
+        std::io::BufWriter::with_capacity(16 << 20, std::fs::File::create(&tmp).map_err(io(&tmp))?);
+    out.write_all(&(json.len() as u64).to_le_bytes())
+        .map_err(io(&tmp))?;
+    out.write_all(&json).map_err(io(&tmp))?;
+    let mut written = 0usize;
+    let mut chunk = vec![0u8; 16 << 20];
+    for (from, n, to) in copies {
+        out.write_all(&vec![0u8; to - written]).map_err(io(&tmp))?;
+        let mut done = 0;
+        while done < n {
+            let k = (n - done).min(chunk.len());
+            #[cfg(unix)]
+            std::os::unix::fs::FileExt::read_exact_at(&input, &mut chunk[..k], from + done as u64)
+                .map_err(io(src))?;
+            #[cfg(not(unix))]
+            {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = &input;
+                f.seek(SeekFrom::Start(from + done as u64))
+                    .map_err(io(src))?;
+                f.read_exact(&mut chunk[..k]).map_err(io(src))?;
+            }
+            out.write_all(&chunk[..k]).map_err(io(&tmp))?;
+            done += k;
+        }
+        written = to + n;
+    }
+    out.into_inner()
+        .map_err(|e| Error::Io(format!("{}: {e}", tmp.display())))?
+        .sync_all()
+        .map_err(io(&tmp))?;
+    std::fs::rename(&tmp, dst).map_err(io(dst))
+}
+
+/// [`load_safetensors_filtered`] through an aligned copy: an aligned file is loaded (mapped)
+/// as it is; a misaligned one (mlx-community checkpoints) is loaded from an aligned copy in
+/// `cache_dir` ([`align_safetensors`]), written on first use and rewritten when the source's
+/// size or modification time changes, so later loads map it without a copy. If the copy
+/// cannot be written (no room, no permission), the file is read as usual.
+pub fn load_safetensors_cached(
+    path: impl AsRef<Path>,
+    cache_dir: impl AsRef<Path>,
+    keep: impl Fn(&str) -> bool,
+) -> Result<SafeTensors> {
+    use std::hash::{Hash, Hasher};
+    let (path, cache_dir) = (path.as_ref(), cache_dir.as_ref());
+    let (header, len) = read_header(path)?;
+    if header.aligned() {
+        return load_safetensors_filtered(path, keep);
+    }
+    let meta =
+        std::fs::metadata(path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .hash(&mut h);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tensors");
+    let copy = cache_dir.join(format!(
+        "{stem}-{:016x}-{len}-{mtime}.safetensors",
+        h.finish()
+    ));
+    if !copy.exists() {
+        let made = std::fs::create_dir_all(cache_dir)
+            .map_err(|e| Error::Io(format!("{}: {e}", cache_dir.display())))
+            .and_then(|()| align_safetensors(path, &copy));
+        if let Err(e) = made {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!("nuvec: no aligned copy ({e}); reading {}", path.display())
+            });
+            return load_safetensors_filtered(path, keep);
+        }
+    }
+    load_safetensors_filtered(&copy, keep)
 }
 
 /// Writes `bytes` to `path` atomically: to `path.tmp`, renamed over `path` on success.
@@ -682,5 +920,31 @@ mod tests {
             [(s, 0, 300), (s + 300, 512, 10), (s + 312, 768, 260)]
         );
         assert_eq!(plan.len, 1028);
+    }
+
+    #[test]
+    fn filtered_aligned_loads_map_page_runs_of_the_kept_tensors() {
+        // Pages of 64 bytes for the test. Data starts at 8 + 376 = 384 (a padded header).
+        let json = format!(
+            "{:<376}",
+            r#"{"a":{"dtype":"F32","shape":[8],"data_offsets":[0,32]},"#.to_string()
+                + r#""b":{"dtype":"F32","shape":[8],"data_offsets":[32,64]},"#
+                + r#""big":{"dtype":"F32","shape":[64],"data_offsets":[64,320]},"#
+                + r#""e":{"dtype":"F32","shape":[0],"data_offsets":[320,320]},"#
+                + r#""z":{"dtype":"F32","shape":[8],"data_offsets":[320,352]}}"#
+        );
+        assert_eq!(json.len(), 376);
+        let start = 8 + json.len();
+        let len = start + 352;
+        let header = parse_header(json.as_bytes(), start, len).unwrap();
+        // Everything: the whole file, one run.
+        assert_eq!(header.runs(len, 64, &|_| true), [(0, 768)]);
+        // `a` and `b` share their pages: one run; `big` dropped; `z` its own pages.
+        let some = header.runs(len, 64, &|n| n != "big");
+        assert_eq!(some, [(384, 64), (704, 64)]);
+        // Touching runs merge.
+        assert_eq!(header.runs(len, 64, &|n| n != "z"), [(384, 320)]);
+        // An empty tensor takes nothing; nothing kept, nothing mapped.
+        assert_eq!(header.runs(len, 64, &|n| n == "e"), []);
     }
 }

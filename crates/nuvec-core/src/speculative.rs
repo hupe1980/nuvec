@@ -104,7 +104,7 @@ pub fn accept_greedy(logits: &Array, draft: &Array, eos: &Array) -> Array {
 fn invalid(m: String) -> crate::Error {
     crate::Error::Op {
         op: "speculative",
-        at: Location::caller(),
+        at: Some(Location::caller()),
         kind: OpErrorKind::InvalidArgument(m),
     }
 }

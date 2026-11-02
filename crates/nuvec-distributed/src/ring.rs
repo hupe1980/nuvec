@@ -9,7 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nuvec_core::distributed::{AllReduce, Communicator};
-use nuvec_core::{DType, Error, Result, bf16, f16};
+use nuvec_core::{DType, Error, Result};
+
+use crate::reduce::combine;
 
 pub(crate) struct Ring {
     rank: usize,
@@ -18,6 +20,8 @@ pub(crate) struct Ring {
     right: Vec<TcpStream>,
     /// Connections from the left neighbour (this rank accepted).
     left: Vec<TcpStream>,
+    /// Receive buffers of a split all-reduce's parts, kept between calls.
+    scratch: Vec<std::sync::Mutex<Vec<u8>>>,
     /// The first transport error: a failed transfer leaves unread bytes in the sockets, so
     /// every later operation fails with it instead of reading misaligned data.
     failed: std::sync::Mutex<Option<String>>,
@@ -41,14 +45,20 @@ fn configure(s: &TcpStream, timeout: Duration, peer: usize) -> Result<()> {
         s.set_nonblocking(false)?;
         s.set_nodelay(true)?;
         s.set_read_timeout(Some(timeout))?;
-        s.set_write_timeout(Some(timeout))
+        s.set_write_timeout(Some(timeout))?;
+        crate::keepalive::enable(s)
     };
     set().map_err(|e| peer_error(peer, "configuring the connection", e))
 }
 
 impl Ring {
     /// Connects rank `rank` of the ring described by `nodes` (the addresses per rank).
-    pub(crate) fn connect(nodes: &[Vec<String>], rank: usize, timeout: Duration) -> Result<Self> {
+    pub(crate) fn connect(
+        nodes: &[Vec<String>],
+        rank: usize,
+        timeout: Duration,
+        key: Option<&crate::auth::Key>,
+    ) -> Result<Self> {
         let size = nodes.len();
         if rank >= size {
             return Err(Error::InvalidArgument(format!(
@@ -77,30 +87,31 @@ impl Ring {
             listeners
                 .iter()
                 .map(|l| {
-                    let s = loop {
-                        match l.accept() {
-                            Ok((s, _)) => break s,
+                    // With a key, a connection that fails the handshake (a stray client) is
+                    // dropped and accepting goes on until the deadline.
+                    let mut refused = None;
+                    loop {
+                        let s = match l.accept() {
+                            Ok((s, _)) => s,
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 if Instant::now() > deadline {
-                                    return Err(peer_error(left, "never connected", "timed out"));
+                                    return Err(refused.unwrap_or_else(|| {
+                                        peer_error(left, "never connected", "timed out")
+                                    }));
                                 }
                                 thread::sleep(Duration::from_millis(5));
+                                continue;
                             }
                             Err(e) => return Err(peer_error(left, "accepting", e)),
+                        };
+                        configure(&s, timeout, left)?;
+                        let who = format!("rank {left}");
+                        match crate::auth::accept(&s, key, rank as u64, Some(left as u64), &who) {
+                            Ok(_) => return Ok(s),
+                            Err(e) if key.is_some() => refused = Some(e),
+                            Err(e) => return Err(e),
                         }
-                    };
-                    configure(&s, timeout, left)?;
-                    let mut who = [0u8; 8];
-                    (&s).read_exact(&mut who)
-                        .map_err(|e| peer_error(left, "handshake", e))?;
-                    if u64::from_le_bytes(who) != left as u64 {
-                        return Err(peer_error(
-                            left,
-                            "handshake",
-                            format!("rank {} connected instead", u64::from_le_bytes(who)),
-                        ));
                     }
-                    Ok(s)
                 })
                 .collect()
         };
@@ -119,8 +130,8 @@ impl Ring {
                         }
                     };
                     configure(&s, timeout, right)?;
-                    (&s).write_all(&(rank as u64).to_le_bytes())
-                        .map_err(|e| peer_error(right, "handshake", e))?;
+                    let who = format!("rank {right}");
+                    crate::auth::connect(&s, key, rank as u64, right as u64, &who)?;
                     Ok(s)
                 })
                 .collect()
@@ -133,11 +144,13 @@ impl Ring {
             let r = connect()?;
             (r, accept()?)
         };
+        let parts = right_s.len() + left_s.len();
         Ok(Self {
             rank,
             size,
             right: right_s,
             left: left_s,
+            scratch: (0..parts).map(|_| std::sync::Mutex::default()).collect(),
             failed: std::sync::Mutex::new(None),
         })
     }
@@ -200,10 +213,39 @@ fn parts(len: usize, elem: usize, k: usize) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
+/// Whether a failed send is transient: the kernel's buffers are full for the moment
+/// (`ENOBUFS` on macOS loopback under load, `EAGAIN`) or the call was interrupted. MLX's ring
+/// retries these too ("made no progress").
+fn transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    ) || e.raw_os_error() == Some(libc::ENOBUFS)
+}
+
 fn write_all(s: &TcpStream, data: &[u8], peer: usize) -> Result<()> {
     let mut s = s;
-    s.write_all(data)
-        .map_err(|e| peer_error(peer, "sending", e))
+    let mut rest = data;
+    let mut stalled = std::time::Duration::ZERO;
+    let mut backoff = std::time::Duration::from_micros(50);
+    while !rest.is_empty() {
+        match s.write(rest) {
+            Ok(0) => return Err(peer_error(peer, "sending", "connection closed")),
+            Ok(n) => {
+                rest = &rest[n..];
+                stalled = std::time::Duration::ZERO;
+                backoff = std::time::Duration::from_micros(50);
+            }
+            // Transient: wait and retry, but give up after 10 s without progress.
+            Err(e) if transient(&e) && stalled < std::time::Duration::from_secs(10) => {
+                std::thread::sleep(backoff);
+                stalled += backoff;
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(peer_error(peer, "sending", e)),
+        }
+    }
+    Ok(())
 }
 
 fn read_exact(s: &TcpStream, data: &mut [u8], peer: usize) -> Result<()> {
@@ -218,12 +260,16 @@ fn read_exact(s: &TcpStream, data: &mut [u8], peer: usize) -> Result<()> {
 /// the sockets' buffers, and a thread would cost more than the transfer.
 const SMALL: usize = 32 << 10;
 
-/// Packets of a step's receive: each is reduced while the next arrives (MLX's 32 KB–8 MB
-/// packets, double-buffered).
-const PACKET: usize = 1 << 20;
+/// The packets of a step's receive of `len` bytes (elements of `elem` bytes), each reduced
+/// while the next arrives: half the step, from 32K elements up to 8 MB (MLX's packets).
+fn packet(len: usize, elem: usize) -> usize {
+    (len / 2).min(8 << 20).max(32_768 * elem)
+}
 
-/// Sends `data` to `to` while receiving `into` from `from`; `each` consumes every received
-/// packet (its offset in `into` and its bytes) as soon as it is complete.
+/// Sends `data` to `to` while receiving `into` from `from` in packets of `packet` bytes;
+/// `each` consumes every received packet (its offset in `into` and its bytes) as soon as it
+/// is complete.
+#[allow(clippy::too_many_arguments)]
 fn exchange(
     to: &TcpStream,
     data: &[u8],
@@ -231,6 +277,7 @@ fn exchange(
     from: &TcpStream,
     into: &mut [u8],
     from_rank: usize,
+    packet: usize,
     mut each: impl FnMut(usize, &[u8]) -> Result<()>,
 ) -> Result<()> {
     if data.len() <= SMALL && into.len() <= SMALL {
@@ -238,124 +285,47 @@ fn exchange(
         read_exact(from, into, from_rank)?;
         return each(0, into);
     }
-    thread::scope(|scope| {
-        let sender = scope.spawn(|| write_all(to, data, to_rank));
-        let mut received = Ok(());
-        let mut at = 0;
-        while at < into.len() && received.is_ok() {
-            let end = (at + PACKET).min(into.len());
-            received = read_exact(from, &mut into[at..end], from_rank)
-                .and_then(|()| each(at, &into[at..end]));
-            at = end;
-        }
-        let sent = sender.join().unwrap_or_else(|_| {
-            Err(Error::Backend(
-                "distributed: the sending thread panicked".into(),
-            ))
-        });
-        received.and(sent)
-    })
-}
-
-macro_rules! fold {
-    ($acc:ident, $x:ident, $t:ty, $n:expr, $f:expr) => {{
-        for (a, b) in $acc.chunks_exact_mut($n).zip($x.chunks_exact($n)) {
-            let (p, q) = (
-                <$t>::from_le_bytes(a.try_into().unwrap()),
-                <$t>::from_le_bytes(b.try_into().unwrap()),
-            );
-            let f: fn($t, $t) -> $t = $f;
-            a.copy_from_slice(&f(p, q).to_le_bytes());
-        }
-    }};
-}
-
-macro_rules! numeric {
-    ($op:expr, $acc:ident, $x:ident, $t:ty) => {{
-        let n = size_of::<$t>();
-        match $op {
-            AllReduce::Sum => fold!($acc, $x, $t, n, |a, b| a + b),
-            AllReduce::Max => fold!($acc, $x, $t, n, |a, b| if a < b { b } else { a }),
-            _ => fold!($acc, $x, $t, n, |a, b| if b < a { b } else { a }),
-        }
-    }};
-}
-
-macro_rules! wrapping {
-    ($op:expr, $acc:ident, $x:ident, $t:ty) => {{
-        let n = size_of::<$t>();
-        match $op {
-            AllReduce::Sum => fold!($acc, $x, $t, n, |a, b| a.wrapping_add(b)),
-            AllReduce::Max => fold!($acc, $x, $t, n, |a, b| a.max(b)),
-            _ => fold!($acc, $x, $t, n, |a, b| a.min(b)),
-        }
-    }};
-}
-
-macro_rules! half_float {
-    ($op:expr, $acc:ident, $x:ident, $t:ty) => {{
-        // Exact in float32, so rounded once (float32 has more than twice the bits).
-        for (a, b) in $acc.chunks_exact_mut(2).zip($x.chunks_exact(2)) {
-            let p = <$t>::from_bits(u16::from_le_bytes([a[0], a[1]]));
-            let q = <$t>::from_bits(u16::from_le_bytes([b[0], b[1]]));
-            let r = match $op {
-                AllReduce::Sum => <$t>::from_f32(p.to_f32() + q.to_f32()),
-                AllReduce::Max => {
-                    if p < q {
-                        q
-                    } else {
-                        p
-                    }
-                }
-                _ => {
-                    if q < p {
-                        q
-                    } else {
-                        p
-                    }
-                }
-            };
-            a.copy_from_slice(&r.to_bits().to_le_bytes());
-        }
-    }};
-}
-
-/// `acc = op(acc, x)` element-wise for elements of `dtype`.
-fn combine(op: AllReduce, dtype: DType, acc: &mut [u8], x: &[u8]) -> Result<()> {
-    match dtype {
-        DType::Bool => {
-            for (a, b) in acc.iter_mut().zip(x) {
-                *a = match op {
-                    AllReduce::Min => u8::from(*a != 0 && *b != 0),
-                    _ => u8::from(*a != 0 || *b != 0),
-                };
+    let (sent, received) = crate::pool::join(
+        || write_all(to, data, to_rank),
+        || {
+            if into.len() <= packet {
+                read_exact(from, into, from_rank)?;
+                return each(0, into);
             }
-        }
-        DType::U8 => wrapping!(op, acc, x, u8),
-        DType::U16 => wrapping!(op, acc, x, u16),
-        DType::U32 => wrapping!(op, acc, x, u32),
-        DType::U64 => wrapping!(op, acc, x, u64),
-        DType::I8 => wrapping!(op, acc, x, i8),
-        DType::I16 => wrapping!(op, acc, x, i16),
-        DType::I32 => wrapping!(op, acc, x, i32),
-        DType::I64 => wrapping!(op, acc, x, i64),
-        DType::F32 => numeric!(op, acc, x, f32),
-        DType::F64 => numeric!(op, acc, x, f64),
-        DType::F16 => half_float!(op, acc, x, f16),
-        DType::BF16 => half_float!(op, acc, x, bf16),
-        DType::Complex64 if op == AllReduce::Sum => fold!(acc, x, f32, 4, |a, b| a + b),
-        d => {
-            return Err(Error::InvalidArgument(format!(
-                "distributed: no {op:?} reduction for {}",
-                d.name()
-            )));
-        }
-    }
-    Ok(())
+            // Several packets: one thread receives them while this one consumes those
+            // already in (MLX's double buffering), so the sender never waits for a reduction.
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, &mut [u8])>();
+            let (read, consumed) = crate::pool::join(
+                move || {
+                    let mut at = 0;
+                    for packet in into.chunks_mut(packet) {
+                        let n = packet.len();
+                        read_exact(from, packet, from_rank)?;
+                        if tx.send((at, packet)).is_err() {
+                            break; // the consumer failed
+                        }
+                        at += n;
+                    }
+                    Ok(())
+                },
+                || {
+                    for (at, packet) in rx {
+                        each(at, packet)?;
+                    }
+                    Ok(())
+                },
+            );
+            consumed.and(read)
+        },
+    );
+    received.and(sent)
 }
 
 impl Ring {
-    /// The ring reduction of `buf` (elements of `elem` bytes) over one socket pair.
+    /// The ring reduction of `buf` (elements of `elem` bytes) over one socket pair: sending
+    /// right and receiving from the left, or with `reverse` the other way round (the ring
+    /// in the opposite direction, as MLX's second half of a split reduction).
+    #[allow(clippy::too_many_arguments)]
     fn reduce_part(
         &self,
         op: AllReduce,
@@ -363,12 +333,23 @@ impl Ring {
         buf: &mut [u8],
         to: &TcpStream,
         from: &TcpStream,
+        reverse: bool,
+        incoming: &mut Vec<u8>,
     ) -> Result<()> {
-        let (size, rank, elem) = (self.size, self.rank, dtype.size());
+        let (size, elem) = (self.size, dtype.size());
+        // In the reversed ring, this rank's position counts the other way round.
+        let rank = if reverse {
+            (size - self.rank) % size
+        } else {
+            self.rank
+        };
         let n = buf.len() / elem;
         let segment = |s: usize| (s * n / size) * elem..((s + 1) * n / size) * elem;
-        let (right, left) = (self.right_rank(), self.left_rank());
-        let mut incoming = vec![0u8; (n.div_ceil(size)) * elem];
+        let (right, left) = match reverse {
+            false => (self.right_rank(), self.left_rank()),
+            true => (self.left_rank(), self.right_rank()),
+        };
+        incoming.resize(incoming.len().max(n.div_ceil(size) * elem), 0);
         // Reduce-scatter: after it, this rank holds segment `rank + 1` reduced.
         for step in 0..size - 1 {
             let send = segment((rank + size - step) % size);
@@ -376,20 +357,59 @@ impl Ring {
             // The segments are disjoint: send one while reducing into the other.
             let (sent, acc) = disjoint(buf, send, recv.clone());
             let into = &mut incoming[..recv.len()];
-            exchange(to, sent, right, from, into, left, |at, packet| {
+            let packet = packet(recv.len(), elem);
+            exchange(to, sent, right, from, into, left, packet, |at, packet| {
                 combine(op, dtype, &mut acc[at..at + packet.len()], packet)
             })?;
         }
-        // All-gather: pass the reduced segments around.
+        // All-gather: pass the reduced segments around, received in place.
         for step in 0..size - 1 {
             let send = segment((rank + 1 + size - step) % size);
             let recv = segment((rank + size - step) % size);
-            let (sent, out) = disjoint(buf, send, recv.clone());
-            let into = &mut incoming[..recv.len()];
-            exchange(to, sent, right, from, into, left, |at, packet| {
-                out[at..at + packet.len()].copy_from_slice(packet);
-                Ok(())
-            })?;
+            let (sent, out) = disjoint(buf, send, recv);
+            let whole = out.len();
+            exchange(to, sent, right, from, out, left, whole, |_, _| Ok(()))?;
+        }
+        Ok(())
+    }
+
+    /// The reduce-scatter of `buf` (`size` equal segments) over one socket pair, shifted so
+    /// that this rank ends holding segment `rank` (the all-reduce's first half ends on
+    /// `rank + 1`).
+    fn scatter_part(
+        &self,
+        dtype: DType,
+        buf: &mut [u8],
+        to: &TcpStream,
+        from: &TcpStream,
+    ) -> Result<()> {
+        let (size, rank) = (self.size, self.rank);
+        let len = buf.len() / size;
+        let segment = |s: usize| s * len..(s + 1) * len;
+        let (right, left) = (self.right_rank(), self.left_rank());
+        let mut incoming = vec![0u8; len];
+        for step in 0..size - 1 {
+            let send = segment((rank + 2 * size - step - 1) % size);
+            let recv = segment((rank + 2 * size - step - 2) % size);
+            let (sent, acc) = disjoint(buf, send, recv);
+            let packet = packet(len, dtype.size());
+            exchange(
+                to,
+                sent,
+                right,
+                from,
+                &mut incoming,
+                left,
+                packet,
+                |at, packet| {
+                    combine(
+                        AllReduce::Sum,
+                        dtype,
+                        &mut acc[at..at + packet.len()],
+                        packet,
+                    )
+                },
+            )?;
         }
         Ok(())
     }
@@ -437,15 +457,75 @@ impl Communicator for Ring {
     fn recv(&self, src: usize, data: &mut [u8]) -> Result<()> {
         self.guarded(|| self.recv_now(src, data))
     }
+
+    fn sum_scatter(&self, dtype: DType, input: &[u8], output: &mut [u8]) -> Result<()> {
+        self.guarded(|| self.sum_scatter_now(dtype, input, output))
+    }
+
+    fn health(&self) -> Result<()> {
+        self.guarded(|| {
+            let sockets = self
+                .right
+                .iter()
+                .map(|s| (s, self.right_rank()))
+                .chain(self.left.iter().map(|s| (s, self.left_rank())));
+            for (s, peer) in sockets {
+                probe(s, peer)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Whether a connection is still open: a non-blocking peek sees the peer's close (or an
+/// error) at once; pending bytes (a peer already in the next collective) mean it is alive.
+pub(crate) fn probe(s: &TcpStream, peer: usize) -> Result<()> {
+    s.set_nonblocking(true)
+        .map_err(|e| peer_error(peer, "checking the connection", e))?;
+    let mut b = [0u8; 1];
+    let result = match s.peek(&mut b) {
+        Ok(0) => Err(peer_error(
+            peer,
+            "the connection was closed",
+            "the peer left",
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(e) => Err(peer_error(peer, "the connection failed", e)),
+    };
+    s.set_nonblocking(false)
+        .map_err(|e| peer_error(peer, "checking the connection", e))?;
+    result
 }
 
 impl Ring {
     fn all_reduce_now(&self, op: AllReduce, dtype: DType, data: &mut [u8]) -> Result<()> {
-        // Large buffers are split over the connections (at least 256 KB per rank's segment
-        // each, as MLX), each part reduced around the ring in parallel.
-        let k = self
-            .right
-            .len()
+        if self.size == 2 && data.len() <= SMALL {
+            // Two ranks, a small buffer (decode's): one exchange of the whole buffer instead
+            // of the ring's two steps. Both combine in rank order, so they get the same bits.
+            let mut other = vec![0u8; data.len()];
+            let peer = self.right_rank();
+            exchange(
+                &self.right[0],
+                data,
+                peer,
+                &self.left[0],
+                &mut other,
+                peer,
+                SMALL,
+                |_, _| Ok(()),
+            )?;
+            if self.rank == 0 {
+                return combine(op, dtype, data, &other);
+            }
+            combine(op, dtype, &mut other, data)?;
+            data.copy_from_slice(&other);
+            return Ok(());
+        }
+        // Large buffers are split over every connection in both directions (at least 256 KB
+        // per rank's segment each, as MLX): part `i` goes around the ring on connection
+        // pair `i / 2`, the odd parts in the opposite direction, all in parallel.
+        let k = (2 * self.right.len().min(self.left.len()))
             .min(data.len() / (self.size * 262_144))
             .max(1);
         let ranges = parts(data.len(), dtype.size(), k);
@@ -456,46 +536,101 @@ impl Ring {
             chunks.push(head);
             rest = tail;
         }
-        if k == 1 {
-            return self.reduce_part(op, dtype, chunks.remove(0), &self.right[0], &self.left[0]);
+        let part = |i: usize, chunk: &mut [u8]| {
+            let (right, left) = (&self.right[i / 2], &self.left[i / 2]);
+            let (to, from, reverse) = match i % 2 {
+                0 => (right, left, false),
+                _ => (left, right, true),
+            };
+            let mut scratch = self.scratch[i]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.reduce_part(op, dtype, chunk, to, from, reverse, &mut scratch)
+        };
+        // Every part but the first on a helper thread, the first on this one.
+        fn all(
+            part: &(impl Fn(usize, &mut [u8]) -> Result<()> + Sync),
+            mut chunks: Vec<(usize, &mut [u8])>,
+        ) -> Result<()> {
+            let Some((i, chunk)) = chunks.pop() else {
+                return Ok(());
+            };
+            if chunks.is_empty() {
+                return part(i, chunk);
+            }
+            let (last, rest) = crate::pool::join(|| part(i, chunk), || all(part, chunks));
+            rest.and(last)
         }
-        thread::scope(|scope| {
-            let handles: Vec<_> = chunks
-                .into_iter()
+        all(&part, chunks.into_iter().enumerate().collect())
+    }
+
+    fn sum_scatter_now(&self, dtype: DType, input: &[u8], output: &mut [u8]) -> Result<()> {
+        // Every chunk is split over the connections as the all-reduce splits its buffer;
+        // each connection reduces its part of every chunk around its own ring.
+        let chunk = output.len();
+        let k = self
+            .right
+            .len()
+            .min(chunk * self.size / (self.size * 262_144))
+            .max(1);
+        let ranges = parts(chunk, dtype.size(), k);
+        let mut bufs: Vec<Vec<u8>> = ranges
+            .iter()
+            .map(|r| {
+                input
+                    .chunks(chunk.max(1))
+                    .flat_map(|c| &c[r.clone()])
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        let rank = self.rank;
+        let result = thread::scope(|scope| {
+            let mut bufs = bufs.iter_mut();
+            let first = bufs.next();
+            let handles: Vec<_> = bufs
                 .enumerate()
-                .map(|(i, chunk)| {
-                    let (to, from) = (&self.right[i], &self.left[i]);
-                    scope.spawn(move || self.reduce_part(op, dtype, chunk, to, from))
+                .map(|(i, buf)| {
+                    let (to, from) = (&self.right[i + 1], &self.left[i + 1]);
+                    scope.spawn(move || self.scatter_part(dtype, buf, to, from))
                 })
                 .collect();
-            handles.into_iter().try_for_each(|h| {
-                h.join().unwrap_or_else(|_| {
+            let first = match first {
+                Some(buf) => self.scatter_part(dtype, buf, &self.right[0], &self.left[0]),
+                None => Ok(()),
+            };
+            handles.into_iter().fold(first, |acc, h| {
+                acc.and(h.join().unwrap_or_else(|_| {
                     Err(Error::Backend("distributed: a thread panicked".into()))
-                })
+                }))
             })
-        })
+        });
+        result?;
+        for (r, buf) in ranges.iter().zip(&bufs) {
+            let len = r.len();
+            output[r.clone()].copy_from_slice(&buf[rank * len..(rank + 1) * len]);
+        }
+        Ok(())
     }
 
     fn all_gather_now(&self, input: &[u8], output: &mut [u8]) -> Result<()> {
         let (size, rank, n) = (self.size, self.rank, input.len());
         output[rank * n..(rank + 1) * n].copy_from_slice(input);
         let (right, left) = (self.right_rank(), self.left_rank());
-        let mut incoming = vec![0u8; n];
         for step in 0..size - 1 {
             let send = (rank + size - step) % size;
             let recv = (rank + 2 * size - step - 1) % size;
+            // Received in place, as MLX's.
             let (block, out) = disjoint(output, send * n..(send + 1) * n, recv * n..(recv + 1) * n);
             exchange(
                 &self.right[0],
                 block,
                 right,
                 &self.left[0],
-                &mut incoming,
+                out,
                 left,
-                |at, p| {
-                    out[at..at + p.len()].copy_from_slice(p);
-                    Ok(())
-                },
+                n,
+                |_, _| Ok(()),
             )?;
         }
         Ok(())

@@ -27,7 +27,7 @@ nuvec brings [MLX](https://github.com/ml-explore/mlx)'s programming model to Rus
 - 🔁 **Composable transforms.** `grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`, `checkpoint` and `compile` (shaped or shapeless) nest in any order, over complex numbers, tuples, maps and your own structs.
 - 🧠 **Models as plain structs.** `#[derive(Module)]` gives MLX's parameter names; optimizers, freezing, LoRA, `save_weights` and a compiled training step (`compile_mut`) work on the model's own type.
 - 🔥 **MLX's Metal kernels.** GEMM and GEMV, quantized products (affine 1, 2, 3, 4, 5, 6 and 8 bits; MXFP4, MXFP8, NVFP4), fused attention, RMSNorm, RoPE, sort, scan, mixture-of-experts gather kernels, and your own kernels from source (`fast::MetalKernel`). Metal 4 TensorOps kernels for M5 Neural Accelerators are opt-in (`NUVEC_NAX=on`).
-- 🌐 **Several Macs.** MLX's collectives (`all_sum`, `all_gather`, `send`/`recv`, …) as lazy, differentiable array operations over MLX's TCP ring, with tensor-parallel layers.
+- 🌐 **Several Macs.** MLX's collectives (`all_sum`, `all_gather`, `sum_scatter`, `send`/`recv`, …) as lazy, differentiable array operations over MLX's TCP ring or, experimentally, JACCL over Thunderbolt 5 RDMA, with pipeline-parallel models (a model larger than one Mac, one stage per Mac) and tensor-parallel decode (every layer split across Macs).
 - 🧪 **Tested against MLX.** Over a thousand cases replay results recorded from MLX, with random layouts, gradients and every dtype.
 - 🤖 **LLM runtime.** Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 (dense, hybrid Gated DeltaNet, mixture-of-experts) from mlx-community or Hugging Face checkpoints. Speculative decoding (MTP heads, prompt lookup, SuffixDecoding) and batched serving.
 - 💾 **Memory-mapped weights.** Aligned checkpoints (such as those nuvec writes) go to the GPU without a copy. Unaligned ones (mlx-community's) are read once, in parallel, with no more memory than MLX.
@@ -64,6 +64,13 @@ The full record (JSON) and method are on the [benchmarks](https://hupe1980.githu
 cargo add nuvec            # arrays, transforms, Metal kernels
 cargo add nuvec-nn         # layers and optimizers (optional)
 cargo add nuvec-lm         # the LLM runtime (optional)
+```
+
+Build dependencies optimised even in debug builds; otherwise CPU kernels and tests that run them are tens of times slower:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 3
 ```
 
 **Arrays are lazy, and gradients are arrays too:**
@@ -174,7 +181,7 @@ cargo run --release -p nuvec-lm --example generate -- \
 | [`nuvec-kernels`](crates/nuvec-kernels) | Metal kernel sources and the precompiled `nuvec.metallib` |
 | [`nuvec-cpu`](crates/nuvec-cpu) | Pure-Rust CPU kernels |
 | [`nuvec-io`](crates/nuvec-io) | safetensors, npy and IDX; memory-mapped loading |
-| [`nuvec-distributed`](crates/nuvec-distributed) | MLX's TCP ring for `nuvec::distributed` (collectives across processes and Macs) |
+| [`nuvec-distributed`](crates/nuvec-distributed) | MLX's TCP ring and JACCL (Thunderbolt 5 RDMA, experimental) for `nuvec::distributed` |
 | [`nuvec-nn`](crates/nuvec-nn) | Modules (`#[derive(Module)]`), layers (Linear, quantized, LoRA, norms, RoPE, dropout, tensor-parallel sharded linear), losses, optimizers (SGD, Adam, AdamW, Lion, Muon, parameter groups) |
 | [`nuvec-lm`](crates/nuvec-lm) | LLM runtime: models, tokenizer, KV cache, sampling, speculative decoding, LoRA adapters |
 

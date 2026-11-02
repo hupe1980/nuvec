@@ -166,6 +166,104 @@ impl MappedFile {
     }
 }
 
+/// Byte ranges of a file in array storage: each range memory-mapped on its own (without a
+/// copy, on a Mac with a GPU; read elsewhere), so the bytes between them are neither mapped,
+/// wired nor counted. For loads that keep some of a file's tensors. The file must not be
+/// modified while it is mapped (see [`MappedFile`]).
+///
+/// ```
+/// use nuvec_core::{DType, MappedRanges};
+///
+/// # fn main() -> nuvec_core::Result<()> {
+/// # if cfg!(miri) { return Ok(()); }
+/// let page = MappedRanges::page_size();
+/// let path = std::env::temp_dir().join("nuvec-mapped-ranges-doc.bin");
+/// let mut bytes = vec![0u8; 3 * page];
+/// bytes[2 * page..2 * page + 8].copy_from_slice(&[1.0f32, 2.0].map(f32::to_le_bytes).concat());
+/// std::fs::write(&path, &bytes).unwrap();
+/// let file = MappedRanges::open(&path, &[(2 * page as u64, page as u64)])?; // the last page only
+/// assert_eq!(file.array(2 * page, DType::F32, &[2])?.to_vec::<f32>()?, vec![1.0, 2.0]);
+/// assert!(file.array(0, DType::F32, &[2]).is_err()); // not mapped
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct MappedRanges {
+    /// `(file offset, buffer)`, in file order.
+    runs: Vec<(usize, Arc<Buffer>)>,
+}
+
+impl std::fmt::Debug for MappedRanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let runs: Vec<(usize, usize)> = self.runs.iter().map(|(o, b)| (*o, b.len())).collect();
+        f.debug_struct("MappedRanges").field("runs", &runs).finish()
+    }
+}
+
+impl MappedRanges {
+    /// The granularity of mappings: range offsets must be multiples of it.
+    pub fn page_size() -> usize {
+        nuvec_gpu::page_size()
+    }
+
+    /// Maps each `(offset, length)` range of the file at `path` (offsets multiples of
+    /// [`Self::page_size`], ranges disjoint and increasing).
+    pub fn open(path: impl AsRef<Path>, ranges: &[(u64, u64)]) -> Result<Self> {
+        let path = path.as_ref();
+        let mut end = 0;
+        let mut runs = Vec::with_capacity(ranges.len());
+        for &(offset, len) in ranges {
+            if offset < end {
+                return Err(Error::InvalidArgument(format!(
+                    "{}: mapped ranges must be increasing and disjoint",
+                    path.display()
+                )));
+            }
+            end = offset + len;
+            let (offset, len) = (offset as usize, len as usize);
+            runs.push((offset, Arc::new(Buffer::map_file_range(path, offset, len)?)));
+        }
+        Ok(Self { runs })
+    }
+
+    /// The bytes mapped, page-rounded (what the GPU allocator's `mapped` counts).
+    pub fn mapped_size(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|(_, b)| MappedFile::mapping_size(b.len() as u64))
+            .sum()
+    }
+
+    /// A row-major array of `dtype` and `shape` at byte `offset` of the file: a view of the
+    /// range that holds it (it must lie inside one range and be aligned to its element size).
+    pub fn array(&self, offset: usize, dtype: DType, shape: &[usize]) -> Result<Array> {
+        let nbytes = shape::checked_nbytes(shape, dtype.size())?;
+        let run = self.runs.iter().find(|(start, b)| {
+            *start <= offset
+                && offset
+                    .checked_add(nbytes)
+                    .is_some_and(|end| end <= start + b.len())
+        });
+        let Some((start, buffer)) = run else {
+            return Err(Error::Io(format!(
+                "{nbytes} bytes at offset {offset} are not inside a mapped range"
+            )));
+        };
+        let at = offset - start;
+        if !at.is_multiple_of(dtype.size()) {
+            return Err(Error::Io(format!(
+                "offset {offset} is not aligned to {} bytes",
+                dtype.size()
+            )));
+        }
+        let data = Data {
+            buffer: buffer.clone(),
+            offset: (at / dtype.size()) as isize,
+        };
+        Array::leaf(Ok(data), dtype, shape.into())
+    }
+}
+
 /// Reads chunk size: large enough that a read's cost is the copy, small enough to spread a
 /// file over the threads.
 const CHUNK: usize = 16 << 20;

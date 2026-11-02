@@ -16,6 +16,17 @@ categories.workspace = true
 [dependencies]
 nuvec-kernels.workspace = true
 
+[features]
+# The CUDA runtime (Linux): NVIDIA's cuda-rust, which needs CUDA ≥ 13.0 headers and libclang
+# to build (constitution 1.4.0). Without it, and on other targets, `cuda` does not exist.
+cuda = ["nuvec-kernels/cuda", "dep:cuda-core", "dep:cuda-async", "dep:cutile", "dep:half"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cuda-core = { version = "=0.4.0", optional = true }
+cuda-async = { version = "=0.4.0", optional = true }
+cutile = { version = "=0.4.0", optional = true }
+half = { workspace = true, optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
 libc.workspace = true
@@ -27,6 +38,10 @@ objc2-metal.workspace = true
 # Document the Metal API, which only exists on Apple targets.
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
+
+[[example]]
+name = "cuda_bench"
+required-features = ["cuda"]
 
 [lints]
 workspace = true

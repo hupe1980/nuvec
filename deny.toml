@@ -2,6 +2,13 @@
 
 [graph]
 all-features = true
+# The supported targets: macOS (Metal) and Linux (CPU, and CUDA with feature `cuda`).
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
 
 [advisories]
 version = 2
@@ -35,11 +42,13 @@ wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 # Constitution I (pure Rust, no bindings): crates that compile or link
-# third-party C/C++ code are not allowed anywhere in the graph.
+# third-party C/C++ code are not allowed anywhere in the graph, except beneath the opt-in
+# CUDA backend's cuda-rust (constitution 1.4.0, D-112): `wrappers` names the only parents.
 deny = [
-    { crate = "cc", reason = "compiles C/C++ (constitution I)" },
+    { crate = "cc", reason = "compiles C/C++ (constitution I)", wrappers = ["psm", "stacker"] },
     { crate = "cmake", reason = "drives a C/C++ build (constitution I)" },
-    { crate = "bindgen", reason = "generates bindings to C/C++ headers (constitution I)" },
+    { crate = "bindgen", reason = "generates bindings to C/C++ headers (constitution I)", wrappers = ["cuda-bindings"] },
+    { crate = "clang-sys", reason = "loads libclang for bindgen (constitution I)", wrappers = ["bindgen"] },
     { crate = "pkg-config", reason = "links native system libraries (constitution I)" },
     { crate = "vcpkg", reason = "links native libraries (constitution I)" },
     { crate = "openssl-sys", reason = "links OpenSSL (constitution I)" },
@@ -73,6 +82,9 @@ allow-build-scripts = [
     # OS's own C library (system API, as allowed by D-001); both scripts are compiler probes.
     { crate = "libc" },
     { crate = "thiserror" },
+    # Via `sha2`/`hmac` (distributed pre-shared-key authentication): a compiler version
+    # probe that sets a cfg flag (`version_check`), no native code.
+    { crate = "generic-array" },
     # Via `gemm`'s `rayon` feature (multithreaded GEMM): compiler version/cfg probes only.
     { crate = "rayon-core" },
     { crate = "crossbeam-deque" },
@@ -88,6 +100,32 @@ allow-build-scripts = [
     { crate = "zmij" },
     # Metal access (D-002): Apple-target cfg probe only, no native code.
     { crate = "objc2" },
+    # The CUDA backend (feature `cuda` of nuvec-gpu and nuvec-kernels, Linux; constitution
+    # 1.4.0, D-112), via
+    # NVIDIA's cuda-rust:
+    # - `cuda-bindings`: bindgen over the CUDA toolkit's cuda.h/curand.h (the driver is
+    #   loaded at run time with dlopen); `bindgen` and `clang-sys` (finds libclang) with it.
+    { crate = "cuda-bindings" },
+    { crate = "bindgen" },
+    { crate = "clang-sys" },
+    # - `psm` (via `stacker`, cutile's compiler): compiles its stack-switching assembly with
+    #   `cc`; `stacker`'s script builds a C file on Windows only.
+    { crate = "psm" },
+    { crate = "stacker" },
+    # - Compiler version/cfg probes and build-time environment variables only, no native
+    #   code: `cuda-core` (a driver-symbol cfg), `cutile-compiler` (debug-info setting and the
+    #   toolkit version), `anyhow`, `getrandom`, `linkme`, `linkme-impl`, `object`,
+    #   `parking_lot_core`, `prettyplease`, `rustix`.
+    { crate = "cuda-core" },
+    { crate = "cutile-compiler" },
+    { crate = "anyhow" },
+    { crate = "getrandom" },
+    { crate = "linkme" },
+    { crate = "linkme-impl" },
+    { crate = "object" },
+    { crate = "parking_lot_core" },
+    { crate = "prettyplease" },
+    { crate = "rustix" },
 ]
 
 [sources]

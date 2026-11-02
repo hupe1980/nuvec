@@ -1,6 +1,6 @@
 [package]
 name = "nuvec-distributed"
-description = "MLX's TCP ring for nuvec's distributed collectives across processes and Macs"
+description = "MLX's TCP ring and JACCL (Thunderbolt 5 RDMA) backends for nuvec's distributed collectives"
 exclude.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -13,8 +13,22 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# The experimental JACCL backend (RDMA over Thunderbolt 5); see the crate docs.
+jaccl = []
+
 [dependencies]
 nuvec-core.workspace = true
+# Pre-shared-key authentication of every connection (HMAC-SHA256).
+sha2.workspace = true
+hmac.workspace = true
+# Block-wise float16 conversions in the half-precision sum (already in the graph via nuvec-core).
+half.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# TCP keepalive on every connection; with `jaccl`, `dlopen` of the system RDMA library and the
+# macOS version.
+libc.workspace = true
 
 [dev-dependencies]
 # Compiled functions with collectives (tests/ring.rs).
@@ -25,6 +39,7 @@ nuvec-nn = { path = "../nuvec-nn" }
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
+all-features = true
 
 [lints]
 workspace = true

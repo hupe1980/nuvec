@@ -16,8 +16,9 @@
 
 use nuvec::{Array, Result, async_eval, eval, ops};
 
-use crate::generate::{GenerateOptions, Keys, WiredLimit};
+use crate::generate::{FinishReason, GenerateOptions, Keys, WiredLimit, judge};
 use crate::model::{KvCache, Model};
+use crate::stop::StopState;
 
 pub use crate::suffix::SuffixDecoding;
 
@@ -380,6 +381,10 @@ pub struct SpeculativeGeneration<'a, D: Drafter> {
     probed: Option<Draft>,
     /// Sampling keys (one per step) when the temperature is above 0.
     keys: Keys,
+    /// The prompt's length (`context` starts with it).
+    prompt: usize,
+    stops: StopState,
+    finished: Option<FinishReason>,
     _wired: WiredLimit,
 }
 
@@ -414,7 +419,10 @@ pub fn speculative_generate<'a, D: Drafter>(
     if prompt.is_empty() {
         return invalid("empty prompt");
     }
-    options.sampler.validate()?;
+    if model.stage().is_some() {
+        return invalid("not supported on a pipelined model");
+    }
+    options.validate()?;
     let auto = drafter.auto(model);
     let wired = WiredLimit::new();
     let mut cache = model.new_cache();
@@ -437,8 +445,10 @@ pub fn speculative_generate<'a, D: Drafter>(
         }
         states.extend(cache.iter().flat_map(KvCache::state));
         eval(&states)?;
+        nuvec::memory::clear_cache();
         start += n;
     }
+    let keys = Keys::new(options.seed);
     Ok(SpeculativeGeneration {
         model,
         drafter,
@@ -455,7 +465,10 @@ pub fn speculative_generate<'a, D: Drafter>(
         inflight: None,
         draft_due: false,
         probed: None,
-        keys: Keys::new(options.seed),
+        keys,
+        prompt: prompt.len(),
+        stops: StopState::default(),
+        finished: None,
         _wired: wired,
     })
 }
@@ -474,30 +487,42 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         self.stats
     }
 
-    /// The token chosen from `logits` `[1, 1, vocab]`: the argmax, or a sample.
-    fn choose(&mut self, logits: &Array) -> Result<Array> {
+    /// Why the generation ended, once it has (the iterator returned its last item).
+    pub fn finish_reason(&self) -> Option<&FinishReason> {
+        self.finished.as_ref()
+    }
+
+    /// The tokens generated so far (pending ones included).
+    fn generated(&self) -> usize {
+        self.context.len() - self.prompt
+    }
+
+    /// The token chosen from `logits` `[1, 1, vocab]` as the `n`-th generated: the
+    /// argmax, or a sample.
+    fn choose(&mut self, logits: &Array, n: usize) -> Result<Array> {
         let sampler = self.options.sampler;
+        let eos = &self.model.config.eos_token_ids;
+        let last = self.options.mask(logits.reshape([1, -1]), eos, n);
         if sampler.temperature == 0.0 {
-            return Ok(logits.argmax(-1).reshape([1]));
+            return Ok(last.argmax(-1).reshape([1]));
         }
-        let last = logits.reshape([1, -1]);
         let logprobs = last.subtract(last.logsumexp_keepdims(-1));
         let key = self.keys.next()?;
         Ok(sampler.sample_with(&logprobs, key.as_ref())?.reshape([1]))
     }
 
     /// Submits a single-token step after `token` (`[1]`, maybe not computed yet) and
-    /// returns its token, not read.
-    fn submit(&mut self, token: &Array) -> Result<Array> {
+    /// returns its token, the `n`-th generated, not read.
+    fn submit(&mut self, token: &Array, n: usize) -> Result<Array> {
         let input = token.reshape([1, 1]);
         let next = if self.drafter.needs_hidden() {
             let (logits, hidden) = self.model.forward_hidden(&input, &mut self.cache);
-            let next = self.choose(&logits)?;
+            let next = self.choose(&logits, n)?;
             self.drafter.observe(self.model, &next, Some(&hidden))?;
             next
         } else {
             let logits = self.model.forward(&input, &mut self.cache);
-            let next = self.choose(&logits)?;
+            let next = self.choose(&logits, n)?;
             self.drafter.observe(self.model, &next, None)?;
             next
         };
@@ -543,6 +568,18 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             (self.model.forward(&input, &mut self.cache), None)
         };
         let rows = logits.reshape([k as i32 + 1, -1]);
+        // Row r chooses the token after the last and r draft tokens.
+        let first = self.generated() + 1;
+        let rows = match first <= self.options.min_tokens {
+            false => rows,
+            true => {
+                let eos = &self.model.config.eos_token_ids;
+                let masked: Vec<Array> = (0..=k as i32)
+                    .map(|r| self.options.mask(rows.i(r..r + 1), eos, first + r as usize))
+                    .collect();
+                ops::concatenate(&masked, 0)
+            }
+        };
         let none = Array::from_slice(&[0u32; 0], [0]);
         let sampler = self.options.sampler;
         let decision = match sampler.temperature {
@@ -608,7 +645,9 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             // Keep the pipeline going (submit the following step, then read this token)
             // unless a draft is due.
             if !self.draft_due && more {
-                self.inflight = Some(self.submit(&y)?);
+                // `y` is the next generated token; the step after it samples the one after.
+                let n = self.generated() + 2;
+                self.inflight = Some(self.submit(&y, n)?);
             }
             let t = y.item::<u32>()?;
             self.context.push(t);
@@ -636,7 +675,8 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         };
         if draft.is_empty() {
             let last = Array::from_slice(&[*self.context.last().expect("never empty")], [1]);
-            self.inflight = Some(self.submit(&last)?);
+            let n = self.generated() + 1;
+            self.inflight = Some(self.submit(&last, n)?);
             self.draft_due = false;
             return self.advance();
         }
@@ -659,24 +699,31 @@ impl<D: Drafter> Iterator for SpeculativeGeneration<'_, D> {
     type Item = Result<u32>;
 
     fn next(&mut self) -> Option<Result<u32>> {
+        if self.finished.is_some() {
+            return None;
+        }
         if self.produced >= self.options.max_tokens {
+            self.finished = Some(FinishReason::Length);
             return None;
         }
         // Verification rows keep the bits of one-row decode steps (the prompt is prefilled
         // as `generate` prefills it), so the tokens are plain decoding's (D-103).
-        let token = nuvec::with_row_exact(|| self.advance());
-        self.produced = match token {
-            Ok(_) => self.produced + 1,
-            Err(_) => self.options.max_tokens,
+        let token = match nuvec::with_row_exact(|| self.advance()) {
+            Ok(t) => t,
+            Err(e) => {
+                self.finished = Some(FinishReason::Error(e.clone()));
+                return Some(Err(e));
+            }
         };
-        // An end-of-sequence token ends the generation (not yielded), as in `generate`.
-        if let Ok(t) = token
-            && self.model.config.eos_token_ids.contains(&t)
-        {
-            self.produced = self.options.max_tokens;
-            return None;
+        self.produced += 1;
+        // The same end rules as `generate`; tokens verified after the end are dropped.
+        let eos = &self.model.config.eos_token_ids;
+        let (emit, reason) = judge(&self.options, eos, &mut self.stops, token, self.produced);
+        if reason.is_some() {
+            self.finished = reason;
+            self.pending.clear();
         }
-        Some(token)
+        emit.then_some(Ok(token))
     }
 }
 

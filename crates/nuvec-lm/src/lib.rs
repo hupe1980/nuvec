@@ -71,22 +71,26 @@ pub mod generate;
 pub mod lora;
 pub mod model;
 pub mod paged;
+pub mod pipeline;
 pub mod quant;
 pub mod sample;
 pub mod speculative;
+pub mod stop;
 mod suffix;
 pub mod tokenizer;
 
-pub use batch::{Batcher, Event, FinishReason, RequestId};
+pub use batch::{Batcher, BatcherOptions, Event, RequestId};
 pub use config::{Activation, Config, Gemma4, LayerQuant, PackedFormat, Quantization};
-pub use generate::{GenerateOptions, Generation, WiredLimit, generate};
+pub use generate::{FinishReason, GenerateOptions, Generation, WiredLimit, generate};
 pub use model::{KvCache, Model};
 pub use paged::{PagedCache, SeqId, decode_batch};
+pub use pipeline::{Split, Stage, load_model_pipelined, load_model_sharded};
 pub use sample::Sampler;
 pub use speculative::{
     Auto, Draft, DraftPolicy, Drafter, MtpDrafter, PromptLookup, SpeculativeGeneration,
     SpeculativeStats, SuffixDecoding, speculative_generate, verify_rows,
 };
+pub use stop::{Stop, Stopped, TextStream};
 pub use tokenizer::{StreamDecoder, Tokenizer};
 
 /// The Rust snippets of the README and of the user guide's pages that use the LLM runtime,
@@ -400,7 +404,16 @@ fn infer_quant(weight: &Array, scales: &Array, default: Quant) -> Quant {
 /// A `generation_config.json` adds its end-of-sequence ids ([`Config::from_file`]); a
 /// config without `tie_word_embeddings` is tied when the checkpoint has no `lm_head`.
 pub fn load_model(dir: impl AsRef<Path>) -> Result<Model> {
-    let dir = dir.as_ref();
+    load_model_with(dir.as_ref(), None)
+}
+
+/// Decides a pipeline stage from the configuration and the checkpoint's tensors (names and
+/// sizes from the headers) before any weight is read.
+pub(crate) type StagePlan<'a> =
+    &'a dyn Fn(&Config, &[nuvec::io::TensorInfo]) -> Result<pipeline::Stage>;
+
+/// [`load_model`], or with `stage`, only that stage's tensors (the others stay unloaded).
+pub(crate) fn load_model_with(dir: &Path, stage: Option<StagePlan<'_>>) -> Result<Model> {
     let (mut config, tie_set) = Config::read(&dir.join("config.json"))?;
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| Error::InvalidArgument(format!("{}: {e}", dir.display())))?
@@ -419,11 +432,40 @@ pub fn load_model(dir: impl AsRef<Path>) -> Result<Model> {
             dir.display()
         )));
     }
+    // A pipeline stage: decided from the headers, then only its tensors are read.
+    let mut has_head = None;
+    let stage = match stage {
+        Some(plan) => {
+            let mut index = Vec::new();
+            for file in &files {
+                index.extend(nuvec::io::safetensors_tensors(file)?);
+            }
+            index.retain(|t| !dropped(&t.name, &config));
+            has_head = Some(index.iter().any(|t| t.name == "lm_head.weight"));
+            if !tie_set {
+                config.tie_word_embeddings = has_head == Some(false);
+            }
+            Some(plan(&config, &index)?)
+        }
+        None => None,
+    };
+    let keep = |k: &str| {
+        !dropped(k, &config)
+            && stage
+                .as_ref()
+                .is_none_or(|s| pipeline::in_stage(k, s, config.tie_word_embeddings))
+    };
     let mut weights: BTreeMap<String, Array> = BTreeMap::new();
+    // `NUVEC_ALIGNED_CACHE`: misaligned checkpoints (mlx-community's) load from aligned
+    // copies there, mapped without a copy after the first load.
+    let cache = std::env::var_os("NUVEC_ALIGNED_CACHE").filter(|d| !d.is_empty());
     for file in &files {
         // Weights `sanitize` drops are not read (mlx-lm never evaluates them either).
-        weights
-            .extend(nuvec::io::load_safetensors_filtered(file, |k| !dropped(k, &config))?.tensors);
+        let loaded = match &cache {
+            Some(dir) => nuvec::io::load_safetensors_cached(file, dir, keep)?,
+            None => nuvec::io::load_safetensors_filtered(file, keep)?,
+        };
+        weights.extend(loaded.tensors);
     }
     let mut weights = sanitize(weights, &config)?;
     // AWQ and GPTQ packings in MLX's affine layout.
@@ -435,7 +477,8 @@ pub fn load_model(dir: impl AsRef<Path>) -> Result<Model> {
     // Without `tie_word_embeddings` (Hugging Face's default is tied), a checkpoint
     // without an output head is tied.
     if !tie_set {
-        config.tie_word_embeddings = !weights.contains_key("lm_head.weight");
+        config.tie_word_embeddings =
+            !has_head.unwrap_or_else(|| weights.contains_key("lm_head.weight"));
     }
     // mlx-lm's `sanitize`: drop precomputed rotary frequencies and tied heads.
     weights.retain(|name, _| !name.contains("rotary_emb.inv_freq"));
@@ -467,7 +510,15 @@ pub fn load_model(dir: impl AsRef<Path>) -> Result<Model> {
     } else {
         weights.retain(|k, _| !k.starts_with("mtp."));
     }
-    model.load_weights(weights)?;
+    match stage {
+        // The other stages' parameters stay unloaded placeholders (no memory).
+        Some(mut stage) => {
+            model.load_weights_partial(weights)?;
+            pipeline::share_activations(&model, &mut stage)?;
+            model.set_stage(stage);
+        }
+        None => model.load_weights(weights)?,
+    }
     // Evaluation mode, as `mlx_lm.load` leaves models (dropout in LoRA layers is off;
     // `model.train(true)` switches it on for fine-tuning).
     model.train(false);

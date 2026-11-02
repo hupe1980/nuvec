@@ -592,6 +592,702 @@ mod gpu {
         assert_close("norm_rope vmap", &got[0], &want[0], 1e-6);
     }
 
+    /// `norm_rope_at` composed of its parts.
+    fn norm_rope_at_composed(
+        x: &Array,
+        norm: Option<(&Array, f32)>,
+        rotation: fast::Rotation<'_>,
+        positions: &Array,
+        pool: Option<(&Array, &Array)>,
+    ) -> Array {
+        let x = match norm {
+            Some((w, eps)) => fast::rms_norm(x, Some(w), eps),
+            None => x.clone(),
+        };
+        let r = fast::rope(
+            &x,
+            rotation.dims,
+            rotation.traditional,
+            rotation.base,
+            rotation.scale,
+            positions,
+            rotation.freqs,
+        );
+        match pool {
+            Some((p, slots)) => fast::paged_write(p, &r.transpose([0, 2, 1, 3]), slots),
+            None => r,
+        }
+    }
+
+    #[test]
+    fn norm_rope_at_equals_rms_norm_rope_and_paged_write() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x70);
+        let freqs: Array = (0..32).map(|i| 1.5f32 + i as f32 * 0.75).collect();
+        // (batch, heads, length, head size, rotated dims, blocks, block size)
+        let cases = [
+            (4, 2, 1, 128, 128, 8, 16),
+            (3, 4, 1, 64, 64, 6, 4),
+            (2, 3, 3, 80, 64, 4, 8),
+            (2, 1, 1, 256, 256, 3, 8),
+            (5, 2, 1, 512, 512, 4, 4),
+        ];
+        for (b, h, l, d, dims, blocks, bs) in cases {
+            let end = (blocks * bs) as i32;
+            // Distinct slots across rows, with out-of-range ones (skipped).
+            let mut all: Vec<i32> = (0..end).collect();
+            for i in (1..all.len()).rev() {
+                all.swap(i, rng.below(i + 1));
+            }
+            let mut slot_values: Vec<i32> = all[..b * l].to_vec();
+            slot_values[0] = -1;
+            if b * l > 2 {
+                slot_values[2] = end + 3;
+            }
+            let slots = Array::from_slice(&slot_values, [b as i32, l as i32]);
+            let positions = Array::from((0..b).map(|i| (i * 37 + 5) as i32).collect::<Vec<_>>());
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let x = random(&mut rng, &[b, l, h, d], dtype).transpose([0, 2, 1, 3]);
+                let w = random(&mut rng, &[d], dtype);
+                let pool = random(&mut rng, &[blocks, h, bs, d], dtype);
+                for (normed, traditional, with_freqs, paged) in [
+                    (true, false, false, false),
+                    (true, false, false, true),
+                    (false, false, false, true),
+                    (true, true, false, true),
+                    (false, true, false, false),
+                    (true, false, true, true),
+                ] {
+                    if with_freqs && dims != 64 {
+                        continue;
+                    }
+                    let rotation = fast::Rotation {
+                        dims,
+                        traditional,
+                        base: (!with_freqs).then_some(10000.0),
+                        scale: 1.0,
+                        freqs: with_freqs.then_some(&freqs),
+                    };
+                    let norm = normed.then_some((&w, 1e-6));
+                    let pool = paged.then_some((&pool, &slots));
+                    let name = format!(
+                        "{dtype} {:?} norm {normed} trad {traditional} freqs {with_freqs} paged {paged}",
+                        (b, h, l, d, dims)
+                    );
+                    for (device, tol) in [(Device::gpu(0), 0.0), (Device::cpu(), tolerance(dtype))]
+                    {
+                        on(device, || {
+                            let got = fast::norm_rope_at(&x, norm, rotation, &positions, pool);
+                            let want = norm_rope_at_composed(&x, norm, rotation, &positions, pool);
+                            assert_close(&format!("{name} {device:?}"), &got, &want, tol);
+                        });
+                    }
+                }
+                // The kernel against the CPU fallback, with gradients for `x`, the weight and
+                // the pool.
+                let g = random(&mut rng, &[blocks, h, bs, d], dtype);
+                let rotation = fast::Rotation {
+                    dims,
+                    traditional: false,
+                    base: Some(10000.0),
+                    scale: 0.5,
+                    freqs: None,
+                };
+                let tol = tolerance(dtype) * 4.0;
+                both(
+                    &format!("norm_rope_at grads {dtype} {:?}", (b, h, l, d)),
+                    tol,
+                    || {
+                        let f = |xs: &[Array]| {
+                            let n = Some((&xs[1], 1e-6));
+                            Ok(vec![fast::norm_rope_at(
+                                &xs[0],
+                                n,
+                                rotation,
+                                &positions,
+                                (&xs[2], &slots),
+                            )])
+                        };
+                        with_grads(f, &[x.clone(), w.clone(), pool.clone()], &g)
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn norm_rope_at_writes_an_owned_pool_in_place_and_checks_its_inputs() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x71);
+        let rotation = fast::Rotation {
+            dims: 64,
+            traditional: false,
+            base: Some(10000.0),
+            scale: 1.0,
+            freqs: None,
+        };
+        let w = random(&mut rng, &[64], DType::BF16);
+        let (b, blocks, bs) = (3, 4, 4);
+        let start = random(&mut rng, &[blocks, 2, bs, 64], DType::BF16);
+        // Decoding: each step writes one position per sequence; each step's pool is the only
+        // handle to the previous one (donated), but every other step keeps it alive.
+        let decode = |fused: bool| -> Array {
+            let mut pool = start.clone();
+            pool.eval().unwrap();
+            let mut kept = Vec::new();
+            for step in 0..4i32 {
+                let x = random(&mut Rng::new(step as u64), &[b, 2, 1, 64], DType::BF16);
+                let positions = Array::from([step, step + 10, step + 3]);
+                let slots = Array::from_slice(&[step, 4 + step, 8 + step], [b as i32, 1]);
+                let at = (&pool, &slots);
+                let next = if fused {
+                    fast::norm_rope_at(&x, Some((&w, 1e-6)), rotation, &positions, at)
+                } else {
+                    norm_rope_at_composed(&x, Some((&w, 1e-6)), rotation, &positions, Some(at))
+                };
+                if step % 2 == 1 {
+                    kept.push((pool.clone(), values(&pool)));
+                }
+                pool = next;
+                async_eval(std::slice::from_ref(&pool)).unwrap();
+            }
+            for (old, before) in kept {
+                assert_eq!(values(&old), before, "a shared pool was written");
+            }
+            pool
+        };
+        on(Device::gpu(0), || {
+            assert_close("decode", &decode(true), &decode(false), 0.0);
+        });
+        // Invalid pools, slots and positions are rejected.
+        let x = random(&mut rng, &[2, 2, 1, 64], DType::F32);
+        let positions = Array::from([1i32, 2]);
+        let slots = Array::from_slice(&[0i32, 5], [2, 1]);
+        let pool = ops::zeros([4, 2, 4, 64], DType::F32);
+        for bad in [&[4, 3, 4, 64][..], &[4, 2, 4, 32], &[2, 4, 64]] {
+            let p = ops::zeros(bad, DType::F32);
+            let got = fast::norm_rope_at(&x, None, rotation, &positions, (&p, &slots));
+            assert!(got.check().is_err(), "pool {bad:?}");
+        }
+        let bad_slots = Array::from([0i32, 5]);
+        let got = fast::norm_rope_at(&x, None, rotation, &positions, (&pool, &bad_slots));
+        assert!(got.check().is_err(), "slots [B]");
+        let got = fast::norm_rope_at(&x, None, rotation, &Array::from([1i32, 2, 3]), None);
+        assert!(got.check().is_err(), "positions [3] for 2 rows");
+        // Forward mode and batching through the fallback.
+        let (x, t) = (
+            random(&mut rng, &[2, 2, 3, 64], DType::F32),
+            random(&mut rng, &[2, 2, 3, 64], DType::F32),
+        );
+        let w = random(&mut rng, &[64], DType::F32);
+        let slots = Array::from_slice(&[0i32, 1, 2, 9, 10, 11], [2, 3]);
+        let pool = random(&mut rng, &[4, 2, 4, 64], DType::F32);
+        let fused = |xs: &[Array]| {
+            let at = (&pool, &slots);
+            Ok(vec![fast::norm_rope_at(
+                &xs[0],
+                Some((&w, 1e-6)),
+                rotation,
+                &positions,
+                at,
+            )])
+        };
+        let composed = |xs: &[Array]| {
+            let at = Some((&pool, &slots));
+            Ok(vec![norm_rope_at_composed(
+                &xs[0],
+                Some((&w, 1e-6)),
+                rotation,
+                &positions,
+                at,
+            )])
+        };
+        let got = jvp_flat(fused, std::slice::from_ref(&x), std::slice::from_ref(&t)).unwrap();
+        let want = jvp_flat(composed, std::slice::from_ref(&x), std::slice::from_ref(&t)).unwrap();
+        assert_close("norm_rope_at jvp", &got.1[0], &want.1[0], 1e-6);
+        let xs = random(&mut rng, &[3, 2, 2, 3, 64], DType::F32);
+        let got = vmap_flat(fused, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+        let want = vmap_flat(composed, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+        assert_close("norm_rope_at vmap", &got[0], &want[0], 1e-6);
+    }
+
+    /// `moe_route` composed as mlx-lm's MoE blocks route.
+    fn moe_route_composed(p: &Array, k: i32, normalize: bool) -> (Array, Array) {
+        let top = p.argpartition(-k, -1).i((Ellipsis, -k..));
+        let mut scores = p.take_along_axis(&top, -1);
+        if normalize {
+            scores = scores.divide(scores.sum_keepdims(-1));
+        }
+        (top, scores)
+    }
+
+    #[test]
+    fn moe_route_equals_argpartition_take_and_renormalisation() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x72);
+        for (rows, e, ks) in [
+            (3, 8, &[1, 2, 8][..]),
+            (5, 60, &[4, 8]),
+            (4, 128, &[1, 8, 10, 128]),
+            (2, 512, &[8, 22]),
+        ] {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                // Router probabilities, with ties: a few values (none 0) repeated across experts.
+                let p = random(&mut rng, &[rows, e], DType::F32).softmax(-1);
+                let levels = 4.0 * e as f64;
+                let ties = p
+                    .multiply(levels)
+                    .floor_divide(1.0)
+                    .add(1.0)
+                    .divide(levels)
+                    .astype(dtype);
+                // A strided view: every other row of a wider array.
+                let wide = random(&mut rng, &[rows, 2 * e], dtype);
+                let strided = wide.i((.., ..e));
+                for (name, probs) in [
+                    ("probs", &p.astype(dtype)),
+                    ("ties", &ties),
+                    ("strided", &strided),
+                ] {
+                    for &k in ks {
+                        for normalize in [false, true] {
+                            let case =
+                                format!("{name} {dtype} rows {rows} E {e} k {k} norm {normalize}");
+                            on(Device::gpu(0), || {
+                                let (top, scores) = fast::moe_route(probs, k, normalize);
+                                let (want_top, want_scores) =
+                                    moe_route_composed(probs, k, normalize);
+                                assert_eq!(top.dtype(), DType::U32, "{case}");
+                                assert_eq!(
+                                    top.to_vec::<u32>().unwrap(),
+                                    want_top.to_vec::<u32>().unwrap(),
+                                    "{case}"
+                                );
+                                assert_close(&case, &scores, &want_scores, 0.0);
+                            });
+                            on(Device::cpu(), || {
+                                let (top, _) = fast::moe_route(probs, k, normalize);
+                                let (want, _) = moe_route_composed(probs, k, normalize);
+                                assert_eq!(
+                                    top.to_vec::<u32>().unwrap(),
+                                    want.to_vec::<u32>().unwrap()
+                                );
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // NaN sorts last (float32 and float16, whose sort compares NaN).
+        for dtype in [DType::F32, DType::F16] {
+            let p = Array::from([0.1f32, f32::NAN, 0.3, 0.2])
+                .astype(dtype)
+                .reshape([1, 4]);
+            on(Device::gpu(0), || {
+                let (top, _) = fast::moe_route(&p, 2, false);
+                let (want, _) = moe_route_composed(&p, 2, false);
+                assert_eq!(top.to_vec::<u32>().unwrap(), want.to_vec::<u32>().unwrap());
+                assert_eq!(top.to_vec::<u32>().unwrap(), [2, 1]);
+            });
+        }
+        // Batched leading axes, as a model's `[B, L, E]`.
+        let p = random(&mut rng, &[2, 3, 16], DType::BF16).softmax(-1);
+        on(Device::gpu(0), || {
+            let (top, scores) = fast::moe_route(&p, 4, true);
+            let (want_top, want_scores) = moe_route_composed(&p, 4, true);
+            assert_eq!(top.shape(), &[2, 3, 4]);
+            assert_eq!(
+                top.to_vec::<u32>().unwrap(),
+                want_top.to_vec::<u32>().unwrap()
+            );
+            assert_close("batched", &scores, &want_scores, 0.0);
+        });
+        // Gradients of the scores through the fallback.
+        let p = random(&mut rng, &[3, 16], DType::F32).softmax(-1);
+        let g = random(&mut rng, &[3, 4], DType::F32);
+        both("moe_route grads", 1e-5, || {
+            let f = |xs: &[Array]| Ok(vec![fast::moe_route(&xs[0], 4, true).1]);
+            with_grads(f, std::slice::from_ref(&p), &g)
+        });
+        let t = random(&mut rng, &[3, 16], DType::F32);
+        let fused = |xs: &[Array]| Ok(vec![fast::moe_route(&xs[0], 4, true).1]);
+        let composed = |xs: &[Array]| Ok(vec![moe_route_composed(&xs[0], 4, true).1]);
+        let got = jvp_flat(fused, std::slice::from_ref(&p), std::slice::from_ref(&t)).unwrap();
+        let want = jvp_flat(composed, std::slice::from_ref(&p), std::slice::from_ref(&t)).unwrap();
+        assert_close("moe_route jvp", &got.1[0], &want.1[0], 1e-6);
+        let ps = random(&mut rng, &[2, 3, 16], DType::F32);
+        let got = vmap_flat(fused, &[Some(0)], &[0])(std::slice::from_ref(&ps)).unwrap();
+        let want = vmap_flat(composed, &[Some(0)], &[0])(std::slice::from_ref(&ps)).unwrap();
+        assert_close("moe_route vmap", &got[0], &want[0], 1e-6);
+        // Invalid k and integer probabilities.
+        let p = ops::ones([2, 8], DType::F32);
+        for k in [0, 9, -1] {
+            assert!(fast::moe_route(&p, k, false).1.check().is_err(), "k {k}");
+        }
+        assert!(
+            fast::moe_route(&ops::ones([2, 8], DType::I32), 2, false)
+                .0
+                .check()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn weighted_sum_equals_multiply_and_sum() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x73);
+        for (rows, k, d) in [
+            (3, 1, 64),
+            (2, 4, 7),
+            (4, 8, 2048),
+            (3, 10, 64),
+            (2, 16, 1),
+            (1, 31, 96),
+            (2, 32, 8),
+        ] {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let x = random(&mut rng, &[rows, k, d], dtype);
+                let w = random(&mut rng, &[rows, k], dtype);
+                // Strided: the experts' outputs as a transposed view.
+                let xt = random(&mut rng, &[rows, d, k], dtype).transpose([0, 2, 1]);
+                for (name, x) in [("contiguous", &x), ("strided", &xt)] {
+                    let case = format!("{name} {dtype} {:?}", (rows, k, d));
+                    let want = |x: &Array| x.multiply(w.expand_dims(-1)).sum(-2);
+                    on(Device::gpu(0), || {
+                        assert_close(&case, &fast::weighted_sum(x, &w), &want(x), 0.0);
+                    });
+                    on(Device::cpu(), || {
+                        assert_close(
+                            &case,
+                            &fast::weighted_sum(x, &w),
+                            &want(x),
+                            tolerance(dtype),
+                        );
+                    });
+                }
+            }
+        }
+        // `[B, L, k, D]`, as a MoE block's.
+        let x = random(&mut rng, &[2, 3, 8, 64], DType::BF16);
+        let w = random(&mut rng, &[2, 3, 8], DType::BF16);
+        on(Device::gpu(0), || {
+            let got = fast::weighted_sum(&x, &w);
+            assert_eq!(got.shape(), &[2, 3, 64]);
+            assert_close("batched", &got, &x.multiply(w.expand_dims(-1)).sum(-2), 0.0);
+        });
+        // Gradients for both inputs, forward mode and batching through the fallback.
+        let x = random(&mut rng, &[3, 4, 16], DType::F32);
+        let w = random(&mut rng, &[3, 4], DType::F32);
+        let g = random(&mut rng, &[3, 16], DType::F32);
+        both("weighted_sum grads", 1e-5, || {
+            let f = |xs: &[Array]| Ok(vec![fast::weighted_sum(&xs[0], &xs[1])]);
+            with_grads(f, &[x.clone(), w.clone()], &g)
+        });
+        let t = random(&mut rng, &[3, 4, 16], DType::F32);
+        let fused = |xs: &[Array]| Ok(vec![fast::weighted_sum(&xs[0], &w)]);
+        let composed = |xs: &[Array]| Ok(vec![xs[0].multiply(w.expand_dims(-1)).sum(-2)]);
+        let got = jvp_flat(fused, std::slice::from_ref(&x), std::slice::from_ref(&t)).unwrap();
+        let want = jvp_flat(composed, std::slice::from_ref(&x), std::slice::from_ref(&t)).unwrap();
+        assert_close("weighted_sum jvp", &got.1[0], &want.1[0], 1e-6);
+        let xs = random(&mut rng, &[2, 3, 4, 16], DType::F32);
+        let got = vmap_flat(fused, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+        let want = vmap_flat(composed, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+        assert_close("weighted_sum vmap", &got[0], &want[0], 1e-6);
+        assert!(
+            fast::weighted_sum(&x, &ops::ones([3, 5], DType::F32))
+                .check()
+                .is_err()
+        );
+        assert!(
+            fast::weighted_sum(&ops::ones([4], DType::F32), &ops::ones([4], DType::F32))
+                .check()
+                .is_err()
+        );
+    }
+
+    /// `residual_rms_norm` composed as Gemma 4's layers did: `rms_norm`, add, multiply and
+    /// the next `rms_norm`.
+    fn residual_composed(
+        h: &Array,
+        x: &Array,
+        (w, eps): (&Array, f32),
+        scale: Option<&Array>,
+        next: Option<(&Array, f32)>,
+    ) -> (Array, Option<Array>) {
+        let mut s = h.add(fast::rms_norm(x, w, eps));
+        if let Some(scale) = scale {
+            s = s.multiply(scale);
+        }
+        let n = next.map(|(w2, e2)| fast::rms_norm(&s, w2, e2));
+        (s, n)
+    }
+
+    #[test]
+    fn residual_rms_norm_equals_norm_add_scale_and_norm() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x79);
+        // Rows of the single-row kernel (up to 4,096) and of the looped one, Gemma 4's
+        // hidden sizes among them.
+        for (rows, d) in [
+            (1, 1),
+            (3, 7),
+            (2, 64),
+            (1, 2560),
+            (2, 2816),
+            (1, 4096),
+            (2, 4100),
+            (1, 5376),
+            (1, 8192),
+        ] {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                // A residual stream larger than the branch, as in a deep model.
+                let h = random(&mut rng, &[rows, d], dtype)
+                    .multiply(Array::from(40.0f32).astype(dtype));
+                let x = random(&mut rng, &[rows, d], dtype);
+                let w = random(&mut rng, &[d], dtype);
+                let w2 = random(&mut rng, &[d], dtype);
+                let scale = random(&mut rng, &[1], dtype);
+                // Strided: the branch as a transposed view.
+                let xt = random(&mut rng, &[d, rows], dtype).transpose([1, 0]);
+                for (name, x) in [("contiguous", &x), ("strided", &xt)] {
+                    for (scaled, next) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
+                        let case = format!("{name} {dtype} {rows}x{d} scale {scaled} next {next}");
+                        let scale = scaled.then_some(&scale);
+                        let next = next.then_some((&w2, 1e-6));
+                        let check = |tol: f64| {
+                            let (s, n) = fast::residual_rms_norm(&h, x, (&w, 1e-5), scale, next);
+                            let (ws, wn) = residual_composed(&h, x, (&w, 1e-5), scale, next);
+                            assert_close(&case, &s, &ws, tol);
+                            assert_eq!(n.is_some(), wn.is_some(), "{case}");
+                            if let (Some(n), Some(wn)) = (n, wn) {
+                                assert_close(&case, &n, &wn, tol);
+                            }
+                        };
+                        on(Device::gpu(0), || check(0.0));
+                        on(Device::cpu(), || check(tolerance(dtype)));
+                    }
+                }
+            }
+        }
+        // `[B, L, D]` with a `[1]` scale, as Gemma 4's layer scalar.
+        let h = random(&mut rng, &[2, 3, 64], DType::BF16);
+        let x = random(&mut rng, &[2, 3, 64], DType::BF16);
+        let w = random(&mut rng, &[64], DType::BF16);
+        let scale = random(&mut rng, &[1], DType::BF16);
+        on(Device::gpu(0), || {
+            let (s, n) = fast::residual_rms_norm(&h, &x, (&w, 1e-6), &scale, Some((&w, 1e-6)));
+            let (ws, wn) = residual_composed(&h, &x, (&w, 1e-6), Some(&scale), Some((&w, 1e-6)));
+            assert_eq!(s.shape(), &[2, 3, 64]);
+            assert_close("batched", &s, &ws, 0.0);
+            assert_close("batched", &n.unwrap(), &wn.unwrap(), 0.0);
+        });
+        // A float32 scale widens the sum: the composition, with MLX's promotion.
+        let wide = random(&mut rng, &[1], DType::F32);
+        on(Device::gpu(0), || {
+            let (s, _) = fast::residual_rms_norm(&h, &x, (&w, 1e-6), &wide, None);
+            let (ws, _) = residual_composed(&h, &x, (&w, 1e-6), Some(&wide), None);
+            assert_eq!(s.dtype(), DType::F32);
+            assert_close("widened", &s, &ws, 0.0);
+        });
+        // Gradients for every input, forward mode and batching through the fallback.
+        let h = random(&mut rng, &[3, 16], DType::F32);
+        let x = random(&mut rng, &[3, 16], DType::F32);
+        let w = random(&mut rng, &[16], DType::F32);
+        let w2 = random(&mut rng, &[16], DType::F32);
+        let scale = random(&mut rng, &[1], DType::F32);
+        let g = random(&mut rng, &[3, 16], DType::F32);
+        both("residual_rms_norm grads", 1e-5, || {
+            let f = |xs: &[Array]| {
+                let (s, n) = fast::residual_rms_norm(
+                    &xs[0],
+                    &xs[1],
+                    (&xs[2], 1e-5),
+                    &xs[3],
+                    Some((&xs[4], 1e-5)),
+                );
+                Ok(vec![s.add(n.unwrap())])
+            };
+            with_grads(
+                f,
+                &[h.clone(), x.clone(), w.clone(), scale.clone(), w2.clone()],
+                &g,
+            )
+        });
+        let t = random(&mut rng, &[3, 16], DType::F32);
+        let fused = |xs: &[Array]| {
+            let (s, n) = fast::residual_rms_norm(&xs[0], &x, (&w, 1e-5), &scale, Some((&w2, 1e-5)));
+            Ok(vec![s, n.unwrap()])
+        };
+        let composed = |xs: &[Array]| {
+            let (s, n) = residual_composed(&xs[0], &x, (&w, 1e-5), Some(&scale), Some((&w2, 1e-5)));
+            Ok(vec![s, n.unwrap()])
+        };
+        let got = jvp_flat(fused, std::slice::from_ref(&h), std::slice::from_ref(&t)).unwrap();
+        let want = jvp_flat(composed, std::slice::from_ref(&h), std::slice::from_ref(&t)).unwrap();
+        assert_close("residual_rms_norm jvp", &got.1[1], &want.1[1], 1e-6);
+        let hs = random(&mut rng, &[2, 3, 16], DType::F32);
+        let got = vmap_flat(fused, &[Some(0)], &[0, 0])(std::slice::from_ref(&hs)).unwrap();
+        let want = vmap_flat(composed, &[Some(0)], &[0, 0])(std::slice::from_ref(&hs)).unwrap();
+        assert_close("residual_rms_norm vmap", &got[1], &want[1], 1e-6);
+        // Shapes that disagree are errors.
+        let (s, _) =
+            fast::residual_rms_norm(&h, &ops::ones([3, 8], DType::F32), (&w, 1e-5), None, None);
+        assert!(s.check().is_err());
+    }
+
+    /// `causal_conv1d_slots` composed as nuvec-lm's Gated DeltaNet decode did.
+    fn conv_slots_composed(
+        x: &Array,
+        w: &Array,
+        pool: &Array,
+        slots: &Array,
+        silu: bool,
+    ) -> (Array, Array) {
+        let (l, c) = (x.shape()[1], x.shape()[2]);
+        let k = w.shape()[1];
+        let input = ops::concatenate(&[pool.take(slots, 0), x.clone()], 1);
+        let mut y = input.conv1d(w, 1, 0, 1, c);
+        if silu {
+            y = y.multiply(y.sigmoid());
+        }
+        let kept = input.i((.., l..l + k - 1));
+        let at = slots.reshape([-1, 1, 1]).broadcast_to(kept.shape());
+        (y, pool.put_along_axis(&at, &kept, 0))
+    }
+
+    #[test]
+    fn causal_conv1d_slots_equals_take_conv_silu_and_put() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x74);
+        for (b, l, c, k, s) in [
+            (3, 1, 64, 4, 5),
+            (2, 3, 7, 4, 4),
+            (1, 1, 4096, 4, 2),
+            (4, 1, 1, 2, 6),
+            (2, 2, 16, 1, 3),
+            (2, 1, 32, 3, 2),
+        ] {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let x = random(&mut rng, &[b, l, c], dtype);
+                // Strided: the projection's channels as a view of a wider row.
+                let wide = random(&mut rng, &[b, l, 2 * c], dtype);
+                let xs = wide.i((.., .., c as i32..));
+                let w = random(&mut rng, &[c, k, 1], dtype);
+                let pool = random(&mut rng, &[s, k - 1, c], dtype);
+                // Distinct slots in a shuffled order; the others stay as they were.
+                let mut all: Vec<i32> = (0..s as i32).collect();
+                for i in (1..all.len()).rev() {
+                    all.swap(i, rng.below(i + 1));
+                }
+                let slots = Array::from(all[..b].to_vec());
+                for (name, x) in [("contiguous", &x), ("strided", &xs)] {
+                    for silu in [true, false] {
+                        let case = format!("{name} {dtype} {:?} silu {silu}", (b, l, c, k, s));
+                        for (device, tol) in
+                            [(Device::gpu(0), 0.0), (Device::cpu(), tolerance(dtype))]
+                        {
+                            on(device, || {
+                                let (y, p) = fast::causal_conv1d_slots(x, &w, &pool, &slots, silu);
+                                let (wy, wp) = conv_slots_composed(x, &w, &pool, &slots, silu);
+                                assert_close(&format!("{case} y {device:?}"), &y, &wy, tol);
+                                assert_close(&format!("{case} pool {device:?}"), &p, &wp, tol);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // Decoding in place: each step's pool is the only handle to the previous one, but
+        // every other step keeps it alive (it must not change).
+        let (c, k, s) = (32, 4, 4);
+        let w = random(&mut rng, &[c, k, 1], DType::BF16);
+        let start = random(&mut rng, &[s, k - 1, c], DType::BF16);
+        let slots = Array::from([2i32, 0, 3]);
+        let decode = |fused: bool| -> Array {
+            let mut pool = start.clone();
+            pool.eval().unwrap();
+            let mut kept = Vec::new();
+            for step in 0..4u64 {
+                let x = random(&mut Rng::new(step), &[3, 1, c], DType::BF16);
+                let (_, next) = if fused {
+                    fast::causal_conv1d_slots(&x, &w, &pool, &slots, true)
+                } else {
+                    conv_slots_composed(&x, &w, &pool, &slots, true)
+                };
+                if step % 2 == 1 {
+                    kept.push((pool.clone(), values(&pool)));
+                }
+                pool = next;
+                async_eval(std::slice::from_ref(&pool)).unwrap();
+            }
+            for (old, before) in kept {
+                assert_eq!(values(&old), before, "a shared pool was written");
+            }
+            pool
+        };
+        on(Device::gpu(0), || {
+            assert_close("decode", &decode(true), &decode(false), 0.0);
+        });
+        // Gradients for the inputs, the weights and the pool; forward mode; batching.
+        let x = random(&mut rng, &[2, 1, 8], DType::F32);
+        let w = random(&mut rng, &[8, 3, 1], DType::F32);
+        let pool = random(&mut rng, &[3, 2, 8], DType::F32);
+        let slots = Array::from([2i32, 0]);
+        let g = random(&mut rng, &[2, 1, 8], DType::F32);
+        both("causal_conv1d_slots grads", 1e-5, || {
+            let f = |xs: &[Array]| {
+                Ok(vec![
+                    fast::causal_conv1d_slots(&xs[0], &xs[1], &xs[2], &slots, true).0,
+                ])
+            };
+            with_grads(f, &[x.clone(), w.clone(), pool.clone()], &g)
+        });
+        let t = random(&mut rng, &[2, 1, 8], DType::F32);
+        let fused = |xs: &[Array]| {
+            Ok(vec![
+                fast::causal_conv1d_slots(&xs[0], &w, &pool, &slots, true).0,
+            ])
+        };
+        let composed =
+            |xs: &[Array]| Ok(vec![conv_slots_composed(&xs[0], &w, &pool, &slots, true).0]);
+        let got = jvp_flat(fused, std::slice::from_ref(&x), std::slice::from_ref(&t)).unwrap();
+        let want = jvp_flat(composed, std::slice::from_ref(&x), std::slice::from_ref(&t)).unwrap();
+        assert_close("causal_conv1d_slots jvp", &got.1[0], &want.1[0], 1e-6);
+        let xs = random(&mut rng, &[3, 2, 1, 8], DType::F32);
+        let got = vmap_flat(fused, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+        let want = vmap_flat(composed, &[Some(0)], &[0])(std::slice::from_ref(&xs)).unwrap();
+        assert_close("causal_conv1d_slots vmap", &got[0], &want[0], 1e-6);
+        // Invalid shapes.
+        let bad_pool = ops::zeros([3, 3, 8], DType::F32);
+        assert!(
+            fast::causal_conv1d_slots(&x, &w, &bad_pool, &slots, true)
+                .0
+                .check()
+                .is_err()
+        );
+        let bad_slots = Array::from([0i32]);
+        assert!(
+            fast::causal_conv1d_slots(&x, &w, &pool, &bad_slots, true)
+                .0
+                .check()
+                .is_err()
+        );
+    }
+
     #[test]
     fn depthwise_conv1d_matches_the_fallback() {
         if crate::common::require_gpu().is_none() {
@@ -978,6 +1674,46 @@ mod gpu {
     }
 
     #[test]
+    fn paged_write_reads_strided_and_batched_sources() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x6f);
+        let (blocks, hkv, bs, d) = (8, 2, 4, 64);
+        let end = (blocks * bs) as i32;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let cache = random(&mut rng, &[blocks, hkv, bs, d], dtype);
+            // A batch-3 prefill cache `[B, Hkv, C, D]`, its positions 1..4 as `[B, T, Hkv, D]`
+            // (a transposed, offset view).
+            let prefill = random(&mut rng, &[3, hkv, 6, d], dtype);
+            let rows = prefill.i((.., .., 1..4)).transpose([0, 2, 1, 3]);
+            let slots = Array::from_slice(&[0i32, 5, 9, 12, 13, end, 20, -1, 31], [3, 3]);
+            let packed = (&rows + 0.0).reshape([9, hkv as i32, d as i32]);
+            let flat = slots.reshape([9]);
+            for device in [Device::cpu(), Device::gpu(0)] {
+                on(device, || {
+                    let want = fast::paged_write(&cache, &packed, &flat);
+                    let got = fast::paged_write(&cache, &rows, &slots);
+                    assert_eq!(values(&got), values(&want), "rank 4 {dtype} {device:?}");
+                    // A strided rank-3 source: one sequence's rows.
+                    let one = rows.i(1);
+                    let got = fast::paged_write(&cache, &one, &slots.i(1));
+                    let want = fast::paged_write(&cache, &(&one + 0.0), &slots.i(1));
+                    assert_eq!(values(&got), values(&want), "rank 3 {dtype} {device:?}");
+                });
+            }
+        }
+        let cache = ops::zeros([blocks, hkv, bs, d], DType::F32);
+        let rows = ops::zeros([2, 3, hkv, d], DType::F32);
+        assert!(
+            fast::paged_write(&cache, &rows, &array![1, 2, 3])
+                .check()
+                .is_err(),
+            "slots not [B, T]"
+        );
+    }
+
+    #[test]
     fn paged_attention_clamps_hostile_tables_and_lengths() {
         if crate::common::require_gpu().is_none() {
             return;
@@ -1130,6 +1866,42 @@ mod gpu {
                         )])
                     };
                     with_grads(f, std::slice::from_ref(&x), &g)
+                });
+            }
+        }
+    }
+
+    /// Tiled (prefill) attention, whose output is laid out for the heads' transpose: the
+    /// kernel equals the fallback through that transpose and in its gradients, causal and
+    /// not, with grouped heads.
+    #[test]
+    fn tiled_attention_matches_the_fallback_through_the_heads_transpose() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x6a);
+        for (causal, hkv) in [(true, 2), (false, 4)] {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let (b, h, l, d) = (2, 4, 37, 64);
+                let q = random(&mut rng, &[b, h, l, d], dtype);
+                let k = random(&mut rng, &[b, hkv, l, d], dtype);
+                let v = random(&mut rng, &[b, hkv, l, d], dtype);
+                let g = random(&mut rng, &[b, l, h * d], dtype);
+                let options = match causal {
+                    true => fast::AttentionOptions::causal(),
+                    false => fast::AttentionOptions::default(),
+                };
+                let name = format!("{dtype} causal {causal} kv heads {hkv}");
+                both(&name, tolerance(dtype) * 4.0, || {
+                    let f = |xs: &[Array]| {
+                        let o = fast::scaled_dot_product_attention(
+                            &xs[0], &xs[1], &xs[2], 0.125, &options,
+                        );
+                        Ok(vec![
+                            ops::transpose(&o, [0, 2, 1, 3]).reshape([b as i32, l as i32, -1]),
+                        ])
+                    };
+                    with_grads(f, &[q.clone(), k.clone(), v.clone()], &g)
                 });
             }
         }

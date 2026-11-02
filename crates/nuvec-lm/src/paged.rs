@@ -218,6 +218,18 @@ impl PagedCache {
     /// one-token prompt) is a sequence of length 0: no blocks, zeroed states. When a write
     /// fails, the blocks are returned and the pools left as they were.
     pub fn insert(&mut self, cache: &[KvCache]) -> Result<SeqId> {
+        Ok(self.insert_rows(cache, true)?[0])
+    }
+
+    /// Moves every row of a batched prefill (`cache`, one [`KvCache`] per layer, batch `B`,
+    /// all rows of one length) into the paged cache and returns their ids, in row order:
+    /// as `B` calls of [`insert`](Self::insert), with one write per pool and layer for all
+    /// rows. All rows are inserted or none.
+    pub fn insert_many(&mut self, cache: &[KvCache]) -> Result<Vec<SeqId>> {
+        self.insert_rows(cache, false)
+    }
+
+    fn insert_rows(&mut self, cache: &[KvCache], one: bool) -> Result<Vec<SeqId>> {
         if cache.len() != self.layers.len() {
             return Err(invalid(format!(
                 "{} layer caches for {} layers",
@@ -225,20 +237,38 @@ impl PagedCache {
                 self.layers.len()
             )));
         }
-        let len = cache.first().map_or(0, KvCache::offset);
+        // The length of the layers that keep something (not KV-shared layers, nor another
+        // pipeline stage's).
+        let own = |g: &Option<usize>, states: bool| g.is_some() || states;
+        let len = cache
+            .iter()
+            .zip(&self.layer_group)
+            .zip(&self.states)
+            .find(|((_, g), states)| own(g, **states))
+            .map_or(0, |((c, _), _)| c.offset());
         // Checked before anything is allocated.
+        let mut rows = None;
         for ((c, g), &states) in cache.iter().zip(&self.layer_group).zip(&self.states) {
             let batch = match (c.linear_state(), c.keys_values()) {
                 (Some((conv, _)), _) => conv.shape().first().copied(),
                 (None, Some((k, _))) => k.shape().first().copied(),
-                // An empty sequence, or a KV-shared layer (nothing of its own).
-                (None, None) if len == 0 || (g.is_none() && !states) => Some(1),
+                // An empty sequence, or a layer with nothing of its own.
+                (None, None) if len == 0 || !own(g, states) => None,
                 (None, None) => return Err(invalid("a layer without keys, values or states")),
             };
-            if batch != Some(1) || c.offset() != len {
-                return Err(invalid(
-                    "prefilled caches of one sequence, all of its length",
-                ));
+            let batch_fits = match (batch, rows) {
+                (Some(b), Some(r)) => b == r,
+                (Some(b), None) => {
+                    rows = Some(b);
+                    b > 0 && (!one || b == 1)
+                }
+                (None, _) => true,
+            };
+            if !batch_fits || (own(g, states) && c.offset() != len) {
+                return Err(invalid(match one {
+                    true => "prefilled caches of one sequence, all of its length",
+                    false => "prefilled caches of one batch, all of its length",
+                }));
             }
             if let Some(g) = g
                 && c.start() > self.first_kept(*g, len)
@@ -246,42 +276,66 @@ impl PagedCache {
                 return Err(invalid("a sliding-window cache without its window"));
             }
         }
-        let id = match self.sequences.iter().position(Option::is_none) {
-            Some(free) => free,
-            None if self.sequences.len() < self.max_sequences => self.sequences.len(),
-            None => return Err(invalid(format!("{} sequences already", self.max_sequences))),
-        };
-        // Per group: the blocks of the kept positions (dead entries 0 before them).
-        let mut tables = Vec::with_capacity(self.groups.len());
+        let rows = rows.unwrap_or(1) as usize;
+        let free_ids: Vec<SeqId> = (0..self.max_sequences)
+            .filter(|&i| self.sequences.get(i).is_none_or(Option::is_none))
+            .take(rows)
+            .collect();
+        if free_ids.len() < rows {
+            return Err(invalid(format!(
+                "{} sequences at most, {} free",
+                self.max_sequences,
+                free_ids.len()
+            )));
+        }
+        // Per row and group: the blocks of the kept positions (dead entries 0 before them).
+        let mut tables: Vec<Vec<Vec<u32>>> = Vec::with_capacity(rows);
         let mut live = Vec::with_capacity(self.groups.len());
         for g in 0..self.groups.len() {
             let first = self.first_kept(g, len) / self.block_size;
-            let n = len.div_ceil(self.block_size).saturating_sub(first);
-            match self.allocate(g, n) {
-                Ok(blocks) => {
-                    let mut table = vec![0; first];
-                    table.extend(blocks);
-                    tables.push(table);
-                    live.push(first);
-                }
-                Err(e) => {
-                    self.release(&tables, &live);
-                    return Err(e);
+            live.push(first);
+        }
+        for _ in 0..rows {
+            let mut row = Vec::with_capacity(self.groups.len());
+            for (g, &first) in live.iter().enumerate() {
+                let n = len.div_ceil(self.block_size).saturating_sub(first);
+                match self.allocate(g, n) {
+                    Ok(blocks) => {
+                        let mut table = vec![0; first];
+                        table.extend(blocks);
+                        row.push(table);
+                    }
+                    Err(e) => {
+                        self.release(&row, &live);
+                        for t in &tables {
+                            self.release(t, &live);
+                        }
+                        return Err(e);
+                    }
                 }
             }
+            tables.push(row);
         }
         let saved = self.layers.clone();
-        if let Err(e) = self.write(cache, id, &tables, len) {
+        if let Err(e) = self.write(cache, &free_ids, &tables, len) {
             self.layers = saved;
-            self.release(&tables, &live);
+            for t in &tables {
+                self.release(t, &live);
+            }
             return Err(e);
         }
         drop(saved);
-        if id == self.sequences.len() {
-            self.sequences.push(None);
+        for (&id, tables) in free_ids.iter().zip(tables) {
+            if id >= self.sequences.len() {
+                self.sequences.resize(id + 1, None);
+            }
+            self.sequences[id] = Some(Sequence {
+                tables,
+                live: live.clone(),
+                len,
+            });
         }
-        self.sequences[id] = Some(Sequence { tables, live, len });
-        Ok(id)
+        Ok(free_ids)
     }
 
     /// Returns the live blocks of `tables` to their groups.
@@ -291,36 +345,47 @@ impl PagedCache {
         }
     }
 
-    /// Writes a prefilled sequence's keys and values (the positions each group keeps) into
-    /// its blocks and its states into slot `id` (zeros for an empty sequence).
+    /// Writes prefilled rows' keys and values (the positions each group keeps) into their
+    /// blocks (`tables`, per row and group; one write per pool for all rows) and their
+    /// states into slots `ids` (zeros for empty sequences).
     fn write(
         &mut self,
         cache: &[KvCache],
-        id: SeqId,
-        tables: &[Vec<u32>],
+        ids: &[SeqId],
+        tables: &[Vec<Vec<u32>>],
         len: usize,
     ) -> Result<()> {
+        let rows = ids.len() as i32;
         let firsts: Vec<usize> = (0..self.groups.len())
             .map(|g| self.first_kept(g, len))
             .collect();
-        let slots: Vec<Option<Array>> = tables
+        // Per group: `[B, kept]` slots of every row's kept positions.
+        let slots: Vec<Option<Array>> = firsts
             .iter()
-            .zip(&firsts)
-            .map(|(table, &first)| {
+            .enumerate()
+            .map(|(g, &first)| {
                 (first < len).then(|| {
-                    Array::from(
-                        (first..len)
-                            .map(|p| self.slot(table, p))
-                            .collect::<Vec<_>>(),
-                    )
+                    let all: Vec<i32> = tables
+                        .iter()
+                        .flat_map(|t| (first..len).map(|p| self.slot(&t[g], p)))
+                        .collect();
+                    Array::from_slice(&all, [rows, (len - first) as i32])
                 })
             })
             .collect();
+        // The rows' state slots: a range when consecutive (as one sequence's), else
+        // gathered.
+        let consecutive = ids.windows(2).all(|w| w[1] == w[0] + 1);
+        let at = Array::from(ids.iter().map(|&i| i as i32).collect::<Vec<_>>());
+        let set_rows = |pool: Array, rows_value: &dyn Fn(nuvec::At) -> Array| match consecutive {
+            true => rows_value(pool.at(ids[0] as i32..ids[0] as i32 + rows)),
+            false => rows_value(pool.at(&at)),
+        };
         let block_size = self.block_size;
         for ((layer, c), g) in self.layers.iter_mut().zip(cache).zip(&self.layer_group) {
             let state_slots = layer.state_slots;
             if let Some((conv, recurrent)) = c.linear_state() {
-                // A Gated DeltaNet layer: its states into slot `id` of the pools.
+                // A Gated DeltaNet layer: its states into the rows' slots of the pools.
                 for (pool_slot, state) in
                     [(&mut layer.conv, conv), (&mut layer.recurrent, recurrent)]
                 {
@@ -332,7 +397,7 @@ impl PagedCache {
                             ops::zeros(shape, state.dtype())
                         }
                     };
-                    *pool_slot = Some(pool_array.at(id..id + 1).set(&state).check()?);
+                    *pool_slot = Some(set_rows(pool_array, &|at| at.set(&state)).check()?);
                 }
                 continue;
             }
@@ -342,13 +407,13 @@ impl PagedCache {
                 // KV-shared layer has no pools.
                 for pool_slot in [&mut layer.conv, &mut layer.recurrent] {
                     if let Some(pool_array) = pool_slot.take() {
-                        *pool_slot = Some(pool_array.at(id..id + 1).set(0.0).check()?);
+                        *pool_slot = Some(set_rows(pool_array, &|at| at.set(0.0)).check()?);
                     }
                 }
                 continue;
             };
             let Some(slots) = &slots[g] else {
-                continue; // an empty sequence: no positions to write
+                continue; // empty sequences: no positions to write
             };
             let (k, v) = c.keys_values().expect("checked by insert");
             // The kept positions of the cache's (which starts at `c.start()`).
@@ -360,8 +425,8 @@ impl PagedCache {
                     Some(p) => p,
                     None => ops::zeros([pool_blocks, heads, block_size as i32, dims], new.dtype()),
                 };
-                // `[1, Hkv, len, D]` as rows `[len, Hkv, D]`.
-                let rows = new.i((.., .., from..)).squeeze(0).transpose([1, 0, 2]);
+                // `[B, Hkv, len, D]` as rows `[B, len, Hkv, D]` (a view, read in place).
+                let rows = new.i((.., .., from..)).transpose([0, 2, 1, 3]);
                 *pool_slot = Some(fast::paged_write(&pool_array, &rows, slots).check()?);
             }
         }
@@ -543,4 +608,79 @@ pub(crate) fn forward_reserved(
     let input = tokens.reshape([b, 1]);
     let logits = model.forward_paged(&input, &mut cache.layers, &reservation.step)?;
     logits.i((.., 0)).check()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::tests::fixture_model;
+
+    /// The pools' values, and each sequence's tables and length.
+    type Snapshot = (Vec<Vec<f32>>, Vec<Option<(Vec<Vec<u32>>, usize)>>);
+
+    fn snapshot(cache: &PagedCache) -> Snapshot {
+        let pools = cache
+            .state()
+            .iter()
+            .map(|a| a.astype(nuvec::DType::F32).to_vec::<f32>().unwrap())
+            .collect();
+        let seqs = cache
+            .sequences
+            .iter()
+            .map(|s| s.as_ref().map(|s| (s.tables.clone(), s.len)))
+            .collect();
+        (pools, seqs)
+    }
+
+    /// `insert_many` of a batched prefill equals inserting its rows one by one (full
+    /// attention, sliding windows, Gated DeltaNet states, an empty batch), and inserts
+    /// nothing when a row does not fit.
+    #[test]
+    fn insert_many_equals_inserting_each_row() {
+        for name in ["qwen3_f32", "gpt_oss_f32", "gemma4_e_f32", "qwen3_5_f32"] {
+            let Some(model) = fixture_model(name) else {
+                return;
+            };
+            let (rows, n) = (3i32, 7i32);
+            let tokens: Vec<u32> = (0..(rows * n) as u32).map(|t| t % 50 + 1).collect();
+            let mut kv = model.new_cache();
+            let ids = Array::from_slice(&tokens, [rows, n]);
+            model.forward(&ids, &mut kv).eval().unwrap();
+            let mut many = PagedCache::new(&model, 32, 4, 4).unwrap();
+            let mut each = many.clone();
+            // A sequence already held, so the rows' ids and blocks are not the first.
+            let first = each.insert(&model.new_cache()).unwrap();
+            assert_eq!(many.insert(&model.new_cache()).unwrap(), first);
+            let got = many.insert_many(&kv).unwrap();
+            let want: Vec<SeqId> = (0..rows)
+                .map(|r| {
+                    let row: Vec<KvCache> = kv.iter().map(|c| c.row(r)).collect();
+                    each.insert(&row).unwrap()
+                })
+                .collect();
+            assert_eq!(got, want, "{name}");
+            assert_eq!(snapshot(&many), snapshot(&each), "{name}");
+            // Two more rows than sequences are free: nothing is inserted.
+            let before = snapshot(&many);
+            let free = many.free_blocks();
+            assert!(many.insert_many(&kv).is_err(), "{name}: too many rows");
+            assert_eq!(
+                (snapshot(&many), many.free_blocks()),
+                (before, free),
+                "{name}"
+            );
+            // Too few blocks: the rows allocated first are returned.
+            let mut small = PagedCache::new(&model, 5, 4, 4).unwrap();
+            assert!(small.insert_many(&kv).is_err(), "{name}: too few blocks");
+            assert_eq!(small.free_blocks(), 5, "{name}");
+            assert!(small.is_empty(), "{name}");
+            // `insert` takes one row only.
+            assert!(
+                PagedCache::new(&model, 32, 4, 4)
+                    .unwrap()
+                    .insert(&kv)
+                    .is_err()
+            );
+        }
+    }
 }

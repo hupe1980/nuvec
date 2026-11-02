@@ -127,7 +127,7 @@ pub use device::{
 pub use dtype::{Category, Complex64, DType, Element, at_least_float, bf16, f16, promote_types};
 pub use error::{Error, OpErrorKind, Result};
 pub use eval::{Scheduled, async_eval, eval, schedule};
-pub use file::MappedFile;
+pub use file::{MappedFile, MappedRanges};
 pub use index::{ArrayIndex, At, Ellipsis, NewAxis, Step, Stepped};
 pub use quantized::{GatherQmm, Quant, QuantMode, Quantized};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
@@ -199,6 +199,13 @@ thread_local! {
 #[doc(hidden)]
 pub fn __nax_route(on: bool) -> bool {
     NAX_ROUTE.with(|r| r.replace(on))
+}
+
+/// The GPU dispatches this process has encoded, so a test counts what an evaluation
+/// encodes. A test diagnostic, not a stable API: other threads' evaluations count too.
+#[doc(hidden)]
+pub fn __gpu_dispatches() -> u64 {
+    gpu::DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The version of this crate.

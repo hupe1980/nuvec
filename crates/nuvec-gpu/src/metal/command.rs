@@ -13,7 +13,7 @@ use objc2_metal::{
 };
 
 use super::buffer::Guard;
-use super::{Buffer, Device, Pipeline};
+use super::{Buffer, Device, Event, Pipeline};
 use crate::{GpuError, Result};
 
 /// Metal's limit on buffer argument slots per kernel.
@@ -105,6 +105,8 @@ pub struct CommandBuffer {
     /// Per buffer (by id): its uses in this command buffer, all and the writing ones.
     uses: HashMap<usize, (usize, usize)>,
     retained: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// An event wait ended the last encoder: the next one waits for this buffer's fences.
+    after_wait: bool,
     /// The kernels dispatched, while profiling.
     kernels: Vec<Arc<str>>,
 }
@@ -131,6 +133,7 @@ impl Device {
             guards: Vec::new(),
             uses: HashMap::new(),
             retained: Vec::new(),
+            after_wait: false,
             kernels: Vec::new(),
         })
     }
@@ -426,6 +429,24 @@ impl CommandBuffer {
         }
     }
 
+    /// Raises `event` to `value` once the GPU has finished the work encoded so far in this
+    /// command buffer ([`Event::wait`] waits for it on the CPU).
+    pub fn signal_event(&mut self, event: &Event, value: u64) {
+        autoreleasepool(|_| self.end_encoding());
+        self.raw
+            .encodeSignalEvent_value(ProtocolObject::from_ref(event.raw()), value);
+    }
+
+    /// Makes the work encoded after this call wait on the GPU until `event` reaches `value`
+    /// (the CPU raises it with [`Event::signal`]).
+    pub fn wait_event(&mut self, event: &Event, value: u64) {
+        autoreleasepool(|_| self.end_encoding());
+        self.raw
+            .encodeWaitForEvent_value(ProtocolObject::from_ref(event.raw()), value);
+        // The next encoder also orders after this buffer's earlier encoders.
+        self.after_wait = true;
+    }
+
     /// Submits the work to the GPU. Dropping the returned [`Submitted`] waits for it and
     /// discards its result; [`Submitted::wait`] reports GPU errors.
     #[must_use = "dropping `Submitted` waits for the GPU and discards its errors; call `wait`"]
@@ -514,6 +535,16 @@ impl CommandBuffer {
                 .ok_or_else(|| GpuError::CommandBuffer("cannot create a compute encoder".into()))?;
             if let Some((fence, true)) = &self.fence {
                 encoder.waitForFence(fence);
+            }
+            if std::mem::take(&mut self.after_wait) {
+                if let Some((fence, _)) = &self.fence {
+                    encoder.waitForFence(fence);
+                }
+                if let Some(own) = &self.own {
+                    encoder.waitForFence(own);
+                }
+                self.reads.clear();
+                self.writes.clear();
             }
             self.encoder = Some(encoder);
         }
@@ -673,10 +704,17 @@ fn complete(finish: &Finish, raw: &ProtocolObject<dyn MTLCommandBuffer>) {
 /// wait; [`wait`](Self::wait) blocks until the GPU has finished and the completion has run
 /// (on this thread, if Metal's handler has not started it yet).
 #[must_use = "dropping `Pending` does not wait; keep it to `wait`, or drop it explicitly"]
+#[derive(Clone)]
 pub struct Pending {
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     finish: Arc<Finish>,
 }
+
+// SAFETY: a committed command buffer is only waited on (`waitUntilCompleted`, which Metal
+// allows from any thread) and retained or released; the completion state is behind a mutex.
+unsafe impl Send for Pending {}
+// SAFETY: as above; every method takes `&self` and waiting is thread-safe.
+unsafe impl Sync for Pending {}
 
 impl Pending {
     /// Blocks until the GPU has finished; the completion has run when this returns (its
@@ -686,6 +724,10 @@ impl Pending {
     }
 
     /// Waits as [`wait`](Self::wait) does and returns the command buffer's result.
+    pub fn wait_result(&self) -> Result<()> {
+        self.result()
+    }
+
     fn result(&self) -> Result<()> {
         autoreleasepool(|_| {
             self.raw.waitUntilCompleted();

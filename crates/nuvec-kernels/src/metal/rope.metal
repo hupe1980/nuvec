@@ -240,7 +240,13 @@ template [[host_name("nuvec_rope_freqs_large_bfloat16")]] [[kernel]] decltype(ml
 // angles and rounding) in one pass, written at `write_offset + l` of the output's rows,
 // for instance into a key cache. One threadgroup per `[b, h, l]` row of at most
 // `NORM_ROPE_MAX` features; `x` is read through its strides (heads may be transposed).
+// With `norm_rope_positions`, row `l` of batch `b` rotates at `positions[b] + l` (as
+// `rope` with an array offset); with `norm_rope_paged`, it is written at
+// `slots[b · L + l]` of a pool `[blocks, H, block_size, D]` (`paged`: block_size, blocks;
+// out-of-range slots skipped).
 static constant constexpr int NORM_ROPE_MAX = 1024;
+constant bool norm_rope_positions [[function_constant(25)]];
+constant bool norm_rope_paged [[function_constant(26)]];
 
 template <typename T, bool NORM, bool FREQS>
 [[kernel]] void norm_rope(
@@ -256,6 +262,9 @@ template <typename T, bool NORM, bool FREQS>
     constant int* sizes [[buffer(9)]],
     constant float& base [[buffer(10)]],
     const device float* freqs [[buffer(11)]],
+    const device int* positions [[buffer(12)]],
+    const device int* slots [[buffer(13)]],
+    constant int* paged [[buffer(14)]],
     uint gid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
@@ -268,8 +277,19 @@ template <typename T, bool NORM, bool FREQS>
   const int bh = gid / length;
   const int h = bh % heads, b = bh / heads;
   x += b * x_strides[0] + h * x_strides[1] + l * x_strides[2] + lid * N_READS;
-  out += b * out_strides[0] + h * out_strides[1] +
-      int64_t(write_offset + l) * out_strides[2];
+  if (norm_rope_paged) {
+    // The whole threadgroup shares the row's slot, so it returns together.
+    const int slot = slots[b * length + l], block_size = paged[0];
+    if (slot < 0 || ulong(slot) >= ulong(paged[1]) * ulong(block_size)) {
+      return;
+    }
+    out += int64_t(slot / block_size) * out_strides[0] + h * out_strides[1] +
+        int64_t(slot % block_size) * out_strides[2];
+  } else {
+    out += b * out_strides[0] + h * out_strides[1] +
+        int64_t(write_offset + l) * out_strides[2];
+  }
+  const int at = norm_rope_positions ? positions[b] : offset;
 
   threadgroup T row[NORM_ROPE_MAX];
   float thread_x[N_READS];
@@ -314,7 +334,7 @@ template <typename T, bool NORM, bool FREQS>
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const int half_dims = dims / 2;
-  const float L = scale * static_cast<float>(offset + l);
+  const float L = scale * static_cast<float>(at + l);
   for (int i = 0; i < N_READS; i++) {
     int j = lid * N_READS + i;
     if (j >= d) {

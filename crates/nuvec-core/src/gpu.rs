@@ -7,7 +7,8 @@
 //! and a failure marks the outputs of its chunk and of every later chunk of the evaluation
 //! as failed.
 //! Primitives without a GPU kernel fall back to the CPU after [`GpuEval::flush`], which waits
-//! for this evaluation's outstanding work (unified memory needs no copies).
+//! for this evaluation's outstanding work (unified memory needs no copies); collectives run
+//! on their group's worker instead, without a flush (`GpuEval::collective`).
 
 use std::sync::Arc;
 
@@ -15,6 +16,15 @@ use crate::array::{Data, Node, Output};
 use crate::kernels::Operand;
 use crate::primitive::Primitive;
 use crate::{Device, Result};
+
+#[cfg(test)]
+thread_local! {
+    /// Command buffers committed by evaluations on this thread (tests count them).
+    pub(crate) static COMMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// GPU dispatches encoded by this process (for [`crate::__gpu_dispatches`]).
+pub(crate) static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a Metal GPU is available to evaluate on.
 pub(crate) fn available() -> bool {
@@ -81,8 +91,10 @@ pub(crate) fn vector_threads(
     1024
 }
 
+#[cfg(all(test, target_os = "macos", not(miri)))]
+pub(crate) use metal::fault;
 #[cfg(all(target_os = "macos", not(miri)))]
-pub(crate) use metal::GpuEval;
+pub(crate) use metal::{BufferSignal, GpuEval};
 #[cfg(not(all(target_os = "macos", not(miri))))]
 pub(crate) use stub::GpuEval;
 
@@ -165,6 +177,20 @@ mod stub {
         ) -> Result<Vec<Data>> {
             unreachable!("no GPU kernels on this target")
         }
+        pub(crate) fn collective(
+            &mut self,
+            _: &crate::distributed::CollectiveOp,
+            _: usize,
+            _: &[crate::Array],
+            _: Vec<Data>,
+            _: &Output,
+            _: Option<Data>,
+        ) -> Result<Vec<Data>> {
+            unreachable!("no GPU on this target")
+        }
+        pub(crate) fn collectives_pending(&self) -> bool {
+            false
+        }
         pub(crate) fn defer(&mut self, node: Arc<Node>, outputs: Vec<Data>) {
             for (output, data) in node.outputs.iter().zip(outputs) {
                 let _ = output.slot.set(Ok(data));
@@ -210,6 +236,16 @@ mod stub {
             _: &Output,
             _: Data,
             _: &[Output],
+        ) -> Result<Vec<Data>> {
+            unreachable!("nothing is writable without Metal")
+        }
+        pub(crate) fn conv_slots_in_place(
+            &mut self,
+            _: &[Operand<'_>],
+            _: &Output,
+            _: Data,
+            _: &[Output],
+            _: bool,
         ) -> Result<Vec<Data>> {
             unreachable!("nothing is writable without Metal")
         }
@@ -370,7 +406,15 @@ mod metal {
     /// The readers' command buffers run after the chunks they read (one queue), whose
     /// completion handlers Metal calls in order, so a producer's failure is recorded by the
     /// time a reader's handler checks it.
-    fn chunk_result(result: Result<()>, reads: &[ChunkStatus]) -> Result<()> {
+    /// A failed collective the chunk waits for fails it with the collective's own error.
+    fn chunk_result(
+        result: Result<()>,
+        reads: &[ChunkStatus],
+        collectives: &[ChunkStatus],
+    ) -> Result<()> {
+        if let Some(e) = collectives.iter().find_map(|s| s.get()) {
+            return Err(e.clone());
+        }
         result?;
         match reads.iter().find_map(|s| s.get()) {
             Some(e) => Err(Error::Backend(format!(
@@ -426,6 +470,50 @@ mod metal {
         }
     }
 
+    /// The input signals of one command buffer's collectives: its event, raised after each
+    /// collective's input copy, and whether the command buffer has completed (a completed
+    /// buffer that did not reach a value failed before it).
+    pub(crate) struct BufferSignal {
+        event: nuvec_gpu::Event,
+        issued: std::sync::atomic::AtomicU64,
+        done: std::sync::atomic::AtomicBool,
+    }
+
+    impl BufferSignal {
+        fn new(device: &MetalDevice) -> Result<Self> {
+            Ok(Self {
+                event: nuvec_gpu::Event::new(device).map_err(backend)?,
+                issued: Default::default(),
+                done: Default::default(),
+            })
+        }
+
+        fn next(&self) -> u64 {
+            self.issued
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1
+        }
+
+        /// Waits until the command buffer has signalled `value`; an error if it completed
+        /// without (its GPU work failed).
+        pub(crate) fn wait(&self, value: u64) -> Result<()> {
+            use std::sync::atomic::Ordering;
+            loop {
+                if self.event.wait(value, std::time::Duration::from_millis(5)) {
+                    return Ok(());
+                }
+                if self.done.load(Ordering::Acquire) {
+                    if self.event.value() >= value {
+                        return Ok(());
+                    }
+                    return Err(Error::Backend(
+                        "the GPU work producing this collective's input failed".into(),
+                    ));
+                }
+            }
+        }
+    }
+
     pub(crate) struct GpuEval {
         device: Option<&'static MetalDevice>,
         cmd: Option<CommandBuffer>,
@@ -448,6 +536,13 @@ mod metal {
         /// Failure cells of other evaluations' chunks whose in-flight outputs the open
         /// chunk reads.
         reads: Vec<ChunkStatus>,
+        /// Failure cells of the collectives the open chunk waits for.
+        collectives: Vec<ChunkStatus>,
+        /// The open command buffer's collective input signals.
+        signal: Option<Arc<BufferSignal>>,
+        /// No commit by the dispatch policy now (between a collective's input copy and its
+        /// signal).
+        hold: bool,
     }
 
     fn backend(e: nuvec_gpu::GpuError) -> Error {
@@ -909,6 +1004,13 @@ mod metal {
         }
 "#;
 
+    /// Whether the packed gated delta kernel may run: mlx-lm's `MLX_GDN_PACKED` switch,
+    /// read once (`0` keeps every shape on the generic kernel, for A/B checks).
+    fn gdn_packed_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("MLX_GDN_PACKED").as_deref() != Ok("0"))
+    }
+
     /// mlx-lm's packed gated delta kernel (`_make_gated_delta_packed_kernel`, `Dk = 128`,
     /// float32 gates and state; MIT, Apple): four lanes per value row, eight rows per
     /// SIMD-group, the same reduction tree as the generic kernel.
@@ -1177,6 +1279,9 @@ mod metal {
                 submitted: Vec::new(),
                 foreign: Vec::new(),
                 reads: Vec::new(),
+                collectives: Vec::new(),
+                signal: None,
+                hold: false,
             }
         }
 
@@ -2974,6 +3079,18 @@ mod metal {
             if *op == FastOp::GatedDeltaSlots {
                 return self.gated_delta_slots(operands, outputs);
             }
+            if let FastOp::MoeRoute { k, normalize } = *op {
+                return self.moe_route(operands[0], (k, normalize), outputs);
+            }
+            if *op == FastOp::WeightedSum {
+                return self.weighted_sum(operands, &outputs[0]);
+            }
+            if let FastOp::ConvSlots { silu } = *op {
+                let mut pool = Buffer::try_alloc_gpu(outputs[1].size * outputs[1].dtype.size())?;
+                self.copy(operands[2], &mut pool)?;
+                let y = self.conv_slots_into(operands, outputs, &mut pool, silu)?;
+                return Ok(vec![y, Data::new(pool)]);
+            }
             if let FastOp::GatherQmm {
                 quant,
                 transpose,
@@ -2997,6 +3114,9 @@ mod metal {
             }
             if let FastOp::AddRmsNorm { eps } = *op {
                 return self.add_rms_norm(operands, outputs, eps);
+            }
+            if let FastOp::ResidualRmsNorm { eps, scaled, next } = *op {
+                return self.residual_rms_norm(operands, outputs, (eps, scaled, next));
             }
             if let FastOp::DepthwiseConv1d {
                 stride,
@@ -3047,11 +3167,12 @@ mod metal {
             }
             if let FastOp::NormRope { cache, .. } = *op {
                 let mut out = alloc(&outputs[0])?;
-                if cache {
-                    self.copy(operands[0], &mut out)?;
+                if !cache {
+                    self.norm_rope_into(op, operands, &outputs[0].shape, &mut out)?;
+                    return Ok(vec![Data::new(out)]);
                 }
-                let rest = &operands[usize::from(cache)..];
-                self.norm_rope_into(op, rest, &outputs[0].shape, &mut out)?;
+                self.copy(operands[0], &mut out)?;
+                self.norm_rope_into(op, &operands[1..], &outputs[0].shape, &mut out)?;
                 return Ok(vec![Data::new(out)]);
             }
             let mut out = alloc(&outputs[0])?;
@@ -3264,10 +3385,14 @@ mod metal {
                 }
                 FastOp::Attention { .. }
                 | FastOp::AddRmsNorm { .. }
+                | FastOp::ResidualRmsNorm { .. }
                 | FastOp::NormRope { .. }
                 | FastOp::DepthwiseConv1d { .. }
                 | FastOp::PagedAttention { .. }
                 | FastOp::PagedWrite
+                | FastOp::MoeRoute { .. }
+                | FastOp::WeightedSum
+                | FastOp::ConvSlots { .. }
                 | FastOp::GatedDelta { .. }
                 | FastOp::GatedDeltaSlots
                 | FastOp::GatherQmm { .. }
@@ -3417,6 +3542,75 @@ mod metal {
             ];
             self.dispatch_rows(&pipeline, &args, rows, group)?;
             Ok(vec![Data::new(sum), Data::new(out)])
+        }
+
+        /// [`crate::fast::FastOp::ResidualRmsNorm`]: `(h + rms(x)) · scale` and its RMS
+        /// normalisation, one threadgroup per row. The single-row or looped variant and the
+        /// threadgroup size are the RMS kernel's, so both reductions add as it adds.
+        fn residual_rms_norm(
+            &mut self,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+            (eps, scaled, next): (u32, bool, Option<u32>),
+        ) -> Result<Vec<Data>> {
+            let packed = operands
+                .iter()
+                .map(|&o| self.packed(o, true))
+                .collect::<Result<Vec<_>>>()?;
+            let (h, x, w) = (&packed[0], &packed[1], &packed[2]);
+            let dtn = operands[0].0.dtype.name();
+            let axis = h.shape[h.shape.len() - 1];
+            let rows = h.shape.iter().product::<usize>() / axis;
+            let rms =
+                |looped: bool| format!("nuvec_rms{}_{dtn}", if looped { "_looped" } else { "" });
+            let mut looped = axis > 4096;
+            let mut pipeline = self.pipeline(&rms(looped))?;
+            if !looped && row_threads(axis, 4) > pipeline.max_threads_per_threadgroup() {
+                looped = true;
+                pipeline = self.pipeline(&rms(true))?;
+            }
+            let group = if looped {
+                pipeline.max_threads_per_threadgroup()
+            } else {
+                row_threads(axis, 4)
+            };
+            let name = format!(
+                "nuvec_residual_rms{}_{dtn}_s{}_n{}",
+                if looped { "_looped" } else { "" },
+                u8::from(scaled),
+                u8::from(next.is_some())
+            );
+            let pipeline = self.pipeline(&name)?;
+            if pipeline.max_threads_per_threadgroup() < group {
+                return Err(Error::Backend(format!(
+                    "{name}: {group} threads per threadgroup needed, {} available",
+                    pipeline.max_threads_per_threadgroup()
+                )));
+            }
+            let alloc = |o: &Output| Buffer::try_alloc_gpu(o.size * o.dtype.size());
+            let mut outs = outputs.iter().map(alloc).collect::<Result<Vec<_>>>()?;
+            let stride = |p: &Packed<'_>| u32::from(!p.shape.is_empty()).to_le_bytes();
+            let (e, e2) = (eps.to_le_bytes(), next.unwrap_or(0).to_le_bytes());
+            let n = (axis as u32).to_le_bytes();
+            let (ws, ws2) = (stride(w), stride(&packed[packed.len() - 1]));
+            let mut args = vec![h.arg(), x.arg(), w.arg()];
+            // Absent operands bind the weight again (never read).
+            args.push(if scaled { packed[3].arg() } else { w.arg() });
+            args.push(if next.is_some() {
+                packed[packed.len() - 1].arg()
+            } else {
+                w.arg()
+            });
+            let (first, rest) = outs.split_at_mut(1);
+            args.push(Arg::write(first[0].metal_mut().expect("device storage")));
+            match rest.first_mut() {
+                Some(o) => args.push(Arg::write(o.metal_mut().expect("device storage"))),
+                None => args.push(Arg::bytes(&e2)),
+            }
+            args.extend([Arg::bytes(&e), Arg::bytes(&e2), Arg::bytes(&n)]);
+            args.extend([Arg::bytes(&ws), Arg::bytes(&ws2)]);
+            self.dispatch_rows(&pipeline, &args, rows, group)?;
+            Ok(outs.into_iter().map(Data::new).collect())
         }
 
         /// MLX's softmax or log-sum-exp kernel (`kind`) over `rows` rows of `axis` values,
@@ -3612,7 +3806,8 @@ mod metal {
         }
 
         /// [`crate::fast::FastOp::PagedWrite`]'s kernel over `(new, slots)` into a cache
-        /// buffer of `cache_shape`: one thread per element of `new`.
+        /// buffer of `cache_shape`: one thread per element of `new` (`[T, H, D]` or
+        /// `[B, T, H, D]`), read through its strides.
         fn paged_write_into(
             &mut self,
             operands: &[Operand<'_>],
@@ -3620,11 +3815,24 @@ mod metal {
             buffer: &mut Buffer,
         ) -> Result<()> {
             let (new, slots) = (
-                self.packed(operands[0], true)?,
+                self.view_if(operands[0], true)?,
                 self.packed(operands[1], true)?,
             );
-            let (t, hkv, d) = (new.shape[0], new.shape[1], new.shape[2]);
-            if t == 0 {
+            let (b, s) = match new.shape.len() {
+                3 => (1, [0, new.strides[0], new.strides[1], new.strides[2]]),
+                _ => (
+                    new.shape[0],
+                    [
+                        new.strides[0],
+                        new.strides[1],
+                        new.strides[2],
+                        new.strides[3],
+                    ],
+                ),
+            };
+            let r = new.shape.len();
+            let (t, hkv, d) = (new.shape[r - 3], new.shape[r - 2], new.shape[r - 1]);
+            if b * t == 0 {
                 return Ok(());
             }
             // Slots past `num_blocks · block_size` are skipped by the kernel.
@@ -3637,16 +3845,20 @@ mod metal {
                 as_i32(cache_shape[2])?,
                 as_i32(d)?,
                 as_i32(cache_shape[0])?,
+                as_i32(t)?,
             ];
+            as_i32(b * t)?;
+            let strides = s.map(|v| v as i64);
             let args = [
                 new.arg(),
                 slots.arg(),
                 Arg::write(buffer.metal_mut().expect("device storage")),
                 Arg::bytes(bytemuck::bytes_of(&params)),
+                Arg::bytes(bytemuck::bytes_of(&strides)),
             ];
             let name = format!("nuvec_paged_write_{}", operands[0].0.dtype.name());
             let pipeline = self.pipeline(&name)?;
-            let grid = [d, hkv, t];
+            let grid = [d, hkv, b * t];
             self.encode_threads(&pipeline, &args, grid, block_dims(grid))?;
             self.counted()
         }
@@ -3678,9 +3890,11 @@ mod metal {
             Ok(base)
         }
 
-        /// [`crate::fast::FastOp::NormRope`]'s kernel over `(x, w[, freqs])`, writing rows of
-        /// a row-contiguous `[B, H, rows, D]` output (`out_shape`) from row `offset` (a
-        /// cache) or 0: one threadgroup per row, reading `x` through its strides.
+        /// [`crate::fast::FastOp::NormRope`]'s kernel over `([slots,] x, w[, positions]
+        /// [, freqs])`, writing rows of a row-contiguous `[B, H, rows, D]` output
+        /// (`out_shape`) from row `offset` (a cache) or 0, or of a pool `[blocks, H,
+        /// block_size, D]` at their slots: one threadgroup per row, reading `x` through its
+        /// strides.
         fn norm_rope_into(
             &mut self,
             op: &crate::fast::imp::FastOp,
@@ -3696,20 +3910,32 @@ mod metal {
                 scale,
                 offset,
                 cache,
+                positions,
+                paged,
             } = *op
             else {
                 unreachable!("a norm_rope")
             };
-            let (meta, _) = operands[0];
+            let at = usize::from(paged);
+            let (meta, _) = operands[at];
             let (b, h, l, d) = (meta.shape[0], meta.shape[1], meta.shape[2], meta.shape[3]);
             if b * h * l == 0 {
                 return Ok(());
             }
-            let x = self.view_if(operands[0], d == 1 || meta.strides[3] == 1)?;
-            let w = self.packed(operands[1], true)?;
-            let freqs = match operands.get(2) {
+            let x = self.view_if(operands[at], d == 1 || meta.strides[3] == 1)?;
+            let w = self.packed(operands[at + 1], true)?;
+            let at_freqs = at + 2 + usize::from(positions);
+            let freqs = match operands.get(at_freqs) {
                 Some(&f) => Some(self.packed(f, true)?),
                 None => None,
+            };
+            let per_row = match positions {
+                true => Some(self.packed(operands[at + 2], true)?),
+                false => None,
+            };
+            let slots = match paged {
+                true => Some(self.packed(operands[0], true)?),
+                false => None,
             };
             let name = format!(
                 "nuvec_{}_rope_{}{}",
@@ -3717,7 +3943,8 @@ mod metal {
                 if freqs.is_some() { "freqs_" } else { "" },
                 meta.dtype.name()
             );
-            let pipeline = self.pipeline_with(&name, &[(22, traditional)])?;
+            let pipeline =
+                self.pipeline_with(&name, &[(22, traditional), (25, positions), (26, paged)])?;
             let rows = out_shape[2];
             let x_strides: [i64; 3] = [
                 x.strides[0] as i64,
@@ -3727,17 +3954,19 @@ mod metal {
             let out_strides: [i64; 3] = [(h * rows * d) as i64, (rows * d) as i64, d as i64];
             let sizes: [i32; 4] = [h as i32, l as i32, d as i32, dims as i32];
             let e = f32::from_bits(eps.unwrap_or(0)).to_le_bytes();
-            let at = (offset as i32).to_le_bytes();
-            let write_at = (if cache { offset as i32 } else { 0 }).to_le_bytes();
+            let at_row = (offset as i32).to_le_bytes();
+            let write_at = (if cache && !paged { offset as i32 } else { 0 }).to_le_bytes();
             let sc = scale.to_le_bytes();
             let log_base = f32::from_bits(base).log2().to_le_bytes();
+            // The pool's positions per block and blocks.
+            let pool: [i32; 2] = [rows as i32, out_shape[0] as i32];
             let unused = [0u8; 4];
             let mut args = vec![
                 x.arg(),
                 w.arg(),
                 Arg::write(buffer.metal_mut().expect("device storage")),
                 Arg::bytes(&e),
-                Arg::bytes(&at),
+                Arg::bytes(&at_row),
                 Arg::bytes(&write_at),
                 Arg::bytes(&sc),
                 Arg::bytes(bytemuck::bytes_of(&x_strides)),
@@ -3749,7 +3978,128 @@ mod metal {
                 Some(f) => f.arg(),
                 None => Arg::bytes(&unused),
             });
+            args.push(match &per_row {
+                Some(p) => p.arg(),
+                None => Arg::bytes(&unused),
+            });
+            args.push(match &slots {
+                Some(s) => s.arg(),
+                None => Arg::bytes(&unused),
+            });
+            args.push(Arg::bytes(bytemuck::bytes_of(&pool)));
             self.dispatch_rows(&pipeline, &args, b * h * l, row_threads(d, 4))
+        }
+
+        /// [`crate::fast::FastOp::MoeRoute`]: one threadgroup per row of experts.
+        fn moe_route(
+            &mut self,
+            probs: Operand<'_>,
+            (k, normalize): (usize, bool),
+            outputs: &[Output],
+        ) -> Result<Vec<Data>> {
+            let p = self.packed(probs, true)?;
+            let e = p.shape.last().copied().unwrap_or(0);
+            let rows = p.shape.iter().product::<usize>() / e.max(1);
+            let mut indices = Buffer::try_alloc_gpu(outputs[0].size * 4)?;
+            let mut scores = Buffer::try_alloc_gpu(outputs[1].size * outputs[1].dtype.size())?;
+            if rows > 0 {
+                let sizes = [e as i32, k as i32, i32::from(normalize)].map(i32::to_le_bytes);
+                let args = [
+                    p.arg(),
+                    Arg::write(indices.metal_mut().expect("device storage")),
+                    Arg::write(scores.metal_mut().expect("device storage")),
+                    Arg::bytes(&sizes[0]),
+                    Arg::bytes(&sizes[1]),
+                    Arg::bytes(&sizes[2]),
+                ];
+                let name = format!("nuvec_moe_route_{}", probs.0.dtype.name());
+                self.dispatch_groups(&name, &args, [rows, 1, 1], [e.next_multiple_of(32), 1, 1])?;
+            }
+            Ok(vec![Data::new(indices), Data::new(scores)])
+        }
+
+        /// [`crate::fast::FastOp::ConvSlots`] into its donated pool (`base`): `operands` are
+        /// all inputs but the pool (its metadata is `pool_meta`).
+        pub(crate) fn conv_slots_in_place(
+            &mut self,
+            operands: &[Operand<'_>],
+            pool_meta: &Output,
+            mut base: Data,
+            outputs: &[Output],
+            silu: bool,
+        ) -> Result<Vec<Data>> {
+            let buffer = Arc::get_mut(&mut base.buffer).expect("donated data has one handle");
+            let empty = Data::new(Buffer::try_alloc(0)?);
+            let all = [operands[0], operands[1], (pool_meta, &empty), operands[2]];
+            let y = self.conv_slots_into(&all, outputs, buffer, silu)?;
+            Ok(vec![y, base])
+        }
+
+        /// The convolution at `slots` of `pool` (read and written in place); returns the
+        /// outputs. `operands[2]` gives only the pool's metadata.
+        fn conv_slots_into(
+            &mut self,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+            pool: &mut Buffer,
+            silu: bool,
+        ) -> Result<Data> {
+            let mut y = Buffer::try_alloc_gpu(outputs[0].size * outputs[0].dtype.size())?;
+            let (x, w, slots) = (
+                self.packed(operands[0], true)?,
+                self.packed(operands[1], true)?,
+                self.packed(operands[3], true)?,
+            );
+            let (b, l, c) = (x.shape[0], x.shape[1], x.shape[2]);
+            let (k, s) = (w.shape[1], operands[2].0.shape[0]);
+            if b * c == 0 || (s == 0 && k > 1) {
+                return Ok(Data::new(y));
+            }
+            let sizes = [l as i32, c as i32, k as i32, s.max(1) as i32];
+            let flag = i32::from(silu).to_le_bytes();
+            let args = [
+                x.arg(),
+                w.arg(),
+                Arg::write(pool.metal_mut().expect("device storage")),
+                slots.arg(),
+                Arg::write(y.metal_mut().expect("device storage")),
+                Arg::bytes(bytemuck::bytes_of(&sizes)),
+                Arg::bytes(&flag),
+            ];
+            let name = format!("nuvec_causal_conv1d_slots_{}", operands[0].0.dtype.name());
+            let pipeline = self.pipeline(&name)?;
+            let grid = [c, b, 1];
+            self.encode_threads(&pipeline, &args, grid, block_dims(grid))?;
+            self.counted()?;
+            Ok(Data::new(y))
+        }
+
+        /// [`crate::fast::FastOp::WeightedSum`]: one thread per output element.
+        fn weighted_sum(&mut self, operands: &[Operand<'_>], out: &Output) -> Result<Vec<Data>> {
+            let (x, w) = (
+                self.packed(operands[0], true)?,
+                self.packed(operands[1], true)?,
+            );
+            let n = x.shape.len();
+            let (k, d) = (x.shape[n - 2], x.shape[n - 1]);
+            let rows = out.size / d.max(1);
+            let mut buffer = Buffer::try_alloc_gpu(out.size * out.dtype.size())?;
+            if out.size > 0 {
+                let sizes = [k as i32, d as i32].map(i32::to_le_bytes);
+                let args = [
+                    x.arg(),
+                    w.arg(),
+                    Arg::write(buffer.metal_mut().expect("device storage")),
+                    Arg::bytes(&sizes[0]),
+                    Arg::bytes(&sizes[1]),
+                ];
+                let name = format!("nuvec_weighted_sum_{}", out.dtype.name());
+                let pipeline = self.pipeline(&name)?;
+                let grid = [d, rows, 1];
+                self.encode_threads(&pipeline, &args, grid, block_dims(grid))?;
+                self.counted()?;
+            }
+            Ok(vec![Data::new(buffer)])
         }
 
         fn gated_delta(
@@ -3863,8 +4213,11 @@ mod metal {
             let (q, v, g, st) = (metas[0], metas[2], metas[3], metas[5]);
             let (b, t, hk, dk) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
             let (hv, dv) = (v.shape[2], v.shape[3]);
-            let packed =
-                dk == 128 && dv % 8 == 0 && g.dtype == DType::F32 && st.dtype == DType::F32;
+            let packed = dk == 128
+                && dv % 8 == 0
+                && g.dtype == DType::F32
+                && st.dtype == DType::F32
+                && gdn_packed_enabled();
             let types: Vec<&str> = metas.iter().map(|m| msl_type(m.dtype)).collect();
             let name = format!(
                 "nuvec_gated_delta{}{}_{}_{}_{}_{}_dk{dk}_dv{dv}_hk{hk}_hv{hv}",
@@ -4242,7 +4595,8 @@ mod metal {
                 q_strides: s3(&q),
                 k_strides: s3(&k),
                 v_strides: s3(&v),
-                o_strides: [(hq * lq * dv) as i64, (lq * dv) as i64, dv as i64],
+                // The output's layout: `[B, L, H, D]` in memory (MLX's full attention).
+                o_strides: [out.strides[0] as i64, out.strides[1] as i64, out.strides[2] as i64],
             };
             let params = bytes(&params);
             let mask_params = mask.as_ref().map(|m| bytes(&s3(m)));
@@ -5513,6 +5867,7 @@ mod metal {
             threads: usize,
         ) -> Result<()> {
             let cmd = self.command_buffer()?;
+            super::DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: core's 1-D kernels (elementwise, copies, gathers and scatters, fused
             // elementwise source) guard every access with the element count bound next to
             // the buffers (`if (i >= n) return`, or a grid of exactly that many threads),
@@ -5531,6 +5886,7 @@ mod metal {
             threads: [usize; 3],
         ) -> Result<()> {
             let cmd = self.command_buffer()?;
+            super::DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: core's threadgroup kernels (reductions, matrix products, attention,
             // quantized products) index rows and tiles by threadgroup position within the
             // grid sized from the operands' shapes, and guard partial tiles and rows with
@@ -5548,6 +5904,7 @@ mod metal {
             group: [usize; 3],
         ) -> Result<()> {
             let cmd = self.command_buffer()?;
+            super::DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: core's grid kernels (random bits, strided copies, reductions,
             // attention, user `MetalKernel`s, whose source is trusted code by contract)
             // launch exactly `grid` threads, sized from the operands' shapes, and index
@@ -5637,7 +5994,7 @@ mod metal {
             } else {
                 IDLE_DISPATCHES
             });
-            if self.dispatches >= limit {
+            if self.dispatches >= limit && !self.hold {
                 self.commit();
                 self.limit = Some(if profiling {
                     1
@@ -5663,6 +6020,7 @@ mod metal {
                 }
                 // No GPU work orders these views after their producers: wait for them.
                 let reads = std::mem::take(&mut self.reads);
+                let collectives = std::mem::take(&mut self.collectives);
                 let result = std::mem::take(&mut self.foreign)
                     .iter()
                     .try_for_each(|a| a.out().slot.wait().clone().map(|_| ()));
@@ -5670,12 +6028,15 @@ mod metal {
                 let (k, status) = self.reserve(&committed);
                 expose(&committed, &status);
                 self.shared.exposed(k);
-                self.shared.complete(k, chunk_result(result, &reads));
+                self.shared
+                    .complete(k, chunk_result(result, &reads, &collectives));
                 return;
             };
             // This command buffer runs after every foreign producer (device timeline).
             self.foreign.clear();
             let reads = std::mem::take(&mut self.reads);
+            let collectives = std::mem::take(&mut self.collectives);
+            let signal = self.signal.take();
             if let Some(device) = self.device {
                 device.wait_for_capacity(MAX_IN_FLIGHT);
             }
@@ -5685,6 +6046,8 @@ mod metal {
             let shared = self.shared.clone();
             #[cfg(test)]
             let injected = fault::take();
+            #[cfg(test)]
+            super::COMMITS.set(super::COMMITS.get() + 1);
             let pending = cmd.commit_then(move |result| {
                 #[cfg(test)]
                 let result = match injected {
@@ -5693,7 +6056,15 @@ mod metal {
                     )),
                     false => result,
                 };
-                shared.complete(k, chunk_result(result.map_err(backend), &reads));
+                if let Some(signal) = signal {
+                    signal
+                        .done
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                shared.complete(
+                    k,
+                    chunk_result(result.map_err(backend), &reads, &collectives),
+                );
             });
             // Profiling times each command buffer alone: nothing may overlap it.
             if nuvec_gpu::profile::enabled() {
@@ -5733,6 +6104,158 @@ mod metal {
             {
                 self.reads.push(status);
             }
+        }
+
+        /// Runs a collective without waiting for the GPU or committing (MLX's
+        /// communication stream). In the open command buffer, its input is copied on the GPU
+        /// (into the output for `Reduce` and `Send`, which then run in place; into a staging
+        /// buffer for `Gather` and `SumScatter`), or, `donated` (a `Reduce` or `Send` input
+        /// nothing else holds, as MLX's), becomes the output after a dispatch that orders it
+        /// after its producers; either is ordered after every producer by the buffers'
+        /// fences, and an event is signalled. The group's worker waits for that
+        /// signal, runs the collective and signals back; the work encoded after it waits
+        /// for that on the GPU. The output is deferred with the open chunk, so it is
+        /// published (or failed with the collective's error) once that work completes.
+        pub(crate) fn collective(
+            &mut self,
+            op: &crate::distributed::CollectiveOp,
+            group: usize,
+            inputs: &[crate::Array],
+            data: Vec<Data>,
+            output: &Output,
+            donated: Option<Data>,
+        ) -> Result<Vec<Data>> {
+            use crate::distributed::{CollectiveOp, Input, Ready};
+            let device = self
+                .device()
+                .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
+            let (dtype, shape) = inputs.first().map_or((output.dtype, Vec::new()), |a| {
+                (a.dtype(), a.out().shape.to_vec())
+            });
+            if let Some(mut out) = donated {
+                self.hold = true;
+                let ordered = self.order_write(&mut out);
+                self.hold = false;
+                ordered?;
+                let ready = self.input_signal(device)?;
+                return self.enqueue_collective(
+                    op,
+                    group,
+                    device,
+                    dtype,
+                    shape,
+                    ready,
+                    Input::InOutput,
+                    out,
+                );
+            }
+            let mut out = Buffer::try_alloc(output.size * output.dtype.size())?;
+            let operand = inputs.first().zip(data.first()).map(|(a, d)| (a.out(), d));
+            let on_gpu =
+                operand.is_none_or(|o| o.0.size > 0 && self.supports(&Primitive::Copy, &[o], &[]));
+            let (ready, input) = if on_gpu {
+                let input = match (op, operand) {
+                    (_, None) => Input::InOutput,
+                    (CollectiveOp::Reduce(_) | CollectiveOp::Send { .. }, Some(o)) => {
+                        self.hold = true;
+                        let copied = self.copy(o, &mut out);
+                        self.hold = false;
+                        copied?;
+                        Input::InOutput
+                    }
+                    (_, Some(o)) => {
+                        let mut staged = Buffer::try_alloc(o.0.size * o.0.dtype.size())?;
+                        self.hold = true;
+                        let copied = self.copy(o, &mut staged);
+                        self.hold = false;
+                        copied?;
+                        Input::Staged(Data::new(staged))
+                    }
+                };
+                let ready = match operand {
+                    Some(_) => self.input_signal(device)?,
+                    None => Ready::Now,
+                };
+                (ready, input)
+            } else {
+                // Not copyable on the GPU (host memory, very large): wait for the
+                // committed work, then read the operand as it is.
+                self.commit();
+                let pending = self.submitted.last().cloned();
+                let input = match operand {
+                    Some((_, d)) => Input::Operand(inputs[0].clone(), d.clone()),
+                    None => Input::InOutput,
+                };
+                (Ready::Pending(pending), input)
+            };
+            self.enqueue_collective(
+                op,
+                group,
+                device,
+                dtype,
+                shape,
+                ready,
+                input,
+                Data::new(out),
+            )
+        }
+
+        /// Signals the open command buffer's input event after the work encoded so far.
+        fn input_signal(&mut self, device: &MetalDevice) -> Result<crate::distributed::Ready> {
+            if self.signal.is_none() {
+                self.signal = Some(Arc::new(BufferSignal::new(device)?));
+            }
+            let signal = self.signal.clone().expect("just set");
+            let value = signal.next();
+            self.command_buffer()?.signal_event(&signal.event, value);
+            Ok(crate::distributed::Ready::Signal(signal, value))
+        }
+
+        /// A dispatch writing `out`, which orders what follows after `out`'s producers and
+        /// readers (the buffers' fences and barriers), as the input copy does.
+        fn order_write(&mut self, out: &mut Data) -> Result<()> {
+            let buffer = Arc::get_mut(&mut out.buffer)
+                .and_then(Buffer::metal_mut)
+                .expect("donated: the only handle, on the GPU");
+            self.dispatch("nuvec_order", &[Arg::write(buffer)], 1)
+        }
+
+        /// Queues the collective on its group's worker, which waits for `ready`, and makes
+        /// the work encoded after it wait for the worker's signal.
+        #[allow(clippy::too_many_arguments)]
+        fn enqueue_collective(
+            &mut self,
+            op: &crate::distributed::CollectiveOp,
+            group: usize,
+            device: &MetalDevice,
+            dtype: DType,
+            shape: Vec<usize>,
+            ready: crate::distributed::Ready,
+            input: crate::distributed::Input,
+            out: Data,
+        ) -> Result<Vec<Data>> {
+            use crate::distributed::GpuJob;
+            let status = ChunkStatus::default();
+            let job = GpuJob {
+                op: op.clone(),
+                dtype,
+                shape,
+                ready,
+                input,
+                out: out.clone(),
+                status: status.clone(),
+            };
+            let (worker, value) = crate::distributed::submit_gpu(group, job, device)?;
+            self.command_buffer()?
+                .wait_event(crate::distributed::worker_event(&*worker), value);
+            self.collectives.push(status);
+            Ok(vec![out])
+        }
+
+        /// Whether the open command buffer holds collectives: it must be committed before
+        /// this thread blocks on anything, since their worker waits for it.
+        pub(crate) fn collectives_pending(&self) -> bool {
+            !self.collectives.is_empty()
         }
 
         /// Holds `outputs` of `node` until the GPU work producing them has completed (or

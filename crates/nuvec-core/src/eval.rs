@@ -380,6 +380,14 @@ fn donation(
         | Primitive::Fast(crate::fast::imp::FastOp::NormRope { cache: true, .. })
         | Primitive::Fast(crate::fast::imp::FastOp::PagedWrite) => Some(0),
         Primitive::Fast(crate::fast::imp::FastOp::GatedDeltaSlots) => Some(5),
+        Primitive::Fast(crate::fast::imp::FastOp::ConvSlots { .. }) => Some(2),
+        // MLX's donation for an all-reduce or send: the worker writes the input's buffer.
+        Primitive::Collective {
+            op:
+                crate::distributed::CollectiveOp::Reduce(_)
+                | crate::distributed::CollectiveOp::Send { .. },
+            ..
+        } => Some(0),
         _ => None,
     };
     if let Some(at) = base {
@@ -572,6 +580,10 @@ fn in_place(
         });
     }
     let out = &node.outputs[0];
+    if let Primitive::Collective { op, group } = primitive {
+        let outputs = gpu.collective(op, *group, inputs, Vec::new(), out, Some(base))?;
+        return Ok((outputs, true));
+    }
     let operands = |skip: usize| -> Vec<Operand<'_>> {
         inputs
             .iter()
@@ -584,6 +596,12 @@ fn in_place(
         let pool = inputs[at].out();
         let all = operands(0);
         let datas = gpu.gated_delta_slots_in_place(&all, pool, base, &node.outputs)?;
+        return Ok((datas, true));
+    }
+    if let Primitive::Fast(crate::fast::imp::FastOp::ConvSlots { silu }) = primitive {
+        let pool = inputs[at].out();
+        let all = operands(0);
+        let datas = gpu.conv_slots_in_place(&all, pool, base, &node.outputs, *silu)?;
         return Ok((datas, true));
     }
     let data = match primitive {
@@ -713,6 +731,17 @@ fn compute(
         if gpu.supports(primitive, &operands, &node.outputs) {
             return Ok((gpu.run(primitive, &operands, &node.outputs)?, true));
         }
+        if let Primitive::Collective { op, group } = primitive {
+            // Other evaluations' in-flight inputs: the GPU copy is ordered after them.
+            gpu.depend_on(&foreign);
+            let outputs = gpu.collective(op, *group, inputs, data, &node.outputs[0], None)?;
+            return Ok((outputs, true));
+        }
+    }
+    // Collectives in the open command buffer wait for its signals: submit it before
+    // anything here may block (a collective on the CPU waits for the queued ones).
+    if gpu.collectives_pending() {
+        gpu.commit();
     }
     // The CPU reads inputs in place: wait for the GPU work that produces them.
     await_foreign()?;

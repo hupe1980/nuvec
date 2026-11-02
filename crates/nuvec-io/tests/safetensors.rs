@@ -400,3 +400,167 @@ fn tensors_of_one_file_share_a_buffer_id() {
     assert_ne!(other.tensors["a"].buffer_id(), st.tensors["x"].buffer_id());
     let _ = (std::fs::remove_file(&aligned), std::fs::remove_file(&mlx));
 }
+
+/// A filtered load of an aligned file maps only the kept tensors' pages: the mapped bytes
+/// equal the footprint, the dropped tensor's pages are not counted, and the kept tensors
+/// equal a whole load's.
+#[test]
+fn filtered_aligned_loads_map_only_the_kept_pages() {
+    let _one = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = device() else { return };
+    let path = temp("filtered-aligned");
+    let first = ops::arange(0, 1000, 1).astype(DType::F32);
+    let dropped = ops::arange(0, 4 << 20, 1).astype(DType::F32); // 16 MiB
+    let last = ops::arange(0, 3000, 1).astype(DType::BF16);
+    save_safetensors(
+        &path,
+        &[
+            ("a.first", &first),
+            ("b.dropped", &dropped),
+            ("c.last", &last),
+        ],
+        &[],
+    )
+    .unwrap();
+    let keep = |name: &str| name != "b.dropped";
+    let whole = safetensors_footprint(&path).unwrap();
+    let some = safetensors_footprint_filtered(&path, keep).unwrap();
+    assert!(some.mapped < whole.mapped / 8, "{some:?} vs {whole:?}");
+    assert_eq!((some.copied, some.transient), (0, some.mapped));
+    let before = dev.memory().mapped;
+    let st = load_safetensors_filtered(&path, keep).unwrap();
+    assert_eq!((dev.memory().mapped - before) as u64, some.mapped);
+    let all = load_safetensors(&path).unwrap();
+    for name in ["a.first", "c.last"] {
+        let (x, y) = (&st.tensors[name], &all.tensors[name]);
+        assert_eq!(
+            x.astype(DType::F32).to_vec::<f32>().unwrap(),
+            y.astype(DType::F32).to_vec::<f32>().unwrap(),
+            "{name}"
+        );
+    }
+    assert!(!st.tensors.contains_key("b.dropped"));
+    drop((st, all));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An MLX-style file with metadata and tensors of odd sizes: every tensor misaligned.
+fn misaligned_mixed(path: &Path) -> Vec<(&'static str, DType, Vec<u8>)> {
+    let tensors: Vec<(&str, DType, Vec<u8>)> = vec![
+        (
+            "a.weight",
+            DType::F32,
+            (0..5 * 4).map(|i| (i * 7) as u8).collect(),
+        ),
+        (
+            "b.scales",
+            DType::BF16,
+            (0..7 * 2).map(|i| (i * 13 + 1) as u8).collect(),
+        ),
+        ("c.codes", DType::U8, vec![9, 8, 7]),
+        (
+            "d.big",
+            DType::F32,
+            (0..3000 * 4).map(|i| (i % 251) as u8).collect(),
+        ),
+    ];
+    let names = ["F32", "BF16", "U8", "F32"];
+    let mut at = 0;
+    let mut entries = vec![r#""__metadata__":{"format":"mlx"}"#.to_string()];
+    for ((name, dtype, bytes), dname) in tensors.iter().zip(names) {
+        let n = bytes.len() / dtype.size();
+        entries.push(format!(
+            r#""{name}":{{"dtype":"{dname}","shape":[{n}],"data_offsets":[{at},{}]}}"#,
+            at + bytes.len()
+        ));
+        at += bytes.len();
+    }
+    let mut h = format!("{{{}}}", entries.join(",")).into_bytes();
+    if (8 + h.len()).is_multiple_of(4) {
+        h.push(b' ');
+    }
+    let mut out = (h.len() as u64).to_le_bytes().to_vec();
+    out.extend(&h);
+    for (_, _, b) in &tensors {
+        out.extend(b);
+    }
+    std::fs::write(path, out).unwrap();
+    tensors
+}
+
+fn raw(a: &Array) -> Vec<u8> {
+    a.view(DType::U8).to_vec::<u8>().unwrap()
+}
+
+/// `align_safetensors` keeps every tensor and the metadata bit for bit and makes the file
+/// mappable; padding tensors never surface.
+#[test]
+fn aligned_copies_keep_every_tensor_and_map_without_a_copy() {
+    let _one = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let (src, dst) = (temp("align-src"), temp("align-dst"));
+    let tensors = misaligned_mixed(&src);
+    assert!(
+        safetensors_footprint(&src).unwrap().copied > 0,
+        "the source is read, not mapped"
+    );
+    nuvec_io::align_safetensors(&src, &dst).unwrap();
+    let fp = safetensors_footprint(&dst).unwrap();
+    assert_eq!((fp.copied, fp.mapped > 0), (0, true), "{fp:?}");
+    let (a, b) = (
+        load_safetensors(&src).unwrap(),
+        load_safetensors(&dst).unwrap(),
+    );
+    assert_eq!(b.metadata, a.metadata);
+    assert_eq!(b.tensors.len(), tensors.len());
+    for (name, _, bytes) in &tensors {
+        assert_eq!(&raw(&b.tensors[*name]), bytes, "{name}");
+    }
+    let listed = nuvec_io::safetensors_tensors(&dst).unwrap();
+    assert_eq!(listed.len(), tensors.len());
+    assert!(!dst.with_extension("safetensors.tmp").exists());
+    let _ = (std::fs::remove_file(&src), std::fs::remove_file(&dst));
+}
+
+/// The cache writes an aligned copy once, maps it afterwards, rebuilds it when the source
+/// changes, and falls back to reading when it cannot write.
+#[test]
+fn the_aligned_cache_is_written_once_and_rebuilt_on_change() {
+    let _one = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let src = temp("cache-src.safetensors");
+    let dir = temp("cache-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    let tensors = misaligned_mixed(&src);
+    let copies = || std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+    let first = nuvec_io::load_safetensors_cached(&src, &dir, |_| true).unwrap();
+    assert_eq!(copies(), 1);
+    let copy = std::fs::read_dir(&dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(safetensors_footprint(&copy).unwrap().copied, 0);
+    let again = nuvec_io::load_safetensors_cached(&src, &dir, |n| n != "d.big").unwrap();
+    assert_eq!(copies(), 1);
+    assert_eq!(again.tensors.len(), tensors.len() - 1);
+    for (name, _, bytes) in &tensors {
+        assert_eq!(&raw(&first.tensors[*name]), bytes, "{name}");
+    }
+    // A changed source (another length) gets a new copy.
+    drop((first, again));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    misaligned(&src, 33);
+    let changed = nuvec_io::load_safetensors_cached(&src, &dir, |_| true).unwrap();
+    assert_eq!(copies(), 2);
+    assert_eq!(changed.tensors["x"].to_vec::<f32>().unwrap()[32], 32.0);
+    // An unwritable cache (a file in the way) still loads, by reading.
+    let blocked = temp("cache-blocked");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let read = nuvec_io::load_safetensors_cached(&src, blocked.join("sub"), |_| true).unwrap();
+    assert_eq!(read.tensors.len(), 1);
+    let _ = (
+        std::fs::remove_file(&src),
+        std::fs::remove_dir_all(&dir),
+        std::fs::remove_file(&blocked),
+    );
+}

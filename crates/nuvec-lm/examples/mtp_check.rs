@@ -37,12 +37,13 @@ fn main() -> nuvec::Result<()> {
     };
     let long: Vec<u32> = tokens.iter().copied().cycle().take(4000).collect();
     for prompt in [&tokens, &long] {
-        let plain: Vec<u32> = generate(&model, prompt, options)?.collect::<nuvec::Result<_>>()?;
+        let plain: Vec<u32> =
+            generate(&model, prompt, options.clone())?.collect::<nuvec::Result<_>>()?;
         for k in 1..=3 {
             let g = speculative_generate(
                 &model,
                 prompt,
-                options,
+                options.clone(),
                 MtpDrafter::new(&model)?,
                 DraftPolicy::Fixed(k),
             )?;

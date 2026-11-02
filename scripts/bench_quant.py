@@ -54,7 +54,14 @@ SHAPES = [
     ("e4b-o", 1, 2048, 2560, True, 4, 64),
     ("e4b-pli", 1, 256, 2560, True, 4, 64),
     ("e4b-head", 1, 2560, 262144, True, 4, 64),
-    # Gemma 4 26B-A4B's decode at 8 requests (hidden 2,816): dense, then experts (`g26g`).
+    # Gemma 4 26B-A4B's decode at one row (hidden 2,816: the generic `qmv`), weights in the
+    # system cache, then out of it (N = 32,768, against an aligned K).
+    ("g26-q1", 1, 2816, 4096, True, 4, 64),
+    ("g26-mlp1", 1, 2816, 2112, True, 4, 64),
+    ("g26-down1", 1, 2112, 2816, True, 4, 64),
+    ("g26-dram1", 1, 2816, 32768, True, 4, 64),
+    ("g26-dram1-k3072", 1, 3072, 32768, True, 4, 64),
+    # At 8 requests: dense, then experts (`g26g`).
     ("g26-q", 8, 2816, 4096, True, 4, 64),
     ("g26-kv", 8, 2816, 2048, True, 4, 64),
     ("g26-o", 8, 4096, 2816, True, 4, 64),
@@ -73,6 +80,12 @@ SHAPES = [
     ("q36-out", 2048, 4096, 2048, True, 4, 64),
     ("q36-512", 2048, 2048, 512, True, 4, 64),
     ("q36-shared-down", 2048, 512, 2048, True, 4, 64),
+    # Qwen3-0.6B prefill (mlx-lm's 2,047-row chunk): q, k/v, o, gate/up, down.
+    ("q06-q", 2047, 1024, 2048, True, 4, 64),
+    ("q06-kv", 2047, 1024, 1024, True, 4, 64),
+    ("q06-o", 2047, 2048, 1024, True, 4, 64),
+    ("q06-up", 2047, 1024, 3072, True, 4, 64),
+    ("q06-down", 2047, 3072, 1024, True, 4, 64),
     ("gqmm-2048-up", 16384, 2048, 512, True, 4, 64),
     ("gqmm-2048-down", 16384, 512, 2048, True, 4, 64),
 ]
@@ -89,6 +102,8 @@ FP_SHAPES = [
     ("qvm4096", 1, 4096, 4096, False),
     ("qmv-k128", 1, 128, 4096, True),
     ("oss-qmv2880", 1, 2880, 2880, True),
+    ("oss-dram", 1, 2880, 32768, True),
+    ("oss-dram-k3072", 1, 3072, 32768, True),
     ("oss-qmv2880-m4", 4, 2880, 2880, True),
     ("oss-qmm2880", 512, 2880, 2880, True),
 ]

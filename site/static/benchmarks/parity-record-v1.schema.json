@@ -257,7 +257,8 @@
           "ttft",
           "memory",
           "load",
-          "concurrency"
+          "concurrency",
+          "speculative"
         ]
       },
       "uniqueItems": true
@@ -686,6 +687,28 @@
                   "boolean",
                   "null"
                 ]
+              }
+            }
+          }
+        },
+        "speculative": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "drafter",
+              "tok_s"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "drafter": {
+                "enum": [
+                  "mtp",
+                  "lookup"
+                ]
+              },
+              "tok_s": {
+                "$ref": "#/$defs/pair"
               }
             }
           }

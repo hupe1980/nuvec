@@ -42,18 +42,22 @@ mod info;
 mod memory;
 
 pub use error::{GpuError, Result};
-pub use info::{DeviceInfo, NaxReason, NaxStatus};
-pub use memory::{MemoryStats, allocation_size, mapping_size};
+pub use info::{DeviceInfo, NaxReason, NaxStatus, physical_memory};
+pub use memory::{MemoryStats, allocation_size, mapping_size, page_size};
 
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(target_os = "macos")]
 pub use metal::{
-    Arg, Buffer, CommandBuffer, Constant, Device, Pending, Pipeline, Submitted, Timeline, profile,
+    Arg, Buffer, CommandBuffer, Constant, Device, Event, Pending, Pipeline, Submitted, Timeline,
+    profile,
 };
 
 #[cfg(not(target_os = "macos"))]
 mod stub;
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+pub mod cuda;
 #[cfg(not(target_os = "macos"))]
 pub use stub::{Device, profile};
 

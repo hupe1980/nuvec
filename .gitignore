@@ -55,3 +55,4 @@ __pycache__/
 
 # Feedback notes for downstream projects (handed over, not part of nuvec).
 /FEEDBACK*.md
+.env

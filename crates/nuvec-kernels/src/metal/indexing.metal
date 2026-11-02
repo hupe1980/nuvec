@@ -299,3 +299,7 @@ template [[host_name("nuvec_copy_into_128_g3")]] [[kernel]] void copy_into_g3<ui
 template [[host_name("nuvec_copy_into_128_g3s")]] [[kernel]] void copy_into_g3s<uint4>(
     device const uint4*, device uint4*, constant long&, constant long&, constant int*,
     constant long*, constant long*, constant int&, uint3);
+
+// Writes nothing: a dispatch that names a buffer as written, so the command buffer's fences
+// order what follows (an event signal to the CPU, which then writes it) after its producers.
+[[kernel]] void nuvec_order(device uchar* buffer [[buffer(0)]]) {}

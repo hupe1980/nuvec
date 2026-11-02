@@ -82,7 +82,8 @@
 //!   custom kernels from source ([`fast::MetalKernel`]).
 //! - **Indexing** as MLX's `x[...]` ([`Array::i`]) and functional updates ([`Array::at`]).
 //! - **Evaluation** on the GPU by default, submitted asynchronously ([`async_eval`],
-//!   [`schedule`]), or on the CPU; memory limits and wired memory on [`gpu::Device`].
+//!   [`schedule`]), or on the CPU; memory limits and wired memory in [`memory`], device
+//!   facts in [`metal`].
 //! - **I/O** ([`io`]): safetensors and npy, memory-mapped without a copy.
 //!
 //! The default stream of each thread is the GPU's when Metal is available, else the CPU's
@@ -153,11 +154,14 @@
 //! # Stability
 //!
 //! Semantic versioning covers every item reachable through `nuvec::` paths, and `nuvec-lm`;
-//! the sub-crates re-exported here make no promise when depended on directly. Runtimes can
-//! rely on arrays and operations, the `fast` kernels, quantized and gathered products,
-//! custom Metal kernels, `compile`, random numbers, evaluation, memory limits and statistics,
-//! safetensors I/O and the attention plan. The pinned items are listed in this crate's
-//! `tests/api_surface.rs`.
+//! the sub-crates make no promise when depended on directly, and the backend crates are not
+//! reachable from here. The public modules are [`ops`], [`fast`], [`random`], [`graph`],
+//! [`tree`], [`speculative`], [`row_exact`], [`compile`](mod@compile), [`distributed`], [`io`],
+//! [`memory`], [`metal`], [`macros`] and [`prelude`]. Runtimes can rely on arrays and
+//! operations, the `fast` kernels, quantized and gathered products, custom Metal kernels,
+//! `compile`, random numbers, evaluation, memory limits and statistics, device facts and
+//! captures, safetensors I/O and the attention plan. The pinned items are listed in this
+//! crate's `tests/api_surface.rs`.
 //!
 //! **Status:** pre-alpha: the API may change between releases.
 
@@ -184,21 +188,29 @@ pub use nuvec_core::{
 pub use nuvec_io::{load_into, save};
 
 /// Distributed groups and collectives (MLX's `mx.distributed`): `all_sum`, `all_gather`,
-/// `send`, … over a [`Group`](distributed::Group), and MLX's TCP ring ([`init`](distributed::init)
-/// reads `MLX_HOSTFILE` and `MLX_RANK`).
+/// `sum_scatter`, `send`, … over a [`Group`](distributed::Group), on MLX's TCP ring or (feature
+/// `jaccl`, experimental) MLX's JACCL over Thunderbolt 5 RDMA; [`init`](distributed::init)
+/// reads MLX's launch environment.
 pub mod distributed {
     pub use nuvec_core::distributed::*;
-    pub use nuvec_distributed::{Options, init, init_with};
+    /// **Experimental:** MLX's JACCL backend, RDMA over Thunderbolt 5 (feature `jaccl`).
+    #[cfg(feature = "jaccl")]
+    pub use nuvec_distributed::jaccl;
+    pub use nuvec_distributed::{Backend, Options, init, init_backend, init_with, is_available};
 }
 pub use nuvec_macros::{Static, Tree};
 
 /// What the derive macros generate code against. Not a public API.
 #[doc(hidden)]
 pub use nuvec_core::__derive;
-pub use nuvec_cpu as cpu;
-pub use nuvec_gpu as gpu;
+/// A test diagnostic, not a public API.
+#[doc(hidden)]
+pub use nuvec_core::__gpu_dispatches;
 pub use nuvec_io as io;
 pub use nuvec_macros as macros;
+
+pub mod memory;
+pub mod metal;
 
 /// The everyday names in one import: `use nuvec::prelude::*;`. The free functions are in
 /// [`ops`], best imported as a module: `use nuvec::ops as mx;`.
@@ -218,6 +230,17 @@ pub mod prelude {
 ///
 /// ```compile_fail
 /// use nuvec::SliceArg; // pinned absent from the root
+/// ```
+///
+/// The backend crates are not reachable (they are not under the semver promise); memory
+/// and device facts are in [`memory`] and [`metal`]:
+///
+/// ```compile_fail
+/// let _ = nuvec::gpu::Device::shared();
+/// ```
+///
+/// ```compile_fail
+/// use nuvec::cpu;
 /// ```
 ///
 /// Free functions are in [`ops`], not at the root (a root `std` would shadow `std::`):

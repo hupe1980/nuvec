@@ -94,6 +94,16 @@ impl Primitive {
                 crate::distributed::CollectiveOp::Recv { .. } => {
                     unreachable!("recv has no inputs to batch")
                 }
+                // The scatter runs along the first axis: a batch there moves to the second.
+                crate::distributed::CollectiveOp::SumScatter => {
+                    let axis = axes[0].expect("the one input is batched");
+                    if axis == 0 {
+                        let moved = move_axis(x, 0, 1)?;
+                        Ok((record(self.clone(), vec![moved])?, 1))
+                    } else {
+                        Ok((record(self.clone(), vec![x.clone()])?, axis))
+                    }
+                }
                 _ => Ok((record(self.clone(), vec![x.clone()])?, axes[0].unwrap_or(0))),
             },
             Self::Unary(_) | Self::AsType(_) | Self::StopGradient | Self::Copy => {

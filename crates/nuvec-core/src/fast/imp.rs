@@ -32,6 +32,17 @@ pub enum FastOp {
         /// `f32::to_bits` of epsilon.
         eps: u32,
     },
+    /// `(h, x, w[, scale][, w2])`: `s = (h + RmsNorm(x, w)) · scale` and, with `next`,
+    /// [`FastOp::RmsNorm`] of `s` with `w2` (see
+    /// [`residual_rms_norm`](crate::fast::residual_rms_norm)).
+    ResidualRmsNorm {
+        /// `f32::to_bits` of the first norm's epsilon.
+        eps: u32,
+        /// Whether a 0-D scale follows the weight.
+        scaled: bool,
+        /// `f32::to_bits` of the second norm's epsilon, when there is one.
+        next: Option<u32>,
+    },
     /// `(x, w, g)`: the gradients of [`FastOp::RmsNorm`] for `x` and `w`.
     RmsNormVjp {
         /// `f32::to_bits` of epsilon.
@@ -61,10 +72,12 @@ pub enum FastOp {
         /// Rotate forwards (`false`: the inverse rotation, the gradient).
         forward: bool,
     },
-    /// `([cache,] x, w[, freqs])`: [`norm_rope`](crate::fast::norm_rope): each `[b, h, l]`
-    /// row of `x` RMS-normalised (with `eps`) and rotated as [`FastOp::Rope`] at position
-    /// `offset + l`; written into `cache` at the same positions, or returned as a new
-    /// `[B, H, L, D]` array.
+    /// `([cache | pool, slots,] x, w[, positions][, freqs])`:
+    /// [`norm_rope`](crate::fast::norm_rope) and [`norm_rope_at`](crate::fast::norm_rope_at):
+    /// each `[b, h, l]` row of `x` RMS-normalised (with `eps`) and rotated as
+    /// [`FastOp::Rope`] at position `offset + l` (`positions[b] + l` with positions);
+    /// written into `cache` at the same positions, into `pool` at `slots[b, l]`, or
+    /// returned as a new `[B, H, L, D]` array.
     NormRope {
         /// `f32::to_bits` of epsilon, or no normalisation.
         eps: Option<u32>,
@@ -78,8 +91,14 @@ pub enum FastOp {
         scale: u32,
         /// The position of the first row.
         offset: usize,
-        /// Whether the first input is a cache written at the rows' positions.
+        /// Whether the first input is a cache written at the rows' positions (or, with
+        /// `paged`, a pool written at their slots).
         cache: bool,
+        /// Whether per-row positions (`[B]`, int32) follow the weight.
+        positions: bool,
+        /// Whether the first inputs are a pool `[blocks, H, block_size, D]` and slots
+        /// `[B, L]` (int32; out-of-range slots skipped). Implies `cache`.
+        paged: bool,
     },
     /// `(x, w)`: [`conv1d`](crate::Array::conv1d) with `groups` equal to the channels (depthwise).
     DepthwiseConv1d {
@@ -102,6 +121,25 @@ pub enum FastOp {
     },
     /// `(cache, new, slots)`: [`paged_write`](crate::fast::paged_write).
     PagedWrite,
+    /// `(probs)`: [`moe_route`](crate::fast::moe_route): the indices (uint32) of the `k`
+    /// largest probabilities along the last axis in the stable ascending order (as
+    /// `argpartition`), and those probabilities, divided by their sum if `normalize`.
+    MoeRoute {
+        /// Experts per row.
+        k: usize,
+        /// Whether the scores are divided by their sum.
+        normalize: bool,
+    },
+    /// `(x, w)`: [`weighted_sum`](crate::fast::weighted_sum): `x` (`[..., k, D]`) times `w`
+    /// (`[..., k]`), summed over `k`.
+    WeightedSum,
+    /// `(x, w, pool, slots)`: [`causal_conv1d_slots`](crate::fast::causal_conv1d_slots): each
+    /// sequence's state `pool[slots[b]]` then its new inputs, convolved depthwise (and
+    /// `silu`); the outputs and the pool with each slot's last `K − 1` inputs.
+    ConvSlots {
+        /// Whether `silu` follows the convolution.
+        silu: bool,
+    },
     /// `(x)`: softmax over the last axis, accumulated in float32.
     Softmax,
     /// `(x)`: [`FastOp::Softmax`] of causally masked scores: row `r` of the second-to-last
@@ -303,6 +341,54 @@ pub(crate) fn add_rms_norm(
     let mut out = record_or_fallback(op, vec![astype(x, dtype)?, astype(residual, dtype)?, w])?;
     let y = out.pop().expect("two outputs");
     Ok((out.pop().expect("two outputs"), y))
+}
+
+/// The body of [`crate::fast::residual_rms_norm`].
+pub(crate) fn residual_rms_norm(
+    h: &Array,
+    x: &Array,
+    (weight, eps): (&Array, f32),
+    scale: Option<&Array>,
+    next: Option<(&Array, f32)>,
+) -> Result<(Array, Option<Array>)> {
+    let dtype = h.dtype();
+    let weight_fits = |w: &Array| {
+        w.slot_error().is_none()
+            && w.dtype() == dtype
+            && w.ndim() == 1
+            && Some(&w.size()) == h.dims().last()
+    };
+    let fused = h.ndim() > 0
+        && h.dims() == x.dims()
+        && x.dtype() == dtype
+        && dtype.category() == Category::Float
+        && weight_fits(weight)
+        && scale.is_none_or(|s| s.slot_error().is_none() && s.dtype() == dtype && s.size() == 1)
+        && next.is_none_or(|(w, _)| weight_fits(w));
+    if !fused {
+        // The composition, with MLX's promotion (which also reports invalid arguments).
+        let mut s = add(h, &rms_norm(x, Some(weight), eps)?)?;
+        if let Some(scale) = scale {
+            s = multiply(&s, scale)?;
+        }
+        let n = next.map(|(w, e)| rms_norm(&s, Some(w), e)).transpose()?;
+        return Ok((s, n));
+    }
+    let mut inputs = vec![h.clone(), x.clone(), weight.clone()];
+    if let Some(scale) = scale {
+        inputs.push(reshape(scale, &[])?);
+    }
+    if let Some((w, _)) = next {
+        inputs.push(w.clone());
+    }
+    let op = FastOp::ResidualRmsNorm {
+        eps: eps.to_bits(),
+        scaled: scale.is_some(),
+        next: next.map(|(_, e)| e.to_bits()),
+    };
+    let mut out = record_or_fallback(op, inputs)?.into_iter();
+    let s = out.next().expect("the sum");
+    Ok((s, out.next()))
 }
 
 /// The body of [`crate::fast::layer_norm`].
@@ -519,6 +605,7 @@ impl FastOp {
         match self {
             Self::RmsNorm { .. } => "rms_norm",
             Self::AddRmsNorm { .. } => "add_rms_norm",
+            Self::ResidualRmsNorm { .. } => "residual_rms_norm",
             Self::RmsNormVjp { .. } => "rms_norm_vjp",
             Self::LayerNorm { .. } => "layer_norm",
             Self::LayerNormVjp { .. } => "layer_norm_vjp",
@@ -527,6 +614,9 @@ impl FastOp {
             Self::DepthwiseConv1d { .. } => "conv1d",
             Self::PagedAttention { .. } => "paged_attention",
             Self::PagedWrite => "paged_write",
+            Self::MoeRoute { .. } => "moe_route",
+            Self::WeightedSum => "weighted_sum",
+            Self::ConvSlots { .. } => "causal_conv1d_slots",
             Self::Softmax => "softmax",
             Self::CausalSoftmax { .. } => "causal_softmax",
             Self::LogSumExp => "logsumexp",
@@ -542,16 +632,30 @@ impl FastOp {
     /// `(dtype, shape)` per output, after checking the input count.
     pub(crate) fn outputs(&self, inputs: &[Array]) -> Result<Vec<(DType, Vec<usize>)>> {
         let arity = match self {
-            Self::Softmax | Self::CausalSoftmax { .. } | Self::LogSumExp => 1,
+            Self::Softmax
+            | Self::CausalSoftmax { .. }
+            | Self::LogSumExp
+            | Self::MoeRoute { .. } => 1,
+            Self::WeightedSum => 2,
+            Self::ResidualRmsNorm { scaled, next, .. } => {
+                3 + usize::from(*scaled) + usize::from(next.is_some())
+            }
             Self::RmsNorm { .. } | Self::CrossEntropy | Self::DepthwiseConv1d { .. } => 2,
             Self::PagedAttention { sinks, .. } => 5 + usize::from(*sinks),
             Self::PagedWrite => 3,
+            Self::ConvSlots { .. } => 4,
             Self::AddRmsNorm { .. } | Self::RmsNormVjp { .. } | Self::LayerNorm { .. } => 3,
             Self::LayerNormVjp { .. } | Self::CrossEntropyVjp => 4,
             Self::Rope { .. } => inputs.len().clamp(2, 3),
-            Self::NormRope { cache, .. } => inputs
-                .len()
-                .clamp(2 + usize::from(*cache), 3 + usize::from(*cache)),
+            Self::NormRope {
+                cache,
+                positions,
+                paged,
+                ..
+            } => {
+                let n = 2 + usize::from(*cache) + usize::from(*paged) + usize::from(*positions);
+                inputs.len().clamp(n, n + 1)
+            }
             Self::Attention { mask, sinks, .. } => 3 + usize::from(*mask) + usize::from(*sinks),
             Self::GatedDelta { .. } => 6,
             Self::GatedDeltaSlots => 7,
@@ -590,7 +694,22 @@ impl FastOp {
                 vec![(x.dtype(), shape)]
             }
             Self::AddRmsNorm { .. } => vec![like(x), like(x)],
+            Self::ResidualRmsNorm { next, .. } => match next {
+                Some(_) => vec![like(x), like(x)],
+                None => vec![like(x)],
+            },
             Self::PagedAttention { .. } | Self::PagedWrite => vec![like(x)],
+            Self::MoeRoute { k, .. } => {
+                let mut shape = x.dims().to_vec();
+                *shape.last_mut().expect("1-D") = *k;
+                vec![(DType::U32, shape.clone()), (x.dtype(), shape)]
+            }
+            Self::WeightedSum => {
+                let mut shape = x.dims().to_vec();
+                shape.remove(x.ndim() - 2);
+                vec![(x.dtype(), shape)]
+            }
+            Self::ConvSlots { .. } => vec![like(x), like(&inputs[2])],
             Self::DepthwiseConv1d {
                 stride,
                 padding,
@@ -682,6 +801,13 @@ impl FastOp {
         let ok = match self {
             Self::RmsNorm { .. } | Self::LayerNorm { .. } => inputs[1..].iter().all(param),
             Self::AddRmsNorm { .. } => like(&inputs[1]) && param(&inputs[2]),
+            Self::ResidualRmsNorm { scaled, .. } => {
+                let scale_fits = !scaled || {
+                    let s = &inputs[3];
+                    s.dtype() == x.dtype() && s.ndim() == 0
+                };
+                like(&inputs[1]) && inputs[2..].iter().all(param) && scale_fits
+            }
             Self::RmsNormVjp { .. } => param(&inputs[1]) && like(&inputs[2]),
             Self::LayerNormVjp { .. } => param(&inputs[1]) && param(&inputs[2]) && like(&inputs[3]),
             Self::Softmax | Self::LogSumExp => true,
@@ -703,9 +829,11 @@ impl FastOp {
                 dims,
                 offset,
                 cache,
+                positions,
+                paged,
                 ..
             } => {
-                let at = usize::from(*cache);
+                let at = usize::from(*cache) + usize::from(*paged);
                 let (y, w) = (&inputs[at], &inputs[at + 1]);
                 let s = y.dims();
                 let Some(end) = offset.checked_add(s.get(2).copied().unwrap_or(0)) else {
@@ -715,12 +843,23 @@ impl FastOp {
                     && y.dtype() == x.dtype()
                     && s[3] <= NORM_ROPE_MAX
                     && end <= i32::MAX as usize;
+                let positions_fit = !positions || {
+                    let p = &inputs[at + 2];
+                    p.dtype() == DType::I32 && p.dims() == [s[0]] && *offset == 0
+                };
                 let cache_fits = !cache
                     || (fits
                         && x.ndim() == 4
-                        && x.dims()[..2] == s[..2]
+                        && x.dims()[1] == s[1]
                         && x.dims()[3] == s[3]
-                        && x.dims()[2] >= end);
+                        && match paged {
+                            true => {
+                                let slots = &inputs[1];
+                                slots.dtype() == DType::I32 && slots.dims() == [s[0], s[2]]
+                            }
+                            false => x.dims()[0] == s[0] && x.dims()[2] >= end,
+                        });
+                let paged_fits = !paged || *cache;
                 let weight = || {
                     w.dtype() == x.dtype()
                         && match eps {
@@ -728,7 +867,11 @@ impl FastOp {
                             None => w.ndim() == 0,
                         }
                 };
-                fits && cache_fits && weight() && rotation(*dims, y, inputs.get(at + 2))
+                fits && positions_fit
+                    && cache_fits
+                    && paged_fits
+                    && weight()
+                    && rotation(*dims, y, inputs.get(at + 2 + usize::from(*positions)))
             }
             Self::DepthwiseConv1d {
                 stride,
@@ -781,16 +924,46 @@ impl FastOp {
                     && lengths.dims().first() == b
                     && lengths.dtype() == DType::I32
             }
+            Self::MoeRoute { k, .. } => {
+                x.dtype().category() == Category::Float && (1..=x.dims()[x.ndim() - 1]).contains(k)
+            }
+            Self::ConvSlots { .. } => {
+                let [_, w, pool, slots] = inputs else {
+                    unreachable!("four inputs")
+                };
+                let k = w.dims().get(1).copied().unwrap_or(0);
+                x.ndim() == 3
+                    && x.dtype().category() == Category::Float
+                    && w.ndim() == 3
+                    && w.dims()[0] == x.dims()[2]
+                    && w.dims()[2] == 1
+                    && k >= 1
+                    && pool.ndim() == 3
+                    && pool.dims()[1] == k - 1
+                    && pool.dims()[2] == x.dims()[2]
+                    && slots.dims() == [x.dims()[0]]
+                    && slots.dtype() == DType::I32
+                    && w.dtype() == x.dtype()
+                    && pool.dtype() == x.dtype()
+            }
+            Self::WeightedSum => {
+                let w = &inputs[1];
+                x.ndim() >= 2
+                    && x.dtype().category() == Category::Float
+                    && w.dtype() == x.dtype()
+                    && w.dims() == &x.dims()[..x.ndim() - 1]
+            }
             Self::PagedWrite => {
                 let [cache, new, slots] = inputs else {
                     unreachable!("three inputs")
                 };
+                let r = new.ndim();
                 cache.ndim() == 4
-                    && new.ndim() == 3
+                    && matches!(r, 3 | 4)
                     && new.dtype() == cache.dtype()
-                    && new.dims()[1] == cache.dims()[1]
-                    && new.dims()[2] == cache.dims()[3]
-                    && slots.dims() == [new.dims()[0]]
+                    && new.dims()[r - 2] == cache.dims()[1]
+                    && new.dims()[r - 1] == cache.dims()[3]
+                    && slots.dims() == &new.dims()[..r - 2]
                     && slots.dtype() == DType::I32
             }
             Self::CrossEntropy | Self::CrossEntropyVjp => {
@@ -967,6 +1140,24 @@ impl FastOp {
                 let y = record_or_fallback(op, vec![h.clone(), inputs[2].clone()])?;
                 vec![h, y.into_iter().next().expect("one output")]
             }
+            Self::ResidualRmsNorm { eps, scaled, next } => {
+                let norm = |a: &Array, w: &Array, eps: u32| -> Result<Array> {
+                    let op = Self::RmsNorm { eps };
+                    let y = record_or_fallback(op, vec![a.clone(), w.clone()])?;
+                    Ok(y.into_iter().next().expect("one output"))
+                };
+                let mut s = add(x, norm(&inputs[1], &inputs[2], *eps)?)?;
+                if *scaled {
+                    s = multiply(&s, &inputs[3])?;
+                }
+                match next {
+                    Some(e) => {
+                        let n = norm(&s, inputs.last().expect("the next weight"), *e)?;
+                        vec![s, n]
+                    }
+                    None => vec![s],
+                }
+            }
             Self::LayerNorm { eps } => {
                 let xf = f32x()?;
                 let xc = subtract(&xf, mean(&xf, &[-1], true)?)?;
@@ -1056,16 +1247,22 @@ impl FastOp {
                 scale,
                 offset,
                 cache,
+                positions,
+                paged,
             } => {
-                let at = usize::from(*cache);
+                let at = usize::from(*cache) + usize::from(*paged);
                 let (x, w) = (&inputs[at], &inputs[at + 1]);
                 let mut h = x.clone();
                 if let Some(eps) = eps {
                     let op = Self::RmsNorm { eps: *eps };
                     h = record_or_fallback(op, vec![h, w.clone()])?.swap_remove(0);
                 }
-                let mut rope_inputs = vec![h, Array::from(*offset as i32)];
-                rope_inputs.extend(inputs.get(at + 2).cloned());
+                let at_positions = match positions {
+                    true => inputs[at + 2].clone(),
+                    false => Array::from(*offset as i32),
+                };
+                let mut rope_inputs = vec![h, at_positions];
+                rope_inputs.extend(inputs.get(at + 2 + usize::from(*positions)).cloned());
                 let op = Self::Rope {
                     dims: *dims,
                     traditional: *traditional,
@@ -1075,6 +1272,12 @@ impl FastOp {
                 };
                 let r = record_or_fallback(op, rope_inputs)?.swap_remove(0);
                 vec![match cache {
+                    true if *paged => {
+                        // `[B, H, L, D]` as rows `[B, L, H, D]` at their slots.
+                        let rows = crate::ops::imp::transpose(&r, &[0, 2, 1, 3])?;
+                        let all = vec![inputs[0].clone(), rows, inputs[1].clone()];
+                        record_or_fallback(Self::PagedWrite, all)?.swap_remove(0)
+                    }
                     true => {
                         let mut region = vec![SliceArg::full(); 4];
                         let end = (offset + r.dims()[2]) as isize;
@@ -1100,6 +1303,44 @@ impl FastOp {
                 vec![paged_attention_graph(inputs, float(*scale), *window)?]
             }
             Self::PagedWrite => vec![paged_write_graph(inputs)?],
+            Self::MoeRoute { k, normalize } => {
+                let e = x.dims()[x.ndim() - 1];
+                let order = crate::sorting::argpartition(x, (e - k) as isize, Some(-1))?;
+                let mut last = vec![SliceArg::full(); x.ndim()];
+                last[x.ndim() - 1] = SliceArg::new(Some((e - k) as isize), None, 1);
+                let top = slice(&order, &last)?;
+                let mut scores = crate::indexing::take_along_axis(x, &top, -1)?;
+                if *normalize {
+                    scores = divide(&scores, sum(&scores, &[-1], true)?)?;
+                }
+                vec![top, scores]
+            }
+            Self::WeightedSum => {
+                let w = expand_dims(&inputs[1], -1)?;
+                vec![sum(&multiply(x, &w)?, &[-2], false)?]
+            }
+            Self::ConvSlots { silu } => {
+                let [x, w, pool, slots] = inputs else {
+                    unreachable!("four inputs")
+                };
+                let (l, c, k) = (x.dims()[1], x.dims()[2], w.dims()[1]);
+                let states = crate::indexing::take(pool, slots, Some(0))?;
+                let input = crate::indexing::concatenate(&[states, x.clone()], 1)?;
+                let mut y = crate::conv::conv1d(&input, w, 1, 0, 1, c)?;
+                if *silu {
+                    y = multiply(&y, &ops::sigmoid(&y)?)?;
+                }
+                let kept = slice(
+                    &input,
+                    &[
+                        SliceArg::full(),
+                        SliceArg::new(Some(l as isize), Some((l + k - 1) as isize), 1),
+                        SliceArg::full(),
+                    ],
+                )?;
+                let at = broadcast_to(&reshape(slots, &[-1, 1, 1])?, kept.dims())?;
+                vec![y, crate::indexing::put_along_axis(pool, &at, &kept, 0)?]
+            }
             Self::Softmax => vec![softmax_graph(x)?],
             Self::CausalSoftmax { rows } => {
                 vec![softmax_graph(&causal_masked(x, *rows as usize)?)?]
@@ -1248,9 +1489,13 @@ impl FastOp {
                 Ok(vec![Some(one(Self::CrossEntropyVjp, all)?), None])
             }
             Self::AddRmsNorm { .. }
+            | Self::ResidualRmsNorm { .. }
             | Self::NormRope { .. }
             | Self::PagedAttention { .. }
             | Self::PagedWrite
+            | Self::MoeRoute { .. }
+            | Self::WeightedSum
+            | Self::ConvSlots { .. }
             | Self::DepthwiseConv1d { .. }
             | Self::RmsNormVjp { .. }
             | Self::LayerNormVjp { .. }
@@ -1390,7 +1635,29 @@ impl FastOp {
 
     /// Runs the fallback graph on the CPU over evaluated operands, for work no kernel takes.
     pub(crate) fn eval_cpu(&self, operands: &[Operand<'_>]) -> Result<Vec<crate::array::Data>> {
+        if let Self::Attention { passes: 0, .. } = self {
+            // Laid out as `output_strides` declares: `[B, L, H, D]` in memory.
+            return run_on_cpu(operands, |leaves| {
+                let out = self.fallback(leaves)?.swap_remove(0);
+                Ok(vec![crate::ops::transpose(&out, [0, 2, 1, 3])])
+            });
+        }
         run_on_cpu(operands, |leaves| self.fallback(leaves))
+    }
+
+    /// The output's strides, if not row-contiguous: the tiled attention kernel writes
+    /// `[B, H, L, D]` laid out as `[B, L, H, D]` (MLX's full attention), so the heads'
+    /// usual transpose back to `[B, L, H·D]` is a view.
+    pub(crate) fn output_strides(&self, inputs: &[Array]) -> Option<crate::shape::Strides> {
+        let Self::Attention { passes: 0, .. } = self else {
+            return None;
+        };
+        let (q, v) = (inputs.first()?, inputs.get(2)?);
+        let (&[_, h, l, _], &[.., dv]) = (q.dims(), v.dims()) else {
+            return None;
+        };
+        let (h, l, dv) = (h as isize, l as isize, dv as isize);
+        Some([l * h * dv, dv, h * dv, 1].into_iter().collect())
     }
 }
 
@@ -1430,6 +1697,27 @@ pub(crate) fn run_on_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tiled attention kernel's output is laid out `[B, L, H, D]` (MLX's full
+    /// attention), so the heads' transpose back is row-contiguous: a view, not a copy.
+    #[test]
+    fn tiled_attention_is_laid_out_for_the_heads_transpose() {
+        let (b, h, l, d) = (2, 4, 40, 64);
+        let q = crate::ops::ones([b, h, l, d], DType::F16);
+        let out = crate::fast::scaled_dot_product_attention(
+            &q,
+            &q,
+            &q,
+            0.125,
+            &crate::fast::AttentionOptions::causal(),
+        );
+        let Some(Primitive::Fast(FastOp::Attention { passes: 0, .. })) = out.primitive_t() else {
+            panic!("a {l}-row prefill takes the tiled kernel");
+        };
+        let (h, l, d) = (h as isize, l as isize, d as isize);
+        assert_eq!(out.strides(), [l * h * d, d, h * d, 1]);
+        assert!(crate::ops::transpose(&out, [0, 2, 1, 3]).out().flags.row_contiguous);
+    }
 
     #[test]
     fn a_panicking_cpu_fallback_restores_the_default_stream() {
@@ -1714,8 +2002,116 @@ pub(crate) fn norm_rope(
         scale: rotation.scale.to_bits(),
         offset,
         cache: cache.is_some(),
+        positions: false,
+        paged: false,
     };
     one(op, inputs)
+}
+
+/// The body of [`crate::fast::norm_rope_at`].
+pub(crate) fn norm_rope_at(
+    x: &Array,
+    norm: Option<(&Array, f32)>,
+    rotation: Rotation<'_>,
+    positions: &Array,
+    pool: Option<(&Array, &Array)>,
+) -> Result<Array> {
+    let integer = |a: &Array| matches!(a.dtype().category(), Category::Signed | Category::Unsigned);
+    let rdims = usize::try_from(rotation.dims).unwrap_or(0);
+    let mut fused = x.ndim() == 4
+        && x.dtype().category() == Category::Float
+        && x.dims()[3] <= NORM_ROPE_MAX
+        && integer(positions)
+        && positions.dims() == [x.dims()[0]];
+    if let Some((p, slots)) = pool {
+        fused &= p.ndim() == 4
+            && p.dtype() == x.dtype()
+            && x.ndim() == 4
+            && p.dims()[1] == x.dims()[1]
+            && p.dims()[3] == x.dims()[3]
+            && integer(slots)
+            && slots.dims() == [x.dims()[0], x.dims()[2]];
+    }
+    if let Some((w, _)) = norm {
+        fused &= w.dtype() == x.dtype() && w.ndim() == 1 && w.size() == x.dims()[x.ndim() - 1];
+    }
+    let freqs_valid = rotation
+        .freqs
+        .is_none_or(|f| f.slot_error().is_none() && f.ndim() == 1 && f.size() == rdims / 2);
+    let dims_valid =
+        rdims > 0 && rdims.is_multiple_of(2) && x.ndim() > 0 && rdims <= x.dims()[x.ndim() - 1];
+    if !fused || !freqs_valid || !dims_valid || rotation.base.is_some() == rotation.freqs.is_some()
+    {
+        // The composition (which also reports invalid arguments).
+        return norm_rope_at_graph(x, norm, rotation, positions, pool);
+    }
+    let mut inputs = Vec::with_capacity(6);
+    if let Some((p, slots)) = pool {
+        inputs.push(p.clone());
+        inputs.push(astype(slots, DType::I32)?);
+    }
+    inputs.push(x.clone());
+    inputs.push(match norm {
+        Some((w, _)) => w.clone(),
+        None => scalar(1.0, x.dtype())?,
+    });
+    inputs.push(astype(positions, DType::I32)?);
+    if let Some(f) = rotation.freqs {
+        inputs.push(astype(f, DType::F32)?);
+    }
+    let op = FastOp::NormRope {
+        eps: norm.map(|(_, eps)| eps.to_bits()),
+        dims: rdims,
+        traditional: rotation.traditional,
+        base: rotation.base.unwrap_or(1.0).to_bits(),
+        scale: rotation.scale.to_bits(),
+        offset: 0,
+        cache: pool.is_some(),
+        positions: true,
+        paged: pool.is_some(),
+    };
+    one(op, inputs)
+}
+
+/// [`norm_rope_at`] composed of [`rms_norm`], [`rope`] and [`paged_write`].
+fn norm_rope_at_graph(
+    x: &Array,
+    norm: Option<(&Array, f32)>,
+    rotation: Rotation<'_>,
+    positions: &Array,
+    pool: Option<(&Array, &Array)>,
+) -> Result<Array> {
+    let rdims = usize::try_from(rotation.dims).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "norm_rope_at: dims must not be negative, got {}",
+            rotation.dims
+        ))
+    })?;
+    let x = match norm {
+        Some((w, eps)) => rms_norm(x, Some(w), eps)?,
+        None => x.clone(),
+    };
+    let r = rope(
+        &x,
+        rdims,
+        rotation.traditional,
+        rotation.base,
+        rotation.scale,
+        positions,
+        rotation.freqs,
+    )?;
+    match pool {
+        Some((p, slots)) => {
+            if r.ndim() != 4 {
+                return Err(Error::InvalidArgument(format!(
+                    "norm_rope_at: a pool takes x of [B, H, L, D], got {:?}",
+                    r.dims()
+                )));
+            }
+            paged_write(p, &crate::ops::imp::transpose(&r, &[0, 2, 1, 3])?, slots)
+        }
+        None => Ok(r),
+    }
 }
 
 /// [`norm_rope`] composed of [`rms_norm`], [`rope`] and [`crate::slice_update`].
@@ -1845,17 +2241,122 @@ pub(crate) fn paged_attention(
     }
 }
 
+/// The largest expert count [`moe_route`]'s kernel takes (one thread per expert).
+const MOE_ROUTE_MAX: usize = 1024;
+/// The reduction length from which a sum over the second-to-last axis leaves
+/// `col_reduce_small`, whose order [`weighted_sum`]'s kernel follows.
+const WEIGHTED_SUM_MAX: usize = 32;
+
+/// The body of [`crate::fast::moe_route`].
+pub(crate) fn moe_route(probs: &Array, k: i32, normalize: bool) -> Result<(Array, Array)> {
+    floating("moe_route", probs.dtype())?;
+    let e = probs.dims().last().copied().unwrap_or(0);
+    let k = usize::try_from(k).ok().filter(|k| (1..=e).contains(k));
+    let Some(k) = k else {
+        return Err(Error::InvalidArgument(format!(
+            "moe_route: k must be in 1..={e} for probabilities of shape {:?}",
+            probs.dims()
+        )));
+    };
+    let op = FastOp::MoeRoute { k, normalize };
+    let inputs = vec![probs.clone()];
+    // The sum of more than 64 scores leaves `row_reduce_small`, whose order the kernel
+    // follows.
+    let mut out = if e <= MOE_ROUTE_MAX && (!normalize || k <= 64) {
+        record_or_fallback(op, inputs)?
+    } else {
+        op.fallback(&inputs)?
+    };
+    let scores = out.pop().expect("two outputs");
+    Ok((out.pop().expect("two outputs"), scores))
+}
+
+/// The longest window (`L + K − 1` positions) [`causal_conv1d_slots`]'s kernel holds per
+/// thread.
+const CONV_SLOTS_WINDOW: usize = 64;
+
+/// The body of [`crate::fast::causal_conv1d_slots`].
+pub(crate) fn causal_conv1d_slots(
+    x: &Array,
+    w: &Array,
+    pool: &Array,
+    slots: &Array,
+    silu: bool,
+) -> Result<(Array, Array)> {
+    floating("causal_conv1d_slots", x.dtype())?;
+    let k = w.dims().get(1).copied().unwrap_or(0);
+    let fits = x.ndim() == 3
+        && w.ndim() == 3
+        && w.dims()[0] == x.dims()[2]
+        && w.dims()[2] == 1
+        && k >= 1
+        && pool.ndim() == 3
+        && pool.dims()[1] == k - 1
+        && pool.dims()[2] == x.dims()[2]
+        && slots.dims() == [x.dims()[0]]
+        && matches!(
+            slots.dtype().category(),
+            Category::Signed | Category::Unsigned
+        );
+    if !fits {
+        return Err(Error::InvalidArgument(format!(
+            "causal_conv1d_slots: x must be [B, L, C], w [C, K, 1], pool [slots, K - 1, C] and \
+             slots [B] integers, got {:?}, {:?}, {:?} and {} {:?}",
+            x.dims(),
+            w.dims(),
+            pool.dims(),
+            slots.dtype(),
+            slots.dims()
+        )));
+    }
+    let inputs = vec![
+        x.clone(),
+        w.clone(),
+        pool.clone(),
+        astype(slots, DType::I32)?,
+    ];
+    let op = FastOp::ConvSlots { silu };
+    let same = w.dtype() == x.dtype() && pool.dtype() == x.dtype();
+    let mut out = if same && x.dims()[1] + k - 1 <= CONV_SLOTS_WINDOW {
+        record_or_fallback(op, inputs)?
+    } else {
+        op.fallback(&inputs)?
+    };
+    let pool = out.pop().expect("two outputs");
+    Ok((out.pop().expect("two outputs"), pool))
+}
+
+/// The body of [`crate::fast::weighted_sum`].
+pub(crate) fn weighted_sum(x: &Array, w: &Array) -> Result<Array> {
+    let n = x.ndim();
+    if n < 2 || w.dims() != &x.dims()[..n - 1] {
+        return Err(Error::InvalidArgument(format!(
+            "weighted_sum: x must be [..., k, D] and w [..., k], got {:?} and {:?}",
+            x.dims(),
+            w.dims()
+        )));
+    }
+    let k = x.dims()[n - 2];
+    let fused = x.dtype().category() == Category::Float && w.dtype() == x.dtype();
+    if fused && (1..WEIGHTED_SUM_MAX).contains(&k) {
+        return one(FastOp::WeightedSum, vec![x.clone(), w.clone()]);
+    }
+    let w = expand_dims(w, -1)?;
+    sum(&multiply(x, &w)?, &[-2], false)
+}
+
 /// The body of [`crate::fast::paged_write`].
 pub(crate) fn paged_write(cache: &Array, new: &Array, slots: &Array) -> Result<Array> {
     let invalid = |msg: String| Err(Error::InvalidArgument(format!("paged_write: {msg}")));
+    let r = new.ndim();
     let fits = cache.ndim() == 4
-        && new.ndim() == 3
-        && new.dims()[1] == cache.dims()[1]
-        && new.dims()[2] == cache.dims()[3];
-    if !fits || slots.dims() != [new.dims().first().copied().unwrap_or(0)] {
+        && matches!(r, 3 | 4)
+        && new.dims()[r - 2] == cache.dims()[1]
+        && new.dims()[r - 1] == cache.dims()[3];
+    if !fits || slots.dims() != &new.dims()[..r - 2] {
         return invalid(format!(
-            "cache must be [blocks, Hkv, block_size, D], new [T, Hkv, D] and slots [T], got \
-             {:?}, {:?}, {:?}",
+            "cache must be [blocks, Hkv, block_size, D], new [T, Hkv, D] or [B, T, Hkv, D] \
+             and slots its leading shape, got {:?}, {:?}, {:?}",
             cache.dims(),
             new.dims(),
             slots.dims()
@@ -1969,6 +2470,13 @@ fn paged_write_graph(inputs: &[Array]) -> Result<Array> {
     let [cache, new, slots] = inputs else {
         unreachable!("three inputs")
     };
+    // `[B, T, Hkv, D]` rows as `[B·T, Hkv, D]`.
+    let r = new.ndim();
+    let new = &reshape(
+        new,
+        &[-1, new.dims()[r - 2] as isize, new.dims()[r - 1] as isize],
+    )?;
+    let slots = &reshape(slots, &[-1])?;
     let (blocks, hkv, bs, d) = (
         cache.dims()[0],
         cache.dims()[1],

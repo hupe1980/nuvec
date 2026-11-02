@@ -16,11 +16,14 @@ categories.workspace = true
 [dependencies]
 nuvec-core.workspace = true
 nuvec-compile.workspace = true
-nuvec-cpu.workspace = true
 nuvec-distributed.workspace = true
 nuvec-gpu.workspace = true
 nuvec-io.workspace = true
 nuvec-macros.workspace = true
+
+[features]
+# The experimental JACCL backend of `distributed` (RDMA over Thunderbolt 5).
+jaccl = ["nuvec-distributed/jaccl"]
 
 [dev-dependencies]
 trybuild.workspace = true
@@ -32,6 +35,7 @@ nuvec-nn = { path = "../nuvec-nn" }
 # Document the Metal API, which only exists on Apple targets.
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
+all-features = true
 
 [lints]
 workspace = true

@@ -32,6 +32,8 @@ pub enum GpuError {
     Io(String),
     /// The buffer is a read-only mapped file.
     ReadOnly,
+    /// A GPU capture could not start (see `Device::start_capture`).
+    Capture(String),
 }
 
 /// `Result` with [`GpuError`].
@@ -54,6 +56,7 @@ impl fmt::Display for GpuError {
             Self::CommandBuffer(msg) => write!(f, "GPU command buffer failed: {msg}"),
             Self::Io(msg) => write!(f, "I/O error: {msg}"),
             Self::ReadOnly => f.write_str("the buffer is a read-only mapped file"),
+            Self::Capture(msg) => write!(f, "GPU capture: {msg}"),
         }
     }
 }

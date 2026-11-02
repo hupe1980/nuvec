@@ -103,15 +103,45 @@ impl Device {
     /// a `&[u8]` (undefined behaviour), and access past a truncated end raises `SIGBUS`.
     /// Map only files nothing writes while they are in use, such as model weights.
     pub fn map_file(&self, path: &std::path::Path) -> Result<Buffer> {
-        autoreleasepool(|_| self.map_file_now(path))
+        autoreleasepool(|_| self.map_file_now(path, None))
     }
 
-    fn map_file_now(&self, path: &std::path::Path) -> Result<Buffer> {
+    /// [`Device::map_file`] for the bytes `offset..offset + len` of the file only: a page
+    /// multiple `offset`, and `len` rounded up to whole pages (within the file). The
+    /// buffer's bytes are that range; nothing outside it is mapped, wired or counted.
+    pub fn map_file_range(
+        &self,
+        path: &std::path::Path,
+        offset: usize,
+        len: usize,
+    ) -> Result<Buffer> {
+        autoreleasepool(|_| self.map_file_now(path, Some((offset, len))))
+    }
+
+    fn map_file_now(
+        &self,
+        path: &std::path::Path,
+        range: Option<(usize, usize)>,
+    ) -> Result<Buffer> {
         use std::os::fd::AsRawFd;
         let io = |e: std::io::Error| GpuError::Io(format!("{}: {e}", path.display()));
         let file = std::fs::File::open(path).map_err(io)?;
-        let len = usize::try_from(file.metadata().map_err(io)?.len())
+        let file_len = usize::try_from(file.metadata().map_err(io)?.len())
             .map_err(|_| GpuError::Io(format!("{}: too large", path.display())))?;
+        let (offset, len) = range.unwrap_or((0, file_len));
+        if !offset.is_multiple_of(crate::memory::page()) {
+            return Err(GpuError::InvalidArgument(format!(
+                "{}: a mapping must start at a page boundary, not byte {offset}",
+                path.display()
+            )));
+        }
+        if offset.checked_add(len).is_none_or(|end| end > file_len) {
+            return Err(GpuError::InvalidArgument(format!(
+                "{}: bytes {offset}..{} are past the end ({file_len} bytes)",
+                path.display(),
+                offset.saturating_add(len)
+            )));
+        }
         if len == 0 {
             return self.new_buffer(0);
         }
@@ -125,7 +155,7 @@ impl Device {
                 libc::PROT_READ,
                 libc::MAP_SHARED,
                 file.as_raw_fd(),
-                0,
+                offset as libc::off_t,
             )
         };
         if ptr == libc::MAP_FAILED {
@@ -243,6 +273,20 @@ impl Buffer {
         // SAFETY: as in `contents`; additionally `&mut self` is exclusive, and `Buffer` is not
         // `Clone`, so no other CPU reference to these bytes exists.
         Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) })
+    }
+
+    /// The bytes' address and length, for a CPU write that submitted GPU work is ordered
+    /// after by other means (an [`Event`](super::Event) it waits for), so the in-flight
+    /// guards that [`contents_mut`](Self::contents_mut) checks do not apply. Blocks first
+    /// until the previous owner's GPU work on reused memory has completed. The caller
+    /// writes through it only while no GPU work accesses the bytes and no other CPU
+    /// reference to them exists.
+    pub fn unsynchronized_ptr(&self) -> Result<(NonNull<u8>, usize)> {
+        if self.mapped {
+            return Err(GpuError::ReadOnly);
+        }
+        self.wait_for_previous();
+        Ok((self.ptr, if self.raw.is_none() { 0 } else { self.len }))
     }
 
     /// The Metal buffer to bind: the device's placeholder for empty buffers.

@@ -19,6 +19,7 @@ use crate::config::{
 
 mod gemma;
 mod mtp;
+mod shard;
 
 /// A stand-in of `shape` and `dtype` for a weight not loaded yet (no memory): a failed
 /// array, so a forward pass or `save_weights` before the weights load reports it.
@@ -64,6 +65,16 @@ pub enum Projection {
 }
 
 impl Projection {
+    /// The output features.
+    pub(crate) fn outputs(&self) -> usize {
+        let rows = match self {
+            Self::Dense(l) => l.weight.value().shape()[0],
+            Self::Quantized(q) => q.weight.shape()[0],
+            Self::Lora(l) => l.lora_b.value().shape()[1],
+        };
+        rows as usize
+    }
+
     /// `x Wᵀ (+ b)`.
     #[track_caller]
     pub fn forward(&self, x: &Array) -> Array {
@@ -274,19 +285,19 @@ impl Rope {
         fast::norm_rope(x, norm, self.rotation(), at, cache)
     }
 
-    /// `x` (`[B, H, L, D]`) rotated at each sequence's position (`positions`, `[B]`).
+    /// `x` (`[B, H, L, D]`) normalised by `norm` (if any) and rotated at each sequence's
+    /// position (`positions`, `[B]`), written at `slots` of a paged pool if given
+    /// ([`fast::norm_rope_at`]: one kernel from the projection to the pool).
     #[track_caller]
-    fn rope_at(&self, x: &Array, positions: &Array) -> Array {
-        let r = self.rotation();
-        fast::rope(
-            x,
-            r.dims,
-            r.traditional,
-            r.base,
-            r.scale,
-            positions,
-            r.freqs,
-        )
+    fn norm_rope_at(
+        &self,
+        x: &Array,
+        norm: Option<&RmsNorm>,
+        positions: &Array,
+        pool: Option<(&Array, &Array)>,
+    ) -> Array {
+        let norm = norm.map(|n| (n.weight.value(), n.eps));
+        fast::norm_rope_at(x, norm, self.rotation(), positions, pool)
     }
 }
 
@@ -492,8 +503,9 @@ impl KvCache {
         Some((self.conv.clone()?, self.recurrent.clone()?))
     }
 
-    /// Sequence `i` of a batched cache (views of its row, the same positions), for
-    /// [`PagedCache::insert`](crate::PagedCache::insert). Kept steps are not carried.
+    /// Sequence `i` of a batched cache (views of its row, the same positions). Kept steps
+    /// are not carried.
+    #[cfg(test)]
     pub(crate) fn row(&self, i: i32) -> KvCache {
         let row = |a: &Option<Array>| a.as_ref().map(|a| a.i(i..i + 1));
         KvCache {
@@ -516,6 +528,22 @@ impl KvCache {
             .flatten()
             .cloned()
             .collect()
+    }
+
+    /// Makes the state's evaluation evaluate `dep` first (a pipeline stage's send, so that
+    /// evaluating the caches, as prefill does, also sends).
+    pub(crate) fn attach(&mut self, dep: &Array) {
+        for a in [
+            &mut self.keys,
+            &mut self.values,
+            &mut self.conv,
+            &mut self.recurrent,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *a = nuvec::ops::depends(a, std::slice::from_ref(dep));
+        }
     }
 }
 
@@ -798,44 +826,40 @@ pub(crate) struct GroupStep {
 }
 
 impl PagedLayer {
-    /// Keys and values (`[B, kv_heads, head_dim]`) written at `slots` of their pools, and
-    /// the pools.
+    /// The keys (`[B, kv_heads, 1, head_dim]`) normalised by `k_norm`, rotated at
+    /// `positions` and written at `slots` of their pool in one kernel, the values (`[B,
+    /// kv_heads, head_dim]`) written at `slots` of theirs; and the pools.
     #[track_caller]
-    fn write_kv(&mut self, k: &Array, v: &Array, slots: &Array) -> (Array, Array) {
-        let keys = write_pool(&mut self.keys, self.pool_size, k, slots);
-        (keys, write_pool(&mut self.values, self.pool_size, v, slots))
+    fn write_kv(
+        &mut self,
+        (rope, k_norm): (&Rope, Option<&RmsNorm>),
+        (k, v): (&Array, &Array),
+        positions: &Array,
+        slots: &Array,
+    ) -> (Array, Array) {
+        let size = self.pool_size;
+        let pool = take_pool(&mut self.keys, size, k);
+        let slots_2d = slots.reshape([-1, 1]);
+        let keys = rope.norm_rope_at(k, k_norm, positions, Some((&pool, &slots_2d)));
+        self.keys = Some(keys.clone());
+        let pool = take_pool(&mut self.values, size, k);
+        let values = fast::paged_write(&pool, v, slots);
+        self.values = Some(values.clone());
+        (keys, values)
     }
 }
 
-/// `rows` (`[B, kv_heads, head_dim]`) written at `slots` of the pool in `pool` (of `size`,
-/// blocks and positions per block), taken out first so that the write is done in place
-/// (zeros until a prefilled sequence brought the pool); put back and returned.
-#[track_caller]
-fn write_pool(pool: &mut Option<Array>, size: (i32, i32), rows: &Array, slots: &Array) -> Array {
-    let all = match pool.take() {
-        Some(p) => p,
-        None => {
-            let [_, heads, dims] = rows.shape_n::<3>().unwrap_or_default();
-            ops::zeros([size.0, heads, size.1, dims], rows.dtype())
-        }
-    };
-    let written = fast::paged_write(&all, rows, slots);
-    *pool = Some(written.clone());
-    written
+/// The pool in `pool` (of `size`, blocks and positions per block), taken out so that the
+/// write is done in place: zeros shaped for `like`'s heads and head size (`[B, heads, 1,
+/// head_dim]`) until a prefilled sequence brought it.
+fn take_pool(pool: &mut Option<Array>, size: (i32, i32), like: &Array) -> Array {
+    pool.take().unwrap_or_else(|| {
+        let [_, heads, _, dims] = like.shape_n::<4>().unwrap_or_default();
+        ops::zeros([size.0, heads, size.1, dims], like.dtype())
+    })
 }
 
 impl Attention {
-    /// `h` (`[B, 1, H, D]`) normalised per head, then as `[B, H, 1, D]` rotated at each
-    /// sequence's position (as `norm_rope`, unfused: the positions differ).
-    #[track_caller]
-    fn rotate_at(&self, h: Array, norm: Option<&RmsNorm>, positions: &Array) -> Array {
-        let h = match norm {
-            Some(norm) => norm.forward(&h),
-            None => h,
-        };
-        self.rope.rope_at(&h.transpose(HEADS_FIRST), positions)
-    }
-
     /// One new position per sequence (`x` is `[B, 1, D]`) over a paged cache: the query
     /// and key normalised and rotated at each sequence's position, the key and value
     /// written into their slots, then attention through the block tables.
@@ -856,7 +880,10 @@ impl Attention {
     ) -> (Array, (Array, Array, usize)) {
         let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
         let (q, gate) = self.query(x, [b, l]);
-        let q = self.rotate_at(self.input_scale(q), self.q_norm.as_ref(), &step.positions);
+        let q = self.input_scale(q).transpose(HEADS_FIRST);
+        let q = self
+            .rope
+            .norm_rope_at(&q, self.q_norm.as_ref(), &step.positions, None);
         let (keys, values, group) = match shared {
             Some(kv) => kv.clone(),
             None => {
@@ -871,9 +898,13 @@ impl Attention {
                     Some(eps) => fast::rms_norm(&v, None, eps),
                     None => v,
                 };
-                let k = self.rotate_at(self.input_scale(k), self.k_norm.as_ref(), &step.positions);
-                let rows = [b, self.kv_heads, -1];
-                let (keys, values) = layer.write_kv(&k.reshape(rows), &v.reshape(rows), &g.slots);
+                let k = self.input_scale(k).transpose(HEADS_FIRST);
+                let (keys, values) = layer.write_kv(
+                    (&self.rope, self.k_norm.as_ref()),
+                    (&k, &v.reshape([b, self.kv_heads, -1])),
+                    &step.positions,
+                    &g.slots,
+                );
                 (keys, values, layer.group)
             }
         };
@@ -1138,8 +1169,8 @@ impl GatedDeltaNet {
 
 impl GatedDeltaNet {
     /// One new position per sequence (`x` is `[B, 1, D]`) with each sequence's states at
-    /// its slot of the layer's pools: the convolution's inputs gathered and written back,
-    /// the recurrent states updated in place ([`fast::gated_delta_slots`]).
+    /// its slot of the layer's pools, both updated in place
+    /// ([`fast::causal_conv1d_slots`], [`fast::gated_delta_slots`]).
     #[track_caller]
     fn forward_paged(&self, x: &Array, layer: &mut PagedLayer, step: &PagedStep) -> Array {
         let DeltaSizes {
@@ -1149,8 +1180,8 @@ impl GatedDeltaNet {
         let qkv = self.in_proj_qkv.forward(x);
         let z = self.in_proj_z.forward(x);
         let (beta, a) = (self.in_proj_b.forward(x), self.in_proj_a.forward(x));
-        // The convolution's last inputs of each sequence, then the new ones written back
-        // (zeros until a prefilled sequence brought the pools).
+        // The convolution over each sequence's last inputs and the new ones, which are
+        // written back in place (zeros until a prefilled sequence brought the pools).
         let slots = layer.state_slots;
         let conv_pool = match layer.conv.take() {
             Some(p) => p,
@@ -1159,15 +1190,9 @@ impl GatedDeltaNet {
                 ops::zeros([slots, kernel - 1, channels], qkv.dtype())
             }
         };
-        let state = conv_pool.take(&step.state_slots, 0);
-        let input = ops::concatenate(&[state, qkv], 1);
-        let kept = input.i((.., 1..kernel));
-        let at = step
-            .state_slots
-            .reshape([-1, 1, 1])
-            .broadcast_to(kept.shape());
-        layer.conv = Some(conv_pool.put_along_axis(&at, &kept, 0));
-        let conv = causal_conv_silu(&input, &self.conv1d);
+        let (conv, conv_pool) =
+            fast::causal_conv1d_slots(&qkv, &self.conv1d, &conv_pool, &step.state_slots, true);
+        layer.conv = Some(conv_pool);
         let [q, k, v] = self.qkv(&conv, [b, l]);
         let g = decay(&a, &self.dt_bias, &self.a_log);
         let beta = beta.sigmoid();
@@ -1404,21 +1429,18 @@ impl MoeMlp {
         // As mlx-lm's MoE blocks (`Qwen3MoeSparseMoeBlock`, `Qwen3NextSparseMoeBlock`): the
         // router's probabilities (a precise softmax, in the activations' type), the best `k`
         // by probability, renormalised over them if configured, and the experts' outputs
-        // weighted and summed in the activations' type.
+        // weighted and summed in the activations' type (`moe_route` and `weighted_sum`: one
+        // kernel each, the same bits).
         let gates = self.gate.forward(x).softmax(-1);
-        let top = gates.argpartition(-k, -1).i((.., .., -k..));
+        let (top, scores) = fast::moe_route(&gates, k, self.norm_topk_prob);
         #[cfg(feature = "diagnostics")]
         ROUTES.with(|r| {
             if let Some(routes) = r.borrow_mut().as_mut() {
                 routes.push(top.clone());
             }
         });
-        let mut scores = gates.take_along_axis(&top, -1);
-        if self.norm_topk_prob {
-            scores = scores.divide(scores.sum_keepdims(-1));
-        }
         let experts = self.switch_mlp.forward(x, &top);
-        let y = experts.multiply(scores.expand_dims(-1)).sum(-2);
+        let y = fast::weighted_sum(&experts, &scores);
         let (Some(expert), Some(gate)) = (&self.shared_expert, &self.shared_expert_gate) else {
             return y;
         };
@@ -1463,10 +1485,10 @@ impl GptOssMlp {
     fn forward(&self, x: &Array) -> Array {
         let k = self.experts_per_token;
         let logits = self.router.forward(x);
-        let top = logits.argpartition(-k, -1).i((.., .., -k..));
-        let weights = logits.take_along_axis(&top, -1).softmax(-1);
+        let (top, best) = fast::moe_route(&logits, k, false);
+        let weights = best.softmax(-1);
         let y = self.experts.forward(x, &top);
-        y.multiply(weights.expand_dims(-1)).sum(-2)
+        fast::weighted_sum(&y, &weights)
     }
 }
 
@@ -1497,6 +1519,10 @@ struct Block {
     mlp: BlockMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
+    /// The group the block is split across ([`Model::shard`]): its attention and MLP
+    /// outputs are summed over it.
+    #[tree(skip, static_unchecked)]
+    group: Option<nuvec::distributed::Group>,
     /// Gemma 4's further norms, per-layer input and experts (transparent: named as
     /// mlx-lm's decoder layer).
     #[tree(rename = "")]
@@ -1531,8 +1557,21 @@ impl Block {
             Mixer::Attention(a) => a.forward(&n, mask, cache),
             Mixer::Linear(l) => l.forward(&n, cache),
         };
-        let (h, n) = add_norm(&x, Some(&mixed), &self.post_attention_layernorm);
-        (h, self.mlp.forward(&n))
+        let (h, n) = add_norm(
+            &x,
+            Some(&self.reduce(mixed)),
+            &self.post_attention_layernorm,
+        );
+        (h, self.reduce(self.mlp.forward(&n)))
+    }
+
+    /// A sharded block's partial output summed over its group.
+    #[track_caller]
+    fn reduce(&self, y: Array) -> Array {
+        match &self.group {
+            Some(g) => nuvec::distributed::all_sum(&y, Some(g)),
+            None => y,
+        }
     }
 
     /// [`Block::forward`] for one new position per sequence over a paged cache.
@@ -1549,8 +1588,12 @@ impl Block {
             Mixer::Attention(a) => a.forward_paged(&n, layer, step),
             Mixer::Linear(l) => l.forward_paged(&n, layer, step),
         };
-        let (h, n) = add_norm(&x, Some(&mixed), &self.post_attention_layernorm);
-        (h, self.mlp.forward(&n))
+        let (h, n) = add_norm(
+            &x,
+            Some(&self.reduce(mixed)),
+            &self.post_attention_layernorm,
+        );
+        (h, self.reduce(self.mlp.forward(&n)))
     }
 }
 
@@ -1579,6 +1622,15 @@ pub struct Model {
     lm_head: Option<Projection>,
     /// The multi-token-prediction head (Qwen 3.5–3.8), when its weights are loaded.
     mtp: Option<mtp::MtpHead>,
+    /// This rank's stage of a pipeline ([`Model::pipeline`]); `None` runs every layer.
+    #[tree(skip, static_unchecked)]
+    stage: Option<crate::pipeline::Stage>,
+    /// The group a sharded model is split across ([`Model::shard`]).
+    #[tree(skip, static_unchecked)]
+    sharding: Option<nuvec::distributed::Group>,
+    /// Whether the output head keeps this rank's vocabulary rows (its logits are gathered).
+    #[tree(skip)]
+    vocab_sharded: bool,
 }
 
 impl Model {
@@ -1628,6 +1680,7 @@ impl Model {
                     },
                     input_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps),
                     post_attention_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps),
+                    group: None,
                     gemma: None,
                 })
             })
@@ -1645,6 +1698,9 @@ impl Model {
                 .then(|| b.projection("lm_head", c.hidden_size, c.vocab_size, false))
                 .transpose()?,
             mtp: None,
+            stage: None,
+            sharding: None,
+            vocab_sharded: false,
         })
     }
 
@@ -1661,10 +1717,14 @@ impl Model {
 
     /// Per layer, what a paged cache keeps.
     pub(crate) fn paged_layers(&self) -> Vec<PagedKind> {
+        let range = self.stage.as_ref().map(|s| s.layers());
         self.model
             .layers
             .iter()
-            .map(|b| match &b.mixer {
+            .enumerate()
+            .map(|(i, b)| match &b.mixer {
+                // Another stage's layer: nothing of its own here (as a KV-shared layer).
+                _ if range.as_ref().is_some_and(|r| !r.contains(&i)) => PagedKind::Shared,
                 Mixer::Attention(a) if a.k_proj.is_some() => {
                     PagedKind::Keys(a.window.map(|w| usize::try_from(w).unwrap_or(0)))
                 }
@@ -1672,6 +1732,26 @@ impl Model {
                 Mixer::Linear(_) => PagedKind::States,
             })
             .collect()
+    }
+
+    /// The bytes one position of a sequence takes in a [`crate::PagedCache`]: the keys
+    /// and values of this stage's full-attention layers with their own keys, in the
+    /// activations' dtype. Sliding-window layers hold a fixed window per sequence instead.
+    pub fn kv_bytes_per_position(&self) -> usize {
+        let dtype = match self.stage() {
+            Some(stage) => stage.activations(),
+            None => self.embed(&Array::from_slice(&[0u32], [1, 1])).dtype(),
+        };
+        self.paged_layers()
+            .iter()
+            .zip(&self.model.layers)
+            .map(|(kind, b)| match (kind, &b.mixer) {
+                (PagedKind::Keys(None), Mixer::Attention(a)) => {
+                    2 * a.k_proj().outputs() * dtype.size()
+                }
+                _ => 0,
+            })
+            .sum()
     }
 
     /// An empty cache per layer.
@@ -1719,12 +1799,15 @@ impl Model {
             );
             return (e.clone(), e);
         }
-        let mut h = self.model.embed_tokens.forward(tokens);
         // Causal (aligned to the last positions) for several tokens; one token sees all.
         let mask = match tokens.shape().get(1) {
             Some(&l) if l > 1 => AttentionMask::Causal,
             _ => AttentionMask::None,
         };
+        if let Some(stage) = &self.stage {
+            return self.forward_stage(stage, tokens, mask, cache);
+        }
+        let mut h = self.model.embed_tokens.forward(tokens);
         let mut pending = None;
         for (layer, c) in self.model.layers.iter().zip(cache) {
             let (next, mlp) = layer.forward(&h, pending.as_ref(), mask, c);
@@ -1732,6 +1815,121 @@ impl Model {
         }
         let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
         (self.head(&h), h)
+    }
+
+    /// One stage's part of [`Model::forward_hidden`]: the first stage embeds, the others
+    /// receive the residual stream and the last layer's MLP output not yet added
+    /// (`[B, L, 2·hidden]`, so the next layer fuses the addition as the whole model
+    /// does); the local layers run; the stage then sends both on, or (rank 0) runs the norm
+    /// and the head. A stage that sends returns zero logits of the head's shape, evaluated
+    /// after its send; the send is attached to its last layer's cache, so prefill (which
+    /// evaluates the caches) sends too.
+    #[track_caller]
+    fn forward_stage(
+        &self,
+        stage: &crate::pipeline::Stage,
+        tokens: &Array,
+        mask: AttentionMask<'_>,
+        cache: &mut [KvCache],
+    ) -> (Array, Array) {
+        let (mut h, mut pending) = self.stage_input(stage, tokens);
+        let layers = stage.layers();
+        for (layer, c) in self.model.layers[layers.clone()]
+            .iter()
+            .zip(&mut cache[layers.clone()])
+        {
+            let (next, mlp) = layer.forward(&h, pending.as_ref(), mask, c);
+            (h, pending) = (next, Some(mlp));
+        }
+        if stage.is_last() {
+            let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
+            return (self.head(&h), h);
+        }
+        let (logits, h, sent) = self.stage_output(stage, tokens, &h, pending);
+        if let Some(c) = cache.get_mut(layers.end - 1) {
+            c.attach(&sent);
+        }
+        (logits, h)
+    }
+
+    /// A stage's input: the first stage's embeddings, or the residual stream and the
+    /// previous layer's MLP output received from the stage before (`[B, L, 2·hidden]`).
+    #[track_caller]
+    fn stage_input(
+        &self,
+        stage: &crate::pipeline::Stage,
+        tokens: &Array,
+    ) -> (Array, Option<Array>) {
+        if stage.is_first() {
+            return (self.model.embed_tokens.forward(tokens), None);
+        }
+        let shape = tokens.shape();
+        let hidden = self.config.hidden_size as i32;
+        let wire = [shape[0], shape.get(1).copied().unwrap_or(1), 2 * hidden];
+        let got = nuvec::distributed::recv(
+            wire,
+            stage.activations(),
+            stage.previous(),
+            Some(stage.group()),
+        );
+        let parts = got.split(2, -1);
+        (parts[0].clone(), Some(parts[1].clone()))
+    }
+
+    /// A non-last stage's output: sends the residual stream and the last layer's MLP output
+    /// on, and gives zero logits of the head's shape and the residual stream, both
+    /// evaluated after the send, and the send.
+    #[track_caller]
+    fn stage_output(
+        &self,
+        stage: &crate::pipeline::Stage,
+        tokens: &Array,
+        h: &Array,
+        pending: Option<Array>,
+    ) -> (Array, Array, Array) {
+        let pending = pending.expect("a stage runs at least one layer");
+        let wire = nuvec::ops::concatenate(&[h.clone(), pending], -1);
+        let sent = nuvec::distributed::send(&wire, stage.next(), Some(stage.group()));
+        let shape = tokens.shape();
+        let logits = nuvec::ops::zeros(
+            [
+                shape[0],
+                shape.get(1).copied().unwrap_or(1),
+                self.config.vocab_size as i32,
+            ],
+            stage.activations(),
+        );
+        let after = |a: &Array| nuvec::ops::depends(a, std::slice::from_ref(&sent));
+        (after(&logits), after(h), sent)
+    }
+
+    /// The token embeddings of `tokens` (not evaluated).
+    pub(crate) fn embed(&self, tokens: &Array) -> Array {
+        self.model.embed_tokens.forward(tokens)
+    }
+
+    pub(crate) fn set_stage(&mut self, stage: crate::pipeline::Stage) {
+        self.stage = Some(stage);
+    }
+
+    pub(crate) fn stage_ref(&self) -> Option<&crate::pipeline::Stage> {
+        self.stage.as_ref()
+    }
+
+    /// Replaces every weight outside `stage` by an unloaded placeholder of its shape and
+    /// dtype (no memory).
+    pub(crate) fn drop_outside(&mut self, stage: &crate::pipeline::Stage) -> Result<()> {
+        let tied = self.config.tie_word_embeddings;
+        let blank: std::collections::BTreeMap<String, Array> = self
+            .parameters()
+            .into_iter()
+            .filter(|(name, _)| !crate::pipeline::in_stage(name, stage, tied))
+            .map(|(name, a)| {
+                let shape: Vec<usize> = a.shape().iter().map(|&d| d as usize).collect();
+                (name, placeholder(&shape, a.dtype()))
+            })
+            .collect();
+        nuvec_nn::Module::load_weights_partial(self, blank)
     }
 
     /// The logits of final hidden states `[..., hidden_size]` ([`Model::forward_hidden`],
@@ -1744,9 +1942,21 @@ impl Model {
     /// The output head on the final hidden states.
     #[track_caller]
     fn head(&self, h: &Array) -> Array {
-        match &self.lm_head {
+        let logits = match &self.lm_head {
             Some(head) => head.forward(h),
             None => self.model.embed_tokens.as_linear(h),
+        };
+        match (&self.sharding, self.vocab_sharded) {
+            // Every rank's vocabulary rows, joined along the last axis (the gather joins
+            // along the first).
+            (Some(g), true) => {
+                let d = logits.ndim();
+                let front: Vec<usize> = std::iter::once(d - 1).chain(0..d - 1).collect();
+                let back: Vec<usize> = (1..d).chain(std::iter::once(0)).collect();
+                let gathered = nuvec::distributed::all_gather(&logits.transpose(front), Some(g));
+                gathered.transpose(back)
+            }
+            _ => logits,
         }
     }
 }
@@ -1804,14 +2014,31 @@ impl Model {
         if self.config.gemma4.is_some() {
             return gemma::forward_paged(self, tokens, layers, step);
         }
-        let mut h = self.model.embed_tokens.forward(tokens);
-        let mut pending = None;
-        for (layer, pages) in self.model.layers.iter().zip(layers) {
+        let (mut h, mut pending, range) = match &self.stage {
+            Some(stage) => {
+                let (h, pending) = self.stage_input(stage, tokens);
+                (h, pending, stage.layers())
+            }
+            None => (
+                self.model.embed_tokens.forward(tokens),
+                None,
+                0..layers.len(),
+            ),
+        };
+        for (layer, pages) in self.model.layers[range.clone()]
+            .iter()
+            .zip(&mut layers[range])
+        {
             let (next, mlp) = layer.forward_paged(&h, pending.as_ref(), pages, step);
             (h, pending) = (next, Some(mlp));
         }
-        let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
-        self.head(&h)
+        match &self.stage {
+            Some(stage) if !stage.is_last() => self.stage_output(stage, tokens, &h, pending).0,
+            _ => {
+                let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
+                self.head(&h)
+            }
+        }
     }
 }
 
@@ -1864,6 +2091,41 @@ pub(crate) mod tests {
     }
 
     /// A model of the `qwen3_f32` fixture, or `None` without a Metal device.
+    /// A position's bytes are the full-attention pools' bytes per position once a
+    /// sequence brought them (windows, K = V and Gated DeltaNet layers included).
+    #[test]
+    fn kv_bytes_per_position_match_the_pools() {
+        for name in [
+            "qwen3_f32",
+            "llama_bf16",
+            "qwen3_5_q4",
+            "gemma4_e_bf16",
+            "gpt_oss_q4",
+        ] {
+            let Some(model) = fixture_model(name) else {
+                return;
+            };
+            let mut kv = model.new_cache();
+            let _ = model.forward(&Array::from_slice(&[1u32, 2, 3], [1, 3]), &mut kv);
+            let mut cache = crate::PagedCache::new(&model, 8, 16, 1).unwrap();
+            cache.insert(&kv).unwrap();
+            let pools: usize = model
+                .paged_layers()
+                .iter()
+                .zip(&cache.layers)
+                .filter(|(k, _)| **k == PagedKind::Keys(None))
+                .map(|(_, l)| {
+                    [&l.keys, &l.values]
+                        .iter()
+                        .map(|a| a.as_ref().map_or(0, |a| a.nbytes()))
+                        .sum::<usize>()
+                })
+                .sum();
+            assert_eq!(pools, 8 * 16 * model.kv_bytes_per_position(), "{name}");
+            assert!(model.kv_bytes_per_position() > 0, "{name}");
+        }
+    }
+
     pub(crate) fn fixture_model(name: &str) -> Option<Model> {
         nuvec::set_default_stream(nuvec::Stream::default_for(nuvec::Device::gpu(0)));
         if (&Array::from(1.0f32) + 1.0).eval().is_err() {

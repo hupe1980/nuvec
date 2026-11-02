@@ -673,6 +673,13 @@ impl Primitive {
                         }
                         computed(a.dtype(), &shape)
                     }
+                    CollectiveOp::SumScatter => {
+                        let [a] = self.arity::<1>(inputs)?;
+                        let n = crate::distributed::group_size(*group)?;
+                        let mut shape = a.dims().to_vec();
+                        shape[0] /= n;
+                        computed(a.dtype(), &shape)
+                    }
                     CollectiveOp::Reduce(_) | CollectiveOp::Send { .. } => {
                         let [a] = self.arity::<1>(inputs)?;
                         computed(a.dtype(), a.dims())
@@ -1047,10 +1054,15 @@ impl Primitive {
                 computed(dtype, &out)
             }
             Self::Fast(op) => {
+                let strides = op.output_strides(inputs);
                 return Ok(op
                     .outputs(inputs)?
                     .into_iter()
-                    .map(|(dtype, shape)| computed(dtype, &shape))
+                    .map(|(dtype, shape)| OutputSpec {
+                        dtype,
+                        shape: shape.into(),
+                        strides: strides.clone(),
+                    })
                     .collect());
             }
             Self::Compiled(fused) => {

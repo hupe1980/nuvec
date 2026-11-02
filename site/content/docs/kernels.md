@@ -14,16 +14,23 @@ The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each 
 |---|---|
 | `rms_norm(x, weight, eps)` | RMS normalization over the last axis |
 | `add_rms_norm(x, residual, weight, eps)` | `x + residual` and its RMS normalization (a transformer block's residual connection) |
+| `residual_rms_norm(h, x, norm, scale, next)` | `(h + rms_norm(x)) · scale` and, optionally, its RMS normalization (Gemma 4's sandwich norms, layer scalar and the next layer's norm) |
 | `layer_norm(x, weight, bias, eps)` | Layer normalization |
 | `rope(x, dims, traditional, base, scale, offset, freqs)` | Rotary position embeddings, optionally on the first `dims` features only |
 | `norm_rope(x, norm, rotation, offset, cache)` | Per-head RMS normalization and RoPE, optionally written straight into a KV cache |
+| `norm_rope_at(x, norm, rotation, positions, pool)` | The same with each sequence at its own position, optionally written straight into a paged KV cache's slots |
 | `scaled_dot_product_attention(q, k, v, scale, &options)` | Attention with grouped-query heads; `AttentionOptions` holds the mask (causal, boolean or additive), attention sinks, a sliding window and a cap on score memory |
 | `cross_entropy(logits, targets)` | Fused log-softmax and negative log-likelihood |
 | `gated_delta(q, k, v, g, beta, state)` | The Gated DeltaNet recurrence (Qwen 3.5's linear attention), returning the outputs and the new state |
 | `gated_delta_steps(q, k, v, g, beta, state)` | The same, returning the state after every step (to roll the recurrence back) |
 | `gated_delta_slots(q, k, v, g, beta, pool, slots)` | The same for a batch whose states live at slots of a pool, updated in place |
+| `causal_conv1d_slots(x, w, pool, slots, silu)` | A causal depthwise convolution (optionally `silu`) for a batch whose last inputs live at slots of a pool, updated in place |
 | `paged_attention(q, k_cache, v_cache, block_tables, lengths, scale, &options)` | Attention for a batch of sequences of different lengths over a KV cache stored in fixed-size blocks, with the same window and sinks |
-| `paged_write(cache, new, slots)` | Writes new keys or values into their blocks, in place when the cache is owned |
+| `moe_route(probs, k, normalize)` | A mixture of experts' routing: each row's top-k experts (in `argpartition`'s order) and their probabilities, optionally renormalised |
+| `weighted_sum(x, w)` | The experts' outputs weighted and summed over the `k` experts |
+| `paged_write(cache, new, slots)` | Writes new keys or values (of one or several sequences, read through their strides) into their blocks, in place when the cache is owned |
+
+The Gated DeltaNet kernels pick mlx-lm's packed kernel where it applies: key head size 128, value head size a multiple of 8, float32 gates and state. `MLX_GDN_PACKED=0` keeps every shape on the generic kernel, as in mlx-lm, so the two paths can be compared in one build.
 
 Attention picks MLX's kernel for the shape: vector kernels for short queries (decode), a two-pass split-K kernel for long contexts, and the tiled flash-style kernel or the composition for prefill; at head size 512, long causal prefill in half precision runs MLX's blocked path (256 queries at a time over only the keys they see). A sliding window skips the keys outside it in every kernel. `plan_attention` reports the choice, and the scratch memory it holds, from the shapes alone; `max_score_bytes` bounds every score-sized intermediate (the tiled kernel, or the composition in blocks of queries). With 2 to 8 causal queries (speculative verification), each row gives the bits of the same row decoded alone. `softmax` and `logsumexp` over the last axis use fused kernels too.
 
@@ -48,7 +55,7 @@ use nuvec::prelude::*;
 use nuvec::fast::{KernelConfig, MetalKernel, TemplateArg};
 
 # fn main() -> Result<()> {
-# if nuvec::gpu::Device::shared().is_none() { return Ok(()); } // needs a Metal GPU
+# if !nuvec::metal::is_available() { return Ok(()); } // needs a Metal GPU
 # let n = 1024;
 # let x = nuvec::ops::ones([n], DType::F16);
 

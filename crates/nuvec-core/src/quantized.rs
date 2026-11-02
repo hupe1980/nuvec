@@ -197,14 +197,35 @@ pub struct Quantized {
     pub weight: Array,
     /// One scale per group (last dimension `values / group_size`).
     pub scales: Array,
-    /// One bias per group: affine only.
+    /// One bias per group: required for affine, absent for the floating-point modes.
     pub biases: Option<Array>,
     /// How the weights were quantized.
     pub quant: Quant,
 }
 
 impl Quantized {
-    /// Weights quantized elsewhere (a checkpoint's tensors).
+    /// Affine weights quantized elsewhere: the biases are required, as MLX requires them
+    /// (a checkpoint without biases quantized with zero offsets: pass
+    /// `ops::zeros_like(&scales)`).
+    pub fn affine(weight: Array, scales: Array, biases: Array, group_size: i32, bits: i32) -> Self {
+        Self::new(
+            weight,
+            scales,
+            Some(biases),
+            Quant::affine(group_size, bits),
+        )
+    }
+
+    /// Floating-point-mode weights quantized elsewhere (MXFP4, MXFP8, NVFP4), which have no
+    /// biases.
+    pub fn fp(weight: Array, scales: Array, mode: QuantMode) -> Self {
+        Self::new(weight, scales, None, Quant::new(mode))
+    }
+
+    /// Weights quantized elsewhere (a checkpoint's tensors). `biases` must be `Some` for
+    /// [`QuantMode::Affine`] and `None` for the floating-point modes, as in MLX; otherwise
+    /// every operation on them fails with an error saying so. [`Quantized::affine`] and
+    /// [`Quantized::fp`] make the rule part of the signature.
     pub fn new(
         weight: Array,
         scales: Array,

@@ -6,6 +6,137 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `distributed::sum_scatter` (MLX's): rank `r` gets the sum over the group of slice `r` of
+  the first axis, on every backend, with gradient, forward-mode and `vmap` rules.
+- Backend selection as MLX's: `distributed::init_backend(strict, Backend::{Any, Ring, Jaccl})`,
+  `distributed::is_available(backend)`; a second `init` of a backend returns its group.
+- Experimental JACCL backend (feature `jaccl`): MLX's collectives over Thunderbolt 5 RDMA
+  (mesh and ring, several cables), started by `mlx.launch --backend jaccl|jaccl-ring`;
+  `jaccl::devices()` lists a Mac's RDMA devices. Not yet verified on Thunderbolt 5 hardware.
+
+- Pipeline parallelism (nuvec-lm), as mlx-lm's `--pipeline`: `load_model_pipelined(dir,
+  group, Split)` and `Model::pipeline`. Each rank reads only its stage's tensors; the split
+  is even, by layers, or by memory. Rank 0 samples and every rank gets its tokens; the
+  `Batcher` keeps one micro-batch per stage in flight (`BatcherOptions::micro_batches`).
+  Gemma 4 is not supported.
+- Tensor parallelism (nuvec-lm), as mlx-lm's `model.shard(group)`: `Model::shard`,
+  `load_model_sharded`. It shards attention by heads, MLPs by hidden units, experts in place
+  and Gated DeltaNet by heads, with the head split by vocabulary when untied.
+- `ops::depends` (MLX's `depends`) and `io::safetensors_tensors` (a header's tensors
+  without reading them).
+
+- Resilient groups: `Group::close` and `Group::health` (a lost peer found while idle,
+  without a collective). TCP keepalive on every connection, and `init` never returns a failed
+  or closed group, so a group re-forms in the same process.
+- Pre-shared-key authentication of every distributed connection (`NUVEC_DISTRIBUTED_KEY`,
+  `Options::key`): HMAC-SHA256 challenge–response; stray clients are dropped.
+
+- Generation controls (nuvec-lm), as vLLM's: `GenerateOptions::stop` (`Stop::tokens`,
+  `Stop::strings`), `ignore_eos` and `min_tokens`, identical in `generate`, `Batcher` and
+  `speculative_generate`. Stop strings match the decoded bytes across tokens;
+  `FinishReason::Stop` says which stop matched and how many bytes to cut. `TextStream`
+  streams text that never shows a stop string. `Generation::finish_reason` and
+  `SpeculativeGeneration::finish_reason` say why a generation ended.
+- `nuvec::memory` (MLX's memory functions: `active_memory`, `peak_memory`, `cache_memory`,
+  `set_memory_limit`, `set_cache_limit`, `set_wired_limit`, `clear_cache`, …) and
+  `nuvec::metal` (`is_available`, `device_info`, `nax`, `profile`, and GPU captures to
+  `.gputrace` with `start_capture`/`stop_capture`, as `mx.metal`). Both work without a Metal
+  device.
+- `Error::is_oom()`; `Model::kv_bytes_per_position()`.
+- `Quantized::affine` (biases required, as MLX requires them) and `Quantized::fp` (no
+  biases); `nuvec::memory::physical_memory()`, with or without a GPU.
+- `MLX_GDN_PACKED=0` keeps the Gated DeltaNet kernels off mlx-lm's packed kernel, as in
+  mlx-lm.
+- Filtered loads of aligned safetensors map only the kept tensors' pages; the filtered
+  footprint counts exactly those.
+- `io::align_safetensors` (an aligned copy with every tensor at 256 bytes) and
+  `io::load_safetensors_cached`; nuvec-lm uses aligned copies under `NUVEC_ALIGNED_CACHE`,
+  so mlx-community checkpoints map without a copy after the first load.
+- `fast::norm_rope_at`: `norm_rope` at each sequence's own position, optionally written
+  into a paged pool at its slots, in one kernel (bit-identical to `rms_norm`, `rope` and
+  `paged_write`). `PagedCache::insert_many` moves every row of a batched prefill in at
+  once.
+- `fast::moe_route` (a router's top-k experts in `argpartition`'s order, their
+  probabilities, optionally renormalised) and `fast::weighted_sum` (experts' outputs
+  weighted and summed over `k`): one kernel each, bit-identical to their compositions.
+- `fast::residual_rms_norm`: `(h + rms_norm(x)) · scale` and, optionally, the next
+  `rms_norm`, in one kernel (bit-identical to the composition).
+- `just bench-parity` records speculative decoding: nuvec's prompt-lookup and MTP drafters
+  against mlx-lm's plain decode (section `speculative`, not gated).
+- `fast::causal_conv1d_slots`: a causal depthwise convolution (optionally `silu`) over
+  states kept at pool slots, written back in place, in one kernel.
+
+### Changed
+
+- The `Batcher`'s decode step prepares queries, keys and values in 3 kernels per attention
+  layer instead of 6, and a batched prefill enters the paged cache with one write per pool
+  and layer (896 dispatches become 56 for 8 requests on Qwen3-0.6B). Tokens are unchanged.
+- Qwen 3 MoE, gpt-oss and Gemma 4 MoE layers route and weight their experts with
+  `moe_route` and `weighted_sum`: 6 fewer kernels per Qwen 3 MoE layer, 3 fewer per gpt-oss
+  and Gemma 4 layer. Tokens are unchanged.
+- Gated DeltaNet layers in a `Batcher` step convolve at their pool slots in one kernel
+  (7 fewer dispatches per layer). Tokens are unchanged.
+- Wired memory is spread over residency sets of at most 5% of the GPU's working set each,
+  as MLX 0.32 does (`MLX_RESIDENCY_SET_MAX_PCT`, `MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS`),
+  and residency is requested once per set instead of on every new buffer.
+  `MemoryStats::residency_sets` counts the sets.
+- Gemma 4 layers run each norm–add–scale–norm chain as one kernel: 4–5 fewer dispatches
+  per layer. Tokens are unchanged.
+- Decode attention at head size 512 (Gemma 4 26B's full layers), and at head 256 in
+  float32, reads one key per step in its first pass, with MLX's bits: 5–7× faster in
+  bfloat16 from 1,024 to 32,768 keys (MLX's four-key prefetch spills registers there).
+  Gemma 4 26B decodes 1.2× mlx-lm's speed at 3.7K tokens of context and 1.4× at 7.4K.
+- `fast::paged_write` takes the rows of several sequences (`[B, T, H, D]`, slots `[B, T]`)
+  and reads strided sources without a copy.
+- `distributed::init(strict)` tries every backend (the ring, then JACCL when built in).
+- `send`/`recv` frame an array as two messages; ranks must run the same nuvec version.
+- Collectives on a GPU stream neither wait for the GPU nor end the command buffer: the
+  group's worker thread runs them once their inputs are ready, and the GPU work after them
+  waits for the result on the GPU, so encoding goes on meanwhile (MLX's communication
+  stream). Results are unchanged. Two-rank tensor-parallel Qwen3-0.6B decodes 1.31× as
+  fast as mlx-lm on one Mac.
+- The TCP ring: a two-rank all-reduce of up to 32 KB is one exchange instead of two; larger
+  ones use both directions of every connection, persistent threads, and receive while they
+  reduce, in packets of half a step, as MLX's ring. All-gathers receive in place.
+- A GPU-stream `all_sum`/`all_max`/`all_min`/`send` whose input nothing else holds reduces
+  it in place instead of copying it (MLX's donation). Two-rank tensor-parallel Qwen3-0.6B
+  prefills as fast as mlx-lm on one Mac.
+- Prefill attention writes its output in the layout the heads' transpose needs, as MLX's,
+  so that transpose no longer copies.
+- `pipeline_generate` runs as `mlx_lm.benchmark` does (`--random-prompt`, `--ignore-eos`,
+  `--trials`) and prints decode also in mlx-lm's definition.
+- Tensor-parallel generation samples on every rank when sampling is greedy or seeded, as
+  mlx-lm, instead of sharing rank 0's token (`Model::share_sampled`).
+
+### Fixed
+
+- The TCP ring retries a send that the kernel refuses for a moment (`ENOBUFS`, would-block,
+  interrupted) instead of failing the group; it gives up after 10 s without progress. 4-rank
+  all-sums of 256 MB on loopback failed before.
+- nuvec-lm empties the allocator's cache where mlx-lm does: after each prefill chunk, every
+  256 generated tokens and every 512 `Batcher` steps. A `Batcher` prefill of 4 × 2K tokens
+  on Qwen3-30B-A3B kept 13 GB cached; two pipeline ranks on one Mac swapped and decoded at
+  0.1–1.4 tok/s (now 104–131).
+- Half-precision sums over the TCP ring run block-wise (same bits): 2-rank tensor-parallel
+  Qwen3-0.6B prefill is 1.7× faster, decode 1.09×.
+- A stop-string test shared one temporary tokenizer file between parallel tests.
+
+### Breaking
+
+| Before | Now |
+|---|---|
+| `nuvec::gpu::Device::shared()…memory()`, `.set_memory_limit(..)`, … | `nuvec::memory::{stats, set_memory_limit, …}` |
+| `nuvec::gpu::Device::shared()…info()`, `.nax()` | `nuvec::metal::{device_info, nax}` |
+| `nuvec::gpu::profile` | `nuvec::metal::profile` |
+| `nuvec::gpu`, `nuvec::cpu` (the backend crates) | removed from the facade |
+| `Error::Op { at: &Location, .. }` | `at: Option<&Location>` (none for an unlocated op error) |
+| `Batcher::new(&model, blocks, block_size, max_batch)` | `Batcher::new(&model, BatcherOptions { blocks: Some(blocks), block_size, max_batch, ..Default::default() })` |
+| `Batcher::batch_invariant(on)`, `Batcher::micro_batches(n)` | `BatcherOptions::batch_invariant`, `BatcherOptions::micro_batches` |
+| `FinishReason::Error(String)` | `FinishReason::Error(nuvec::Error)` |
+| `GenerateOptions: Copy` | `Clone` only (it holds stop lists) |
+
 ## [0.5.0] - 2026-10-31
 
 ### Added

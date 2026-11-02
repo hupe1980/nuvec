@@ -131,7 +131,7 @@ fn awq_and_gptq_checkpoints_match_mlx_lm() {
 
 /// Whether this is the GPU architecture the fixtures' mlx-lm outputs were recorded on.
 fn recorded_gpu() -> bool {
-    nuvec::gpu::Device::shared().is_some_and(|d| d.info().architecture == "applegpu_g16s")
+    nuvec::metal::device_info().is_some_and(|d| d.architecture == "applegpu_g16s")
 }
 
 /// Gemma 4's model types (`gemma4`, `gemma4_text`, `gemma4_unified`, `gemma4_unified_text`)
@@ -768,7 +768,7 @@ fn paged_batched_decoding_equals_decoding_each_sequence_alone() {
 /// to an end-of-sequence token), also when a small cache forces preemptions.
 #[test]
 fn batcher_serves_each_request_its_solo_tokens() {
-    use nuvec_lm::{Batcher, Event, FinishReason};
+    use nuvec_lm::{Batcher, BatcherOptions, Event, FinishReason};
     if !gpu() {
         return;
     }
@@ -797,9 +797,17 @@ fn batcher_serves_each_request_its_solo_tokens() {
                 )
             })
             .collect();
-        let mut batcher = Batcher::new(&model, blocks, 4, 3)
-            .unwrap()
-            .batch_invariant(true);
+        let mut batcher = Batcher::new(
+            &model,
+            BatcherOptions {
+                blocks: Some(blocks),
+                block_size: 4,
+                max_batch: 3,
+                batch_invariant: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for (p, max) in &requests {
             let options = GenerateOptions {
                 max_tokens: *max,
@@ -851,7 +859,7 @@ fn batcher_serves_each_request_its_solo_tokens() {
 /// models with sinks (gpt-oss, Gemma 4), with prompts longer than the window.
 #[test]
 fn batched_prefill_gives_each_request_its_solo_tokens() {
-    use nuvec_lm::{Batcher, Event};
+    use nuvec_lm::{Batcher, BatcherOptions, Event};
     if !gpu() {
         return;
     }
@@ -872,11 +880,19 @@ fn batched_prefill_gives_each_request_its_solo_tokens() {
         let prompts: Vec<Vec<u32>> = (0..4)
             .map(|i| prompt.iter().cycle().skip(i).take(96).copied().collect())
             .collect();
-        let mut batcher = Batcher::new(&model, 4 * 108 / 8 + 4, 8, 4)
-            .unwrap()
-            .batch_invariant(true);
+        let mut batcher = Batcher::new(
+            &model,
+            BatcherOptions {
+                blocks: Some(4 * 108 / 8 + 4),
+                block_size: 8,
+                max_batch: 4,
+                batch_invariant: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for p in &prompts {
-            batcher.submit(p.clone(), options).unwrap();
+            batcher.submit(p.clone(), options.clone()).unwrap();
         }
         let mut got: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
         while batcher.is_busy() {
@@ -887,7 +903,7 @@ fn batched_prefill_gives_each_request_its_solo_tokens() {
             }
         }
         for (i, p) in prompts.iter().enumerate() {
-            let alone: Vec<u32> = generate(&model, p, options)
+            let alone: Vec<u32> = generate(&model, p, options.clone())
                 .unwrap()
                 .collect::<nuvec::Result<_>>()
                 .unwrap();
@@ -899,7 +915,7 @@ fn batched_prefill_gives_each_request_its_solo_tokens() {
 /// A seed reproduces sampled tokens, alone and in a batch with other requests.
 #[test]
 fn seeded_sampling_is_reproducible_alone_and_batched() {
-    use nuvec_lm::{Batcher, Event, Sampler};
+    use nuvec_lm::{Batcher, BatcherOptions, Event, Sampler};
     if !gpu() {
         return;
     }
@@ -929,11 +945,19 @@ fn seeded_sampling_is_reproducible_alone_and_batched() {
         (prompt[1..].to_vec(), options(None, 0.0)),
         (prompt.clone(), options(Some(11), 1.0)),
     ];
-    let mut batcher = Batcher::new(&model, 64, 8, 3)
-        .unwrap()
-        .batch_invariant(true);
+    let mut batcher = Batcher::new(
+        &model,
+        BatcherOptions {
+            blocks: Some(64),
+            block_size: 8,
+            max_batch: 3,
+            batch_invariant: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for (p, o) in &requests {
-        batcher.submit(p.clone(), *o).unwrap();
+        batcher.submit(p.clone(), o.clone()).unwrap();
     }
     let mut got: Vec<Vec<u32>> = vec![Vec::new(); requests.len()];
     while batcher.is_busy() {
@@ -944,7 +968,7 @@ fn seeded_sampling_is_reproducible_alone_and_batched() {
         }
     }
     for (i, (p, o)) in requests.iter().enumerate() {
-        assert_eq!(got[i], alone(p, *o), "request {i}");
+        assert_eq!(got[i], alone(p, o.clone()), "request {i}");
     }
 }
 
@@ -963,7 +987,7 @@ fn the_cache_grows_past_its_first_capacity() {
         prefill_step: 100,
         ..Default::default()
     };
-    let chunked: Vec<u32> = generate(&model, &long, options)
+    let chunked: Vec<u32> = generate(&model, &long, options.clone())
         .unwrap()
         .collect::<nuvec::Result<_>>()
         .unwrap();
@@ -1160,7 +1184,7 @@ fn speculative_decoding_keeps_the_greedy_output() {
             prompt: prompt.len(),
             tokens: greedy.clone(),
         };
-        let (ids, stats) = run(Box::new(oracle));
+        let (ids, stats) = run.clone()(Box::new(oracle));
         assert_eq!(ids, greedy, "{name}: oracle drafts");
         assert_eq!(
             stats.accepted, stats.drafted,
@@ -1171,7 +1195,7 @@ fn speculative_decoding_keeps_the_greedy_output() {
             prompt: prompt.len(),
             tokens: greedy.iter().map(|t| (t + 1) % 128).collect(),
         };
-        let (ids, stats) = run(Box::new(wrong));
+        let (ids, stats) = run.clone()(Box::new(wrong));
         assert_eq!(ids, greedy, "{name}: wrong drafts");
         assert_eq!((stats.accepted, stats.steps), (0, greedy.len()), "{name}");
         // Right for two tokens, then wrong: partial acceptance, a rollback mid-draft.
@@ -1183,7 +1207,7 @@ fn speculative_decoding_keeps_the_greedy_output() {
                 .map(|(i, t)| if i % 4 < 2 { *t } else { (t + 1) % 128 })
                 .collect(),
         };
-        let (ids, stats) = run(Box::new(half));
+        let (ids, stats) = run.clone()(Box::new(half));
         assert_eq!(ids, greedy, "{name}: partly right drafts");
         assert!(
             stats.accepted > 0 && stats.accepted < stats.drafted,
@@ -1329,7 +1353,7 @@ fn mtp_drafts_keep_the_greedy_output() {
             let g = speculative_generate(
                 &model,
                 &prompt,
-                options,
+                options.clone(),
                 MtpDrafter::new(&model).unwrap(),
                 DraftPolicy::Fixed(k),
             )
@@ -1343,7 +1367,7 @@ fn mtp_drafts_keep_the_greedy_output() {
             max_tokens: 24,
             ..Default::default()
         };
-        let plain = tokens(&model, &long, options);
+        let plain = tokens(&model, &long, options.clone());
         let mut g = speculative_generate(
             &model,
             &long,
@@ -1621,7 +1645,7 @@ fn suffix_decoding_keeps_the_greedy_output() {
         let mut g = speculative_generate(
             &model,
             &prompt,
-            options,
+            options.clone(),
             &mut *suffix,
             DraftPolicy::Fixed(4),
         )
@@ -1693,7 +1717,7 @@ fn forward_rejects_a_cache_of_another_length() {
 /// `generate` and the batcher stop at either without yielding it.
 #[test]
 fn generation_stops_at_either_files_end_of_sequence_ids() {
-    use nuvec_lm::{Batcher, Config, Event, FinishReason};
+    use nuvec_lm::{Batcher, BatcherOptions, Config, Event, FinishReason};
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/eos");
     let config = Config::from_file(dir.join("config.json")).unwrap();
     let expected =
@@ -1739,12 +1763,24 @@ fn generation_stops_at_either_files_end_of_sequence_ids() {
         );
         let model = load_model(&dir).unwrap();
         assert!(model.config.eos_token_ids.contains(&eos));
-        assert_eq!(tokens(&model, &prompt, options), greedy[..k], "{edit:?}");
+        assert_eq!(
+            tokens(&model, &prompt, options.clone()),
+            greedy[..k],
+            "{edit:?}"
+        );
         // The batcher too, finishing with `EndOfSequence`.
-        let mut batcher = Batcher::new(&model, 16, 8, 2)
-            .unwrap()
-            .batch_invariant(true);
-        batcher.submit(prompt.clone(), options).unwrap();
+        let mut batcher = Batcher::new(
+            &model,
+            BatcherOptions {
+                blocks: Some(16),
+                block_size: 8,
+                max_batch: 2,
+                batch_invariant: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        batcher.submit(prompt.clone(), options.clone()).unwrap();
         let (mut got, mut reason) = (Vec::new(), None);
         while batcher.is_busy() {
             for event in batcher.step().unwrap() {
@@ -1776,7 +1812,7 @@ fn generation_stops_at_either_files_end_of_sequence_ids() {
 #[test]
 fn sampler_settings_are_checked_and_filters_chain_as_mlx_lm() {
     use nuvec_lm::sample::{apply_min_p, apply_top_k, apply_top_p};
-    use nuvec_lm::{Batcher, PromptLookup, Sampler, speculative_generate};
+    use nuvec_lm::{Batcher, BatcherOptions, PromptLookup, Sampler, speculative_generate};
     if !gpu() {
         return;
     }
@@ -1824,9 +1860,17 @@ fn sampler_settings_are_checked_and_filters_chain_as_mlx_lm() {
             ..Default::default()
         },
     ];
-    let mut batcher = Batcher::new(&model, 16, 8, 2)
-        .unwrap()
-        .batch_invariant(true);
+    let mut batcher = Batcher::new(
+        &model,
+        BatcherOptions {
+            blocks: Some(16),
+            block_size: 8,
+            max_batch: 2,
+            batch_invariant: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for sampler in invalid {
         let options = GenerateOptions {
             max_tokens: 4,
@@ -1834,12 +1878,15 @@ fn sampler_settings_are_checked_and_filters_chain_as_mlx_lm() {
             ..Default::default()
         };
         assert!(sampler.validate().is_err(), "{sampler:?}");
-        assert!(generate(&model, &prompt, options).is_err(), "{sampler:?}");
+        assert!(
+            generate(&model, &prompt, options.clone()).is_err(),
+            "{sampler:?}"
+        );
         assert!(
             speculative_generate(
                 &model,
                 &prompt,
-                options,
+                options.clone(),
                 PromptLookup::default(),
                 Default::default()
             )

@@ -409,6 +409,53 @@ fn wired_limit_wires_buffers_up_to_it() {
     device.set_wired_limit(0).unwrap();
 }
 
+/// Wired buffers spread over residency sets of at most the per-set cap, as MLX's (first
+/// fit, then a new set), with the wired totals exact through releases and resizes.
+#[test]
+fn wired_buffers_spread_over_capped_residency_sets() {
+    let Some(device) = device() else { return };
+    if !device.can_wire() {
+        assert_eq!(device.memory().residency_sets, 0);
+        return;
+    }
+    // One set at first (MLX's set 0); a cap of 3 pages fits one 2-page buffer per set.
+    assert_eq!(device.memory().residency_sets, 1);
+    device.__set_residency_set_cap(3 * PAGE);
+    device.set_wired_limit(64 * PAGE).unwrap();
+    let mut buffers: Vec<_> = (0..5)
+        .map(|_| device.new_buffer(2 * PAGE).unwrap())
+        .collect();
+    let m = device.memory();
+    assert_eq!((m.wired, m.residency_sets), (10 * PAGE, 5));
+    // A one-page buffer fits beside a two-page one: no new set.
+    let small = device.new_buffer(PAGE).unwrap();
+    let m = device.memory();
+    assert_eq!((m.wired, m.residency_sets), (11 * PAGE, 5));
+    // Released buffers leave their sets; an emptied set is reused before a new one.
+    buffers.truncate(2);
+    device.clear_cache();
+    assert_eq!(device.memory().wired, 5 * PAGE);
+    buffers.extend((0..3).map(|_| device.new_buffer(2 * PAGE).unwrap()));
+    let m = device.memory();
+    assert_eq!((m.wired, m.residency_sets), (11 * PAGE, 5));
+    // Lowering the limit unwires, raising it wires the waiting buffers into sets again.
+    device.set_wired_limit(4 * PAGE).unwrap();
+    assert!(device.memory().wired <= 4 * PAGE);
+    device.set_wired_limit(64 * PAGE).unwrap();
+    assert_eq!(device.memory().wired, 11 * PAGE);
+    // A cap of 0 is one set: later buffers all go to set 0.
+    device.__set_residency_set_cap(0);
+    let more: Vec<_> = (0..3)
+        .map(|_| device.new_buffer(4 * PAGE).unwrap())
+        .collect();
+    let m = device.memory();
+    assert_eq!((m.wired, m.residency_sets), (23 * PAGE, 5));
+    drop((buffers, small, more));
+    device.clear_cache();
+    assert_eq!(device.memory().wired, 0);
+    device.set_wired_limit(0).unwrap();
+}
+
 #[test]
 fn sizes_near_usize_max_are_out_of_memory() {
     let Some(device) = device() else { return };
@@ -587,4 +634,37 @@ fn gc_threshold_counts_mapped_files() {
     let m = device.memory();
     assert_eq!((m.active, m.mapped, m.cache), (3 * PAGE, 16 * PAGE, 0));
     drop((big, mapped));
+}
+
+/// A range of a file maps only its pages: its bytes are the file's, `mapped` grows by the
+/// range alone, and an offset off a page boundary is refused.
+#[test]
+fn file_ranges_map_only_their_pages() {
+    let Some(device) = Device::shared() else {
+        return;
+    };
+    let page = nuvec_gpu::page_size();
+    let path = std::env::temp_dir().join(format!("nuvec-range-{}", std::process::id()));
+    let bytes: Vec<u8> = (0..4 * page)
+        .map(|i| (i / page) as u8 + (i % 7) as u8)
+        .collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let before = device.memory().mapped;
+    let range = device.map_file_range(&path, page, page + 10).unwrap();
+    assert_eq!(range.len(), page + 10);
+    assert_eq!(range.contents().unwrap(), &bytes[page..2 * page + 10]);
+    assert_eq!(device.memory().mapped - before, 2 * page);
+    drop(range);
+    assert_eq!(device.memory().mapped, before);
+    let e = device
+        .map_file_range(&path, page / 2, 10)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("page boundary"), "{e}");
+    let e = device
+        .map_file_range(&path, 3 * page, 2 * page)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("past the end"), "{e}");
+    let _ = std::fs::remove_file(path);
 }

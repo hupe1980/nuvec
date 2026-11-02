@@ -56,6 +56,32 @@ impl Device {
     pub fn reset_peak(&self) {
         match self.0 {}
     }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    pub fn can_wire(&self) -> bool {
+        match self.0 {}
+    }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    #[doc(hidden)]
+    pub fn __set_residency_set_cap(&self, _bytes: usize) {
+        match self.0 {}
+    }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    pub fn clear_cache(&self) {
+        match self.0 {}
+    }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    pub fn start_capture(&self, _path: impl AsRef<std::path::Path>) -> crate::Result<()> {
+        match self.0 {}
+    }
+
+    /// Unreachable: no `Device` can be constructed on this target.
+    pub fn stop_capture(&self) {
+        match self.0 {}
+    }
 }
 
 /// GPU profiling: never enabled without Metal.

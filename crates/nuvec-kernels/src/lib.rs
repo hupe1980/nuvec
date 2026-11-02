@@ -21,10 +21,16 @@
 //! - in a second library for macOS 26.2 and later ([`NAX_MODE`]), GEMM on the GPU's matrix
 //!   units through Metal 4 TensorOps (the Neural Accelerators of M5-class GPUs).
 //!
+//! With feature `cuda`, [`cuda`] holds the CUDA kernels: generated PTX, and Tile kernels
+//! (cutile) on Linux.
+//!
 //! **Stability:** no promise when this crate is depended on directly; depend on `nuvec`,
 //! whose re-exports are semver-tracked.
 //!
 //! **Status:** pre-alpha.
+
+#[cfg(feature = "cuda")]
+pub mod cuda;
 
 /// How the kernel library is provided in this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

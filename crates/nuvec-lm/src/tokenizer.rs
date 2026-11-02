@@ -1122,7 +1122,7 @@ impl Tokenizer {
     }
 
     /// The bytes of `ids`, token by token (nothing stripped).
-    fn token_bytes(&self, ids: &[u32]) -> Vec<u8> {
+    pub(crate) fn token_bytes(&self, ids: &[u32]) -> Vec<u8> {
         let mut out = Vec::new();
         for &id in ids {
             let Some(Some(token)) = self.tokens.get(id as usize) else {
@@ -1145,9 +1145,14 @@ impl Tokenizer {
         out
     }
 
+    /// How many leading spaces the decoder strips from the start of a text.
+    pub(crate) fn strip_count(&self) -> usize {
+        self.spm.as_ref().map_or(0, |s| s.strip)
+    }
+
     /// Strips the decoder's leading spaces from the start of a text.
     fn strip_leading(&self, out: &mut Vec<u8>) {
-        let n = self.spm.as_ref().map_or(0, |s| s.strip);
+        let n = self.strip_count();
         let spaces = out.iter().take(n).take_while(|&&b| b == b' ').count();
         out.drain(..spaces);
     }
@@ -1231,7 +1236,7 @@ impl StreamDecoder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// o200k's pattern (GPT-4o, gpt-oss) against Hugging Face `tokenizers`
@@ -1346,7 +1351,7 @@ mod tests {
 
     /// A tiny byte-level tokenizer: the 256 byte characters plus merges for "he", "ll",
     /// "hell" and "hello", and one added token.
-    fn tiny() -> Tokenizer {
+    pub(crate) fn tiny() -> Tokenizer {
         let chars = byte_chars();
         let mut vocab: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
         vocab.extend(["he", "ll", "hell", "hello"].map(String::from));

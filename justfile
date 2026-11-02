@@ -223,7 +223,7 @@ internal-paths:
 # The crates CI builds on Linux (no Metal) compile without warnings there.
 portable-check:
     rustup target add x86_64-unknown-linux-gnu >/dev/null 2>&1 || true
-    RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-gnu -p nuvec-core -p nuvec-cpu -p nuvec-io -p nuvec-kernels -p nuvec-gpu --all-targets
+    RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-gnu -p nuvec-core -p nuvec-cpu -p nuvec-io -p nuvec-kernels -p nuvec-gpu -p nuvec --all-targets
 
 # Crate dependencies follow the layering: lower layers never depend on higher ones.
 layering:
@@ -302,7 +302,7 @@ no-hand-visits:
 notices:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in nuvec-core nuvec-gpu nuvec-kernels nuvec-nn nuvec-lm nuvec-compile; do
+    for c in nuvec-core nuvec-gpu nuvec-kernels nuvec-nn nuvec-lm nuvec-compile nuvec-distributed; do
         cmp -s THIRD_PARTY_NOTICES "crates/$c/THIRD_PARTY_NOTICES" || { echo "✗ crates/$c/THIRD_PARTY_NOTICES differs from the root" >&2; exit 1; }
         cargo package -p "$c" --list --allow-dirty 2>/dev/null | grep -qx THIRD_PARTY_NOTICES || { echo "✗ $c does not package THIRD_PARTY_NOTICES" >&2; exit 1; }
     done

@@ -138,6 +138,42 @@ fn float_sums_agree_bit_for_bit() {
     }
 }
 
+/// Max and min of signed zeros and NaNs, where the order of the operands decides the bits:
+/// every rank still gets the same ones.
+fn signed_zeros(g: Group) {
+    let r = g.rank() as f32;
+    let v = [
+        0.0 * (1.0 - 2.0 * (r % 2.0)),
+        f32::NAN * r,
+        1.0 - r,
+        -0.0 + r,
+    ];
+    let x = Array::from_slice(&v, [4]);
+    for s in [
+        distributed::all_max(&x, None),
+        distributed::all_min(&x, None),
+    ] {
+        let bits: Vec<u32> = s
+            .to_vec::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        println!("BITS {bits:x?}");
+    }
+}
+
+#[test]
+fn max_and_min_agree_bit_for_bit() {
+    for n in [2, 3] {
+        if let Some(outputs) = ranks("max_and_min_agree_bit_for_bit", n, signed_zeros) {
+            agree(&outputs);
+        } else {
+            return;
+        }
+    }
+}
+
 /// 64 MB per rank: split over the connection and the ring's segments.
 fn large(g: Group) {
     let n = 16 << 20;
@@ -152,6 +188,55 @@ fn large(g: Group) {
 fn large_arrays_on_two_and_four_ranks() {
     for n in [2, 4] {
         if ranks("large_arrays_on_two_and_four_ranks", n, large).is_none() {
+            return;
+        }
+    }
+}
+
+/// Split all-reduces (both ring directions over every connection) of 1, 4 and 64 MB with
+/// a different value per element, exact against the reference.
+fn split(g: Group) {
+    let (rank, size) = (g.rank() as f32, g.size() as f32);
+    for mb in [1usize, 4, 64] {
+        let n = (mb << 20) / 4;
+        let v: Vec<f32> = (0..n).map(|i| (i % 1000) as f32 + rank).collect();
+        let x = Array::from_slice(&v, [n]).multiply(1.0);
+        let v = distributed::all_sum(&x, None).to_vec::<f32>().unwrap();
+        let ranks: f32 = (0..g.size()).map(|r| r as f32).sum();
+        for (i, got) in v.iter().enumerate() {
+            let want = size * (i % 1000) as f32 + ranks;
+            assert_eq!(*got, want, "{mb} MB, element {i}");
+        }
+    }
+}
+
+#[test]
+fn split_all_reduces_over_one_and_two_connections() {
+    for (n, connections) in [(2, 1), (2, 2), (4, 1), (4, 2)] {
+        let file = std::env::temp_dir().join(format!(
+            "nuvec-split-{}-{n}-{connections}.json",
+            std::process::id()
+        ));
+        let entries: Vec<String> = (0..n)
+            .map(|_| {
+                let a: Vec<String> = common::free_addresses(connections)
+                    .iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect();
+                format!("[{}]", a.join(", "))
+            })
+            .collect();
+        std::fs::write(&file, format!("[{}]", entries.join(", "))).unwrap();
+        let hostfile = file.display().to_string();
+        let env = [("MLX_HOSTFILE", hostfile.as_str())];
+        if common::ranks_with(
+            "split_all_reduces_over_one_and_two_connections",
+            n,
+            &env,
+            split,
+        )
+        .is_none()
+        {
             return;
         }
     }
@@ -280,6 +365,141 @@ fn collectives_compose_with_transforms() {
     }
 }
 
+/// `sum_scatter` for every dtype and shape class, on contiguous, strided and offset inputs,
+/// with its gradient (each rank's loss is its own), jvp, vmap and compile.
+fn scatter(g: Group) {
+    let (rank, size) = (g.rank(), g.size());
+    let dtypes = [
+        DType::U8,
+        DType::U32,
+        DType::I32,
+        DType::I64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
+    for dtype in dtypes {
+        for (k, rest) in [(0usize, &[][..]), (1, &[]), (3, &[]), (2, &[5, 3])] {
+            let mut shape = vec![size * k];
+            shape.extend_from_slice(rest);
+            let x = input(rank, &shape, dtype);
+            let all: Vec<Vec<f64>> = (0..size)
+                .map(|r| as_f64(&input(r, &shape, dtype)))
+                .collect();
+            let per: usize = rest.iter().product::<usize>() * k;
+            let want: Vec<f64> = (rank * per..(rank + 1) * per)
+                .map(|i| all.iter().map(|v| v[i]).sum())
+                .collect();
+            let y = distributed::sum_scatter(&x, None);
+            let name = format!("{} {shape:?}", dtype.name());
+            let mut out_shape = vec![k as i32];
+            out_shape.extend(rest.iter().map(|&d| d as i32));
+            assert_eq!(y.shape(), out_shape.as_slice(), "sum_scatter shape {name}");
+            assert_eq!(as_f64(&y), want, "sum_scatter {name}");
+        }
+    }
+    // A transposed view and a slice at an offset scatter as their contiguous copies.
+    let base = Array::from_slice(&values(rank, 6 * size * 4), [4, 6 * size]);
+    for view in [
+        base.transpose([1, 0]),
+        base.transpose([1, 0]).i(size as i32..(3 * size) as i32),
+    ] {
+        let dense = view.contiguous();
+        assert_eq!(
+            distributed::sum_scatter(&view, None)
+                .to_vec::<f32>()
+                .unwrap(),
+            distributed::sum_scatter(&dense, None)
+                .to_vec::<f32>()
+                .unwrap()
+        );
+    }
+    // The shape errors (MLX's): a scalar, a first axis not divisible by the size.
+    let e = distributed::sum_scatter(&Array::from(1.0f32), None)
+        .check()
+        .unwrap_err();
+    assert!(e.to_string().contains("first axis"), "{e}");
+    let odd = Array::from_slice(&vec![1.0f32; size + 1], [size + 1]);
+    assert!(distributed::sum_scatter(&odd, None).check().is_err());
+    // Gradient: d sum(sum_scatter(x)·w) / dx is w in this rank's rows, zero elsewhere.
+    let n = 2 * size;
+    let x = Array::from_slice(&values(rank, n), [n]);
+    let w = Array::from_slice(&[3.0f32, -1.0], [2]);
+    let loss = |x: &Array| distributed::sum_scatter(x, None).multiply(&w).sum(..);
+    let dx = grad(loss)(&x).unwrap().to_vec::<f32>().unwrap();
+    let mut want = vec![0.0f32; n];
+    want[2 * rank] = 3.0;
+    want[2 * rank + 1] = -1.0;
+    assert_eq!(dx, want);
+    // Finite differences of each rank's loss in its own input (every rank moves element 0
+    // of rank 0's rows in turn; only the owner's loss changes).
+    let h = 1e-2f32;
+    for i in 0..n {
+        let mut e = vec![0.0f32; n];
+        e[i] = h;
+        let e = Array::from_slice(&e, [n]);
+        let fd = (loss(&x.add(&e)).item::<f32>().unwrap()
+            - loss(&x.subtract(&e)).item::<f32>().unwrap())
+            / (2.0 * h);
+        // Every rank perturbed element i together, so the loss moved by the sum of the
+        // ranks' own derivatives in row i: size·want only within this rank's rows.
+        let expected = if i / 2 == rank {
+            want[i] * size as f32
+        } else {
+            0.0
+        };
+        assert!(
+            (fd - expected).abs() < 2e-2,
+            "finite difference {i}: {fd} vs {expected}"
+        );
+    }
+    // jvp: the op on the tangent.
+    let t = Array::from_slice(&values(rank + 1, n), [n]);
+    let (_, jt) = nuvec_core::jvp(|x: &Array| distributed::sum_scatter(x, None), &x, &t).unwrap();
+    assert_eq!(
+        jt.to_vec::<f32>().unwrap(),
+        distributed::sum_scatter(&t, None).to_vec::<f32>().unwrap()
+    );
+    // vmap over axis 0 and 1: each example scattered on its own.
+    let batch = Array::from_slice(&values(rank, 3 * n), [3, n]);
+    let batched = vmap(|r: &Array| distributed::sum_scatter(r, None))
+        .call(&batch)
+        .unwrap();
+    let looped: Vec<f32> = (0..3)
+        .flat_map(|b| {
+            distributed::sum_scatter(&batch.i(b), None)
+                .to_vec::<f32>()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(batched.to_vec::<f32>().unwrap(), looped);
+    let cols = batch.transpose([1, 0]).contiguous();
+    let along = vmap(|r: &Array| distributed::sum_scatter(r, None))
+        .in_axes(1)
+        .call(&cols)
+        .unwrap();
+    assert_eq!(along.to_vec::<f32>().unwrap(), looped);
+    // Compiled: equal to the uncompiled call.
+    let f = nuvec_compile::compile(|x: &Array| distributed::sum_scatter(x, None).multiply(2.0));
+    assert_eq!(
+        f(&x).unwrap().to_vec::<f32>().unwrap(),
+        distributed::sum_scatter(&x, None)
+            .multiply(2.0)
+            .to_vec::<f32>()
+            .unwrap()
+    );
+}
+
+#[test]
+fn sum_scatter_on_two_three_and_four_ranks() {
+    for n in [2, 3, 4] {
+        if ranks("sum_scatter_on_two_three_and_four_ranks", n, scatter).is_none() {
+            return;
+        }
+    }
+}
+
 /// A peer that exits: the others fail with an error naming a rank, within the timeout, and
 /// every later collective fails at once.
 fn peer_exits(g: Group) {
@@ -356,4 +576,123 @@ fn a_rank_that_never_starts_fails_init() {
         .to_string();
     assert!(err.contains("rank 1"), "{err}");
     assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+/// Whether the GPU evaluates here; sets the GPU stream if so.
+fn on_gpu() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    set_default_stream(Stream::default_for(Device::gpu(0)));
+    (&Array::from(1.0f32) + 1.0).eval().is_ok()
+}
+
+fn bits_of(a: &Array) -> Vec<u32> {
+    a.astype(DType::F32)
+        .to_vec::<f32>()
+        .unwrap()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// Collectives on the GPU stream (non-blocking, behind GPU work) and on the CPU stream
+/// (blocking) give the same bits, on GPU-produced, transposed and half-precision inputs.
+fn streams(g: Group) {
+    let key = Array::from_slice(&[1u32, g.rank() as u32], [2]);
+    let x = nuvec_core::random::normal([24, 65], DType::F32, 0.0, 1.0, &key);
+    x.eval().unwrap();
+    let graph = |x: &Array| -> Vec<Array> {
+        let t = x.multiply(1.5).transpose([1, 0]);
+        vec![
+            distributed::all_sum(&t, None),
+            distributed::all_max(&x.astype(DType::BF16), None),
+            distributed::all_min(&x.subtract(0.25), None),
+            distributed::all_gather(&t.add(1.0), None),
+            distributed::sum_scatter(&x.astype(DType::F16).multiply(2.0), None),
+        ]
+    };
+    let mut gpu = Vec::new();
+    if on_gpu() {
+        gpu = graph(&x).iter().map(bits_of).collect();
+    }
+    set_default_stream(Stream::default_for(Device::cpu()));
+    let cpu: Vec<Vec<u32>> = graph(&x).iter().map(bits_of).collect();
+    if !gpu.is_empty() {
+        assert_eq!(gpu, cpu);
+    }
+    // `sum_scatter` leaves each rank its own segment; the others are the same everywhere.
+    let replicated = cpu[..4].concat();
+    // On a line of its own: the harness's "test ... " line may still be open.
+    println!();
+    println!(
+        "BITS {:x}",
+        replicated
+            .iter()
+            .fold(0u64, |h, &b| h.rotate_left(5) ^ u64::from(b))
+    );
+}
+
+#[test]
+fn gpu_and_cpu_streams_agree_bit_for_bit() {
+    for n in [2, 3, 4] {
+        if let Some(outputs) = ranks("gpu_and_cpu_streams_agree_bit_for_bit", n, streams) {
+            agree(&outputs);
+        } else {
+            return;
+        }
+    }
+}
+
+/// Decode's shape: 56 GPU ops each followed by an all_sum in one evaluation, three times,
+/// equal to the CPU stream's; then two such graphs evaluated with `async_eval` before either
+/// is read; then 600 collectives in one graph.
+fn decode(g: Group) {
+    let x = nuvec_core::ops::full([1, 1024], g.rank() as f32 + 0.5).astype(DType::BF16);
+    let chain = |x: &Array, n: usize| {
+        let mut y = x.clone();
+        for _ in 0..n {
+            y = distributed::all_sum(&y.multiply(0.5), None);
+        }
+        y
+    };
+    if !on_gpu() {
+        return;
+    }
+    let gpu: Vec<Vec<u32>> = (0..3).map(|_| bits_of(&chain(&x, 56))).collect();
+    let (a, b) = (chain(&x, 20), chain(&x.add(1.0), 20));
+    nuvec_core::async_eval(&a).unwrap();
+    nuvec_core::async_eval(&b).unwrap();
+    let (a, b) = (bits_of(&a), bits_of(&b));
+    let long = bits_of(&chain(&x, 600));
+    set_default_stream(Stream::default_for(Device::cpu()));
+    let cpu = bits_of(&chain(&x, 56));
+    assert!(gpu.iter().all(|v| *v == cpu));
+    assert_eq!(a, bits_of(&chain(&x, 20)));
+    assert_eq!(b, bits_of(&chain(&x.add(1.0), 20)));
+    assert_eq!(long, bits_of(&chain(&x, 600)));
+}
+
+#[test]
+fn decode_shaped_graphs_match_the_cpu_stream() {
+    for n in [2, 3] {
+        if ranks("decode_shaped_graphs_match_the_cpu_stream", n, decode).is_none() {
+            return;
+        }
+    }
+}
+
+/// The blocking path: every collective on the CPU stream.
+fn on_cpu(g: Group) {
+    set_default_stream(Stream::default_for(Device::cpu()));
+    collectives(g);
+}
+
+#[test]
+fn collectives_on_the_cpu_stream() {
+    for n in [2, 3] {
+        if ranks("collectives_on_the_cpu_stream", n, on_cpu).is_none() {
+            return;
+        }
+    }
 }

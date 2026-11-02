@@ -546,6 +546,212 @@ template <typename T, int N_READS = RMS_N_READS>
   }
 }
 
+
+// nuvec's own: `s = (h + rms(x) · w) · scale` (`SCALED`) and, with `NEXT`, `rms(s) · w2`,
+// one threadgroup per row: Gemma 4's sandwich norm, residual add, layer scalar and the
+// next layer's norm without dependent dispatches. Each normalisation reads and reduces as
+// `rms_single_row` (or `rms_looped`) does, and the add and multiply round to `T` as the
+// element-wise kernels do, so the results are the composition's.
+
+// The threadgroup's `1 / sqrt(mean + eps)` from each thread's partial sum, as the RMS
+// kernels reduce it.
+METAL_FUNC float residual_inv_mean(
+    float acc,
+    float eps,
+    uint axis_size,
+    threadgroup float* local_sums,
+    threadgroup float* local_inv_mean,
+    uint simd_lane_id,
+    uint simd_group_id) {
+  acc = simd_sum(acc);
+  if (simd_group_id == 0) {
+    local_sums[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lane_id == 0) {
+    local_sums[simd_group_id] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    acc = simd_sum(local_sums[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return local_inv_mean[0];
+}
+
+template <typename T, bool SCALED, bool NEXT, int N_READS = RMS_N_READS>
+[[kernel]] void residual_rms_single_row(
+    const device T* h [[buffer(0)]],
+    const device T* x [[buffer(1)]],
+    const device T* w [[buffer(2)]],
+    const device T* scale [[buffer(3)]],
+    const device T* w2 [[buffer(4)]],
+    device T* sum [[buffer(5)]],
+    device T* out [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    constant float& eps2 [[buffer(8)]],
+    constant uint& axis_size [[buffer(9)]],
+    constant uint& w_stride [[buffer(10)]],
+    constant uint& w2_stride [[buffer(11)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+  constexpr int SIMD_SIZE = 32;
+  threadgroup float local_inv_mean[2];
+  threadgroup float local_sums[2 * SIMD_SIZE];
+
+  size_t row = gid * size_t(axis_size) + lid * N_READS;
+  h += row;
+  x += row;
+  sum += row;
+  w += w_stride * lid * N_READS;
+  w2 += w2_stride * lid * N_READS;
+
+  // `x`'s normalisation, as `rms_single_row`.
+  float acc = 0;
+  float thread_x[N_READS];
+  if (lid * N_READS + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      thread_x[i] = x[i];
+      acc += thread_x[i] * thread_x[i];
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      thread_x[i] = (lid * N_READS + i < axis_size) ? (float)x[i] : 0;
+      acc += thread_x[i] * thread_x[i];
+    }
+  }
+  float inv = residual_inv_mean(
+      acc, eps, axis_size, local_sums, local_inv_mean, simd_lane_id, simd_group_id);
+
+  // The residual sum (and its scale), kept for the next normalisation.
+  float acc2 = 0;
+  for (int i = 0; i < N_READS; i++) {
+    if ((lid * N_READS + i) < axis_size) {
+      T y = w[w_stride * i] * static_cast<T>(thread_x[i] * inv);
+      T s = T(float(h[i]) + float(y));
+      if (SCALED) {
+        s = T(float(s) * float(scale[0]));
+      }
+      sum[i] = s;
+      thread_x[i] = s;
+    } else {
+      thread_x[i] = 0;
+    }
+    acc2 += thread_x[i] * thread_x[i];
+  }
+  if (!NEXT) {
+    return;
+  }
+  float inv2 = residual_inv_mean(
+      acc2,
+      eps2,
+      axis_size,
+      local_sums + SIMD_SIZE,
+      local_inv_mean + 1,
+      simd_lane_id,
+      simd_group_id);
+  out += row;
+  for (int i = 0; i < N_READS; i++) {
+    if ((lid * N_READS + i) < axis_size) {
+      out[i] = w2[w2_stride * i] * static_cast<T>(thread_x[i] * inv2);
+    }
+  }
+}
+
+template <typename T, bool SCALED, bool NEXT, int N_READS = RMS_N_READS>
+[[kernel]] void residual_rms_looped(
+    const device T* h [[buffer(0)]],
+    const device T* x [[buffer(1)]],
+    const device T* w [[buffer(2)]],
+    const device T* scale [[buffer(3)]],
+    const device T* w2 [[buffer(4)]],
+    device T* sum [[buffer(5)]],
+    device T* out [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    constant float& eps2 [[buffer(8)]],
+    constant uint& axis_size [[buffer(9)]],
+    constant uint& w_stride [[buffer(10)]],
+    constant uint& w2_stride [[buffer(11)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lsize [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+  constexpr int SIMD_SIZE = 32;
+  threadgroup float local_inv_mean[2];
+  threadgroup float local_sums[2 * SIMD_SIZE];
+
+  size_t row = gid * size_t(axis_size) + lid * N_READS;
+  h += row;
+  x += row;
+  sum += row;
+  w += w_stride * lid * N_READS;
+  w2 += w2_stride * lid * N_READS;
+
+  // `x`'s normalisation, as `rms_looped`.
+  float acc = 0;
+  for (uint r = 0; r < axis_size; r += lsize * N_READS) {
+    if (r + lid * N_READS + N_READS <= axis_size) {
+      for (int i = 0; i < N_READS; i++) {
+        float xi = x[i + r];
+        acc += xi * xi;
+      }
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        if ((r + lid * N_READS + i) < axis_size) {
+          float xi = x[i + r];
+          acc += xi * xi;
+        }
+      }
+    }
+  }
+  float inv = residual_inv_mean(
+      acc, eps, axis_size, local_sums, local_inv_mean, simd_lane_id, simd_group_id);
+
+  // The residual sum, written, then reduced as `rms_looped` reduces its input.
+  float acc2 = 0;
+  for (uint r = 0; r < axis_size; r += lsize * N_READS) {
+    for (int i = 0; i < N_READS; i++) {
+      if ((r + lid * N_READS + i) < axis_size) {
+        T y = w[w_stride * (i + r)] * static_cast<T>(x[r + i] * inv);
+        T s = T(float(h[r + i]) + float(y));
+        if (SCALED) {
+          s = T(float(s) * float(scale[0]));
+        }
+        sum[r + i] = s;
+        float si = s;
+        acc2 += si * si;
+      }
+    }
+  }
+  if (!NEXT) {
+    return;
+  }
+  float inv2 = residual_inv_mean(
+      acc2,
+      eps2,
+      axis_size,
+      local_sums + SIMD_SIZE,
+      local_inv_mean + 1,
+      simd_lane_id,
+      simd_group_id);
+  // Each thread reads back the sums it wrote itself.
+  out += row;
+  for (uint r = 0; r < axis_size; r += lsize * N_READS) {
+    for (int i = 0; i < N_READS; i++) {
+      if ((r + lid * N_READS + i) < axis_size) {
+        out[r + i] = w2[w2_stride * (i + r)] *
+            static_cast<T>(sum[r + i] * inv2);
+      }
+    }
+  }
+}
+
 } // namespace rms
 } // namespace mlx
 
@@ -567,3 +773,27 @@ template [[host_name("nuvec_add_rms_float16")]] [[kernel]] decltype(mlx::rms::ad
 template [[host_name("nuvec_add_rms_looped_float16")]] [[kernel]] decltype(mlx::rms::add_rms_looped<half>) mlx::rms::add_rms_looped<half>;
 template [[host_name("nuvec_add_rms_bfloat16")]] [[kernel]] decltype(mlx::rms::add_rms_single_row<bfloat16_t>) mlx::rms::add_rms_single_row<bfloat16_t>;
 template [[host_name("nuvec_add_rms_looped_bfloat16")]] [[kernel]] decltype(mlx::rms::add_rms_looped<bfloat16_t>) mlx::rms::add_rms_looped<bfloat16_t>;
+template [[host_name("nuvec_residual_rms_float32_s0_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<float, false, false>) mlx::rms::residual_rms_single_row<float, false, false>;
+template [[host_name("nuvec_residual_rms_looped_float32_s0_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<float, false, false>) mlx::rms::residual_rms_looped<float, false, false>;
+template [[host_name("nuvec_residual_rms_float32_s0_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<float, false, true>) mlx::rms::residual_rms_single_row<float, false, true>;
+template [[host_name("nuvec_residual_rms_looped_float32_s0_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<float, false, true>) mlx::rms::residual_rms_looped<float, false, true>;
+template [[host_name("nuvec_residual_rms_float32_s1_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<float, true, false>) mlx::rms::residual_rms_single_row<float, true, false>;
+template [[host_name("nuvec_residual_rms_looped_float32_s1_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<float, true, false>) mlx::rms::residual_rms_looped<float, true, false>;
+template [[host_name("nuvec_residual_rms_float32_s1_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<float, true, true>) mlx::rms::residual_rms_single_row<float, true, true>;
+template [[host_name("nuvec_residual_rms_looped_float32_s1_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<float, true, true>) mlx::rms::residual_rms_looped<float, true, true>;
+template [[host_name("nuvec_residual_rms_float16_s0_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<half, false, false>) mlx::rms::residual_rms_single_row<half, false, false>;
+template [[host_name("nuvec_residual_rms_looped_float16_s0_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<half, false, false>) mlx::rms::residual_rms_looped<half, false, false>;
+template [[host_name("nuvec_residual_rms_float16_s0_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<half, false, true>) mlx::rms::residual_rms_single_row<half, false, true>;
+template [[host_name("nuvec_residual_rms_looped_float16_s0_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<half, false, true>) mlx::rms::residual_rms_looped<half, false, true>;
+template [[host_name("nuvec_residual_rms_float16_s1_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<half, true, false>) mlx::rms::residual_rms_single_row<half, true, false>;
+template [[host_name("nuvec_residual_rms_looped_float16_s1_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<half, true, false>) mlx::rms::residual_rms_looped<half, true, false>;
+template [[host_name("nuvec_residual_rms_float16_s1_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<half, true, true>) mlx::rms::residual_rms_single_row<half, true, true>;
+template [[host_name("nuvec_residual_rms_looped_float16_s1_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<half, true, true>) mlx::rms::residual_rms_looped<half, true, true>;
+template [[host_name("nuvec_residual_rms_bfloat16_s0_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<bfloat16_t, false, false>) mlx::rms::residual_rms_single_row<bfloat16_t, false, false>;
+template [[host_name("nuvec_residual_rms_looped_bfloat16_s0_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<bfloat16_t, false, false>) mlx::rms::residual_rms_looped<bfloat16_t, false, false>;
+template [[host_name("nuvec_residual_rms_bfloat16_s0_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<bfloat16_t, false, true>) mlx::rms::residual_rms_single_row<bfloat16_t, false, true>;
+template [[host_name("nuvec_residual_rms_looped_bfloat16_s0_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<bfloat16_t, false, true>) mlx::rms::residual_rms_looped<bfloat16_t, false, true>;
+template [[host_name("nuvec_residual_rms_bfloat16_s1_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<bfloat16_t, true, false>) mlx::rms::residual_rms_single_row<bfloat16_t, true, false>;
+template [[host_name("nuvec_residual_rms_looped_bfloat16_s1_n0")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<bfloat16_t, true, false>) mlx::rms::residual_rms_looped<bfloat16_t, true, false>;
+template [[host_name("nuvec_residual_rms_bfloat16_s1_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_single_row<bfloat16_t, true, true>) mlx::rms::residual_rms_single_row<bfloat16_t, true, true>;
+template [[host_name("nuvec_residual_rms_looped_bfloat16_s1_n1")]] [[kernel]] decltype(mlx::rms::residual_rms_looped<bfloat16_t, true, true>) mlx::rms::residual_rms_looped<bfloat16_t, true, true>;

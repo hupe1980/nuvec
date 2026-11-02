@@ -1,6 +1,6 @@
 +++
 title = "Distributed"
-description = "nuvec::distributed runs one program across processes or Macs with MLX's collectives (all_sum, all_gather, send, recv) over MLX's TCP ring, and splits linear layers for tensor parallelism."
+description = "nuvec::distributed runs one program across processes or Macs with MLX's collectives (all_sum, all_gather, sum_scatter, send, recv) over MLX's TCP ring or, experimentally, JACCL over Thunderbolt 5 RDMA, and splits linear layers for tensor parallelism."
 weight = 115
 [extra]
 group = "Libraries"
@@ -10,7 +10,9 @@ group = "Libraries"
 
 ## Launching a group
 
-Every process calls `init`, which reads MLX's launch environment: `MLX_HOSTFILE`, a JSON list with one entry per rank of `"host:port"` addresses, and `MLX_RANK`. The processes can share one Mac (over loopback) or run one per Mac (over Ethernet or Thunderbolt IP).
+Every process calls `init`, which reads MLX's launch environment and connects the first backend it describes: the TCP ring, then JACCL. `init_backend(strict, Backend::Ring)` (or `Backend::Jaccl`) names the backend, as MLX's `init(backend=...)`; a second call returns the same group, and `is_available(backend)` reports whether a backend can run on this machine.
+
+The ring reads `MLX_HOSTFILE`, a JSON list with one entry per rank of `"host:port"` addresses, and `MLX_RANK`. The processes can share one Mac (over loopback) or run one per Mac (over Ethernet or Thunderbolt IP).
 
 ```json
 [["10.0.0.1:5000"], ["10.0.0.2:5000"]]
@@ -39,14 +41,15 @@ assert_eq!(all.shape(), [3 * group.size() as i32]);
 |---|---|
 | `all_sum`, `all_max`, `all_min` | The element-wise reduction over the group; every rank gets the same bits, and reruns repeat them |
 | `all_gather` | Every rank's array, concatenated along the first axis in rank order |
-| `send(x, dst)`, `recv(shape, dtype, src)`, `recv_like(x, src)` | Point to point between ring neighbours; a receive of another dtype or shape is an error |
+| `sum_scatter` | Rank `r`'s slice `r` of the first axis, summed over the group (the first axis must be divisible by the group size) |
+| `send(x, dst)`, `recv(shape, dtype, src)`, `recv_like(x, src)` | Point to point (on the ring topologies, between neighbours); a receive of another dtype or shape is an error |
 | `sum_gradients(x)` | `x`, with its gradient summed over the group |
 
 Each takes the group as its last argument (`None`: the default group, which `init` sets). Collectives run on the CPU over the arrays' memory; on the GPU they wait for the work producing their inputs.
 
 ## Gradients and compile
 
-As in MLX, the gradient of `all_sum` passes the cotangent through (each rank's loss is its own), and the gradient of `all_gather` is this rank's rows. A compiled function with collectives communicates on every call. For data-parallel training, average the gradients with `all_sum` before the optimizer step.
+As in MLX, the gradient of `all_sum` passes the cotangent through (each rank's loss is its own), and the gradient of `all_gather` is this rank's rows. By the same rule, the gradient of `sum_scatter` is the cotangent in this rank's rows and zero elsewhere. A compiled function with collectives communicates on every call. For data-parallel training, average the gradients with `all_sum` before the optimizer step.
 
 ## Tensor-parallel layers
 
@@ -69,10 +72,31 @@ assert_eq!(y.shape(), [1, 4]);
 # }
 ```
 
-## Failures
+## JACCL: RDMA over Thunderbolt 5 (experimental)
 
-A peer that never starts, or exits during a collective, fails every pending operation with an error naming its rank within the timeout (`NUVEC_DISTRIBUTED_TIMEOUT`, in seconds, default 30). Nothing hangs or panics.
+The `jaccl` feature (`nuvec = { version = "0.6", features = ["jaccl"] }`) adds MLX's JACCL backend: the collectives over RDMA between Macs cabled with Thunderbolt 5 (macOS 26.2 or later). It is experimental: it is tested on an emulated fabric, not yet on Thunderbolt 5 hardware.
+
+- **Enable RDMA** once per Mac: start in recoveryOS, open Terminal, run `rdma_ctl enable`, reboot. `nuvec::distributed::jaccl::devices()` then lists the Mac's RDMA devices with their port state and address; a device without an IPv4 address needs a link-local one on its Thunderbolt interface.
+- **Cable** every pair of Macs (the mesh, up to 8 Macs) or every Mac to its two neighbours (the ring), with up to four cables per pair; large transfers use every cable at once.
+- **Launch** with MLX's hostfile and `mlx.launch --backend jaccl` (or `--backend jaccl-ring` to prefer the ring), which starts any program: `mlx.launch --backend jaccl --hostfile hosts.json -- ./my-program`. It writes the device file (`MLX_IBV_DEVICES`: per rank, per peer `null`, a device name or a list of names), the rank and rank 0's coordinator address, and `init` picks them up. `jaccl::Config` and `jaccl::init_with` take the same configuration in code, and `jaccl::Options::side_channel` replaces the coordinator with the caller's own all-gather.
+
+Reductions add the ranks' values in rank order (the mesh) or once per chunk owner (the ring), so every rank gets the same bits and reruns repeat them. Every message carries a sequence number, so a frame lost on the link fails the operation instead of corrupting a later one.
+
+## Failures and re-forming
+
+A peer that never starts, exits or loses its link fails every pending operation with an error naming its rank within the timeout (`NUVEC_DISTRIBUTED_TIMEOUT`, in seconds, default 30). The group then refuses further work with that first error. Nothing hangs or panics.
+
+- **Finding a lost peer while idle:** `group.health()` checks every connection without running a collective, sending data or blocking. A peer whose process ended is reported at once, naming its rank. Every connection uses TCP keepalive, so a Mac that went to sleep or lost its cable is reported within about 15 s.
+- **Re-forming in the same process:** `group.close()` releases a group's connections, after which its operations fail. A new group over the remaining Macs then forms with `init_with`, or with `init` from a new hostfile: `init` never returns a failed or closed group.
+
+## Authentication
+
+Set the same secret on every Mac to authenticate every connection: `NUVEC_DISTRIBUTED_KEY` for `init`, or `Options::key` (`jaccl::Options::key` for JACCL's side channel). Generate it with `openssl rand -hex 32`; shorter than 16 bytes is refused.
+
+Both ends prove that they hold the key (HMAC-SHA256 over fresh challenges from each side), so a host without it cannot join a group, and a recorded handshake cannot be replayed. A stray connection is dropped while the group forms. A key on some ranks only, or different keys, fail with an error saying so, and the key never appears in an error.
+
+The key authenticates who connects; it does not encrypt the traffic. On a network you do not trust, run the group over a VPN such as WireGuard, or on its own network segment.
 
 ## Performance
 
-`just bench-distributed` times `all_sum` against MLX's ring backend on the same Mac. On an M4 Pro over loopback nuvec takes 0.36–0.78× MLX's time with 2 ranks and 0.17–0.66× with 4, from 4 KB to 256 MB. RDMA over Thunderbolt 5 (MLX's JACCL backend) is not supported.
+`just bench-distributed` times `all_sum` against MLX's ring backend on the same Mac. On an M4 Pro over loopback nuvec takes 0.36–0.78× MLX's time with 2 ranks and 0.17–0.66× with 4, from 4 KB to 256 MB. `scripts/bench_distributed.py --hostfile hosts.json --backend jaccl` runs the same comparison on several Macs.

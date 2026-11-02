@@ -24,12 +24,7 @@ fn aq(w: &Array, gs: i32, bits: i32) -> Quantized {
 
 /// Affine quantized weights from their parts.
 fn qw(w: &Array, s: &Array, b: &Array, gs: i32, bits: i32) -> Quantized {
-    Quantized::new(
-        w.clone(),
-        s.clone(),
-        Some(b.clone()),
-        Quant::affine(gs, bits),
-    )
+    Quantized::affine(w.clone(), s.clone(), b.clone(), gs, bits)
 }
 
 /// The parts of affine quantized weights: codes, scales and biases.
@@ -1799,4 +1794,34 @@ fn sorted_few_row_gathers_keep_the_one_row_bits() {
             }
         }
     });
+}
+
+/// The constructors carry MLX's bias rule; `new` with the wrong biases fails with an
+/// error saying so, and zero biases stand for a bias-free affine checkpoint.
+#[test]
+fn constructors_carry_the_bias_rule() {
+    let mut rng = Rng::new(3);
+    let w = random(&mut rng, &[4, 64], DType::F32);
+    let (codes, scales, biases) = parts(aq(&w, 32, 4));
+    let q = Quantized::new(
+        codes.clone(),
+        scales.clone(),
+        Some(biases.clone()),
+        Quant::affine(32, 4),
+    );
+    assert_eq!(qw(&codes, &scales, &biases, 32, 4).quant, q.quant);
+    let e = Quantized::new(codes.clone(), scales.clone(), None, Quant::affine(32, 4))
+        .dequantize(DType::F32)
+        .check()
+        .unwrap_err();
+    assert!(e.to_string().contains("biases must be provided"), "{e}");
+    // Zero offsets: the codes times the scales.
+    let zeros = Quantized::affine(codes, scales.clone(), ops::zeros_like(&scales), 32, 4);
+    assert!(zeros.dequantize(DType::F32).check().is_ok());
+    let fp = w.quantize(QuantMode::Mxfp4);
+    let rebuilt = Quantized::fp(fp.weight.clone(), fp.scales.clone(), QuantMode::Mxfp4);
+    assert_eq!(
+        rebuilt.dequantize(DType::F32).to_vec::<f32>().unwrap(),
+        fp.dequantize(DType::F32).to_vec::<f32>().unwrap()
+    );
 }

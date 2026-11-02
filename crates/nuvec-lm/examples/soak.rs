@@ -64,10 +64,10 @@ fn main() -> nuvec::Result<()> {
 
 fn soak(run: Duration, fixture: bool, model_id: &str) -> nuvec::Result<()> {
     set_default_stream(Stream::default_for(Device::gpu(0)));
-    let device = nuvec::gpu::Device::shared().expect("a Metal device");
+    assert!(nuvec::metal::is_available(), "a Metal device");
     // A server bounds the buffer cache (by default it may grow to the memory limit, as
     // MLX's): requests of varying lengths leave buffers of sizes no later request reuses.
-    device.set_cache_limit(1 << 30);
+    nuvec::memory::set_cache_limit(1 << 30);
     let (model, prompt) = if fixture {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3_f32");
         (
@@ -137,13 +137,13 @@ fn soak(run: Duration, fixture: bool, model_id: &str) -> nuvec::Result<()> {
         drop((y, picked));
         requests += 1;
         if requests.is_multiple_of(10) {
-            device.clear_cache();
+            nuvec::memory::clear_cache();
             if start.elapsed() >= warmup {
                 floors.push(phys_footprint());
             }
         }
         // Between requests nothing is in use but the weights.
-        let active = device.memory().active;
+        let active = nuvec::memory::stats().active;
         match baseline {
             None => baseline = Some(active),
             Some(b) if active > b + (1 << 20) => {
@@ -154,7 +154,7 @@ fn soak(run: Duration, fixture: bool, model_id: &str) -> nuvec::Result<()> {
             Some(_) => {}
         }
         if start.elapsed() >= next_sample {
-            let m = device.memory();
+            let m = nuvec::memory::stats();
             let foot = phys_footprint();
             let t = start.elapsed();
             writeln!(

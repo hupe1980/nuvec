@@ -88,6 +88,40 @@ impl Buffer {
         Ok(buffer)
     }
 
+    /// The bytes `offset..offset + len` of the file at `path` (`offset` a page multiple):
+    /// mapped without a copy where arrays live in Metal memory, read elsewhere.
+    pub(crate) fn map_file_range(
+        path: &std::path::Path,
+        offset: usize,
+        len: usize,
+    ) -> Result<Self> {
+        #[cfg(all(target_os = "macos", not(miri)))]
+        if let Some(device) = device() {
+            let buffer = device
+                .map_file_range(path, offset, len)
+                .map_err(|e| match e {
+                    nuvec_gpu::GpuError::OutOfMemory(n) => Error::OutOfMemory(n),
+                    e => Error::Io(e.to_string()),
+                })?;
+            let len = buffer.len();
+            return Ok(Self::new(Storage::Metal(buffer), len));
+        }
+        let io = |e: std::io::Error| Error::Io(format!("{}: {e}", path.display()));
+        let file = std::fs::File::open(path).map_err(io)?;
+        let mut buffer = Self::try_alloc(len)?;
+        #[cfg(unix)]
+        std::os::unix::fs::FileExt::read_exact_at(&file, buffer.bytes_mut(), offset as u64)
+            .map_err(io)?;
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = file;
+            file.seek(SeekFrom::Start(offset as u64)).map_err(io)?;
+            file.read_exact(buffer.bytes_mut()).map_err(io)?;
+        }
+        Ok(buffer)
+    }
+
     /// A buffer of `len` zero bytes.
     pub(crate) fn try_zeroed(len: usize) -> Result<Self> {
         let mut buffer = Self::try_alloc(len)?;

@@ -69,6 +69,8 @@ pub enum NaxReason {
     Unmeasured,
     /// A NAX pipeline failed to build; the existing kernels are used from then on.
     PipelineError,
+    /// There is no Metal device.
+    NoDevice,
 }
 
 /// Whether products run on the Neural Accelerator kernels ([`crate::Device::nax`]).
@@ -191,4 +193,20 @@ mod nax_tests {
             off(NaxReason::NoLibrary)
         );
     }
+}
+
+/// The machine's physical memory in bytes, with or without a GPU: `NSProcessInfo` on
+/// macOS, `MemTotal` of `/proc/meminfo` on Linux, 0 where neither is available.
+pub fn physical_memory() -> u64 {
+    #[cfg(target_os = "macos")]
+    return objc2_foundation::NSProcessInfo::processInfo().physicalMemory();
+    #[cfg(not(target_os = "macos"))]
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            let line = s.lines().find(|l| l.starts_with("MemTotal:"))?;
+            let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+            Some(kib * 1024)
+        })
+        .unwrap_or(0)
 }

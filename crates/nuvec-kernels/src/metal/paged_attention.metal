@@ -286,25 +286,31 @@ template <typename T, int D, int TK = 4, bool W = false>
   }
 }
 
-// `cache[slot / block_size, h, slot % block_size, :] = new[t, h, :]` for each new position
-// `t` with its `slots[t]`; one thread per element. `params`: kv_heads, block_size, D,
-// num_blocks. Slots outside `0..num_blocks * block_size` are skipped.
+// `cache[slot / block_size, h, slot % block_size, :] = new[b, t, h, :]` for each new
+// position `(b, t)` with its `slots[b · T + t]`; one thread per element, `new` read through
+// its strides (`src_strides`: b, t, h, e; a strided view needs no copy). `params`:
+// kv_heads, block_size, D, num_blocks, T. Slots outside `0..num_blocks * block_size` are
+// skipped.
 template <typename T>
 [[kernel]] void paged_write(
     const device T* src [[buffer(0)]],
     const device int* slots [[buffer(1)]],
     device T* cache [[buffer(2)]],
     const constant int* params [[buffer(3)]],
+    const constant int64_t* src_strides [[buffer(4)]],
     uint3 pos [[thread_position_in_grid]]) {
   const int hkv = params[0], block_size = params[1], d = params[2], num_blocks = params[3];
-  const int t = pos.z, h = pos.y, e = pos.x;
-  const int slot = slots[t];
+  const int length = params[4];
+  const int bt = pos.z, h = pos.y, e = pos.x;
+  const int b = bt / length, t = bt % length;
+  const int slot = slots[bt];
   if (slot < 0 || ulong(slot) >= ulong(num_blocks) * ulong(block_size)) {
     return;
   }
   const size_t at =
       ((size_t(slot / block_size) * hkv + h) * block_size + slot % block_size) * d + e;
-  cache[at] = src[(size_t(t) * hkv + h) * d + e];
+  cache[at] = src[b * src_strides[0] + t * src_strides[1] + h * src_strides[2] +
+                  e * src_strides[3]];
 }
 
 #define instantiate_paged_w(tname, type, w, suffix)                                    \

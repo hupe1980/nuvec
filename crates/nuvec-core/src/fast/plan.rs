@@ -138,8 +138,23 @@ pub(crate) fn tiled_head(d: usize, dv: usize) -> bool {
 
 /// Whether the two-pass kernel has a one-key-per-step (`_tk1`) variant for these types.
 pub(crate) fn tk1_variant(dtype: DType, d: usize, dv: usize) -> bool {
-    (dtype == DType::BF16 && d == 256 && dv == 256)
+    (d == 512 && dv == 512)
+        || (dtype == DType::BF16 && d == 256 && dv == 256)
         || (dtype == DType::F32 && d == dv && (d == 192 || d == 256))
+}
+
+/// Whether one key per step is the faster first pass. Its bits are MLX's (the four-key
+/// prefetch only issues loads early), but at head 512, and at head 256 in float32, the
+/// prefetched keys and values spill registers: one key per step takes 0.15–0.57× the time
+/// (D-117).
+fn tk1_faster(dtype: DType, d: usize) -> bool {
+    d == 512 || (dtype == DType::F32 && d == 256)
+}
+
+/// Whether the four-keys-per-step first pass cannot launch `gqa` query heads per
+/// threadgroup, so one key per step is the only vector kernel.
+fn tk1_needed(key: &RouteKey, blocks: usize) -> bool {
+    32 * (key.hq / key.hkv) > threads(key, blocks, false)
 }
 
 /// The configuration of one query row over `lk` keys run alone (MLX's one-query rule), or
@@ -169,8 +184,9 @@ fn one_row(key: &RouteKey, class: char, lk: usize) -> Option<GroupKind> {
         && d == dv
         && lk >= 8192
         && ((gqa == 8 && (d == 64 || d == 128)) || ((gqa == 12 || gqa == 16) && d == 128));
-    let tk1 =
-        !gqa_kernel && tk1_variant(key.dtype, d, dv) && 32 * gqa > threads(key, blocks, false);
+    let tk1 = !gqa_kernel
+        && tk1_variant(key.dtype, d, dv)
+        && (tk1_faster(key.dtype, d) || tk1_needed(key, blocks));
     Some(GroupKind::Vector {
         passes: 2,
         blocks,
@@ -242,8 +258,8 @@ fn vector_schedule(key: &RouteKey, class: char) -> Option<SmallVec<[Group; 2]>> 
     // times slower than the composition MLX picks when the rows do not fit one vector
     // threadgroup (`Lq · gqa > 32`): those calls keep the composition (no serial rule).
     let gqa = key.hq / key.hkv;
-    let tk1 = |k: &Option<GroupKind>| matches!(k, Some(GroupKind::Vector { tk1: true, .. }));
-    if lq > 1 && lq * gqa > 32 && kinds.iter().any(tk1) {
+    let needed = |k: &Option<GroupKind>| matches!(k, Some(GroupKind::Vector { tk1: true, blocks, .. }) if tk1_needed(key, *blocks));
+    if lq > 1 && lq * gqa > 32 && kinds.iter().any(needed) {
         return None;
     }
     let mut groups: SmallVec<[Group; 2]> = SmallVec::new();

@@ -76,10 +76,10 @@ fn main() -> nuvec::Result<()> {
         "Generation: {count} tokens, {:.3} tokens-per-sec",
         count.saturating_sub(1) as f64 / decode_seconds
     );
-    if let Some(d) = nuvec::gpu::Device::shared() {
+    if nuvec::metal::is_available() {
         println!(
             "Peak memory: {:.3} GB allocated (memory-mapped weights not included)",
-            d.memory().peak as f64 / 1e9
+            nuvec::memory::stats().peak as f64 / 1e9
         );
     }
     Ok(())
