@@ -61,8 +61,8 @@ pub(crate) fn ranks_with(
         })
         .collect();
     let deadline = Instant::now() + Duration::from_secs(120);
-    let mut outputs = Vec::new();
-    for (rank, child) in children.iter_mut().enumerate() {
+    let mut results = Vec::new();
+    for child in &mut children {
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break Some(status);
@@ -86,18 +86,25 @@ pub(crate) fn ranks_with(
             .unwrap()
             .read_to_string(&mut err)
             .unwrap();
-        match status {
-            Some(s) if s.success() => outputs.push(out),
-            _ => {
-                for c in &mut children {
-                    let _ = c.kill();
-                }
-                panic!("{test}: rank {rank} failed ({status:?})\n{out}\n{err}");
-            }
+        if status.is_none() {
+            let _ = child.kill();
         }
+        results.push((status, out, err));
     }
     let _ = std::fs::remove_file(&hostfile);
-    Some(outputs)
+    // On a failure, every rank's output: the first rank to fail is often not rank 0.
+    if results
+        .iter()
+        .any(|(s, ..)| !s.is_some_and(|s| s.success()))
+    {
+        let report: Vec<String> = results
+            .iter()
+            .enumerate()
+            .map(|(rank, (s, out, err))| format!("rank {rank} ({s:?}):\n{out}\n{err}"))
+            .collect();
+        panic!("{test}: a rank failed\n{}", report.join("\n"));
+    }
+    Some(results.into_iter().map(|(_, out, _)| out).collect())
 }
 
 /// The lines of each rank's output starting with `BITS`, which must agree.

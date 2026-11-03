@@ -49,8 +49,8 @@ pub use memory::{MemoryStats, allocation_size, mapping_size, page_size};
 mod metal;
 #[cfg(target_os = "macos")]
 pub use metal::{
-    Arg, Buffer, CommandBuffer, Constant, Device, Event, Pending, Pipeline, Submitted, Timeline,
-    profile,
+    Arg, Buffer, CommandBuffer, Constant, Deferred, Device, Event, Pending, Pipeline, Submitted,
+    Timeline, profile,
 };
 
 #[cfg(not(target_os = "macos"))]

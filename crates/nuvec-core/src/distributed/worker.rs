@@ -30,6 +30,12 @@ struct State {
     /// The value of the last job queued.
     #[cfg(all(target_os = "macos", not(miri)))]
     issued: u64,
+    /// The value of the last job finished.
+    #[cfg(all(target_os = "macos", not(miri)))]
+    done: u64,
+    /// What runs once a job is done, by its value (in order).
+    #[cfg(all(target_os = "macos", not(miri)))]
+    after: VecDeque<(u64, Job)>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -99,6 +105,34 @@ impl Worker {
                 self.idle.notify_all();
             }
         }
+    }
+
+    /// Marks the job of `value` done and runs what waits for it (on the worker thread, before
+    /// the next job starts).
+    #[cfg(all(target_os = "macos", not(miri)))]
+    pub(super) fn finish(&self, value: u64) {
+        let mut state = lock(&self.state);
+        state.done = value;
+        while state.after.front().is_some_and(|(v, _)| *v <= value) {
+            let (_, after) = state.after.pop_front().expect("just checked");
+            drop(state);
+            after();
+            state = lock(&self.state);
+        }
+    }
+
+    /// Runs `f` once the job of `value` is done: at once if it is, otherwise when it
+    /// [finishes](Self::finish).
+    #[cfg(all(target_os = "macos", not(miri)))]
+    pub(super) fn after(&self, value: u64, f: impl FnOnce() + Send + 'static) {
+        let mut state = lock(&self.state);
+        if state.done >= value {
+            drop(state);
+            return f();
+        }
+        // Values are queued in increasing order, by one thread per group.
+        let at = state.after.partition_point(|(v, _)| *v <= value);
+        state.after.insert(at, (value, Box::new(f)));
     }
 
     /// Ends the thread once the queue is empty (jobs hold their group, so none is left

@@ -5,8 +5,8 @@
 //! operations over a group: they run when their result is evaluated, compose with `grad`,
 //! `vmap` and `compile` as MLX defines, and run on the CPU over the arrays' shared memory.
 //! On a GPU stream they run on the group's worker thread once the GPU work producing their
-//! inputs completes, and the GPU work reading their outputs waits for them on the GPU, so
-//! the evaluating thread never waits there. Without a configured group, the default group
+//! inputs completes, and the GPU work reading their outputs is committed once they are done,
+//! so neither the evaluating thread nor the GPU waits for the network. Without a configured group, the default group
 //! has size 1 and every collective is the identity, so single-process code runs unchanged.
 //!
 //! The transport is a [`Communicator`]; `nuvec-distributed` provides MLX's TCP ring and
@@ -550,12 +550,29 @@ pub(crate) fn submit_gpu(
         if let Err(e) = result {
             let _ = status.set(e);
         }
+        // The GPU work waiting for this value is committed first: it then waits on the GPU
+        // only until the signal just below.
+        entry.worker.finish(value);
         if let Some(event) = entry.worker.event.get() {
             event.signal(value);
         }
         drop((input, out));
     });
     Ok((worker, value))
+}
+
+/// Runs `f` once the job of `value` of a worker that [`submit_gpu`] returned is done (its
+/// event raised): at once if it is, otherwise on the worker's thread.
+#[cfg(all(target_os = "macos", not(miri)))]
+pub(crate) fn after_gpu(
+    worker: &(dyn std::any::Any + Send + Sync),
+    value: u64,
+    f: impl FnOnce() + Send + 'static,
+) {
+    worker
+        .downcast_ref::<worker::Worker>()
+        .expect("returned by submit_gpu")
+        .after(value, f);
 }
 
 /// The event of a worker that [`submit_gpu`] returned.
@@ -728,10 +745,12 @@ mod tests {
     use super::*;
 
     /// Rank 0 of two whose peer holds the same data (so a sum doubles it); logs every
-    /// operation, slowly, and fails the reduction tagged with `fail_at` elements.
+    /// operation, taking `delay` per reduction, and fails the reduction tagged with
+    /// `fail_at` elements.
     struct Fake {
         log: Mutex<Vec<String>>,
         fail_at: Option<usize>,
+        delay: Duration,
     }
 
     impl Communicator for Fake {
@@ -742,7 +761,7 @@ mod tests {
             2
         }
         fn all_reduce(&self, op: AllReduce, dtype: DType, data: &mut [u8]) -> Result<()> {
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(self.delay);
             let n = data.len() / dtype.size();
             self.log.lock().unwrap().push(format!("reduce {n}"));
             if self.fail_at == Some(n) {
@@ -770,9 +789,14 @@ mod tests {
     }
 
     fn fake(fail_at: Option<usize>) -> (Group, Arc<Fake>) {
+        slow(fail_at, Duration::from_millis(2))
+    }
+
+    fn slow(fail_at: Option<usize>, delay: Duration) -> (Group, Arc<Fake>) {
         let comm = Arc::new(Fake {
             log: Mutex::new(Vec::new()),
             fail_at,
+            delay,
         });
         (Group::new(comm.clone()), comm)
     }
@@ -852,11 +876,12 @@ mod tests {
         assert_eq!(*comm.log.lock().unwrap(), ["reduce 6"]);
     }
 
-    /// Decode's shape commits by the dispatch policy (MLX's, which commits a command buffer
-    /// that made new buffers after 50 dispatches), not once per collective.
+    /// Decode's shape commits one command buffer per collective besides the dispatch
+    /// policy's (MLX's, which commits a command buffer that made new buffers after 50
+    /// dispatches).
     #[cfg(all(target_os = "macos", not(miri)))]
     #[test]
-    fn collectives_do_not_commit_command_buffers() {
+    fn collectives_commit_one_command_buffer_each() {
         if !gpu() {
             return;
         }
@@ -885,10 +910,26 @@ mod tests {
         let (with, y) = count(true);
         let (without, _) = count(false);
         assert!(
-            with <= without + 56 / 8,
+            with <= without + 56,
             "{with} command buffers for 56 collectives, {without} without them"
         );
         assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 1024]);
+    }
+
+    /// A collective slower than Metal's GPU timeout (a peer still in a long prefill, or
+    /// starting late) neither fails the GPU work after it nor the GPU work after that.
+    #[cfg(all(target_os = "macos", not(miri)))]
+    #[test]
+    fn a_collective_slower_than_the_gpu_timeout() {
+        if !gpu() {
+            return;
+        }
+        let (g, _) = slow(None, Duration::from_secs(6));
+        let x = crate::ops::ones([4], DType::F32).multiply(2.0);
+        let y = all_sum(&x, Some(&g)).add(1.0).multiply(2.0);
+        assert_eq!(y.to_vec::<f32>().unwrap(), [10.0; 4]);
+        let z = crate::ops::ones([4], DType::F32).add(2.0);
+        assert_eq!(z.to_vec::<f32>().unwrap(), [3.0; 4]);
     }
 
     /// A CPU-stream collective after a GPU-stream one in the same evaluation runs after it
@@ -939,10 +980,10 @@ mod tests {
         assert_eq!(other.to_vec::<f32>().unwrap(), [5.0; 5]);
     }
 
-    /// A failed command buffer holding several collectives fails all of their outputs.
+    /// A failed command buffer fails the outputs of every collective after it.
     #[cfg(all(target_os = "macos", not(miri)))]
     #[test]
-    fn a_failed_buffer_fails_every_collective_in_it() {
+    fn a_failed_buffer_fails_the_collectives_after_it() {
         if !gpu() {
             return;
         }

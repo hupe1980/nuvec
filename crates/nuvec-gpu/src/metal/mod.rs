@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 
 use allocator::Pool;
 pub use buffer::Buffer;
-pub use command::{Arg, CommandBuffer, Pending, Submitted, Timeline};
+pub use command::{Arg, CommandBuffer, Deferred, Pending, Submitted, Timeline};
 pub use event::Event;
 use nuvec_kernels::{MetallibMode, NaxMode};
 use objc2::rc::{Retained, autoreleasepool};

@@ -123,3 +123,28 @@ fn a_cpu_step_inside_one_command_buffer_is_ordered() {
         .collect();
     assert!(out.iter().all(|&v| v == 20.0));
 }
+
+#[test]
+fn a_deferred_command_buffer_and_those_after_it_wait_for_its_commit() {
+    let Some(device) = Device::shared() else {
+        return;
+    };
+    let (first, second) = (Event::new(device).unwrap(), Event::new(device).unwrap());
+    let mut cmd = device.command_buffer().unwrap();
+    cmd.signal_event(&first, 1);
+    let (deferred_pending, deferred) = cmd.enqueue_then(|_| {});
+    let mut cmd = device.command_buffer().unwrap();
+    cmd.signal_event(&second, 1);
+    let pending = cmd.commit_then(|_| {});
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!((first.value(), second.value()), (0, 0));
+    // Waiting blocks until another thread commits it.
+    let committer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        deferred.commit();
+    });
+    deferred_pending.wait_result().unwrap();
+    pending.wait_result().unwrap();
+    committer.join().unwrap();
+    assert_eq!((first.value(), second.value()), (1, 1));
+}

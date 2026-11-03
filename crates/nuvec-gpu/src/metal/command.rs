@@ -467,7 +467,35 @@ impl CommandBuffer {
     /// A panic in `on_complete` on Metal's thread is caught and reported on standard error,
     /// so it never aborts the process; the result is still published to [`Pending::wait`].
     #[must_use = "dropping `Pending` does not wait; keep it to `wait`, or drop it explicitly"]
-    pub fn commit_then(mut self, on_complete: impl FnOnce(Result<()>) + Send + 'static) -> Pending {
+    pub fn commit_then(self, on_complete: impl FnOnce(Result<()>) + Send + 'static) -> Pending {
+        self.submit(on_complete, None)
+    }
+
+    /// [`commit_then`](Self::commit_then), but the GPU gets the work only once
+    /// [`Deferred::commit`] is called (or the [`Deferred`] is dropped). The command buffer
+    /// takes its place in the queue now: command buffers committed later run after it. Work
+    /// that waits on the GPU for an event the CPU may raise late is committed this way once
+    /// the event is raised, so the GPU never waits for it (Metal fails a command buffer that
+    /// waits for seconds).
+    #[must_use = "dropping `Deferred` commits at once"]
+    pub fn enqueue_then(
+        self,
+        on_complete: impl FnOnce(Result<()>) + Send + 'static,
+    ) -> (Pending, Deferred) {
+        let gate = Arc::new(Gate::default());
+        let pending = self.submit(on_complete, Some(gate.clone()));
+        let deferred = Deferred {
+            raw: pending.raw.clone(),
+            gate,
+        };
+        (pending, deferred)
+    }
+
+    fn submit(
+        mut self,
+        on_complete: impl FnOnce(Result<()>) + Send + 'static,
+        gate: Option<Arc<Gate>>,
+    ) -> Pending {
         self.close();
         let guards = self.guards.clone();
         let finish = Arc::new(Finish {
@@ -500,7 +528,10 @@ impl CommandBuffer {
             // is called at most once, on any thread: its captures are `Send` (the buffers
             // are only retained or released, and the guards are atomics).
             unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&handler)) };
-            self.raw.commit();
+            match gate {
+                Some(_) => self.raw.enqueue(),
+                None => self.raw.commit(),
+            }
         });
         let sequence = super::buffer::commit_sequence();
         for (guard, write) in guards {
@@ -515,6 +546,7 @@ impl CommandBuffer {
         Pending {
             raw: self.raw.clone(),
             finish,
+            gate,
         }
     }
 
@@ -708,6 +740,8 @@ fn complete(finish: &Finish, raw: &ProtocolObject<dyn MTLCommandBuffer>) {
 pub struct Pending {
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     finish: Arc<Finish>,
+    /// For [`CommandBuffer::enqueue_then`]: set once the work is committed.
+    gate: Option<Arc<Gate>>,
 }
 
 // SAFETY: a committed command buffer is only waited on (`waitUntilCompleted`, which Metal
@@ -729,6 +763,9 @@ impl Pending {
     }
 
     fn result(&self) -> Result<()> {
+        if let Some(gate) = &self.gate {
+            gate.wait();
+        }
         autoreleasepool(|_| {
             self.raw.waitUntilCompleted();
             complete(&self.finish, &self.raw);
@@ -740,6 +777,63 @@ impl Pending {
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pending").finish_non_exhaustive()
+    }
+}
+
+/// Whether an enqueued command buffer has been committed.
+#[derive(Default)]
+struct Gate {
+    committed: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Gate {
+    fn wait(&self) {
+        let mut committed = self
+            .committed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while !*committed {
+            committed = self
+                .changed
+                .wait(committed)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// The commit of a command buffer queued with [`CommandBuffer::enqueue_then`]: call
+/// [`commit`](Self::commit), from any thread, to hand the work to the GPU. Dropping it
+/// commits as well.
+pub struct Deferred {
+    raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    gate: Arc<Gate>,
+}
+
+// SAFETY: an enqueued command buffer is only committed (which Metal allows from any thread)
+// and retained or released.
+unsafe impl Send for Deferred {}
+
+impl Deferred {
+    /// Hands the work to the GPU.
+    pub fn commit(self) {}
+}
+
+impl Drop for Deferred {
+    fn drop(&mut self) {
+        autoreleasepool(|_| self.raw.commit());
+        *self
+            .gate
+            .committed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        self.gate.changed.notify_all();
+    }
+}
+
+impl std::fmt::Debug for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deferred").finish_non_exhaustive()
     }
 }
 

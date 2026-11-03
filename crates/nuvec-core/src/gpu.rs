@@ -519,6 +519,19 @@ mod metal {
         }
     }
 
+    /// Commits `deferred` once every collective of `gates` is done.
+    fn commit_after(
+        mut gates: Vec<(Arc<dyn std::any::Any + Send + Sync>, u64)>,
+        deferred: nuvec_gpu::Deferred,
+    ) {
+        match gates.pop() {
+            None => deferred.commit(),
+            Some((worker, value)) => crate::distributed::after_gpu(&*worker, value, move || {
+                commit_after(gates, deferred)
+            }),
+        }
+    }
+
     pub(crate) struct GpuEval {
         device: Option<&'static MetalDevice>,
         cmd: Option<CommandBuffer>,
@@ -545,6 +558,9 @@ mod metal {
         collectives: Vec<ChunkStatus>,
         /// The open command buffer's collective input signals.
         signal: Option<Arc<BufferSignal>>,
+        /// The collectives whose results the open command buffer reads, as (worker, value):
+        /// it is committed only once they are done.
+        gates: Vec<(Arc<dyn std::any::Any + Send + Sync>, u64)>,
         /// Holds back the dispatch policy's commits (between a collective's input copy and
         /// its signal).
         hold: bool,
@@ -1287,6 +1303,7 @@ mod metal {
                 foreign: Vec::new(),
                 reads: Vec::new(),
                 collectives: Vec::new(),
+                gates: Vec::new(),
                 signal: None,
                 hold: false,
                 made: 0,
@@ -6083,7 +6100,8 @@ mod metal {
             let injected = fault::take();
             #[cfg(test)]
             super::COMMITS.set(super::COMMITS.get() + 1);
-            let pending = cmd.commit_then(move |result| {
+            let gates = std::mem::take(&mut self.gates);
+            let on_complete = move |result: nuvec_gpu::Result<()>| {
                 #[cfg(test)]
                 let result = match injected {
                     true => Err(nuvec_gpu::GpuError::CommandBuffer(
@@ -6100,7 +6118,14 @@ mod metal {
                     k,
                     chunk_result(result.map_err(backend), &reads, &collectives),
                 );
-            });
+            };
+            let pending = if gates.is_empty() {
+                cmd.commit_then(on_complete)
+            } else {
+                let (pending, deferred) = cmd.enqueue_then(on_complete);
+                commit_after(gates, deferred);
+                pending
+            };
             // Profiling times each command buffer alone: nothing may overlap it.
             if nuvec_gpu::profile::enabled() {
                 pending.wait();
@@ -6141,16 +6166,17 @@ mod metal {
             }
         }
 
-        /// Runs a collective without waiting for the GPU or committing (MLX's
-        /// communication stream). In the open command buffer, its input is copied on the GPU
+        /// Runs a collective without waiting for the GPU or the network (MLX's communication
+        /// stream). In the open command buffer, its input is copied on the GPU
         /// (into the output for `Reduce` and `Send`, which then run in place; into a staging
         /// buffer for `Gather` and `SumScatter`), or, `donated` (a `Reduce` or `Send` input
         /// nothing else holds, as MLX's), becomes the output after a dispatch that orders it
         /// after its producers; either is ordered after every producer by the buffers'
-        /// fences, and an event is signalled. The group's worker waits for that
-        /// signal, runs the collective and signals back; the work encoded after it waits
-        /// for that on the GPU. The output is deferred with the open chunk, so it is
-        /// published (or failed with the collective's error) once that work completes.
+        /// fences, and an event is signalled. That command buffer is committed; the group's
+        /// worker waits for the signal, runs the collective, commits the command buffer
+        /// encoded after it (queued in order meanwhile) and signals back. The output is
+        /// deferred with that command buffer's chunk, so it is published (or failed with
+        /// the collective's error) once that work completes.
         pub(crate) fn collective(
             &mut self,
             op: &crate::distributed::CollectiveOp,
@@ -6281,8 +6307,14 @@ mod metal {
                 status: status.clone(),
             };
             let (worker, value) = crate::distributed::submit_gpu(group, job, device)?;
+            // The work so far (with the input signal) goes to the GPU now; the work after
+            // the collective waits for it in a command buffer committed once the collective
+            // is done, so the GPU never waits for the network (Metal fails a command buffer
+            // that waits for seconds).
+            self.commit();
             self.command_buffer()?
                 .wait_event(crate::distributed::worker_event(&*worker), value);
+            self.gates.push((worker, value));
             self.collectives.push(status);
             Ok(vec![out])
         }

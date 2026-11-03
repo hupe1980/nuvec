@@ -6,6 +6,16 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-03
+
+### Fixed
+
+- A collective on a GPU stream that waits more than a few seconds for its peers (a peer in a
+  long prefill, or starting late) no longer fails with `GPU Timeout Error`: the GPU work
+  that reads its result is committed once it is done, so the GPU never waits for the
+  network (MLX's communication stream waits on the GPU). Tensor-parallel decode on one Mac
+  is up to 7% slower than in 0.6.0 (Qwen3-0.6B, 2 ranks), about 3% on Qwen3-8B.
+
 ## [0.6.0] - 2026-11-03
 
 ### Added
@@ -443,7 +453,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/hupe1980/nuvec/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/hupe1980/nuvec/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hupe1980/nuvec/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/hupe1980/nuvec/compare/v0.4.0...v0.4.1

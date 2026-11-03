@@ -45,7 +45,7 @@ assert_eq!(all.shape(), [3 * group.size() as i32]);
 | `send(x, dst)`, `recv(shape, dtype, src)`, `recv_like(x, src)` | Point to point (on the ring topologies, between neighbours); a receive of another dtype or shape is an error |
 | `sum_gradients(x)` | `x`, with its gradient summed over the group |
 
-Each takes the group as its last argument (`None`: the default group, which `init` sets). Collectives run on the CPU over the arrays' memory. On a GPU stream they run on the group's worker thread once their inputs are ready, and the GPU work that reads their results waits for them on the GPU (MLX's communication stream). An input that nothing else holds is reduced or sent in place. `send` and `recv` frame each array, so every rank must run the same nuvec version.
+Each takes the group as its last argument (`None`: the default group, which `init` sets). Collectives run on the CPU over the arrays' memory. On a GPU stream they run on the group's worker thread once their inputs are ready, and the GPU work that reads their results is committed by that thread once they are done (MLX's communication stream, without its GPU-side wait, which Metal fails after a few seconds). An input that nothing else holds is reduced or sent in place. `send` and `recv` frame each array, so every rank must run the same nuvec version.
 
 ## Gradients and compile
 
