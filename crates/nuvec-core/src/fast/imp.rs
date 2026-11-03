@@ -1703,6 +1703,13 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot execute half's hardware f16 conversion")]
     fn tiled_attention_is_laid_out_for_the_heads_transpose() {
+        if crate::with_stream(Device::gpu(0), || {
+            add(Array::from(1.0f32), 1.0).and_then(|a| a.eval())
+        })
+        .is_err()
+        {
+            return; // no Metal device
+        }
         let (b, h, l, d) = (2, 4, 40, 64);
         let q = crate::ops::ones([b, h, l, d], DType::F16);
         let out = crate::fast::scaled_dot_product_attention(
