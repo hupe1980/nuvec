@@ -72,6 +72,12 @@ const SHAPES: &[(&str, usize, usize, usize, bool, i32, i32)] = &[
     ("q06-o", 2047, 2048, 1024, true, 4, 64),
     ("q06-up", 2047, 1024, 3072, true, 4, 64),
     ("q06-down", 2047, 3072, 1024, true, 4, 64),
+    // Qwen3-0.6B's prefill of a 25-token prompt (a 24-row chunk).
+    ("q06s-q", 24, 1024, 2048, true, 4, 64),
+    ("q06s-kv", 24, 1024, 1024, true, 4, 64),
+    ("q06s-o", 24, 2048, 1024, true, 4, 64),
+    ("q06s-up", 24, 1024, 3072, true, 4, 64),
+    ("q06s-down", 24, 3072, 1024, true, 4, 64),
     ("gqmm-2048-up", 16384, 2048, 512, true, 4, 64),
     ("gqmm-2048-down", 16384, 512, 2048, true, 4, 64),
 ];

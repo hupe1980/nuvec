@@ -193,19 +193,20 @@ fn large_arrays_on_two_and_four_ranks() {
     }
 }
 
-/// Split all-reduces (both ring directions over every connection) of 1, 4 and 64 MB with
-/// a different value per element, exact against the reference.
+/// Split all-reduces (both ring directions over every connection) of 256 KB to 64 MB with
+/// a different value per element, exact against the reference: one part (256 KB), parts in
+/// pairs, and on two ranks over two connections a pair and one part alone (1.5 MB).
 fn split(g: Group) {
     let (rank, size) = (g.rank() as f32, g.size() as f32);
-    for mb in [1usize, 4, 64] {
-        let n = (mb << 20) / 4;
+    for kb in [256usize, 1024, 1536, 4096, 65536] {
+        let n = (kb << 10) / 4;
         let v: Vec<f32> = (0..n).map(|i| (i % 1000) as f32 + rank).collect();
         let x = Array::from_slice(&v, [n]).multiply(1.0);
         let v = distributed::all_sum(&x, None).to_vec::<f32>().unwrap();
         let ranks: f32 = (0..g.size()).map(|r| r as f32).sum();
         for (i, got) in v.iter().enumerate() {
             let want = size * (i % 1000) as f32 + ranks;
-            assert_eq!(*got, want, "{mb} MB, element {i}");
+            assert_eq!(*got, want, "{kb} KB, element {i}");
         }
     }
 }

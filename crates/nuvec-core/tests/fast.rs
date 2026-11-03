@@ -1013,7 +1013,7 @@ mod gpu {
         );
     }
 
-    /// `residual_rms_norm` composed as Gemma 4's layers did: `rms_norm`, add, multiply and
+    /// `residual_rms_norm` composed of Gemma 4's layer ops: `rms_norm`, add, multiply and
     /// the next `rms_norm`.
     fn residual_composed(
         h: &Array,
@@ -1147,7 +1147,7 @@ mod gpu {
         assert!(s.check().is_err());
     }
 
-    /// `causal_conv1d_slots` composed as nuvec-lm's Gated DeltaNet decode did.
+    /// `causal_conv1d_slots` composed of Gated DeltaNet's decode ops.
     fn conv_slots_composed(
         x: &Array,
         w: &Array,

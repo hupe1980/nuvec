@@ -6,9 +6,9 @@
 #     scripts/quiet/manual.sh            # all three
 #     scripts/quiet/manual.sh cold       # only these: cold, memory, tensor
 #
-#   cold   - spec 075 SC-002: load time from a cold page cache, plain mlx-community
+#   cold   - load time from a cold page cache, plain mlx-community
 #            checkpoint against its aligned copy (3 rounds each, purged before every load)
-#   memory - the copied-weight footprint (research/11 §6): one 2K-token prefill of
+#   memory - the copied-weight footprint: one 2K-token prefill of
 #            Qwen3-8B, misaligned and through the aligned cache, under the Allocations
 #            (VM Tracker) and Metal System Trace templates
 #   tensor - the tensor-parallel prefill gap: 2 ranks over loopback, nuvec and mlx-lm, each

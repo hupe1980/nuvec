@@ -5,7 +5,7 @@
 //!
 //! The connecting end sends `"nuvecPSK"`, its challenge and its rank; the accepting end
 //! answers with its challenge and its proof; the connecting end checks it and sends its own
-//! proof. Without a key, the connecting end sends its rank alone, as before.
+//! proof. Without a key, the connecting end sends its rank alone.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

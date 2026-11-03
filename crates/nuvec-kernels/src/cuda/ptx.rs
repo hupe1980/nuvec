@@ -358,8 +358,7 @@ pub const ROW_THREADS: u32 = 256;
 /// The sum of each contiguous row: parameters `(out, in, len, rows)`, one block of
 /// [`ROW_THREADS`] per row. Each thread accumulates a strided share in f32, warps reduce
 /// with shuffles, and the first warp reduces the warps' sums; the result is rounded to
-/// `dtype`. (Rows of a few elements waste most of the block; the full backend picks a warp
-/// per row for those.)
+/// `dtype`. Rows of a few elements leave most of the block idle.
 pub fn row_sum(dtype: DType) -> Kernel {
     let name = format!("nuvec_row_sum_{}", dtype.name());
     let params = [

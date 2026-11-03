@@ -45,7 +45,7 @@ assert_eq!(all.shape(), [3 * group.size() as i32]);
 | `send(x, dst)`, `recv(shape, dtype, src)`, `recv_like(x, src)` | Point to point (on the ring topologies, between neighbours); a receive of another dtype or shape is an error |
 | `sum_gradients(x)` | `x`, with its gradient summed over the group |
 
-Each takes the group as its last argument (`None`: the default group, which `init` sets). Collectives run on the CPU over the arrays' memory; on the GPU they wait for the work producing their inputs.
+Each takes the group as its last argument (`None`: the default group, which `init` sets). Collectives run on the CPU over the arrays' memory. On a GPU stream they run on the group's worker thread once their inputs are ready, and the GPU work that reads their results waits for them on the GPU (MLX's communication stream). An input that nothing else holds is reduced or sent in place. `send` and `recv` frame each array, so every rank must run the same nuvec version.
 
 ## Gradients and compile
 
@@ -53,7 +53,7 @@ As in MLX, the gradient of `all_sum` passes the cotangent through (each rank's l
 
 ## Tensor-parallel layers
 
-`nuvec_nn::sharded` splits a linear layer across a group as `mlx.nn` does: `AllToShardedLinear` keeps each rank's slice of the output features, and `ShardedToAllLinear` each rank's slice of the input features, summing the partial products with one `all_sum`. A pair of them splits an MLP (or attention's projections by heads) with one collective per pair. Both convert full-precision and quantized layers, and an uneven split is an error naming the layer.
+`nuvec_nn::sharded` splits a linear layer across a group as `mlx.nn` does: `AllToShardedLinear` keeps each rank's slice of the output features, and `ShardedToAllLinear` each rank's slice of the input features, summing the partial products with one `all_sum`. A pair of them splits an MLP (or attention's projections by heads) with one collective per pair. Both convert full-precision and quantized layers, and an uneven split is an error naming the layer. nuvec-lm shards whole models this way ([tensor parallelism](@/docs/llm.md#tensor-parallelism)).
 
 ```rust
 use nuvec::distributed::Group;
@@ -74,7 +74,7 @@ assert_eq!(y.shape(), [1, 4]);
 
 ## JACCL: RDMA over Thunderbolt 5 (experimental)
 
-The `jaccl` feature (`nuvec = { version = "0.6", features = ["jaccl"] }`) adds MLX's JACCL backend: the collectives over RDMA between Macs cabled with Thunderbolt 5 (macOS 26.2 or later). It is experimental: it is tested on an emulated fabric, not yet on Thunderbolt 5 hardware.
+The `jaccl` feature of `nuvec` (`cargo add nuvec --features jaccl`) adds MLX's JACCL backend: the collectives over RDMA between Macs cabled with Thunderbolt 5 (macOS 26.2 or later). It is experimental: it is tested on an emulated fabric, not on Thunderbolt 5 hardware.
 
 - **Enable RDMA** once per Mac: start in recoveryOS, open Terminal, run `rdma_ctl enable`, reboot. `nuvec::distributed::jaccl::devices()` then lists the Mac's RDMA devices with their port state and address; a device without an IPv4 address needs a link-local one on its Thunderbolt interface.
 - **Cable** every pair of Macs (the mesh, up to 8 Macs) or every Mac to its two neighbours (the ring), with up to four cables per pair; large transfers use every cable at once.
@@ -86,7 +86,7 @@ Reductions add the ranks' values in rank order (the mesh) or once per chunk owne
 
 A peer that never starts, exits or loses its link fails every pending operation with an error naming its rank within the timeout (`NUVEC_DISTRIBUTED_TIMEOUT`, in seconds, default 30). The group then refuses further work with that first error. Nothing hangs or panics.
 
-- **Finding a lost peer while idle:** `group.health()` checks every connection without running a collective, sending data or blocking. A peer whose process ended is reported at once, naming its rank. Every connection uses TCP keepalive, so a Mac that went to sleep or lost its cable is reported within about 15 s.
+- **Finding a lost peer while idle:** `group.health()` checks every connection without running a collective or sending data. A peer whose process ended is reported at once, naming its rank. Every connection uses TCP keepalive, so a Mac that went to sleep or lost its cable is reported within about 15 s.
 - **Re-forming in the same process:** `group.close()` releases a group's connections, after which its operations fail. A new group over the remaining Macs then forms with `init_with`, or with `init` from a new hostfile: `init` never returns a failed or closed group.
 
 ## Authentication
@@ -99,4 +99,4 @@ The key authenticates who connects; it does not encrypt the traffic. On a networ
 
 ## Performance
 
-`just bench-distributed` times `all_sum` against MLX's ring backend on the same Mac. On an M4 Pro over loopback nuvec takes 0.36–0.78× MLX's time with 2 ranks and 0.17–0.66× with 4, from 4 KB to 256 MB. `scripts/bench_distributed.py --hostfile hosts.json --backend jaccl` runs the same comparison on several Macs.
+`just bench-distributed` times `all_sum` against MLX's ring backend on the same Mac. On an M4 Pro over loopback (2026-11-03) nuvec takes 0.24–0.87× MLX's time with 2 ranks and 0.32–0.83× with 4, from 4 KB to 256 MB. `uv run scripts/bench_distributed.py --hostfile hosts.json --backend jaccl` runs the same comparison on several Macs.

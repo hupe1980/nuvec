@@ -44,9 +44,8 @@ pub fn gemm_tiles(dtype: DType, m: usize, n: usize, _cc: (u32, u32)) -> (usize, 
             return (bm, bn, bk);
         }
     }
-    // Measured on sm_86 (A40, spike run 2): 128 × 128 × 32 reaches 33 TFLOP/s at 4096 in
-    // f16; 128 × 256 and larger collapse to 1–3 (registers and shared memory). f32's tiles
-    // are swept separately (spike run 3).
+    // On sm_86 (A40), 128 × 128 × 32 reaches 33 TFLOP/s at 4096 in f16; 128 × 256 and
+    // larger collapse to 1–3 (registers and shared memory). f32 has its own sweep.
     let _ = (m, n);
     match dtype {
         DType::F32 => (64, 64, 32),

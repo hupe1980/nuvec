@@ -805,7 +805,7 @@ def summary(models: list[dict], threshold: float = REGRESSION) -> dict:
                     below_goal.setdefault(key, []).append({"model": entry["id"],
                                                            "ratio": p["ratio"]})
         # Batched tokens may differ in their low bits from each request run alone, as
-        # mlx-lm's (D-103: products route as MLX's; `Batcher::batch_invariant` is tested in
+        # mlx-lm's (products route as MLX's; `BatcherOptions::batch_invariant` is tested in
         # CI): recorded, not flagged.
     out: dict = {"below_gate": below_gate, "below_goal": below_goal, "correctness_flags": flags}
     vs = [(e["id"], cell, p["vs_baseline"]) for e in models if e["status"] not in

@@ -650,7 +650,7 @@ fn encode(tensors: &[(&str, &Array)], metadata: &[(&str, &str)]) -> Result<Vec<u
 const PAD: &str = "__nuvec_pad_";
 
 /// Writes a copy of the safetensors file `src` at `dst` in which every tensor starts at a
-/// multiple of 256 bytes of the file (the placement D-106 measured fastest), with the same
+/// multiple of 256 bytes of the file (the fastest placement measured), with the same
 /// tensors, bit for bit, in the same order, and the same metadata. Gaps are filled with
 /// padding tensors that nuvec never loads, so `dst` is a valid safetensors file that nuvec
 /// maps without a copy. Tensors are streamed with positioned reads (no whole-file copy in

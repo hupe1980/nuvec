@@ -304,7 +304,7 @@ fn window_groups_hold_only_their_window() {
 /// (the `gemma4` wrapper, bfloat16), with K = V full layers (float32, chunked prefill
 /// too), and with the mixture-of-experts branch (4-bit, and Hugging Face's layout). The
 /// half-precision model without experts is bit for bit mlx-lm's; with experts the logits
-/// equal mlx-lm's with a precise router softmax (D-090; mlx-lm's default differs by up to
+/// equal mlx-lm's with a precise router softmax (mlx-lm's default differs by up to
 /// 0.6% of the largest logit here).
 #[test]
 fn gemma4_matches_mlx_lm() {
@@ -1254,10 +1254,10 @@ fn mtp_file(source: &str) -> PathBuf {
 }
 
 /// The MTP head equals an independent oracle: `scripts/lm_fixtures.py` builds a random head
-/// from mlx-lm's own Qwen 3.5 classes (spec 054 R2) and records the logits of every prompt
+/// from mlx-lm's own Qwen 3.5 classes and records the logits of every prompt
 /// position's next-but-one token, from the target's final hidden states and the next
 /// token's embedding (dense and mixture-of-experts layers, the original checkpoints'
-/// layout). Attaching it adds exactly its weights to memory (SC-012); a model without a
+/// layout). Attaching it adds exactly its weights to memory; a model without a
 /// head holds none.
 #[test]
 fn the_mtp_head_equals_mlx_lm_s_layers() {
@@ -1502,7 +1502,7 @@ fn sampled_speculation_keeps_the_sampling_distribution() {
     assert_eq!(run(), run());
 }
 
-/// SC-007 in full: over 20,000 seeded runs (temperature 0.8, top-p 0.9, top-k 20), each of
+/// In full: over 20,000 seeded runs (temperature 0.8, top-p 0.9, top-k 20), each of
 /// the first three tokens' frequencies under sampled speculation pass a chi-square test of
 /// homogeneity against plain sampling at significance 0.001, with drafts of the greedy
 /// continuation (most steps verify) and with the MTP head. A few minutes: run with `just

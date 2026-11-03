@@ -145,7 +145,7 @@ fn encode(dtype: DType, values: &[f64]) -> Vec<u8> {
             DType::I32 => (v as i32).to_le_bytes().to_vec(),
             DType::I64 => (v as i64).to_le_bytes().to_vec(),
             DType::F16 => f16::from_f64(v).to_bits().to_le_bytes().to_vec(),
-            DType::BF16 => bf16::from_f64(v).to_bits().to_le_bytes().to_vec(),
+            DType::BF16 => bf16::from_f32(v as f32).to_bits().to_le_bytes().to_vec(),
             DType::F32 => (v as f32).to_le_bytes().to_vec(),
             DType::F64 => v.to_le_bytes().to_vec(),
             // A complex value with real part v and imaginary part 2v.
@@ -492,9 +492,14 @@ fn groups_run_array_collectives() {
         })
     };
     let groups: Vec<Group> = comms.into_iter().map(|c| Group::new(c)).collect();
+    // On the CPU stream: ranks in one process would share one GPU queue, where a rank's
+    // command buffer waiting for its collective holds back the others' inputs (a rank per
+    // process, as MLX runs them, has its own).
     std::thread::scope(|s| {
         for g in &groups {
             s.spawn(move || {
+                let cpu = nuvec_core::Stream::default_for(nuvec_core::Device::cpu());
+                nuvec_core::set_default_stream(cpu);
                 let x = nuvec_core::Array::from_slice(&[g.rank() as f32 + 1.0; 6], [6]);
                 let sum = dist::all_sum(&x, Some(g)).to_vec::<f32>().unwrap();
                 assert_eq!(sum, [6.0; 6]);

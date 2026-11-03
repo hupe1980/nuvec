@@ -58,7 +58,7 @@ CASES = [
     ("sdpa-wdecode256-w1024", (1, 16, 8, 1, 8192, 256)),
     ("sdpa-wprefill256-w1024", (1, 16, 8, 2048, 3071, 256)),
     # Decode over exactly the window's keys: MLX without a mask, as mlx-lm's rotating cache
-    # calls it (the SC-002 baseline); nuvec with its window option.
+    # calls it (the baseline); nuvec with its window option.
     ("sdpa-wsdecode-w128", (1, 64, 8, 1, 128, 64)),
     ("sdpa-wsdecode256-w1024", (1, 16, 8, 1, 1024, 256)),
     # The same without a window (plain causal decode at head size 256).

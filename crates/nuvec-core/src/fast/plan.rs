@@ -145,8 +145,7 @@ pub(crate) fn tk1_variant(dtype: DType, d: usize, dv: usize) -> bool {
 
 /// Whether one key per step is the faster first pass. Its bits are MLX's (the four-key
 /// prefetch only issues loads early), but at head 512, and at head 256 in float32, the
-/// prefetched keys and values spill registers: one key per step takes 0.15–0.57× the time
-/// (D-117).
+/// prefetched keys and values spill registers: one key per step takes 0.15–0.57× the time.
 fn tk1_faster(dtype: DType, d: usize) -> bool {
     d == 512 || (dtype == DType::F32 && d == 256)
 }

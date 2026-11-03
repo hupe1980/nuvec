@@ -1,6 +1,6 @@
 +++
 title = "Documentation"
-description = "Learn nuvec, the pure-Rust MLX for Apple Silicon: lazy arrays, autodiff and vmap, compile, Metal kernels, quantization, neural networks and LLM inference."
+description = "Learn nuvec, the pure-Rust MLX for Apple Silicon: lazy arrays, autodiff and vmap, compile, Metal kernels, quantization, neural networks, distributed collectives and LLM inference."
 sort_by = "weight"
 template = "section.html"
 +++

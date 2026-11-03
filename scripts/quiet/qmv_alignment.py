@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["mlx==0.32.4"]
 # ///
-"""MLX's quantized GEMV at aligned and unaligned K (research/11 §4, opportunity 2): K that is
+"""MLX's quantized GEMV at aligned and unaligned K: K that is
 not a multiple of 512 (4-bit) takes MLX's generic `qmv`, not `qmv_fast`. Prints µs per call
 and GB/s. Decision: unaligned ≤ 0.90× aligned GB/s → build nuvec's fast unaligned GEMV."""
 

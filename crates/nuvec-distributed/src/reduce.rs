@@ -42,7 +42,7 @@ macro_rules! wrapping {
 macro_rules! half_float {
     ($op:expr, $acc:ident, $x:ident, $t:ty) => {{
         if $op == AllReduce::Sum {
-            sum_half::<$t>($acc, $x);
+            <$t as Half>::sum($acc, $x);
             return Ok(());
         }
         for (a, b) in $acc.chunks_exact_mut(2).zip($x.chunks_exact(2)) {
@@ -69,69 +69,64 @@ macro_rules! half_float {
     }};
 }
 
-/// A 16-bit float whose blocks widen to and narrow from float32.
+/// A 16-bit float's sum: each element's float32 sum rounded once, as MLX's half-precision
+/// add.
 trait Half: Copy {
-    fn widen(bits: &[u16], out: &mut [f32]);
-    fn narrow(values: &[f32], out: &mut [u16]);
+    fn sum(acc: &mut [u8], x: &[u8]);
 }
 
 impl Half for f16 {
-    fn widen(bits: &[u16], out: &mut [f32]) {
-        bits.reinterpret_cast::<f16>().convert_to_f32_slice(out);
-    }
-    fn narrow(values: &[f32], out: &mut [u16]) {
-        out.reinterpret_cast_mut::<f16>()
-            .convert_from_f32_slice(values);
+    /// In blocks through `half`'s slice conversions, which the compiler vectorizes.
+    fn sum(acc: &mut [u8], x: &[u8]) {
+        const BLOCK: usize = 512;
+        let (mut a16, mut b16) = ([0u16; BLOCK], [0u16; BLOCK]);
+        let (mut a32, mut b32) = ([0f32; BLOCK], [0f32; BLOCK]);
+        for (a, b) in acc.chunks_mut(2 * BLOCK).zip(x.chunks(2 * BLOCK)) {
+            let n = a.len() / 2;
+            for (i, (p, q)) in a
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(b.as_chunks::<2>().0)
+                .enumerate()
+            {
+                a16[i] = u16::from_le_bytes(*p);
+                b16[i] = u16::from_le_bytes(*q);
+            }
+            a16[..n]
+                .reinterpret_cast::<f16>()
+                .convert_to_f32_slice(&mut a32[..n]);
+            b16[..n]
+                .reinterpret_cast::<f16>()
+                .convert_to_f32_slice(&mut b32[..n]);
+            for (p, q) in a32[..n].iter_mut().zip(&b32[..n]) {
+                *p += q;
+            }
+            a16[..n]
+                .reinterpret_cast_mut::<f16>()
+                .convert_from_f32_slice(&a32[..n]);
+            for (p, v) in a.as_chunks_mut::<2>().0.iter_mut().zip(&a16[..n]) {
+                *p = v.to_le_bytes();
+            }
+        }
     }
 }
 
 impl Half for bf16 {
-    fn widen(bits: &[u16], out: &mut [f32]) {
-        for (o, &b) in out.iter_mut().zip(bits) {
-            *o = f32::from_bits(u32::from(b) << 16);
-        }
-    }
-    fn narrow(values: &[f32], out: &mut [u16]) {
-        // `bf16::from_f32`, branch-free: round to nearest even, NaN kept quiet.
-        for (o, &v) in out.iter_mut().zip(values) {
-            let x = v.to_bits();
-            let rounded = ((x + 0x7fff + ((x >> 16) & 1)) >> 16) as u16;
-            let nan = ((x >> 16) | 0x0040) as u16;
-            *o = if x & 0x7fff_ffff > 0x7f80_0000 {
-                nan
-            } else {
-                rounded
-            };
-        }
-    }
-}
-
-/// `acc += x` over 16-bit floats in blocks the compiler vectorizes. Each sum is exact in
-/// float32 and rounded once, as MLX's half-precision add.
-fn sum_half<T: Half>(acc: &mut [u8], x: &[u8]) {
-    const BLOCK: usize = 512;
-    let (mut a16, mut b16) = ([0u16; BLOCK], [0u16; BLOCK]);
-    let (mut a32, mut b32) = ([0f32; BLOCK], [0f32; BLOCK]);
-    for (a, b) in acc.chunks_mut(2 * BLOCK).zip(x.chunks(2 * BLOCK)) {
-        let n = a.len() / 2;
-        for (i, (p, q)) in a
-            .as_chunks::<2>()
+    /// One loop the compiler vectorizes: widening is a shift, and the float32 sum rounds to
+    /// nearest even without a NaN check. Both operands widen with zero low bits, so a NaN
+    /// sum (an operand's, made quiet, or the default NaN) keeps them zero, and rounding
+    /// cannot carry it into an infinity.
+    fn sum(acc: &mut [u8], x: &[u8]) {
+        for (a, b) in acc
+            .as_chunks_mut::<2>()
             .0
-            .iter()
-            .zip(b.as_chunks::<2>().0)
-            .enumerate()
+            .iter_mut()
+            .zip(x.as_chunks::<2>().0)
         {
-            a16[i] = u16::from_le_bytes(*p);
-            b16[i] = u16::from_le_bytes(*q);
-        }
-        T::widen(&a16[..n], &mut a32[..n]);
-        T::widen(&b16[..n], &mut b32[..n]);
-        for (p, q) in a32[..n].iter_mut().zip(&b32[..n]) {
-            *p += q;
-        }
-        T::narrow(&a32[..n], &mut a16[..n]);
-        for (p, v) in a.as_chunks_mut::<2>().0.iter_mut().zip(&a16[..n]) {
-            *p = v.to_le_bytes();
+            let widen = |h: [u8; 2]| f32::from_bits(u32::from(u16::from_le_bytes(h)) << 16);
+            let s = (widen(*a) + widen(*b)).to_bits();
+            *a = (((s + 0x7fff + ((s >> 16) & 1)) >> 16) as u16).to_le_bytes();
         }
     }
 }
@@ -233,9 +228,9 @@ mod tests {
         assert!(combine(AllReduce::Max, DType::Complex64, &mut [0; 8], &[0; 8]).is_err());
     }
 
-    /// The block-wise half sums equal rounding each float32 sum once (`half`'s scalar
-    /// conversions), over every bit pattern of one operand: NaNs, infinities, subnormals,
-    /// overflow, and a length that ends mid-block.
+    /// The half sums equal rounding each float32 sum once (`half`'s scalar conversions),
+    /// over every bit pattern of one operand paired with varied ones and with each edge
+    /// value: NaNs, infinities, subnormals and overflow.
     #[test]
     fn half_sums_round_once() {
         let a: Vec<u16> = (0..=u16::MAX).collect();
@@ -245,7 +240,30 @@ mod tests {
             .map(|&x| x.wrapping_mul(40503).rotate_left(5))
             .collect();
         let raw = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // And every pattern against the edge values: NaNs of several payloads and both
+        // signs, infinities, the largest finite values, the smallest subnormals and zeros.
+        let edges: [u16; 12] = [
+            0x7fc0, 0xffc0, 0x7f81, 0xff81, 0x7fff, 0x7f80, 0xff80, 0x7f7f, 0xff7f, 0x0001, 0x8001,
+            0x8000,
+        ];
+        let f16_edges: [u16; 12] = [
+            0x7e00, 0xfe00, 0x7c01, 0xfc01, 0x7fff, 0x7c00, 0xfc00, 0x7bff, 0xfbff, 0x0001, 0x8001,
+            0x8000,
+        ];
         for dtype in [DType::F16, DType::BF16] {
+            let edges = if dtype == DType::F16 {
+                f16_edges
+            } else {
+                edges
+            };
+            let a: Vec<u16> = (0..=u16::MAX)
+                .chain(edges.iter().flat_map(|_| 0..=u16::MAX))
+                .collect();
+            let b: Vec<u16> = b
+                .iter()
+                .copied()
+                .chain(edges.iter().flat_map(|&e| std::iter::repeat_n(e, 1 << 16)))
+                .collect();
             let mut acc = raw(&a);
             combine(AllReduce::Sum, dtype, &mut acc, &raw(&b)).unwrap();
             let want: Vec<u16> = a

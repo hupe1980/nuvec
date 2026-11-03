@@ -9,7 +9,7 @@
 // causal band of `window` keys per query (the keys before it are skipped, never read),
 // compiled in only by the template parameter `W` (the `_w` kernels; the function constants
 // `sv_has_window`/`att_has_window` only declare the `window` argument): a function
-// constant in the loops costs the windowless kernels 8% (D-102). The vector kernels count
+// constant in the loops costs the windowless kernels 8%. The vector kernels count
 // a window's keys from its first key, so a row's result is MLX's over exactly those keys
 // (`keys[lo..=last]`), and the same for any cache layout holding them (a compacted
 // buffer, a paged cache).

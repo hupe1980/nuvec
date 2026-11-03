@@ -102,6 +102,86 @@ template <typename T, typename U, typename Op>
     out[i] = Op()(a[a_off + loc(i, shape, a_strides, ndim)], b[b_off + loc(i, shape, b_strides, ndim)]);
 }
 
+// The `_c` kernels with `NUVEC_PER_THREAD` elements per thread: operands offset once per
+// thread, 32-bit indices, `size` bounding the last thread's elements.
+
+template <typename T, typename U, typename Op, int N = NUVEC_PER_THREAD(T)>
+[[kernel]] void unary_cn(
+    device const T* a [[buffer(0)]],
+    device U* out [[buffer(1)]],
+    constant long& a_off [[buffer(2)]],
+    constant uint& a_scalar [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    device const T* x = a + a_off;
+    uint i = index * N;
+    uint end = min(i + N, size);
+    if (a_scalar) {
+        U v = Op()(x[0]);
+        for (; i < end; ++i) {
+            out[i] = v;
+        }
+        return;
+    }
+    for (; i < end; ++i) {
+        out[i] = Op()(x[i]);
+    }
+}
+
+template <typename T, typename U, typename Op, int N = NUVEC_PER_THREAD(T)>
+[[kernel]] void binary_cn(
+    device const T* a [[buffer(0)]],
+    device const T* b [[buffer(1)]],
+    device U* out [[buffer(2)]],
+    constant long& a_off [[buffer(3)]],
+    constant long& b_off [[buffer(4)]],
+    constant uint& scalars [[buffer(5)]],
+    constant uint& size [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+    device const T* x = a + a_off;
+    device const T* y = b + b_off;
+    uint i = index * N;
+    uint end = min(i + N, size);
+    if (scalars & 1) {
+        T s = x[0];
+        for (; i < end; ++i) {
+            out[i] = Op()(s, y[i]);
+        }
+    } else if (scalars & 2) {
+        T s = y[0];
+        for (; i < end; ++i) {
+            out[i] = Op()(x[i], s);
+        }
+    } else {
+        for (; i < end; ++i) {
+            out[i] = Op()(x[i], y[i]);
+        }
+    }
+}
+
+template <typename T, int N = NUVEC_PER_THREAD(T)>
+[[kernel]] void select_cn(
+    device const uchar* c [[buffer(0)]],
+    device const T* a [[buffer(1)]],
+    device const T* b [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    constant long& c_off [[buffer(4)]],
+    constant long& a_off [[buffer(5)]],
+    constant long& b_off [[buffer(6)]],
+    constant uint& scalars [[buffer(7)]],
+    constant uint& size [[buffer(8)]],
+    uint index [[thread_position_in_grid]]) {
+    device const uchar* w = c + c_off;
+    device const T* x = a + a_off;
+    device const T* y = b + b_off;
+    uint i = index * N;
+    uint end = min(i + N, size);
+    for (; i < end; ++i) {
+        bool take = w[(scalars & 1) ? 0 : i] != 0;
+        out[i] = take ? x[(scalars & 2) ? 0 : i] : y[(scalars & 4) ? 0 : i];
+    }
+}
+
 // Select moves elements by size: the element type does not matter.
 template <typename T>
 [[kernel]] void select_c(
@@ -273,6 +353,8 @@ template <typename T>
 #define NUVEC_UNARY(op, Op, name, T, U)                                                        \
     template [[host_name("nuvec_unary_" #op "_" #name "_c")]] [[kernel]] void unary_c<T, U, Op>( \
         device const T*, device U*, constant long&, constant uint&, uint);                    \
+    template [[host_name("nuvec_unary_" #op "_" #name "_cn")]] [[kernel]] void unary_cn<T, U, Op>( \
+        device const T*, device U*, constant long&, constant uint&, constant uint&, uint);   \
     template [[host_name("nuvec_unary_" #op "_" #name "_g")]] [[kernel]] void unary_g<T, U, Op>( \
         device const T*, device U*, constant long&, constant int*, constant long*, constant int&, uint); \
     template [[host_name("nuvec_unary_" #op "_" #name "_g3")]] [[kernel]] void unary_g3<T, U, Op>( \
@@ -283,6 +365,9 @@ template <typename T>
 #define NUVEC_BINARY(op, Op, name, T, U)                                                                \
     template [[host_name("nuvec_binary_" #op "_" #name "_c")]] [[kernel]] void binary_c<T, U, Op>(      \
         device const T*, device const T*, device U*, constant long&, constant long&, constant uint&, uint); \
+    template [[host_name("nuvec_binary_" #op "_" #name "_cn")]] [[kernel]] void binary_cn<T, U, Op>(    \
+        device const T*, device const T*, device U*, constant long&, constant long&, constant uint&,    \
+        constant uint&, uint);                                                                          \
     template [[host_name("nuvec_binary_" #op "_" #name "_g")]] [[kernel]] void binary_g<T, U, Op>(      \
         device const T*, device const T*, device U*, constant long&, constant long&, constant int*,     \
         constant long*, constant long*, constant int&, uint);                                          \
@@ -366,6 +451,9 @@ NUVEC_BINARY(ne, Ne, complex64, complex64_t, nbool)
     template [[host_name("nuvec_select_" #bits "_c")]] [[kernel]] void select_c<T>(                \
         device const uchar*, device const T*, device const T*, device T*, constant long&,           \
         constant long&, constant long&, constant uint&, uint);                                      \
+    template [[host_name("nuvec_select_" #bits "_cn")]] [[kernel]] void select_cn<T>(              \
+        device const uchar*, device const T*, device const T*, device T*, constant long&,           \
+        constant long&, constant long&, constant uint&, constant uint&, uint);                      \
     template [[host_name("nuvec_select_" #bits "_g")]] [[kernel]] void select_g<T>(                \
         device const uchar*, device const T*, device const T*, device T*, constant long&,           \
         constant long&, constant long&, constant int*, constant long*, constant long*,              \

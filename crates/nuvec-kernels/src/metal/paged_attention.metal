@@ -335,8 +335,7 @@ template <typename T>
   [[kernel]] decltype(paged_attention_2pass_1<type, 512, 1, w>)                        \
   paged_attention_2pass_1<type, 512, 1, w>;
 
-// The window is a template parameter (`_w` kernels), not a function constant in the loops
-// (D-102).
+// The window is a template parameter (`_w` kernels), not a function constant in the loops.
 #define instantiate_paged(tname, type)                                                 \
   instantiate_paged_w(tname, type, false, "")                                          \
   instantiate_paged_w(tname, type, true, "_w")                                         \

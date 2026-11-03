@@ -884,7 +884,7 @@ fn head_512_prefill_runs_in_blocks() {
             );
         }
     }
-    // G6: the measured scratch is within the plan's.
+    // The measured scratch is within the plan's.
     let dev = nuvec_gpu::Device::shared().expect("Metal");
     let p = fast::plan_attention(&q, &k, &k, DType::BF16, &causal).unwrap();
     let out = fast::scaled_dot_product_attention(&qa, &ka, &va, scale, &causal);

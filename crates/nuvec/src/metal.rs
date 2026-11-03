@@ -43,8 +43,9 @@ pub fn stop_capture() {
     }
 }
 
-/// Per-kernel GPU times, collected when `NUVEC_PROFILE` is set (to anything but `0`): every dispatch runs alone
-/// and is timed, so use the shares to find hotspots and the benchmarks for speed.
+/// Per-kernel GPU times, collected when `NUVEC_PROFILE` is set (to anything but `0`): every
+/// dispatch runs alone and is timed, so use the shares to find hotspots and the benchmarks
+/// for speed.
 pub mod profile {
     /// Whether profiling is on.
     pub fn enabled() -> bool {

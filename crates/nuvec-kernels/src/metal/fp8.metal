@@ -31,6 +31,23 @@ template <typename S, typename D>
     out[i] = fp8_convert<S, D>(a[a_off + (a_scalar ? 0 : i)]);
 }
 
+// `fp8_c` with `NUVEC_PER_THREAD` elements per thread (see elementwise.metal's `_cn`).
+template <typename S, typename D, int N = NUVEC_PER_THREAD(S)>
+[[kernel]] void fp8_cn(
+    device const S* a [[buffer(0)]],
+    device D* out [[buffer(1)]],
+    constant long& a_off [[buffer(2)]],
+    constant uint& a_scalar [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    device const S* x = a + a_off;
+    uint i = index * N;
+    uint end = min(i + N, size);
+    for (; i < end; ++i) {
+        out[i] = fp8_convert<S, D>(x[a_scalar ? 0 : i]);
+    }
+}
+
 template <typename S, typename D>
 [[kernel]] void fp8_g(
     device const S* a [[buffer(0)]],
@@ -70,6 +87,8 @@ template <typename S, typename D>
 #define NUVEC_FP8(name, S, D)                                                                        \
     template [[host_name(name "_c")]] [[kernel]] void fp8_c<S, D>(                                  \
         device const S*, device D*, constant long&, constant uint&, uint);                          \
+    template [[host_name(name "_cn")]] [[kernel]] void fp8_cn<S, D>(                                \
+        device const S*, device D*, constant long&, constant uint&, constant uint&, uint);          \
     template [[host_name(name "_g")]] [[kernel]] void fp8_g<S, D>(                                  \
         device const S*, device D*, constant long&, constant int*, constant long*, constant int&, uint); \
     template [[host_name(name "_g3")]] [[kernel]] void fp8_g3<S, D>(                                \

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The CUDA spike (spec 069, US4) on a GPU pod: differential tests, nuvec's benchmark (with a
+# The CUDA runtime on a GPU pod: differential tests, nuvec's benchmark (with a
 # GEMM tile sweep) and MLX's on the same GPU. Run through
 # `scripts/cuda_remote.py session -- bash scripts/cuda_spike.sh` (TESTS_ONLY=1: the tests and
 # memcheck only). Every step has a timeout.

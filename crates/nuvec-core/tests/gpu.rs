@@ -84,6 +84,42 @@ fn elementwise_matches_cpu_on_random_layouts() {
     }
 }
 
+/// Flat arrays of 2^16 elements and more (the kernels that compute several elements per
+/// thread): lengths that end mid-thread, offset operands, scalars on either side, and
+/// element sizes from 1 to 8 bytes, for unary, binary, comparison, select, cast and fp8
+/// kernels.
+#[test]
+fn large_flat_elementwise_matches_cpu() {
+    if crate::common::require_gpu().is_none() {
+        return;
+    }
+    let mut rng = Rng::new(0x5A);
+    for n in [1usize << 16, (1 << 16) + 3, 300_007] {
+        // One more element than needed: `x` starts at element 1 of its buffer.
+        let fv: Vec<f32> = (0..=n).map(|_| (rng.f64() * 8.0 - 4.0) as f32).collect();
+        let gv: Vec<f32> = (0..n).map(|_| (rng.f64() * 8.0 - 4.0) as f32).collect();
+        let x = Array::from_slice(&fv, [n as i32 + 1]).i(1..);
+        let y = Array::from_slice(&gv, [n as i32]);
+        let b = x.astype(DType::BF16);
+        let u = x.astype(DType::U8);
+        let l = x.astype(DType::I64);
+        let s = Array::from(1.5f32);
+        let ctx = |op: &str| format!("{n} {op}");
+        same_on_both::<f32>(&ctx("neg"), || x.negative());
+        same_on_both::<f32>(&ctx("add"), || x.add(&y));
+        same_on_both::<f32>(&ctx("scalar * x"), || s.multiply(&x));
+        same_on_both::<f32>(&ctx("x - scalar"), || x.subtract(&s));
+        same_on_both::<bf16>(&ctx("mul bf16"), || b.multiply(0.5));
+        same_on_both::<u8>(&ctx("add u8"), || u.add(&u));
+        same_on_both::<i64>(&ctx("mul i64"), || l.multiply(&l));
+        same_on_both::<bool>(&ctx("lt"), || x.less(&y));
+        same_on_both::<f32>(&ctx("where"), || x.greater(&y).select(&x, &s));
+        same_on_both::<bf16>(&ctx("cast"), || x.astype(DType::BF16));
+        same_on_both::<f32>(&ctx("cast u8"), || u.astype(DType::F32));
+        same_on_both::<f32>(&ctx("fp8"), || ops::from_fp8(&ops::to_fp8(&x), DType::F32));
+    }
+}
+
 /// Integer `floor_divide` where MLX leaves it undefined, the same on both devices: 0 for a
 /// zero divisor, `MIN // -1` wraps; and rounding toward negative infinity for every type.
 #[test]

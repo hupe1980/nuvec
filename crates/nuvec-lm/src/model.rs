@@ -1353,8 +1353,7 @@ impl SwitchGlu {
         let [b, l, d] = x.shape_n::<3>().unwrap_or_default();
         // Several prompts prefilled together by a batch-invariant `Batcher`: where an item
         // alone would take other kernels (sorting and the grouped kernels depend on the
-        // number of rows), each item goes through the experts alone, so it keeps its bits
-        // (D-101, D-103).
+        // number of rows), each item goes through the experts alone, so it keeps its bits.
         let k = indices.shape().get(2).copied().unwrap_or_default();
         if b > 1
             && l > 1

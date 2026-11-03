@@ -1701,6 +1701,7 @@ mod tests {
     /// The tiled attention kernel's output is laid out `[B, L, H, D]` (MLX's full
     /// attention), so the heads' transpose back is row-contiguous: a view, not a copy.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot execute half's hardware f16 conversion")]
     fn tiled_attention_is_laid_out_for_the_heads_transpose() {
         let (b, h, l, d) = (2, 4, 40, 64);
         let q = crate::ops::ones([b, h, l, d], DType::F16);
@@ -1716,7 +1717,12 @@ mod tests {
         };
         let (h, l, d) = (h as isize, l as isize, d as isize);
         assert_eq!(out.strides(), [l * h * d, d, h * d, 1]);
-        assert!(crate::ops::transpose(&out, [0, 2, 1, 3]).out().flags.row_contiguous);
+        assert!(
+            crate::ops::transpose(&out, [0, 2, 1, 3])
+                .out()
+                .flags
+                .row_contiguous
+        );
     }
 
     #[test]

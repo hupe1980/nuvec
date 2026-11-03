@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The quiet-machine session (research/11): every pending measurement and the experiments that
+# The quiet-machine session: every pending measurement and the experiments that
 # decide the next optimisations, in priority order. Each phase writes into one directory:
 #
 #     scripts/quiet_session.sh             # every phase, in order
@@ -68,9 +68,9 @@ baseline() { # HEAD's bench in target/baseline (a detached worktree), rebuilt wh
 }
 
 ab() {
-    # Specs 076-080 against HEAD, alternating the two builds (three rounds) so drift hits
-    # both alike. 077: MoE decode; 078: hybrid decode; 079: Gemma 4 chains; D-117: Gemma 4
-    # 26B past 1K keys; 076: the Batcher at 4 requests; 080: long prefill with a wired limit.
+    # The baseline build against HEAD, alternating the two (three rounds) so drift hits both
+    # alike: MoE and hybrid decode, Gemma 4 chains, Gemma 4 26B past 1K keys, the Batcher at
+    # 4 requests, and long prefill with a wired limit.
     [ -x "$A" ] || { log "ab: $A missing (run preflight)"; return; }
     local r v exe
     for r in 1 2 3; do
@@ -104,14 +104,14 @@ gates() {
     step gates pipeline uv run scripts/bench_pipeline.py --model mlx-community/Qwen3-0.6B-4bit -n 2
     step gates pipeline-batch uv run scripts/bench_pipeline.py --model mlx-community/Qwen3-0.6B-4bit -n 2 --batch 4
     step gates tensor uv run scripts/bench_pipeline.py --model mlx-community/Qwen3-0.6B-4bit -n 2 --tensor
-    # 075 SC-002: an mlx-community checkpoint through the aligned cache: the first load
+    # An mlx-community checkpoint through the aligned cache: the first load
     # writes the copy, the second maps it (load time, then peak memory in the bench line).
     local cache=$OUT/gates/aligned-cache
     for i in 1 2; do
         step gates "aligned-cache-load-$i" env NUVEC_ALIGNED_CACHE="$cache" "$B" --model "$(snapshot Qwen3.5-9B-4bit)" --text "$TEXT" --repeats 1 --runs 1 --max-tokens 16
     done
     step gates plain-load "$B" --model "$(snapshot Qwen3.5-9B-4bit)" --text "$TEXT" --repeats 1 --runs 1 --max-tokens 16
-    # 074 SC-003: 16 stop strings cost under 1% of decode.
+    # 16 stop strings cost under 1% of decode.
     local m; m=$(snapshot Qwen3-0.6B-4bit)
     for s in 0 16 0 16; do step gates "stops-$s-$RANDOM" "$B" --model "$m" --text "$TEXT" --repeats 8 --runs 3 --max-tokens 256 --ignore-eos --stops $s; done
 }
@@ -165,7 +165,7 @@ beyond() {
 }
 
 decode() {
-    # Filled from the decode/long-prefill study (research/11 §3): per-kernel traces of both
+    # Filled from the decode/long-prefill study: per-kernel traces of both
     # engines on gpt-oss-20b, Gemma 4 E4B and Qwen3.6-35B-A3B at 32K.
     if [ -x scripts/quiet/decode.sh ]; then step decode traces bash scripts/quiet/decode.sh "$OUT/decode"; else log "decode: scripts/quiet/decode.sh not present"; fi
 }

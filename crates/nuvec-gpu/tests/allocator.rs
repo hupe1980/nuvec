@@ -239,7 +239,7 @@ fn memory_in_use_is_reused_only_by_gpu_work_ordered_after_it() {
 /// Buffers above 64 MiB (prefill-sized) are reused by GPU work even when the latest
 /// committed command buffer still uses them, so a long prefill's chunks share their
 /// intermediates; smaller ones (decode-sized) are not while little is cached, so
-/// consecutive command buffers overlap instead of waiting (D-100, D-102).
+/// consecutive command buffers overlap instead of waiting.
 #[test]
 fn only_large_buffers_of_the_latest_command_buffer_are_reused() {
     let Some(device) = device() else { return };

@@ -378,7 +378,7 @@ mod gather {
             let q4 = wf.quantize(Quant::affine(64, 4));
             let q8 = wf.quantize(Quant::affine(32, 8));
             let dense = pattern(&[e, k, n], DType::F16, 2);
-            // The floating-point modes (spec 055), NVFP4 also with a global scale per expert.
+            // The floating-point modes, NVFP4 also with a global scale per expert.
             let mx4 = wf.quantize(QuantMode::Mxfp4);
             let mx8 = wf.quantize(QuantMode::Mxfp8);
             let nv4 = wf.quantize(QuantMode::Nvfp4);

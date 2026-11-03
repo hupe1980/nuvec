@@ -1,7 +1,8 @@
 //! Storage types and element conversions.
 //!
 //! Every dtype maps to a `Pod` storage type ([`with_type!`]). Conversions go through an
-//! exact canonical value, so each element is rounded at most once.
+//! exact canonical value, so each element is rounded at most once (bfloat16 from float64
+//! and 64-bit integers: through float32, as MLX's, so twice).
 
 use bytemuck::{Pod, Zeroable};
 
@@ -79,7 +80,22 @@ macro_rules! half_scalar {
         }
     )*};
 }
-half_scalar!(f16, bf16);
+half_scalar!(f16);
+
+// bfloat16 through float32, as MLX's `bfloat16_t` (constructed from a `float`): `half`'s
+// `bf16::from_f64` rounds about one float32 value in 20,000 the wrong way.
+impl Scalar for bf16 {
+    fn to_canon(self) -> Canon {
+        Canon::Float(self.to_f64())
+    }
+    fn from_canon(value: Canon) -> Self {
+        match value {
+            Canon::Int(i) => bf16::from_f32(i as f32),
+            Canon::Float(f) => bf16::from_f32(f as f32),
+            Canon::Complex(z) => bf16::from_f32(z.re),
+        }
+    }
+}
 
 impl Scalar for Complex64 {
     fn to_canon(self) -> Canon {
@@ -210,5 +226,10 @@ mod tests {
         assert_eq!(convert::<i32, Complex64>(3), Complex64::new(3.0, 0.0));
         assert_eq!(convert::<f64, f16>(1.0 + 1.0 / 4096.0), f16::from_f32(1.0));
         assert_eq!(convert::<bf16, f32>(bf16::from_f32(0.5)), 0.5);
+        // Just above half-way between two bfloat16 values: rounds up (`half`'s `from_f64`
+        // rounds it down).
+        let above = f32::from_bits(0x41ca_8003);
+        assert_eq!(convert::<f32, bf16>(above).to_bits(), 0x41cb);
+        assert_eq!(convert::<f64, bf16>(f64::from(above)).to_bits(), 0x41cb);
     }
 }

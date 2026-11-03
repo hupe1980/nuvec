@@ -876,7 +876,7 @@ def hugging_face_experts(src: Path, config: dict, params: dict) -> None:
 
 
 def mtp_heads() -> None:
-    """Qwen 3.5 multi-token-prediction heads (spec 054 R2, mlx-vlm's drafter structure) on
+    """Qwen 3.5 multi-token-prediction heads (mlx-vlm's drafter structure) on
     `qwen3_5_f32` and `qwen3_5_moe_f32`, built from mlx-lm's own classes with random weights:
     `h = fc([pre_fc_norm_embedding(embed(t + 1)), pre_fc_norm_hidden(hidden(t))])`, one
     full-attention decoder layer (causal over the prompt), `norm`, then the model's head.

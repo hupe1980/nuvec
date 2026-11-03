@@ -3,7 +3,7 @@
 //! communication stream).
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -24,9 +24,11 @@ struct State {
     jobs: VecDeque<Job>,
     /// A job is running.
     busy: bool,
+    #[cfg(all(target_os = "macos", not(miri)))]
     started: bool,
     shut_down: bool,
     /// The value of the last job queued.
+    #[cfg(all(target_os = "macos", not(miri)))]
     issued: u64,
 }
 
@@ -50,7 +52,11 @@ impl Worker {
 
     /// Queues `job(value)`, which runs on the worker thread after every job queued before
     /// it; returns its value (one more than the previous job's).
-    pub(super) fn submit(self: &Arc<Self>, job: impl FnOnce(u64) + Send + 'static) -> u64 {
+    #[cfg(all(target_os = "macos", not(miri)))]
+    pub(super) fn submit(
+        self: &std::sync::Arc<Self>,
+        job: impl FnOnce(u64) + Send + 'static,
+    ) -> u64 {
         let mut state = lock(&self.state);
         state.issued += 1;
         let value = state.issued;
@@ -67,7 +73,8 @@ impl Worker {
         value
     }
 
-    fn run(self: Arc<Self>) {
+    #[cfg(all(target_os = "macos", not(miri)))]
+    fn run(self: std::sync::Arc<Self>) {
         loop {
             let job = {
                 let mut state = lock(&self.state);

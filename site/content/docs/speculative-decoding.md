@@ -28,6 +28,8 @@ let stats = generation.stats(); // steps, verifies, drafted, accepted, pauses
 # }
 ```
 
+Stops, `ignore_eos` and `min_tokens` apply as in `generate` (see [stops](@/docs/llm.md#stops)), and a stop inside an accepted draft ends generation at that token; `generation.finish_reason()` says why it ended.
+
 Greedy output is the model's own greedy output, **bit for bit**: drafts only decide how many tokens a step produces, never which tokens. A verification computes each row exactly as serial decoding would (row-exact products, `nuvec::with_row_exact`, and the attention planner's serial rule), and the verify width is capped where that holds.
 
 ## Drafters

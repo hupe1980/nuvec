@@ -56,11 +56,13 @@ let w_approx = q.dequantize(None);     // bfloat16
 # assert_eq!(w_approx.dtype(), DType::BF16);
 ```
 
+Weights quantized elsewhere (a checkpoint's tensors) become a `Quantized` with `Quantized::affine(weight, scales, biases, group_size, bits)` (biases required, as in MLX) or `Quantized::fp(weight, scales, mode)`.
+
 `view` reinterprets bits as another dtype (MLX's `mx.view`), and `to_fp8` / `from_fp8` convert floats to E4M3 bytes and back; checkpoints that store F8 tensors load them as `uint8`.
 
 ## Products on the GPU
 
-Products use MLX's kernels, chosen by shape as MLX chooses them: matrix-vector kernels for few rows, as in decode; tiled kernels for many rows; split-K when the output is small but the inner dimension long. From 2 rows, MLX's multi-vector kernel reads each weight group once for several rows, so a row's low bits can depend on how many rows share a product, as in MLX. Under `nuvec::with_row_exact` (speculative verification, `Batcher::batch_invariant`), up to 8 rows run as matrix-vector products in which each row's result equals its single-row product bit for bit.
+Products use MLX's kernels, chosen by shape as MLX chooses them: matrix-vector kernels for few rows, as in decode; tiled kernels for many rows; split-K when the output is small but the inner dimension long. From 2 rows, MLX's multi-vector kernel reads each weight group once for several rows, so a row's low bits can depend on how many rows share a product, as in MLX. Under `nuvec::with_row_exact` (speculative verification, `BatcherOptions::batch_invariant`), up to 8 rows run as matrix-vector products in which each row's result equals its single-row product bit for bit.
 
 ## Mixture of experts
 

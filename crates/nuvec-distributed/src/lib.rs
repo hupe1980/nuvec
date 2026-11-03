@@ -36,6 +36,7 @@ mod keepalive;
 mod pool;
 mod reduce;
 mod ring;
+mod socket;
 
 use std::sync::Arc;
 use std::time::Duration;

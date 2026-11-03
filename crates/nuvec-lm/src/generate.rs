@@ -390,11 +390,21 @@ impl Generation<'_> {
     }
 }
 
+/// Whether the allocator's cache is emptied when the caller asks for the token after
+/// `produced` tokens: after the first and every 256 after it, as mlx-lm's `generate_step`
+/// clears after yielding token `n` with `n % 256 == 0` (outside that token's time).
+fn clears_before(produced: usize) -> bool {
+    produced > 0 && (produced - 1).is_multiple_of(256)
+}
+
 impl Iterator for Generation<'_> {
     type Item = Result<u32>;
 
     fn next(&mut self) -> Option<Result<u32>> {
         let y = self.next.take()?;
+        if clears_before(self.produced) {
+            nuvec::memory::clear_cache();
+        }
         self.produced += 1;
         let mut next = None;
         if self.produced < self.options.max_tokens {
@@ -428,16 +438,18 @@ impl Iterator for Generation<'_> {
             return emit.then_some(Ok(token));
         }
         self.next = next;
-        // As mlx-lm: the allocator's cache is emptied every 256 tokens.
-        if self.produced.is_multiple_of(256) {
-            nuvec::memory::clear_cache();
-        }
         Some(Ok(token))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// mlx-lm's schedule: token `n` (0-based) is followed by a clear when `n % 256 == 0`.
+    #[test]
+    fn the_cache_is_cleared_after_mlx_lm_s_tokens() {
+        let clears: Vec<usize> = (0..800).filter(|&p| super::clears_before(p)).collect();
+        assert_eq!(clears, [1, 257, 513, 769]);
+    }
 
     /// Prefilling prompts of the same length together gives each row's cache the keys and
     /// values of the prompt prefilled alone (the `Batcher`'s grouped prefill), for every

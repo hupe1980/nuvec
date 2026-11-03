@@ -10,7 +10,7 @@ group = "GPU"
 
 Evaluating a graph encodes one Metal compute dispatch per node into command buffers and commits them without waiting:
 
-- **Growing command buffers.** An evaluation that starts with the GPU idle commits after 8 dispatches, so the GPU starts quickly, then doubles the batch while the GPU is busy (up to 256).
+- **Growing command buffers.** An evaluation that starts with the GPU idle commits after 8 dispatches, so the GPU starts quickly, then doubles the batch while the GPU is busy (up to 256). A command buffer that makes new buffers commits after 50 dispatches, as MLX's 50 ops, so later work reuses its intermediates.
 - **Minimal barriers.** Dispatches that don't depend on each other run concurrently within a command buffer; a memory barrier is inserted only when a dispatch reads what an earlier one wrote.
 - **Ordering by fences.** Command buffers are ordered through per-buffer fences, so independent work from different evaluations can overlap on the GPU.
 - **Errors.** A GPU failure is reported by the first read of an affected array, and every later GPU result on the device reports it too, as in MLX.

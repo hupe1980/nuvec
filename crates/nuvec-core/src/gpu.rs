@@ -322,6 +322,11 @@ mod metal {
     const IDLE_DISPATCHES: usize = 8;
     /// Command buffers in flight per device before submission blocks (MLX: 10).
     const MAX_IN_FLIGHT: usize = 10;
+    /// Dispatches at which a command buffer that made new buffers is committed, as MLX
+    /// commits every 50 ops (`max_ops_per_buffer`): later work then reuses its
+    /// intermediates instead of making its own (the first steps after `clear_cache`).
+    /// Command buffers that only reuse cached buffers grow up to [`MAX_DISPATCHES`].
+    const FRESH_DISPATCHES: usize = 50;
 
     type Chunk = Vec<(Arc<Node>, Vec<Data>)>;
 
@@ -540,9 +545,11 @@ mod metal {
         collectives: Vec<ChunkStatus>,
         /// The open command buffer's collective input signals.
         signal: Option<Arc<BufferSignal>>,
-        /// No commit by the dispatch policy now (between a collective's input copy and its
-        /// signal).
+        /// Holds back the dispatch policy's commits (between a collective's input copy and
+        /// its signal).
         hold: bool,
+        /// The device's system allocations when the open command buffer began.
+        made: u64,
     }
 
     fn backend(e: nuvec_gpu::GpuError) -> Error {
@@ -1282,12 +1289,14 @@ mod metal {
                 collectives: Vec::new(),
                 signal: None,
                 hold: false,
+                made: 0,
             }
         }
 
         fn device(&mut self) -> Option<&'static MetalDevice> {
             if self.device.is_none() {
                 self.device = MetalDevice::shared();
+                self.made = self.device.map_or(0, |d| d.system_allocations());
             }
             self.device
         }
@@ -1510,8 +1519,8 @@ mod metal {
             Ok(vec![Data::new(buffer)])
         }
 
-        /// Element-wise kernels: the `_c` variant when every operand is flat or a scalar,
-        /// else `_g`.
+        /// Element-wise kernels: the `_c` variant when every operand is flat or a scalar
+        /// (`_cn` from 2^16 elements), else `_g`.
         fn elementwise(
             &mut self,
             base: &str,
@@ -1616,6 +1625,19 @@ mod metal {
                 consts.push(bytes(&flags));
                 format!("{base}_c")
             };
+            // From 2^16 elements a flat kernel computes `8 / itemsize` of them per thread
+            // (MLX's work per thread), bounded by a size argument. The last operand holds
+            // the data type (a select's first is its condition).
+            let per_thread = match metas.last() {
+                Some(m) if !general && out.size >= 1 << 16 => (8 / m.dtype.size()).max(1),
+                _ => 1,
+            };
+            let name = if per_thread > 1 {
+                consts.push(Vec::new());
+                format!("{name}n")
+            } else {
+                name
+            };
             let output_slot = datas.len();
             // The flat kernels index with 32 bits: 2^32 elements and more run in chunks of
             // 2^31, the output (and an in-place operand) bound at the chunk's first element
@@ -1633,6 +1655,9 @@ mod metal {
                         consts[i] = bytes(&(d.offset as i64 + start as i64));
                     }
                 }
+                if per_thread > 1 {
+                    *consts.last_mut().expect("the size slot") = bytes(&(n as u32));
+                }
                 let mut args: Vec<Arg<'_>> = datas
                     .iter()
                     .map(|d| match d {
@@ -1644,7 +1669,7 @@ mod metal {
                 args.extend(consts.iter().map(|c| Arg::bytes(c)));
                 match grid {
                     Some(grid) => self.dispatch_grid(&name, &args, grid)?,
-                    None => self.dispatch(&name, &args, n)?,
+                    None => self.dispatch(&name, &args, n.div_ceil(per_thread))?,
                 }
                 start += n;
             }
@@ -3691,7 +3716,7 @@ mod metal {
                 (41, Constant::Bool(window > 0)),
             ];
             let wb = (window as i32).to_le_bytes();
-            // The windowed kernels (`_w`, D-102).
+            // The windowed kernels (`_w`).
             let w = if window > 0 { "_w" } else { "" };
             let (q, cache, tables) = (operands[0].0, operands[1].0, operands[3].0);
             let (b, hq, lq, d) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
@@ -4338,7 +4363,7 @@ mod metal {
             } = flags;
             use nuvec_gpu::Constant;
             let wb = (window as i32).to_le_bytes();
-            // The windowed kernels (`_w`, D-102).
+            // The windowed kernels (`_w`).
             let w = if window > 0 { "_w" } else { "" };
             let (qm, km) = (operands[0].0, operands[1].0);
             let (b, hq, lq, d) = (qm.shape[0], qm.shape[1], qm.shape[2], qm.shape[3]);
@@ -4596,7 +4621,11 @@ mod metal {
                 k_strides: s3(&k),
                 v_strides: s3(&v),
                 // The output's layout: `[B, L, H, D]` in memory (MLX's full attention).
-                o_strides: [out.strides[0] as i64, out.strides[1] as i64, out.strides[2] as i64],
+                o_strides: [
+                    out.strides[0] as i64,
+                    out.strides[1] as i64,
+                    out.strides[2] as i64,
+                ],
             };
             let params = bytes(&params);
             let mask_params = mask.as_ref().map(|m| bytes(&s3(m)));
@@ -4736,7 +4765,7 @@ mod metal {
             let output = buffer.metal_mut().expect("device storage");
             let quad = k == 128 || k == 64;
             // Row-exact (`with_row_exact`): matrix-vector products up to `rows` rows; else
-            // MLX's routing, with `qmv_wide` from 2 rows (D-103).
+            // MLX's routing, with `qmv_wide` from 2 rows.
             let exact = crate::row_exact();
             if transpose {
                 let limit = if exact {
@@ -5240,7 +5269,7 @@ mod metal {
             let (generation, class) = (info.generation.unwrap_or(0), info.class.unwrap_or('g'));
             // Row-exact (`with_row_exact`): matrix-vector products up to
             // `ROW_INDEPENDENT_ROWS` rows; else MLX's limits (4 untransposed), and
-            // `qmv_wide` from 2 rows on GPUs from generation 15 (D-103).
+            // `qmv_wide` from 2 rows on GPUs from generation 15.
             let exact = crate::row_exact();
             let rows = crate::ROW_INDEPENDENT_ROWS + 1;
             let limit = match (transpose, exact) {
@@ -5258,7 +5287,7 @@ mod metal {
             let item = if flat && nd >= 3 { x.shape[nd - 2] } else { m };
             // MLX splits K only for one batch item (`B == 1`); row-exact, every item's rows
             // are partitioned as alone (`item`), so prompts prefilled together keep their
-            // solo bits (D-101, D-103).
+            // solo bits.
             let split = !batched && (exact || item == m);
             if item >= limit && transpose && split {
                 // The K partitions are chosen from one item's rows (`x`'s second-to-last
@@ -5971,7 +6000,8 @@ mod metal {
         /// starts while the rest is encoded, and each next one twice as many while the GPU
         /// is still busy (up to [`MAX_DISPATCHES`]), so it is ready before the GPU runs out
         /// of work; a few again whenever the GPU is idle. If earlier work keeps the GPU
-        /// busy, buffers are full-size from the start, so they stay few.
+        /// busy, buffers are full-size from the start, so they stay few. One that made new
+        /// buffers commits at [`FRESH_DISPATCHES`].
         fn counted(&mut self) -> Result<()> {
             self.dispatches += 1;
             if self.large {
@@ -5994,7 +6024,11 @@ mod metal {
             } else {
                 IDLE_DISPATCHES
             });
-            if self.dispatches >= limit && !self.hold {
+            let fresh = self.dispatches >= FRESH_DISPATCHES
+                && self
+                    .device()
+                    .is_some_and(|d| d.system_allocations() > self.made);
+            if (self.dispatches >= limit || fresh) && !self.hold {
                 self.commit();
                 self.limit = Some(if profiling {
                     1
@@ -6011,6 +6045,7 @@ mod metal {
         /// published when it completes. Blocks while too many command buffers are in flight.
         pub(crate) fn commit(&mut self) {
             self.dispatches = 0;
+            self.made = self.device().map_or(0, |d| d.system_allocations());
             self.release_unreferenced();
             let Some(cmd) = self.cmd.take() else {
                 // Outputs deferred without GPU work (views of pending data) still need a

@@ -11,6 +11,10 @@
 
 #include <metal_stdlib>
 
+// Elements per thread of the flat `_cn` kernels: 8 bytes' worth (MLX's work per thread,
+// used from 2^16 elements).
+#define NUVEC_PER_THREAD(T) (sizeof(T) < 8 ? int(8 / sizeof(T)) : 1)
+
 using namespace metal;
 
 namespace nuvec {

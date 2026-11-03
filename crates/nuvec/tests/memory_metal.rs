@@ -69,3 +69,41 @@ fn an_allocation_over_the_limit_is_out_of_memory() {
     memory::set_memory_limit(previous);
     assert!(e.is_oom(), "{e}");
 }
+
+#[test]
+fn work_after_clear_cache_reuses_its_own_intermediates() {
+    let _serial = serial();
+    if !metal::is_available() {
+        return;
+    }
+    with_stream(Stream::default_for(Device::gpu(0)), || {
+        // 1,200 dependent casts, each a new output (no input can be donated to it).
+        let chain = || {
+            let mut x = ops::ones([1024], DType::F32);
+            for _ in 0..600 {
+                x = x.astype(DType::F16).astype(DType::F32);
+            }
+            x
+        };
+        // Work still on the GPU, as the previous step is while a decode step is encoded.
+        let busy = || {
+            let a = ops::ones([2048, 2048], DType::F32);
+            let b = a.matmul(&a).matmul(&a).matmul(&a);
+            nuvec::async_eval(std::slice::from_ref(&b)).unwrap();
+            b
+        };
+        let b = busy();
+        chain().eval().unwrap();
+        b.eval().unwrap();
+        memory::clear_cache();
+        let b = busy();
+        let before = memory::stats().system_allocations;
+        chain().eval().unwrap();
+        let made = memory::stats().system_allocations - before;
+        // Command buffers that make new buffers commit every 50 dispatches (as MLX's every
+        // 50 ops), so later ones reuse their intermediates: about 110 new buffers, against
+        // 265 in 256-dispatch command buffers.
+        assert!(made < 180, "{made} new buffers for 1,200 casts");
+        b.eval().unwrap();
+    });
+}

@@ -1,4 +1,4 @@
-//! Groups that survive a lost Mac (073): a lost peer is found while idle, the failed group
+//! Groups that survive a lost Mac: a lost peer is found while idle, the failed group
 //! is closed and a new one formed in the same processes; keys authenticate every
 //! connection, and a stray client cannot block or join a forming group.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The decode and long-prefill phase of scripts/quiet_session.sh (research/11 §3): per-kernel
+# The decode and long-prefill phase of scripts/quiet_session.sh: per-kernel
 # traces of both engines (Metal System Trace), MLX-side switches that test hypotheses
 # without code, and the Qwen3-30B-A3B 0.4.1 vs 0.5.0 A/B. Released code is measured from
 # worktrees (the working tree carries v0.6 changes).

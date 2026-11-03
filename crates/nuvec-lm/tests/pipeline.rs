@@ -1,5 +1,5 @@
 //! Pipeline parallelism across processes: each test re-runs this binary as 2–4 ranks over
-//! loopback (068's harness). On every model family's tiny fixture the pipelined logits
+//! loopback. On every model family's tiny fixture the pipelined logits
 //! equal the unpipelined model's bit for bit, generation yields the same tokens on every
 //! rank, and each rank loads only its stage's weights.
 

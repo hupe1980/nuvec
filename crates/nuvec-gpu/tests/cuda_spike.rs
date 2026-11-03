@@ -1,5 +1,5 @@
-//! The spike (spec 069, US4): generated element-wise and reduction kernels and the Tile
-//! GEMM against CPU references, on a real GPU (`scripts/cuda_remote.py`).
+//! The CUDA backend on a real GPU: generated element-wise and reduction kernels and the Tile
+//! GEMM against CPU references (`scripts/cuda_remote.py`).
 
 #![cfg(all(feature = "cuda", target_os = "linux"))]
 

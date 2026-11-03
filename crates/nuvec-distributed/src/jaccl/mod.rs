@@ -1,5 +1,5 @@
 //! **Experimental:** MLX's JACCL backend, RDMA over Thunderbolt 5 (macOS 26.2+), behind the
-//! `jaccl` feature. It is not yet verified on Thunderbolt 5 hardware; its algorithms are
+//! `jaccl` feature. It is unverified on Thunderbolt 5 hardware; its algorithms are
 //! tested on an emulated fabric.
 //!
 //! RDMA must be enabled once per Mac in recoveryOS (`rdma_ctl enable`), and every pair of

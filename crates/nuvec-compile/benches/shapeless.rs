@@ -1,4 +1,4 @@
-//! Shapeless replay against shaped replay (spec 067 SC-003), on the GPU: mrun's compiled
+//! Shapeless replay against shaped replay, on the GPU: mrun's compiled
 //! activations at decode and prefill chunk sizes. The shaped function is called at one
 //! size only, so it replays a cached trace; the shapeless one has traced once, at another
 //! size. Prints `name<TAB>rows<TAB>dtype<TAB>us_shaped<TAB>us_shapeless<TAB>ratio`.

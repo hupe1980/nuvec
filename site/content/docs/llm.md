@@ -1,6 +1,6 @@
 +++
 title = "LLM runtime"
-description = "nuvec-lm runs Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 models from mlx-community or Hugging Face checkpoints on Apple Silicon, matching mlx-lm's outputs and speed, with samplers, speculative decoding and batched serving."
+description = "nuvec-lm runs Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 models from mlx-community or Hugging Face checkpoints on Apple Silicon, matching mlx-lm's outputs and speed, with samplers, stops, speculative decoding, batched serving, and pipeline or tensor parallelism across Macs."
 weight = 90
 [extra]
 group = "Libraries"
@@ -92,8 +92,8 @@ if let Some(FinishReason::Stop(stopped)) = generation.finish_reason() {
 
 - **Chunked prefill** (2,048 tokens at a time, as mlx-lm) with the cache written once per position.
 - **A pipelined decode loop:** step *n + 1* is built and submitted while the GPU still runs step *n*; token *n* is read afterwards. The KV cache is updated in place, even while the previous step is still in flight.
-- **MLX's kernels** for every hot operation, mlx-lm's compiled activations, and fused kernels that shorten each layer's chain of dependent dispatches (residual add + norm; q/k norm + RoPE + cache write).
-- **Wired memory** while generating (`WiredLimit`), as mlx-lm does, so weights are not paged out between steps.
+- **MLX's kernels** for every hot operation, mlx-lm's compiled activations, and fused kernels that shorten each layer's chain of dependent dispatches (residual add + norm; q/k norm + RoPE + cache write; mixture-of-experts routing and weighting).
+- **Wired memory** while generating (`WiredLimit`), as mlx-lm does, so weights are not paged out between steps. The allocator's cache is emptied where mlx-lm empties it: after each prefill chunk, after the first generated token and every 256 after it, and every 512 `Batcher` steps.
 
 See [benchmarks](@/docs/benchmarks.md) for the numbers and [speculative decoding](@/docs/speculative-decoding.md) for going beyond them.
 
@@ -200,7 +200,7 @@ for token in generate(&model, &[9707, 11], options)? {
 
 ### Tensor parallelism
 
-To decode one request faster across Macs cabled with Thunderbolt 5 (JACCL), split every layer instead, as mlx-lm's `model.shard(group)`. Each Mac keeps a slice of every attention, MLP, expert and Gated DeltaNet projection, and each layer's two outputs are summed over the group. An untied output head is split by vocabulary when the vocabulary divides. Only rank 0 samples, as with pipelining.
+To decode one request faster across Macs cabled with Thunderbolt 5 (JACCL), split every layer instead, as mlx-lm's `model.shard(group)`. Each Mac keeps a slice of every attention, MLP, expert and Gated DeltaNet projection, and each layer's two outputs are summed over the group. An untied output head is split by vocabulary when the vocabulary divides. With greedy or seeded sampling every rank samples the same token from its own logits, as mlx-lm; otherwise rank 0 samples and shares its token.
 
 ```rust,no_run
 use nuvec_lm::{GenerateOptions, generate, load_model_sharded};
@@ -232,4 +232,4 @@ cargo run --release -p nuvec-lm --example generate -- \
     --max-tokens 256 --temp 0.7 --top-p 0.9
 ```
 
-`--chat` wraps the prompt in the ChatML template used by Qwen models.
+`--chat` wraps the prompt in the ChatML template used by Qwen models; `--min-p` and `--top-k` set the other samplers.

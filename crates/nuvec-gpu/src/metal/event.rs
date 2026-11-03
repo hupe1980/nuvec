@@ -10,9 +10,9 @@ use crate::{GpuError, Result};
 /// How long [`Event::wait`] spins before it blocks.
 const SPIN: std::time::Duration = std::time::Duration::from_micros(50);
 
-/// A counter command buffers wait on ([`CommandBuffer::wait_event`](super::CommandBuffer::wait_event))
-/// and the CPU raises ([`signal`](Self::signal)). Waiters for a value run once the counter
-/// reaches it.
+/// A counter command buffers wait on
+/// ([`CommandBuffer::wait_event`](super::CommandBuffer::wait_event)) and the CPU raises
+/// ([`signal`](Self::signal)). Waiters for a value run once the counter reaches it.
 pub struct Event {
     raw: Retained<ProtocolObject<dyn MTLSharedEvent>>,
 }

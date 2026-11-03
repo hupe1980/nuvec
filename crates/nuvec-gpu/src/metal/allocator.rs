@@ -13,6 +13,7 @@
 //! before they are released.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use objc2::rc::Retained;
@@ -33,13 +34,13 @@ const SMALL: usize = 256;
 /// it, so a new allocation is preferred (the cache then holds one buffer per command buffer
 /// in flight). Decode-sized work (activations, attention partials, softmax outputs) is
 /// latency-bound; larger buffers belong to GPU-bound work (long prefill), where waiting costs
-/// little and reusing them keeps the peak (D-100, D-102).
+/// little and reusing them keeps the peak.
 const OVERLAP_MAX: usize = 64 << 20;
 
 /// Cached bytes past which smaller buffers are taken from the latest committed command
 /// buffer too: decode never holds that much it cannot take yet, while a long prefill's
 /// command buffers, each allocating its intermediates anew, would add up to gigabytes (a
-/// 27B model at 32K tokens runs out of GPU memory) (D-102).
+/// 27B model at 32K tokens runs out of GPU memory).
 const OVERLAP_CACHE: usize = 1 << 30;
 
 /// Number of small size classes: 256 B steps up to one page.
@@ -96,6 +97,9 @@ pub(crate) struct Pool {
     /// A tiny buffer bound in place of empty buffers (Metal requires a binding for every
     /// kernel argument; kernels never touch it, as empty buffers have no elements).
     placeholder: Option<Cached>,
+    /// Buffers made by the system so far ([`MemoryStats::system_allocations`]), read
+    /// without the lock.
+    made: AtomicU64,
 }
 
 struct State {
@@ -267,6 +271,7 @@ impl Pool {
                 residency,
             }),
             placeholder: placeholder.map(Cached),
+            made: AtomicU64::new(0),
         }
     }
 
@@ -334,6 +339,7 @@ impl Pool {
             MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
         match device.newBufferWithLength_options(size, options) {
             Some(raw) => {
+                self.made.fetch_add(1, Ordering::Relaxed);
                 let mut s = self.lock();
                 s.system_allocations += 1;
                 s.residency.insert(&raw, false);
@@ -354,6 +360,11 @@ impl Pool {
         s.put(raw, size, busy);
         let limit = s.cache_limit;
         s.evict_to(limit);
+    }
+
+    /// Buffers made by the system so far, without taking the lock.
+    pub(crate) fn system_allocations(&self) -> u64 {
+        self.made.load(Ordering::Relaxed)
     }
 
     pub(crate) fn stats(&self) -> MemoryStats {

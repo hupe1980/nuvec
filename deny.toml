@@ -14,8 +14,7 @@ targets = [
 version = 2
 yanked = "deny"
 ignore = [
-    # `paste` (a proc-macro used inside `gemm`) is archived, not vulnerable. Revisit when
-    # `gemm` drops it.
+    # `paste` (a proc-macro used inside `gemm`) is archived, not vulnerable.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro inside gemm; no vulnerability" },
 ]
 
@@ -43,7 +42,7 @@ allow-wildcard-paths = true
 highlight = "all"
 # Constitution I (pure Rust, no bindings): crates that compile or link
 # third-party C/C++ code are not allowed anywhere in the graph, except beneath the opt-in
-# CUDA backend's cuda-rust (constitution 1.4.0, D-112): `wrappers` names the only parents.
+# CUDA backend's cuda-rust: `wrappers` names the only parents.
 deny = [
     { crate = "cc", reason = "compiles C/C++ (constitution I)", wrappers = ["psm", "stacker"] },
     { crate = "cmake", reason = "drives a C/C++ build (constitution I)" },
@@ -79,7 +78,7 @@ allow-build-scripts = [
     # lookup table (OUT_DIR), no native code.
     { crate = "unicode-general-category" },
     # Via `gemm-common` -> `sysctl` (CPU feature detection on macOS). `libc` is FFI to the
-    # OS's own C library (system API, as allowed by D-001); both scripts are compiler probes.
+    # OS's own C library (a system API); both scripts are compiler probes.
     { crate = "libc" },
     { crate = "thiserror" },
     # Via `sha2`/`hmac` (distributed pre-shared-key authentication): a compiler version
@@ -98,11 +97,10 @@ allow-build-scripts = [
     { crate = "serde_json" },
     { crate = "target-tuple" },
     { crate = "zmij" },
-    # Metal access (D-002): Apple-target cfg probe only, no native code.
+    # Metal access: Apple-target cfg probe only, no native code.
     { crate = "objc2" },
-    # The CUDA backend (feature `cuda` of nuvec-gpu and nuvec-kernels, Linux; constitution
-    # 1.4.0, D-112), via
-    # NVIDIA's cuda-rust:
+    # The CUDA backend (feature `cuda` of nuvec-gpu and nuvec-kernels, Linux), via NVIDIA's
+    # cuda-rust:
     # - `cuda-bindings`: bindgen over the CUDA toolkit's cuda.h/curand.h (the driver is
     #   loaded at run time with dlopen); `bindgen` and `clang-sys` (finds libclang) with it.
     { crate = "cuda-bindings" },

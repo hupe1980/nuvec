@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["mlx==0.32.4"]
 # ///
-"""The upper bound of fusing MoE decode glue (research/11 §4, opportunity 3), on MLX with
+"""The upper bound of fusing MoE decode glue, on MLX with
 Qwen3-30B-A3B's shapes: 48 layers, 128 experts, top-8, D = 2048, I = 768, 4-bit experts.
 (a) mlx-lm's path (router, softmax, argpartition, gather, normalise, gate/up/down gathers,
 combine); (b) the three gathers alone with fixed indices; (c) (b) with gate and up as one

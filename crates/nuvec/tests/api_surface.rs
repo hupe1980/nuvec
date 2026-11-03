@@ -590,7 +590,7 @@ mod spec_063 {
         }
     }
 
-    /// Speculation (spec 054): on-device acceptance, capture-all Gated DeltaNet with
+    /// Speculation: on-device acceptance, capture-all Gated DeltaNet with
     /// storage rounding, and nuvec-lm's drafters, policy and MTP head.
     mod speculation {
         use nuvec::fast::{self, StepOptions};
@@ -648,7 +648,7 @@ mod spec_063 {
         }
     }
 
-    /// The Neural Accelerator status (spec 059).
+    /// The Neural Accelerator status.
     #[test]
     fn nax_status_is_pinned() {
         use nuvec::metal::{NaxReason, NaxStatus};
@@ -833,7 +833,7 @@ mod spec_063 {
         const _: fn(&mut Model, usize, Option<&[&str]>, LoraParams) -> Result<usize> =
             linear_to_lora_layers;
 
-        /// Pipeline parallelism (spec 071).
+        /// Pipeline parallelism.
         fn pipeline(m: &mut Model, g: &nuvec::distributed::Group) -> Result<()> {
             m.pipeline(g, Split::Even)?;
             let _ = load_model_pipelined("dir", g, Split::memory());
@@ -849,7 +849,7 @@ mod spec_063 {
                 let _: &nuvec::distributed::Group = s.group();
             }
             let _: Array = m.share_tokens(&Array::from(1u32));
-            // Tensor parallelism (spec 072).
+            // Tensor parallelism.
             m.shard(g)?;
             let _: Option<&nuvec::distributed::Group> = m.sharding();
             let _ = nuvec_lm::load_model_sharded("dir", g);
@@ -861,7 +861,7 @@ mod spec_063 {
             Ok(())
         }
 
-        /// Generation controls and batcher options (spec 074).
+        /// Generation controls and batcher options.
         fn controls(m: &Model, t: &nuvec_lm::Tokenizer) -> Result<()> {
             use nuvec_lm::{
                 BatcherOptions, FinishReason, GenerateOptions, Stop, Stopped, TextStream,
@@ -938,7 +938,7 @@ mod spec_063 {
     }
 }
 
-/// Spec 055: floating-point quantization modes (MXFP4, MXFP8, NVFP4), bit views and E4M3
+/// Floating-point quantization modes (MXFP4, MXFP8, NVFP4), bit views and E4M3
 /// conversions, and the checkpoint side in nuvec-nn and nuvec-lm.
 mod spec_055 {
     use std::str::FromStr;
@@ -1043,7 +1043,7 @@ mod spec_055 {
     }
 }
 
-/// Spec 056 (gpt-oss and Gemma 4): windows and sinks in the attention options (paged too),
+/// Gpt-oss and Gemma 4: windows and sinks in the attention options (paged too),
 /// the blocked head-512 plan, `norm_rope_kv`, `power`, RoPE scalings, the activations and
 /// the model settings.
 mod spec_056 {
@@ -1200,7 +1200,7 @@ mod engine_surface {
     const GMM: fn(&Array, &Array, &Array) -> Array =
         |x, w, i| ops::gather_mm(x, w, None, Some(i), true);
     const ROWS: usize = nuvec::ROW_INDEPENDENT_ROWS;
-    // Row-exact products (D-103) and the grouped-gather rule.
+    // Row-exact products and the grouped-gather rule.
     const ROW_EXACT: fn(fn() -> Array) -> Array = |f| nuvec::with_row_exact(f);
     const IS_ROW_EXACT: fn() -> bool = nuvec::row_exact;
     const GROUPS: fn(usize, usize) -> bool = nuvec::GatherQmm::groups;
@@ -1388,7 +1388,7 @@ mod engine_surface {
     }
 }
 
-/// Spec 076 (paged serving): `norm_rope_at` with and without a pool, and `paged_write` of
+/// Paged serving: `norm_rope_at` with and without a pool, and `paged_write` of
 /// several sequences' rows.
 mod spec_076 {
     use nuvec::Array;

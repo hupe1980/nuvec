@@ -17,8 +17,8 @@ categories.workspace = true
 nuvec-kernels.workspace = true
 
 [features]
-# The CUDA runtime (Linux): NVIDIA's cuda-rust, which needs CUDA ≥ 13.0 headers and libclang
-# to build (constitution 1.4.0). Without it, and on other targets, `cuda` does not exist.
+# The experimental CUDA runtime (Linux): NVIDIA's cuda-rust, which needs CUDA ≥ 13.0 headers
+# and libclang to build. Without it, or off Linux, `nuvec_gpu::cuda` does not exist.
 cuda = ["nuvec-kernels/cuda", "dep:cuda-core", "dep:cuda-async", "dep:cutile", "dep:half"]
 
 [target.'cfg(target_os = "linux")'.dependencies]

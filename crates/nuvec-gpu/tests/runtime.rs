@@ -531,7 +531,7 @@ fn reused_memory_is_written_after_in_flight_readers() {
         acc = next;
     }
     // One more command buffer, so that the latest committed one does not use `a`: small
-    // buffers of the latest are not reused while it runs (D-100).
+    // buffers of the latest are not reused while it runs.
     let mut other = device.new_buffer(n * 4).unwrap();
     let mut cmd = device.ordered_command_buffer().unwrap();
     add(&mut cmd, &device, &zeros, &zeros, &mut other, n as u32);
@@ -660,7 +660,7 @@ fn reading_reused_memory_waits_for_the_previous_owner() {
     with_timeout(std::time::Duration::from_secs(30), || {
         let Some(device) = device() else { return };
         // 68 MiB: buffers up to 64 MiB of the latest committed command buffer are not
-        // reused while it runs (D-100, D-102); larger ones are.
+        // reused while it runs; larger ones are.
         let n = 17 << 20;
         let a = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
         device.clear_cache();

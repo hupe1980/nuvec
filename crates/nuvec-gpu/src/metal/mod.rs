@@ -225,6 +225,12 @@ impl Device {
         self.inner.pool.stats()
     }
 
+    /// Buffers the system has made for this device's allocator so far
+    /// ([`MemoryStats::system_allocations`]), cheap enough to read per dispatch.
+    pub fn system_allocations(&self) -> u64 {
+        self.inner.pool.system_allocations()
+    }
+
     /// Sets the memory limit and returns the previous one (as MLX's `set_memory_limit`).
     ///
     /// The limit bounds `active + mapped` ([`MemoryStats::active_with_mapped`]): an
@@ -476,7 +482,7 @@ impl Device {
             let source = inline_sources(&[("generated.metal", &source())]);
             // As MLX compiles its runtime kernels (`mx.compile`, custom kernels): safe math
             // with Metal's default, fast `metal::` functions (pow, exp, tanh, …), so their
-            // results can differ in the low bits from the precompiled kernels' (D-104).
+            // results can differ in the low bits from the precompiled kernels'.
             let options = objc2_metal::MTLCompileOptions::new();
             options.setMathMode(objc2_metal::MTLMathMode::Safe);
             options.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version3_2);

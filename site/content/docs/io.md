@@ -25,7 +25,9 @@ save_safetensors("out.safetensors", &[("weight", w)], &[("format", "mlx")])?;
 
 Files whose tensors are not aligned to their element size are not mapped. mlx-community checkpoints are among them (MLX writes headers without padding). Their tensors are read once, with parallel positioned reads (up to 8 threads), into one buffer per file in which each tensor starts at a multiple of 256 bytes.
 
-- `load_safetensors_filtered(path, keep)` returns only the tensors `keep` accepts and does not read the others from unaligned files (nuvec-lm skips vision and multi-token-prediction weights this way).
+- `load_safetensors_filtered(path, keep)` returns only the tensors `keep` accepts: from aligned files it maps only their pages, from unaligned files it reads only them (nuvec-lm skips vision and multi-token-prediction weights this way).
+- `align_safetensors(src, dst)` writes a copy of a file with every tensor at a multiple of 256 bytes, which then maps without a copy. `load_safetensors_cached(path, cache_dir, keep)` loads an unaligned file through such a copy in `cache_dir`, written on first use and rewritten when the source's size or modification time changes.
+- `safetensors_tensors(path)` lists a file's tensors (name, dtype, shape, bytes) from its header alone.
 - `safetensors_footprint(path)` reads only the headers of a file or a directory and reports what loading will hold: the bytes kept mapped, the bytes read into memory, and the transient peak (their sum). `safetensors_footprint_filtered(path, keep)` does the same for a filtered load. A load whose transient would pass the memory limit fails before mapping or reading anything.
 
 ## Saving

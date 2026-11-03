@@ -1,6 +1,5 @@
-//! The spike's measurements (spec 069, US4), as JSON lines: element-wise bandwidth, a row
-//! reduction, and Tile GEMM throughput. `scripts/bench_cuda.py` measures MLX on the same
-//! shapes.
+//! CUDA measurements as JSON lines: element-wise bandwidth, a row reduction, and Tile GEMM
+//! throughput. `scripts/bench_cuda.py` measures MLX on the same shapes.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

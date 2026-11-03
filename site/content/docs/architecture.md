@@ -18,11 +18,11 @@ group = "Project"
 | `nuvec-kernels` | Metal kernel sources and the precompiled library |
 | `nuvec-cpu` | Pure-Rust CPU kernels over typed slices |
 | `nuvec-io` | safetensors, npy, IDX; memory-mapped files |
-| `nuvec-distributed` | MLX's TCP ring backend for `nuvec::distributed` |
+| `nuvec-distributed` | MLX's TCP ring and JACCL (RDMA over Thunderbolt 5) backends for `nuvec::distributed` |
 | `nuvec-nn` | Modules (every tree is one), layers, losses, optimizers |
-| `nuvec-lm` | Models, tokenizer, KV cache, generation, speculative decoding |
+| `nuvec-lm` | Models, tokenizer, KV cache, generation, batched serving, speculative decoding, pipeline and tensor parallelism |
 
-`unsafe` code stays in the Metal runtime (`nuvec-gpu`, including file mapping), `nuvec-core`'s three kernel-dispatch calls and one CPU matrix-product call in `nuvec-cpu`; the other crates contain none.
+`unsafe` code stays in the Metal runtime (`nuvec-gpu`, including file mapping), `nuvec-core`'s kernel dispatches and GPU collectives' buffer access, one CPU matrix-product call in `nuvec-cpu`, and `nuvec-distributed`'s system calls (sockets, a scoped helper thread, RDMA through `librdma` loaded at run time); the other crates contain none.
 
 ## The graph
 

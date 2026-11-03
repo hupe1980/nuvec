@@ -707,7 +707,7 @@ impl<D: Drafter> Iterator for SpeculativeGeneration<'_, D> {
             return None;
         }
         // Verification rows keep the bits of one-row decode steps (the prompt is prefilled
-        // as `generate` prefills it), so the tokens are plain decoding's (D-103).
+        // as `generate` prefills it), so the tokens are plain decoding's.
         let token = match nuvec::with_row_exact(|| self.advance()) {
             Ok(t) => t,
             Err(e) => {

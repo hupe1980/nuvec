@@ -18,7 +18,7 @@ categories.workspace = true
 cuda = ["dep:cutile"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Pinned exactly: the API changes between minors (research/10).
+# Pinned exactly: the API changes between minors.
 cutile = { version = "=0.4.0", optional = true }
 
 [package.metadata.docs.rs]

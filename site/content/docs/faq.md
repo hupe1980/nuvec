@@ -32,7 +32,7 @@ Apple Silicon (M1 or later) with macOS 15 or newer. Wired memory needs a Metal 3
 
 ## Can I use it from Python?
 
-Not today; nuvec is a Rust library. The `nuvec` name on PyPI is reserved.
+No; nuvec is a Rust library. The `nuvec` name on PyPI is reserved.
 
 ## Can I train models?
 

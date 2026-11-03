@@ -292,7 +292,7 @@ fn stop_tokens_eos_ignore_eos_and_min_tokens() {
     }
 }
 
-/// Eight requests with different endings, batched: each as alone (SC-002); and with a
+/// Eight requests with different endings, batched: each as alone; and with a
 /// cache small enough to preempt, every request still ends at its own first stop.
 #[test]
 fn mixed_requests_end_as_alone_and_across_preemption() {

@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["mlx[cuda13]==0.32.4"]
 # ///
-"""MLX's side of the CUDA spike (spec 069): the shapes of nuvec-gpu's `cuda_bench` example, on
+"""MLX's side of the CUDA spike: the shapes of nuvec-gpu's `cuda_bench` example, on
 MLX's CUDA backend, as JSON lines. Run on the same GPU (scripts/cuda_remote.py). TF32 for
 float32 products follows MLX_ENABLE_TF32 (MLX's default: on)."""
 

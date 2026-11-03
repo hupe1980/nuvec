@@ -1,4 +1,4 @@
-//! Tensor parallelism across processes (071's harness): every family's tiny fixture sharded
+//! Tensor parallelism across processes: every family's tiny fixture sharded
 //! over 2 and 4 ranks gives the whole model's logits within the reduction order, the whole
 //! model's greedy tokens on the float32 fixtures, and the same tokens on every rank. Sizes
 //! that do not split are errors that leave the model whole.

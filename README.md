@@ -22,12 +22,12 @@ nuvec brings [MLX](https://github.com/ml-explore/mlx)'s programming model to Rus
 
 ## ✨ Highlights
 
-- 🦀 **Pure Rust.** No C++ build, no FFI to MLX. Metal goes through [`objc2-metal`](https://crates.io/crates/objc2-metal). `unsafe` is confined to the Metal runtime, three kernel dispatches in nuvec-core and the CPU matrix product.
+- 🦀 **Pure Rust.** No C++ build, no FFI to MLX. Metal goes through [`objc2-metal`](https://crates.io/crates/objc2-metal). `unsafe` is confined to the GPU runtime, the CPU matrix product, kernel dispatches and buffer views in nuvec-core, and system calls in nuvec-distributed (sockets, RDMA).
 - 💤 **Lazy arrays on unified memory.** Operations build a graph that runs when you read a result. CPU and GPU share memory, with no copies between them.
 - 🔁 **Composable transforms.** `grad`, `value_and_grad`, `vjp`, `jvp`, `vmap`, `custom_function`, `checkpoint` and `compile` (shaped or shapeless) nest in any order, over complex numbers, tuples, maps and your own structs.
 - 🧠 **Models as plain structs.** `#[derive(Module)]` gives MLX's parameter names; optimizers, freezing, LoRA, `save_weights` and a compiled training step (`compile_mut`) work on the model's own type.
 - 🔥 **MLX's Metal kernels.** GEMM and GEMV, quantized products (affine 1, 2, 3, 4, 5, 6 and 8 bits; MXFP4, MXFP8, NVFP4), fused attention, RMSNorm, RoPE, sort, scan, mixture-of-experts gather kernels, and your own kernels from source (`fast::MetalKernel`). Metal 4 TensorOps kernels for M5 Neural Accelerators are opt-in (`NUVEC_NAX=on`).
-- 🌐 **Several Macs.** MLX's collectives (`all_sum`, `all_gather`, `sum_scatter`, `send`/`recv`, …) as lazy, differentiable array operations over MLX's TCP ring or, experimentally, JACCL over Thunderbolt 5 RDMA, with pipeline-parallel models (a model larger than one Mac, one stage per Mac) and tensor-parallel decode (every layer split across Macs).
+- 🌐 **Several Macs.** MLX's collectives (`all_sum`, `all_gather`, `sum_scatter`, `send`/`recv`, …) as lazy, differentiable array operations over MLX's TCP ring or, experimentally, JACCL over Thunderbolt 5 RDMA, with pipeline-parallel models (a model larger than one Mac, one stage per Mac) and tensor-parallel models (every layer split across Macs).
 - 🧪 **Tested against MLX.** Over a thousand cases replay results recorded from MLX, with random layouts, gradients and every dtype.
 - 🤖 **LLM runtime.** Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 (dense, hybrid Gated DeltaNet, mixture-of-experts) from mlx-community or Hugging Face checkpoints. Speculative decoding (MTP heads, prompt lookup, SuffixDecoding) and batched serving.
 - 💾 **Memory-mapped weights.** Aligned checkpoints (such as those nuvec writes) go to the GPU without a copy. Unaligned ones (mlx-community's) are read once, in parallel, with no more memory than MLX.
@@ -190,7 +190,7 @@ cargo run --release -p nuvec-lm --example generate -- \
 | | |
 |---|---|
 | 🍎 **macOS 15+ on Apple Silicon** | The primary target, with the full Metal backend |
-| 🐧 **Linux** | The core and CPU crates build and run; the GPU crates compile as stubs |
+| 🐧 **Linux** | The core and CPU crates build and run; the GPU crates compile as stubs (nuvec-gpu's `cuda` feature adds an experimental CUDA runtime that arrays do not use) |
 
 ## 🛠️ Building from source
 
