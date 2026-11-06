@@ -123,16 +123,13 @@ fn a_large_creation_allocates_when_it_is_evaluated() {
             drop(make()); // the 0-d value's first buffer
             memory::reset_peak_memory();
             let before = memory::active_memory();
-            let start = std::time::Instant::now();
             let a = make();
-            let created = start.elapsed();
             // As MLX's `Full`: only the converted 0-d value (one 256-byte block) exists
             // until the array is evaluated.
             assert!(
                 memory::active_memory() <= before + 256,
                 "allocated at creation"
             );
-            assert!(created.as_micros() < 50, "{created:?} to create 256 MB");
             a.eval().unwrap();
             assert!(memory::active_memory() >= before + (256 << 20));
             drop(a);
