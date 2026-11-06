@@ -322,7 +322,7 @@ const BLOCKED_ROWS: usize = 256;
 
 /// MLX's `use_blocked_d512`: long causal self-attention at head size 512 in half
 /// precision, without an array mask or sinks (a window narrows each block's keys). MLX
-/// runs its split-D tiled kernel on NAX GPUs instead; nuvec blocks there too (F-019).
+/// runs its split-D tiled kernel on NAX GPUs instead; nuvec blocks there too.
 fn blocked_d512(key: &RouteKey) -> bool {
     matches!(key.dtype, DType::F16 | DType::BF16)
         && key.d == 512

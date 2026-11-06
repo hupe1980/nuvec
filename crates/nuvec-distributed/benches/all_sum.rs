@@ -5,11 +5,14 @@
 //! at a time, on the CPU stream. With `--decode`, decode's shape instead: 56 GPU ops each
 //! followed by an all_sum of `[1, 1024]` bfloat16 per evaluation, on the GPU stream; rank 0
 //! prints `decode<TAB>us` per all_sum (the best of five bursts of 20 evaluations).
-//! `NUVEC_BENCH_ROWS=2048` gives the arrays 2,048 rows (prefill's 4 MB per all_sum).
+//! `NUVEC_BENCH_ROWS=2048` gives the arrays 2,048 rows (prefill's 4 MB per all_sum). With
+//! `--hop`, a pipeline hop: 32 MB float32 sent from rank 0 to rank 1 (on the CPU stream);
+//! rank 0 prints `hop<TAB>us` per send, the best of five bursts of five ending in a barrier.
+//! With `NUVEC_DISTRIBUTED_KEY` set, every connection is encrypted.
 
 use std::time::Instant;
 
-use nuvec_core::distributed::all_sum;
+use nuvec_core::distributed::{all_sum, recv, send};
 use nuvec_core::{DType, Device, Result, Stream, ops, set_default_stream};
 
 const SIZES: &[usize] = &[4 << 10, 1 << 20, 4 << 20, 16 << 20, 256 << 20];
@@ -20,6 +23,9 @@ fn main() -> Result<()> {
     }
     if std::env::args().any(|a| a == "--decode") {
         return decode();
+    }
+    if std::env::args().any(|a| a == "--hop") {
+        return hop();
     }
     set_default_stream(Stream::default_for(Device::cpu()));
     let group = nuvec_distributed::init(true)?;
@@ -70,6 +76,35 @@ fn decode() -> Result<()> {
     }
     if group.rank() == 0 {
         println!("decode\t{best:.1}");
+    }
+    Ok(())
+}
+
+fn hop() -> Result<()> {
+    set_default_stream(Stream::default_for(Device::cpu()));
+    let group = nuvec_distributed::init(true)?;
+    let n = (32 << 20) / 4;
+    let x = ops::ones([n], DType::F32);
+    x.eval()?;
+    let mut best = f64::INFINITY;
+    for burst in 0..6 {
+        all_sum(&ops::ones([1], DType::F32), None).eval()?; // barrier
+        let t = Instant::now();
+        for _ in 0..5 {
+            match group.rank() {
+                0 => send(&x, 1, None).eval()?,
+                1 => recv([n], DType::F32, 0, None).eval()?,
+                _ => {}
+            }
+        }
+        all_sum(&ops::ones([1], DType::F32), None).eval()?; // the last receive is done
+        let us = t.elapsed().as_secs_f64() / 5.0 * 1e6;
+        if burst > 0 {
+            best = best.min(us);
+        }
+    }
+    if group.rank() == 0 {
+        println!("hop\t{best:.1}");
     }
     Ok(())
 }

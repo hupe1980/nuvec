@@ -224,6 +224,17 @@ Two ranks over Ethernet are slower than one Mac (an all-reduce per layer per tok
 
 `examples/pipeline_generate.rs` (`--tensor` for tensor parallelism) is a ready-made program for `mlx.launch`.
 
+## Fine-tuning with LoRA
+
+`nuvec_lm::tuner` is mlx-lm's LoRA training loop: `text` JSONL datasets, length-sorted padded batches, the masked next-token loss, a compiled step over the model and the optimizer, validation, and adapters saved in mlx-lm's layout (`mlx_lm.generate --adapter-path` loads them).
+
+```sh
+cargo run --release -p nuvec-lm --example lora -- \
+    --model models/Qwen3-0.6B-4bit --data data --iters 1000 --batch-size 4
+```
+
+`--model` is a local model directory; `--data` holds `train.jsonl` and, optionally, `valid.jsonl`; the other options and defaults are `mlx_lm.lora`'s. To train from your own code, call `tuner::train` with a model whose projections `lora::linear_to_lora_layers` replaced; it reports the loss, speed and peak memory as `Event`s.
+
 ## Command line
 
 ```sh

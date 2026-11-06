@@ -660,13 +660,31 @@ fn product(a: &Array, b: &Array, c: Option<(&Array, f32, f32)>) -> Result<Array>
 
 /// An array of zeros.
 pub(crate) fn zeros(shape: &[usize], dtype: DType) -> Result<Array> {
-    let buffer = Buffer::try_zeroed(shape::checked_nbytes(shape, dtype.size())?)?;
-    Array::from_buffer(buffer, dtype, shape)
+    constant(shape, dtype, Canon::Int(0))
 }
 
 /// An array of ones.
 pub(crate) fn ones(shape: &[usize], dtype: DType) -> Result<Array> {
-    filled(shape, dtype, |_| Canon::Int(1))
+    constant(shape, dtype, Canon::Int(1))
+}
+
+/// Creations of at least this many bytes are filled when they are evaluated, on the
+/// evaluating stream's device (MLX's `Full`); smaller ones are filled at once on the host,
+/// which costs less than a dispatch.
+pub(crate) const LAZY_FILL_BYTES: usize = 64 << 10;
+
+/// An array of `shape` whose every element is `value` converted to `dtype`. From
+/// [`LAZY_FILL_BYTES`], a copy of the converted 0-d value broadcast to `shape`: nothing is
+/// allocated until it is evaluated.
+pub(crate) fn constant(shape: &[usize], dtype: DType, value: Canon) -> Result<Array> {
+    let bytes = shape::checked_nbytes(shape, dtype.size())?;
+    if bytes < LAZY_FILL_BYTES {
+        return match value {
+            Canon::Int(0) => Array::from_buffer(Buffer::try_zeroed(bytes)?, dtype, shape),
+            _ => filled(shape, dtype, |_| value),
+        };
+    }
+    copy(&broadcast_to(&filled(&[], dtype, |_| value)?, shape)?)
 }
 
 /// Evenly spaced values `start, start + step, …` below `stop` (above it for negative

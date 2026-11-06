@@ -1055,13 +1055,16 @@ impl Primitive {
             }
             Self::Fast(op) => {
                 let strides = op.output_strides(inputs);
+                // A declared layout is the first output's (the attention's log-sum-exp
+                // is row-contiguous).
                 return Ok(op
                     .outputs(inputs)?
                     .into_iter()
-                    .map(|(dtype, shape)| OutputSpec {
+                    .enumerate()
+                    .map(|(i, (dtype, shape))| OutputSpec {
                         dtype,
                         shape: shape.into(),
-                        strides: strides.clone(),
+                        strides: if i == 0 { strides.clone() } else { None },
                     })
                     .collect());
             }

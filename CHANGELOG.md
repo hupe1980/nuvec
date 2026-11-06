@@ -6,6 +6,47 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-06
+
+### Added
+
+- Encrypted ring traffic: with a key, every connection derives a key per direction
+  (HKDF-SHA256) and seals every frame with ChaCha20-Poly1305. A changed, replayed or
+  reordered frame, or a rank that does not encrypt, fails with an error naming the peer.
+  Results are bit-identical to an unencrypted ring's. An encrypted 32 MB hop runs at about
+  1.7 GB/s over loopback. `Options::encrypt(false)` or `NUVEC_DISTRIBUTED_ENCRYPT=0` keeps
+  authentication only.
+- A test of a peer that stops mid-transfer without closing its connections (a sleeping Mac):
+  the waiting transfer fails within the timeout on the GPU stream, and the others re-form.
+- `scripts/bench_distributed.py` measures encrypted rings and a 32 MB pipeline hop.
+- LoRA training as mlx-lm's tuner (`nuvec_lm::tuner`): `text` JSONL datasets, mlx-lm's
+  length-sorted padded batches and masked loss, a compiled training step, gradient
+  accumulation, validation, reports and adapters in mlx-lm's layout; the `lora` example
+  takes `mlx_lm.lora`'s options. Qwen3-0.6B-4bit trains at 0.96× `mlx_lm.lora`'s speed at
+  0.86× its peak memory (`scripts/bench_lora.py`).
+- `Model::forward_uncached`: logits without a cache, as mlx-lm's `model(inputs)`.
+- The `ttft_parts` example (nuvec-lm) and `scripts/ttft_parts.py` time a short prompt's
+  first token part by part, in both engines; `scripts/bench_creation.py` times creation ops.
+
+### Changed
+
+- The ring's handshake carries the mode (authenticated or encrypted), so keyed ranks of
+  earlier versions cannot join a keyed group of this one.
+- Attention gradients follow MLX's backward: under a gradient transform the tiled
+  attention kernel keeps each row's log-sum-exp, and the backward is one operation over
+  tiles of 1,024 × 1,024 that reuses one set of tile buffers and accumulates in float32
+  (no softmax recomputed). Forward plus backward takes 1.00–1.02× MLX's time at 2,048 and
+  4,096 keys (from up to 2.3×), with peak memory 0.78–0.87× MLX's (from up to 6.1×).
+- `zeros`, `ones` and `full` of 64 KB and more are filled when they are evaluated, on the
+  evaluating stream's device, as MLX's: creating one takes about 1 µs and allocates nothing
+  until it is evaluated (256 MB `full`: 16.8 ms on the host, now 1.4 ms on the GPU, MLX
+  1.6 ms). Smaller ones are filled at once on the host. An allocation that fails is
+  reported when the array is evaluated.
+- A copy of one element broadcast fills 16 bytes per GPU thread, as MLX's scalar copy.
+- nuvec-lm's KV cache grows with zeros written on the GPU, as mlx-lm's lazy `mx.zeros`,
+  instead of zeroing fresh memory on the host: the first token of a 25-token prompt on
+  Qwen3-0.6B after mlx-lm's cache clears 16.5 → 14.5 ms (mlx-lm 15.2 ms).
+
 ## [0.6.1] - 2026-11-03
 
 ### Fixed
@@ -453,7 +494,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/hupe1980/nuvec/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/hupe1980/nuvec/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/hupe1980/nuvec/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hupe1980/nuvec/compare/v0.4.1...v0.5.0

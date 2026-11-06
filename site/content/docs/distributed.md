@@ -84,18 +84,26 @@ Reductions add the ranks' values in rank order (the mesh) or once per chunk owne
 
 ## Failures and re-forming
 
-A peer that never starts, exits or loses its link fails every pending operation with an error naming its rank within the timeout (`NUVEC_DISTRIBUTED_TIMEOUT`, in seconds, default 30). The group then refuses further work with that first error. Nothing hangs or panics.
+A peer that never starts, exits or loses its link fails every pending operation with an error naming its rank within the timeout (`NUVEC_DISTRIBUTED_TIMEOUT`, in seconds, default 30). That includes a peer that stops answering without closing its connections, as a Mac that sleeps or loses its cable mid-transfer, on the CPU and GPU streams alike. The group then refuses further work with that first error. Nothing hangs or panics.
 
 - **Finding a lost peer while idle:** `group.health()` checks every connection without running a collective or sending data. A peer whose process ended is reported at once, naming its rank. Every connection uses TCP keepalive, so a Mac that went to sleep or lost its cable is reported within about 15 s.
 - **Re-forming in the same process:** `group.close()` releases a group's connections, after which its operations fail. A new group over the remaining Macs then forms with `init_with`, or with `init` from a new hostfile: `init` never returns a failed or closed group.
 
-## Authentication
+## Authentication and encryption
 
-Set the same secret on every Mac to authenticate every connection: `NUVEC_DISTRIBUTED_KEY` for `init`, or `Options::key` (`jaccl::Options::key` for JACCL's side channel). Generate it with `openssl rand -hex 32`; shorter than 16 bytes is refused.
+Set the same secret on every Mac: `NUVEC_DISTRIBUTED_KEY` for `init`, or `Options::key` (`jaccl::Options::key` for JACCL's side channel). Generate it with `openssl rand -hex 32`; shorter than 16 bytes is refused.
 
-Both ends prove that they hold the key (HMAC-SHA256 over fresh challenges from each side), so a host without it cannot join a group, and a recorded handshake cannot be replayed. A stray connection is dropped while the group forms. A key on some ranks only, or different keys, fail with an error saying so, and the key never appears in an error.
+Both ends prove that they hold the key (HMAC-SHA256 over the mode and fresh challenges from each side), so a host without it cannot join a group, and a recorded handshake cannot be replayed. A stray connection is dropped while the group forms. A key on some ranks only, or different keys, fail with an error saying so, and the key never appears in an error.
 
-The key authenticates who connects; it does not encrypt the traffic. On a network you do not trust, run the group over a VPN such as WireGuard, or on its own network segment.
+With a key, the ring also encrypts its traffic:
+- Each connection derives one key per direction (HKDF-SHA256 over the secret, both challenges and the ranks).
+- Every frame of up to 64 KB is sealed with ChaCha20-Poly1305. Frames are sealed and opened on several cores.
+- A changed, replayed or reordered frame fails the transfer with an error naming the peer.
+- A rank that does not encrypt is refused, naming it.
+- The results are bit-identical to an unencrypted group's.
+- Frame sizes and timing stay visible, and there is no forward secrecy: rotate the key if it leaks.
+
+Over loopback on an M4 Pro, an encrypted 32 MB `send` runs at about 1.7 GB/s (9.4 GB/s unencrypted), above a 10 Gb/s Ethernet link. `NUVEC_DISTRIBUTED_ENCRYPT=0` or `Options::encrypt(false)` keeps a trusted link authenticated only. JACCL's RDMA traffic is not encrypted.
 
 ## Performance
 

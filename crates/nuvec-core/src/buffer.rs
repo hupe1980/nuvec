@@ -277,7 +277,8 @@ mod tests {
         let Some(device) = device() else { return };
         let before = device.memory();
         let a = crate::ops::imp::zeros(&[1 << 18], crate::DType::F32).unwrap(); // 1 MiB
-        let storage = a.data().expect("leaf data");
+        a.eval().unwrap(); // filled when evaluated, as MLX's
+        let storage = a.data().expect("evaluated data");
         assert!(storage.buffer.is_metal());
         assert!(
             device.memory().active >= before.active + (1 << 20) || device.memory().peak >= 1 << 20

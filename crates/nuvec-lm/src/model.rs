@@ -334,6 +334,8 @@ pub struct KvCache {
     /// From the last forward with `keep_steps`: every step's recurrent state
     /// (`[B, T, ...]`) and the convolution's input (`[B, kernel − 1 + T, channels]`).
     steps: Option<(Array, Array)>,
+    /// Attention keys and values are returned, not kept ([`Model::forward_uncached`]).
+    uncached: bool,
 }
 
 /// Positions added to a cache's capacity at a time.
@@ -375,6 +377,10 @@ impl KvCache {
         let (prev, start) = (self.offset, self.start);
         let l = values.shape().get(2).copied().unwrap_or_default();
         let end = prev + l;
+        if self.uncached {
+            self.offset = end;
+            return (rope.norm_rope(keys, norm, prev, None), values.clone());
+        }
         let fits = self
             .keys
             .as_ref()
@@ -518,6 +524,7 @@ impl KvCache {
             offset: self.offset,
             keep_steps: false,
             steps: None,
+            uncached: self.uncached,
         }
     }
 
@@ -581,7 +588,9 @@ fn grow(old: Option<Array>, kept: (i32, i32), new: &Array, pad: i32) -> Array {
         if let Some(d) = shape.get_mut(2) {
             *d = pad;
         }
-        parts.push(ops::zeros(shape, new.dtype()));
+        // A broadcast zero: the concatenation writes the zeros on the stream's device, as
+        // mlx-lm's lazy `mx.zeros`.
+        parts.push(ops::broadcast_to(&ops::zeros((), new.dtype()), shape));
     }
     ops::concatenate(&parts, 2)
 }
@@ -1765,6 +1774,17 @@ impl Model {
             .collect()
     }
 
+    /// The logits `[B, L, vocab]` for tokens `[B, L]` with no cache, as mlx-lm's
+    /// `model(inputs)`: for training and scoring, the keys and values are not kept.
+    #[track_caller]
+    pub fn forward_uncached(&self, tokens: &Array) -> Array {
+        let mut cache = self.new_cache();
+        for c in &mut cache {
+            c.uncached = true;
+        }
+        self.forward(tokens, &mut cache)
+    }
+
     /// The logits `[B, L, vocab]` for tokens `[B, L]` (integers) following the cached
     /// positions, which are extended. `cache` has one entry per layer
     /// ([`Model::new_cache`]); another length gives a failed array (and leaves the cache
@@ -2087,6 +2107,45 @@ pub(crate) mod tests {
     pub(crate) fn fail_paged_at(layer: usize) -> Fault {
         FAIL_PAGED_AT.with(|f| f.set(Some(layer)));
         Fault
+    }
+
+    /// Growing a cache keeps `old`'s kept positions, appends `new` and pads with zeros, in
+    /// every dtype, on the CPU and the GPU (the padding is a broadcast zero, written by the
+    /// concatenation).
+    #[test]
+    fn grow_keeps_appends_and_pads_with_zeros() {
+        let devices = [
+            Some(nuvec::Device::cpu()),
+            nuvec::metal::is_available().then(|| nuvec::Device::gpu(0)),
+        ];
+        for device in devices.into_iter().flatten() {
+            nuvec::with_stream(nuvec::Stream::default_for(device), || {
+                for dtype in [DType::F32, DType::F16, DType::BF16] {
+                    let old = ops::arange(0.0, 24.0, 1.0)
+                        .reshape([1, 2, 6, 2])
+                        .astype(dtype);
+                    let new = ops::arange(100.0, 104.0, 1.0)
+                        .reshape([1, 2, 1, 2])
+                        .astype(dtype);
+                    let grown = grow(Some(old), (1, 4), &new, 3);
+                    assert_eq!(grown.shape(), [1, 2, 7, 2]);
+                    assert_eq!(grown.dtype(), dtype);
+                    let got = grown.astype(DType::F32).to_vec::<f32>().unwrap();
+                    let head = |h: f32| {
+                        let base = h * 12.0;
+                        let mut row: Vec<f32> = (2..8).map(|i| base + i as f32).collect();
+                        row.extend([100.0 + 2.0 * h, 101.0 + 2.0 * h]);
+                        row.extend([0.0; 6]);
+                        row
+                    };
+                    let want: Vec<f32> = [head(0.0), head(1.0)].concat();
+                    assert_eq!(got, want, "{dtype:?} on {device:?}");
+                    // No kept positions and no padding: `new` alone.
+                    let alone = grow(None, (0, 0), &new, 0);
+                    assert_eq!(alone.shape(), new.shape());
+                }
+            });
+        }
     }
 
     /// A model of the `qwen3_f32` fixture, or `None` without a Metal device.

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -16,24 +16,25 @@ categories = ["science", "mathematics"]
 exclude = ["tests/fixtures"]
 
 [workspace.dependencies]
-nuvec = { path = "crates/nuvec", version = "0.6.1" }
-nuvec-core = { path = "crates/nuvec-core", version = "0.6.1" }
-nuvec-compile = { path = "crates/nuvec-compile", version = "0.6.1" }
-nuvec-cpu = { path = "crates/nuvec-cpu", version = "0.6.1" }
-nuvec-distributed = { path = "crates/nuvec-distributed", version = "0.6.1" }
-nuvec-gpu = { path = "crates/nuvec-gpu", version = "0.6.1" }
-nuvec-io = { path = "crates/nuvec-io", version = "0.6.1" }
-nuvec-kernels = { path = "crates/nuvec-kernels", version = "0.6.1" }
-nuvec-lm = { path = "crates/nuvec-lm", version = "0.6.1" }
-nuvec-nn = { path = "crates/nuvec-nn", version = "0.6.1" }
-nuvec-macros = { path = "crates/nuvec-macros", version = "0.6.1" }
+nuvec = { path = "crates/nuvec", version = "0.7.0" }
+nuvec-core = { path = "crates/nuvec-core", version = "0.7.0" }
+nuvec-compile = { path = "crates/nuvec-compile", version = "0.7.0" }
+nuvec-cpu = { path = "crates/nuvec-cpu", version = "0.7.0" }
+nuvec-distributed = { path = "crates/nuvec-distributed", version = "0.7.0" }
+nuvec-gpu = { path = "crates/nuvec-gpu", version = "0.7.0" }
+nuvec-io = { path = "crates/nuvec-io", version = "0.7.0" }
+nuvec-kernels = { path = "crates/nuvec-kernels", version = "0.7.0" }
+nuvec-lm = { path = "crates/nuvec-lm", version = "0.7.0" }
+nuvec-nn = { path = "crates/nuvec-nn", version = "0.7.0" }
+nuvec-macros = { path = "crates/nuvec-macros", version = "0.7.0" }
 
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2", "block2"] }
 libc = "0.2"
-# Pre-shared-key authentication of distributed connections (RustCrypto, pure Rust).
+# Authentication and encryption of distributed connections (RustCrypto, pure Rust).
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false }
 unicode-general-category = "1"
 unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
 gemm = { version = "0.19", default-features = false, features = ["std", "f16", "rayon"] }

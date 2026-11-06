@@ -58,3 +58,11 @@ harness = false
 [[bench]]
 name = "paged"
 harness = false
+
+[[bench]]
+name = "creation"
+harness = false
+
+[[bench]]
+name = "attention_vjp"
+harness = false

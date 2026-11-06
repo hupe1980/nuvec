@@ -1495,6 +1495,9 @@ mod gpu {
             (3, 8, 2, 1, 128, 32, &[1, 64, 300]),
             (2, 4, 1, 4, 64, 16, &[4, 77]),
             (2, 2, 2, 1, 256, 8, &[9, 513]),
+            // Qwen3-0.6B's decode at 4 sequences, blocks smaller and larger than 32 keys.
+            (4, 16, 8, 1, 128, 16, &[640, 639, 600, 17]),
+            (4, 16, 8, 1, 128, 256, &[640, 639, 600, 17]),
             // Long caches: two passes.
             (2, 8, 2, 1, 128, 32, &[1500, 3000]),
             (1, 8, 2, 4, 128, 64, &[2100]),
@@ -1945,6 +1948,156 @@ mod gpu {
         both("vmap cross entropy", 2e-5, || {
             let f = |xs: &[Array]| Ok(vec![fast::cross_entropy(&xs[0], &xs[1])]);
             vmap_flat(f, &[Some(1), Some(1)], &[0])(&[x.clone(), targets.clone()])
+        });
+    }
+
+    /// MLX's attention backward (from the forward's log-sum-exp) against the composed
+    /// backward (the same attention with its causal pattern as an array mask, which keeps the
+    /// fallback graph's gradients), with grouped heads, short and long queries, in every float
+    /// dtype.
+    #[test]
+    fn attention_vjp_matches_the_composed_backward() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x87);
+        // (batch, query heads, kv heads, queries, keys, head size, causal)
+        let cases = [
+            (2, 4, 2, 37, 37, 64, true),
+            (1, 4, 4, 64, 64, 128, false),
+            (1, 8, 2, 16, 80, 64, true),
+            (1, 2, 1, 1100, 1100, 64, true),
+            (1, 2, 1, 1027, 2100, 64, false),
+        ];
+        for (b, hq, hkv, lq, lk, d, causal) in cases {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let q = random(&mut rng, &[b, hq, lq, d], dtype);
+                let k = random(&mut rng, &[b, hkv, lk, d], dtype);
+                let v = random(&mut rng, &[b, hkv, lk, d], dtype);
+                let w = random(&mut rng, &[b, hq, lq, d], DType::F32);
+                let scale = (d as f32).powf(-0.5);
+                let seen: Vec<bool> = (0..lq * lk)
+                    .map(|x| !causal || x % lk <= x / lk + (lk - lq))
+                    .collect();
+                let mask = Array::from_slice(&seen, [lq as i32, lk as i32])
+                    .broadcast_to([b as i32, hq as i32, lq as i32, lk as i32]);
+                on(Device::gpu(0), || {
+                    let fused = if causal {
+                        fast::AttentionOptions::causal()
+                    } else {
+                        fast::AttentionOptions::default()
+                    };
+                    let composed = fast::AttentionOptions::default().mask(&mask);
+                    let f = |(q, k, v): &(Array, Array, Array)| {
+                        (fast::scaled_dot_product_attention(q, k, v, scale, &fused)
+                            .astype(DType::F32)
+                            * &w)
+                            .sum(..)
+                    };
+                    let c = |(q, k, v): &(Array, Array, Array)| {
+                        (fast::scaled_dot_product_attention(q, k, v, scale, &composed)
+                            .astype(DType::F32)
+                            * &w)
+                            .sum(..)
+                    };
+                    let primals = (q.clone(), k.clone(), v.clone());
+                    let (lf, (gq, gk, gv)) = value_and_grad(f)(&primals).unwrap();
+                    let (lc, (cq, ck, cv)) = value_and_grad(c)(&primals).unwrap();
+                    // In half precision MLX's backward rounds P and dS to the dtype before its
+                    // products, as the composed graph rounds elsewhere: both are measured
+                    // against the float32 composed backward, and the fused one may err at
+                    // most twice as much (plus the dtype's tolerance).
+                    if dtype != DType::F32 {
+                        let up = |a: &Array| a.astype(DType::F32);
+                        let (_, (rq, rk, rv)) =
+                            value_and_grad(c)(&(up(&q), up(&k), up(&v))).unwrap();
+                        let err = |a: &Array, r: &Array| {
+                            let (a, r) =
+                                (up(a).to_vec::<f32>().unwrap(), r.to_vec::<f32>().unwrap());
+                            let scale = r.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+                            a.iter()
+                                .zip(&r)
+                                .map(|(x, y)| (x - y).abs())
+                                .fold(0.0f32, f32::max)
+                                / scale
+                        };
+                        let name = format!("{dtype} {:?}", (b, hq, hkv, lq, lk, d, causal));
+                        for (what, fused, composed, r) in [
+                            ("dq", &gq, &cq, &rq),
+                            ("dk", &gk, &ck, &rk),
+                            ("dv", &gv, &cv, &rv),
+                        ] {
+                            let (ef, ec) = (err(fused, r), err(composed, r));
+                            assert!(
+                                ef <= 2.0 * ec + tolerance(dtype) as f32,
+                                "{name} {what}: fused {ef} vs composed {ec}"
+                            );
+                        }
+                        assert_close(&format!("{name} loss"), &lf, &lc, tolerance(dtype) * 4.0);
+                        return;
+                    }
+                    let name = format!("{dtype} {:?}", (b, hq, hkv, lq, lk, d, causal));
+                    let tol = tolerance(dtype) * 4.0;
+                    assert_close(&format!("{name} loss"), &lf, &lc, tol);
+                    assert_close(&format!("{name} dq"), &gq, &cq, tol);
+                    assert_close(&format!("{name} dk"), &gk, &ck, tol);
+                    assert_close(&format!("{name} dv"), &gv, &cv, tol);
+                });
+            }
+        }
+    }
+
+    /// The fused backward from strided inputs (`[B, L, H, D]` views with an offset,
+    /// transposed) equals the contiguous inputs', and composes with `vmap` and `checkpoint`.
+    #[test]
+    fn attention_vjp_takes_views_and_composes_with_transforms() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x88);
+        let (b, hq, hkv, l, d) = (2, 4, 2, 40, 64);
+        let scale = (d as f32).powf(-0.5);
+        let opts = fast::AttentionOptions::causal();
+        on(Device::gpu(0), || {
+            let w = random(&mut rng, &[b, hq, l, d], DType::F32);
+            let loss = |q: &Array, k: &Array, v: &Array| {
+                (fast::scaled_dot_product_attention(q, k, v, scale, &opts) * &w).sum(..)
+            };
+            // Views: one extra leading position, sliced off, then heads first.
+            let view = |rng: &mut Rng, h: usize| {
+                let x = random(rng, &[b, l + 1, h, d], DType::F32);
+                ops::transpose(&x.i((.., 1.., .., ..)), [0, 2, 1, 3])
+            };
+            let (q, k, v) = (view(&mut rng, hq), view(&mut rng, hkv), view(&mut rng, hkv));
+            let dense = |a: &Array| Array::from_slice(&a.to_vec::<f32>().unwrap(), a.shape());
+            let f = |(q, k, v): &(Array, Array, Array)| Ok(loss(q, k, v));
+            let (_, (gq, gk, gv)) = value_and_grad(f)(&(q.clone(), k.clone(), v.clone())).unwrap();
+            let primals = (dense(&q), dense(&k), dense(&v));
+            let (_, (cq, ck, cv)) = value_and_grad(f)(&primals).unwrap();
+            for (what, a, c) in [("dq", &gq, &cq), ("dk", &gk, &ck), ("dv", &gv, &cv)] {
+                assert_close(&format!("views {what}"), a, c, 1e-5);
+            }
+            // vmap of the gradient over a leading axis of queries.
+            let (k0, v0) = (&primals.1, &primals.2);
+            let qs = random(&mut rng, &[3, b, hq, l, d], DType::F32);
+            let per = vmap(|q: &Array| grad(|q: &Array| Ok(loss(q, k0, v0)))(q))
+                .call(&qs)
+                .unwrap();
+            for n in 0..3 {
+                let one = grad(|q: &Array| Ok(loss(q, k0, v0)))(&qs.i(n)).unwrap();
+                assert_close(&format!("vmap {n}"), &per.i(n), &one, 1e-5);
+            }
+            // checkpoint around the attention.
+            let block = checkpoint(move |(q, k, v): &(Array, Array, Array)| {
+                Ok(fast::scaled_dot_product_attention(q, k, v, scale, &opts))
+            });
+            let g = |(q, k, v): &(Array, Array, Array)| {
+                Ok((block(&(q.clone(), k.clone(), v.clone()))? * &w).sum(..))
+            };
+            let (_, (hq_, hk, hv)) = value_and_grad(g)(&primals).unwrap();
+            for (what, a, c) in [("dq", &hq_, &cq), ("dk", &hk, &ck), ("dv", &hv, &cv)] {
+                assert_close(&format!("checkpoint {what}"), a, c, 1e-5);
+            }
         });
     }
 }

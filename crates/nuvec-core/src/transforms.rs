@@ -35,9 +35,17 @@ static NEXT_TRACE: AtomicU64 = AtomicU64::new(PLACEHOLDER + 1);
 struct Frame {
     id: TraceId,
     retained: Vec<Weak<Node>>,
+    /// A reverse-mode transform (`vjp`, `grad`): ops may save what their backward reuses.
+    reverse: bool,
 }
 
 thread_local!(static LIVE: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) });
+
+/// Whether a reverse-mode transform is running on this thread (MLX's `in_grad_tracing`):
+/// ops recorded now may be differentiated, so they may save what their backward reuses.
+pub(crate) fn in_reverse() -> bool {
+    LIVE.with_borrow(|live| live.iter().any(|f| f.reverse))
+}
 
 /// Whether transform `id` is running on this thread.
 pub(crate) fn is_live(id: TraceId) -> bool {
@@ -75,12 +83,23 @@ struct Tracing {
 }
 
 impl Tracing {
+    /// A forward-mode or batching transform.
     fn enter() -> Self {
+        Self::enter_as(false)
+    }
+
+    /// A reverse-mode transform.
+    fn enter_reverse() -> Self {
+        Self::enter_as(true)
+    }
+
+    fn enter_as(reverse: bool) -> Self {
         let id = NEXT_TRACE.fetch_add(1, Ordering::Relaxed);
         LIVE.with_borrow_mut(|live| {
             live.push(Frame {
                 id,
                 retained: Vec::new(),
+                reverse,
             });
         });
         Tracing { id }
@@ -315,7 +334,7 @@ pub fn vjp_flat(
     primals: &[Array],
     cotangents: &[Array],
 ) -> Result<(Vec<Array>, Vec<Array>)> {
-    let tracing = Tracing::enter();
+    let tracing = Tracing::enter_reverse();
     let tracers = primals
         .iter()
         .map(|p| tracing.tracer(p))
@@ -442,7 +461,7 @@ where
                 )));
             }
         }
-        let tracing = Tracing::enter();
+        let tracing = Tracing::enter_reverse();
         let mut inputs = args.to_vec();
         let mut tracers = Vec::with_capacity(argnums.len());
         for &i in &argnums {
@@ -816,7 +835,7 @@ fn value_and_grad_tree<P: Tree, O: GradOutput>(
     params: &P,
 ) -> Result<(O, P)> {
     let (leaves, mask) = differentiated("value_and_grad", params)?;
-    let tracing = Tracing::enter();
+    let tracing = Tracing::enter_reverse();
     let (inputs, tracers) = traced(&tracing, &leaves, &mask)?;
     let out = f(&params.unflatten(inputs)?)?;
     let loss = out.loss().clone().check()?;
@@ -920,7 +939,7 @@ where
     R: IntoResult<Ok = O>,
 {
     let (leaves, mask) = differentiated("vjp", primals)?;
-    let tracing = Tracing::enter();
+    let tracing = Tracing::enter_reverse();
     let (inputs, tracers) = traced(&tracing, &leaves, &mask)?;
     let out = f(&primals.unflatten(inputs)?).into_result()?;
     let outputs = checked(out.leaves())?;

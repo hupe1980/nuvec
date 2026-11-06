@@ -191,7 +191,8 @@ fn every_op_family_reports_the_callers_location() {
         "arange",
         OpErrorKind::InvalidArgument(_)
     );
-    case!(ops::full([i32::MAX, 4], 1.0), "full", _);
+    // A size that overflows fails at creation (allocation fails when evaluated, as MLX).
+    case!(ops::full([i32::MAX, i32::MAX, i32::MAX], 1.0), "full", _);
 }
 
 #[test]

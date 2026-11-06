@@ -97,3 +97,15 @@ pub(crate) fn join<'a, A: Send + 'a, B>(
         (Err(p), _) | (_, Err(p)) => std::panic::resume_unwind(p),
     }
 }
+
+/// Runs `f` on every item, the halves of `items` on two threads, recursively.
+pub(crate) fn for_each<T: Send>(items: &mut [T], f: &(dyn Fn(&mut T) + Sync)) {
+    match items.len() {
+        0 => {}
+        1 => f(&mut items[0]),
+        n => {
+            let (a, b) = items.split_at_mut(n / 2);
+            join(|| for_each(a, f), || for_each(b, f));
+        }
+    }
+}

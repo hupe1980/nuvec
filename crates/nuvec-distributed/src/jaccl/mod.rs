@@ -78,7 +78,8 @@ impl Options {
     }
 
     /// Authenticates the side channel's connections with this pre-shared secret (at least 16
-    /// bytes, the same on every rank; `NUVEC_DISTRIBUTED_KEY` for `init`).
+    /// bytes, the same on every rank; `NUVEC_DISTRIBUTED_KEY` for `init`). The RDMA traffic
+    /// is not encrypted.
     pub fn key(mut self, secret: impl AsRef<[u8]>) -> Self {
         self.key = crate::auth::Secret(Some(secret.as_ref().to_vec()));
         self

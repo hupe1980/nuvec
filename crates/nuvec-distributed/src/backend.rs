@@ -62,6 +62,19 @@ fn secret() -> Option<String> {
     std::env::var("NUVEC_DISTRIBUTED_KEY").ok()
 }
 
+/// `NUVEC_DISTRIBUTED_ENCRYPT`: `0` keeps a keyed ring authenticated only, `1` encrypts
+/// (the default with a key).
+fn encrypt() -> Result<Option<bool>> {
+    match std::env::var("NUVEC_DISTRIBUTED_ENCRYPT").as_deref() {
+        Err(_) => Ok(None),
+        Ok("0") => Ok(Some(false)),
+        Ok("1") => Ok(Some(true)),
+        Ok(v) => Err(Error::InvalidArgument(format!(
+            "distributed: NUVEC_DISTRIBUTED_ENCRYPT {v:?} (0 or 1)"
+        ))),
+    }
+}
+
 /// The ring from `MLX_HOSTFILE` and `MLX_RANK`; `None` when they are not set.
 fn ring() -> Result<Option<Group>> {
     let (Ok(hostfile), Ok(rank)) = (std::env::var("MLX_HOSTFILE"), std::env::var("MLX_RANK"))
@@ -77,6 +90,9 @@ fn ring() -> Result<Option<Group>> {
     let mut options = Options::default().timeout(timeout()?);
     if let Some(secret) = secret() {
         options = options.key(secret);
+    }
+    if let Some(on) = encrypt()? {
+        options = options.encrypt(on);
     }
     init_with(&hostfile::parse(&text)?, rank, &options).map(Some)
 }

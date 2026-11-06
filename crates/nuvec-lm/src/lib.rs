@@ -78,6 +78,7 @@ pub mod speculative;
 pub mod stop;
 mod suffix;
 pub mod tokenizer;
+pub mod tuner;
 
 pub use batch::{Batcher, BatcherOptions, Event, RequestId};
 pub use config::{Activation, Config, Gemma4, LayerQuant, PackedFormat, Quantization};

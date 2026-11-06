@@ -19,9 +19,11 @@ jaccl = []
 
 [dependencies]
 nuvec-core.workspace = true
-# Pre-shared-key authentication of every connection (HMAC-SHA256).
+# Pre-shared-key authentication of every connection (HMAC-SHA256, and HKDF over it).
 sha2.workspace = true
 hmac.workspace = true
+# Encryption of every frame between keyed ranks (RustCrypto, pure Rust).
+chacha20poly1305.workspace = true
 # Block-wise float16 conversions in the half-precision sum (already in the graph via nuvec-core).
 half.workspace = true
 

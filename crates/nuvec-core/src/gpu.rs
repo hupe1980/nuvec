@@ -2200,6 +2200,26 @@ mod metal {
         /// Gathers an operand into contiguous memory, walking its own logical shape (a
         /// reshape keeps the row-major element order of its input).
         fn copy(&mut self, (meta, data): Operand<'_>, buffer: &mut Buffer) -> Result<()> {
+            // One element broadcast (`zeros`, `full`): 16 bytes per thread, as MLX's
+            // scalar copy.
+            if meta.size > 1
+                && meta.size <= u32::MAX as usize
+                && meta.strides.iter().all(|&s| s == 0)
+            {
+                let width = bits(meta.dtype.size());
+                let consts = [bytes(&(data.offset as i64)), bytes(&(meta.size as u32))];
+                let mut args = vec![
+                    Arg::read(data.buffer.metal().expect("checked")),
+                    Arg::write(buffer.metal_mut().expect("device storage")),
+                ];
+                args.extend(consts.iter().map(|c| Arg::bytes(c)));
+                let per = (16 / meta.dtype.size()).max(1);
+                return self.dispatch(
+                    &format!("nuvec_fill_{width}"),
+                    &args,
+                    meta.size.div_ceil(per),
+                );
+            }
             let (mut shape, [mut strides]) = nuvec_cpu::collapse_dims(&meta.shape, [&meta.strides]);
             let small = shape.len() <= 3 && shape.iter().all(|&d| d <= u32::MAX as usize);
             let mut from_off = data.offset;
@@ -3098,9 +3118,14 @@ mod metal {
                 blocks,
                 gqa_kernel,
                 tk1,
+                lse,
             } = *op
             {
                 let mut out = alloc(&outputs[0])?;
+                let mut lse_buf = match lse {
+                    true => Some(alloc(&outputs[1])?),
+                    false => None,
+                };
                 let flags = AttentionFlags {
                     scale: f32::from_bits(scale),
                     causal,
@@ -3112,14 +3137,19 @@ mod metal {
                     gqa_kernel,
                     tk1,
                 };
-                self.attention(operands, &outputs[0], flags, &mut out)?;
-                return Ok(vec![Data::new(out)]);
+                self.attention(operands, &outputs[0], flags, &mut out, lse_buf.as_mut())?;
+                let mut data = vec![Data::new(out)];
+                data.extend(lse_buf.map(Data::new));
+                return Ok(data);
             }
             if let FastOp::GatedDelta { steps } = *op {
                 return self.gated_delta(operands, outputs, steps);
             }
             if *op == FastOp::GatedDeltaSlots {
                 return self.gated_delta_slots(operands, outputs);
+            }
+            if let FastOp::AttentionVjp { scale, causal } = *op {
+                return self.attention_vjp(operands, outputs, f32::from_bits(scale), causal);
             }
             if let FastOp::MoeRoute { k, normalize } = *op {
                 return self.moe_route(operands[0], (k, normalize), outputs);
@@ -3438,6 +3468,7 @@ mod metal {
                 | FastOp::GatedDelta { .. }
                 | FastOp::GatedDeltaSlots
                 | FastOp::GatherQmm { .. }
+                | FastOp::AttentionVjp { .. }
                 | FastOp::GatherMm => {
                     unreachable!("handled above")
                 }
@@ -4360,12 +4391,14 @@ mod metal {
         /// MLX's `ScaledDotProductAttention::eval_gpu` (without NAX): the vector kernels
         /// (one or two passes) or the tiled steel kernel, as the attention plan decided
         /// (`crate::fast::plan`; the encoder makes no routing decisions).
+        /// `lse`: the tiled kernel also writes each query row's log-sum-exp there.
         fn attention(
             &mut self,
             operands: &[Operand<'_>],
             out: &Output,
             flags: AttentionFlags,
             buffer: &mut Buffer,
+            lse: Option<&mut Buffer>,
         ) -> Result<()> {
             let AttentionFlags {
                 scale,
@@ -4607,7 +4640,7 @@ mod metal {
                 (310, has_mask),
                 (311, causal),
                 (312, has_sinks),
-                (313, false),
+                (313, lse.is_some()),
                 (314, window > 0),
             ];
             let pipeline = self.pipeline_with(&name, &constants)?;
@@ -4662,6 +4695,12 @@ mod metal {
                 }
                 args.push(s.arg());
             }
+            if let Some(l) = lse {
+                while args.len() < 8 {
+                    args.push(Arg::bytes(&unused));
+                }
+                args.push(Arg::write(l.metal_mut().expect("device storage")));
+            }
             if window > 0 {
                 while args.len() < 9 {
                     args.push(Arg::bytes(&unused));
@@ -4671,6 +4710,219 @@ mod metal {
             let _ = out;
             self.encode_groups(&pipeline, &args, [nq, hq, b], [32, wm, wn])?;
             self.counted()
+        }
+
+        /// [`crate::fast::imp::FastOp::AttentionVjp`]: MLX's `ScaledDotProductAttentionVJP`
+        /// (`eval_gpu`, `sdpa_vjp_blocked`). The inputs are made contiguous, δ = rowsum(O ⊙
+        /// dO) is one kernel, and one set of tiles serves every query × key tile: `S = Q·Kᵀ`
+        /// and `dP = dO·Vᵀ` (GEMMs over `{B, Hk, G}` batches, the key head broadcast over its
+        /// query group), `P` and `dS` (dS over S), then `dQ = dS·K`, `dK = dSᵀ·Q` and `dV =
+        /// Pᵀ·dO`, each summed over the group into a float32 accumulator that also writes the
+        /// output. Causal tiles wholly above the diagonal are skipped.
+        fn attention_vjp(
+            &mut self,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+            scale: f32,
+            causal: bool,
+        ) -> Result<Vec<Data>> {
+            // MLX's `ensure_row_contiguous`.
+            let mut data = Vec::with_capacity(operands.len());
+            for &(meta, d) in operands {
+                if meta.flags.row_contiguous && d.offset >= 0 && d.buffer.metal().is_some() {
+                    data.push(d.clone());
+                } else {
+                    let mut copy = Buffer::try_alloc_gpu(meta.size * meta.dtype.size())?;
+                    self.copy((meta, d), &mut copy)?;
+                    data.push(Data::new(copy));
+                }
+            }
+            let (q, k, v) = (operands[0].0, operands[1].0, operands[2].0);
+            let dtype = q.dtype;
+            let (b, h, ql, d) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
+            let (hk, kl, dv) = (k.shape[1], k.shape[2], v.shape[3]);
+            let (g, bh, bhk) = (h / hk, b * h, b * hk);
+            let diag_off = kl as i32 - ql as i32;
+            let block = crate::fast::imp::VJP_BLOCK;
+            let (bq, bk) = (ql.min(block), kl.min(block));
+            let alloc = |n: usize, dt: DType| Buffer::try_alloc_gpu(n * dt.size());
+            let mut grads = [
+                alloc(outputs[0].size, dtype)?,
+                alloc(outputs[1].size, dtype)?,
+                alloc(outputs[2].size, dtype)?,
+            ];
+            let name = |kernel: &str| format!("nuvec_sdpa_vjp_{kernel}_{}", dtype.name());
+            let at = |i: usize| {
+                (
+                    &data[i],
+                    data[i].offset as usize * operands[i].0.dtype.size(),
+                )
+            };
+
+            let mut odo = alloc(bh * ql, DType::F32)?;
+            {
+                let ((o, oo), (dout, doo)) = (at(3), at(5));
+                let pipeline = self.pipeline(&name("odo"))?;
+                let (qlb, dvb) = (bytes(&(ql as i32)), bytes(&(dv as i32)));
+                let args = [
+                    Arg::Read(o.buffer.metal().expect("checked"), oo),
+                    Arg::Read(dout.buffer.metal().expect("checked"), doo),
+                    Arg::write(odo.metal_mut().expect("device storage")),
+                    Arg::bytes(&qlb),
+                    Arg::bytes(&dvb),
+                ];
+                self.encode_threads(&pipeline, &args, [32, ql, bh], [32, 1, 1])?;
+                self.counted()?;
+            }
+
+            let tile = |n: usize| -> Result<Arc<Buffer>> { Ok(Arc::new(alloc(n, dtype)?)) };
+            let (mut s_buf, mut dp_buf, mut p_buf) = (
+                tile(bh * bq * bk)?,
+                tile(bh * bq * bk)?,
+                tile(bh * bq * bk)?,
+            );
+            let (mut dq_tile, mut dk_tile, mut dv_tile) =
+                (tile(bh * bq * d)?, tile(bh * bk * d)?, tile(bh * bk * dv)?);
+            let mut accs = [
+                alloc(b * h * ql * d, DType::F32)?,
+                alloc(b * hk * kl * d, DType::F32)?,
+                alloc(b * hk * kl * dv, DType::F32)?,
+            ];
+            fn unshared(a: &mut Arc<Buffer>) -> &mut Buffer {
+                Arc::get_mut(a).expect("the backward's own tile")
+            }
+
+            // Views: `{B, Hk, G}` batches of row slices (element strides and offsets).
+            let i = |n: usize| n as isize;
+            let view = |shape: [usize; 5], strides: [isize; 5]| {
+                crate::kernels::strided(dtype, &shape, &strides)
+            };
+            let slice = |x: &Data, off: usize| Data {
+                buffer: x.buffer.clone(),
+                offset: x.offset + i(off),
+            };
+            let own = |x: &Arc<Buffer>| Data {
+                buffer: x.clone(),
+                offset: 0,
+            };
+            let rows = |len: usize, w: usize, t: usize| {
+                view(
+                    [b, hk, g, len, w],
+                    [i(h * t * w), i(g * t * w), i(t * w), i(w), 1],
+                )
+            };
+            let keys = |len: usize, w: usize, transposed: bool| {
+                let (shape, inner) = match transposed {
+                    true => ([b, hk, g, w, len], [1, i(w)]),
+                    false => ([b, hk, g, len, w], [i(w), 1]),
+                };
+                view(shape, [i(hk * kl * w), i(kl * w), 0, inner[0], inner[1]])
+            };
+            let scores = |r: usize, c: usize, transposed: bool| {
+                let ss = i(r * c);
+                let (shape, inner) = match transposed {
+                    true => ([b, hk, g, c, r], [1, i(c)]),
+                    false => ([b, hk, g, r, c], [i(c), 1]),
+                };
+                view(shape, [i(hk * g) * ss, i(g) * ss, ss, inner[0], inner[1]])
+            };
+            let product = |r: usize, c: usize| scores(r, c, false);
+
+            #[repr(C)]
+            #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+            struct TileParams {
+                bq: i32,
+                bk: i32,
+                ql: i32,
+                i0: i32,
+                j0: i32,
+                scale: f32,
+                diag_off: i32,
+                causal: i32,
+            }
+            let ds_pipeline = self.pipeline(&name("ds"))?;
+            let reduce = [
+                self.pipeline(&name("reduce_set"))?,
+                self.pipeline(&name("reduce_add"))?,
+            ];
+            let (lse, lse_off) = at(4);
+            let (qd, kd, vd, dod) = (&data[0], &data[1], &data[2], &data[5]);
+            for j0 in (0..kl).step_by(bk) {
+                let bk_len = bk.min(kl - j0);
+                let mut kv_accum = false;
+                for i0 in (0..ql).step_by(bq) {
+                    let bq_len = bq.min(ql - i0);
+                    if causal && j0 as i32 > (i0 + bq_len) as i32 - 1 + diag_off {
+                        continue;
+                    }
+                    let (qs, ks) = (slice(qd, i0 * d), slice(kd, j0 * d));
+                    let (os, vs) = (slice(dod, i0 * dv), slice(vd, j0 * dv));
+                    // S = Q·Kᵀ, dP = dO·Vᵀ
+                    let (sm, dpm) = (product(bq_len, bk_len), product(bq_len, bk_len));
+                    let (qm, ktm) = (rows(bq_len, d, ql), keys(bk_len, d, true));
+                    self.gemm((&qm, &qs), (&ktm, &ks), None, &sm, unshared(&mut s_buf))?;
+                    let (om, vtm) = (rows(bq_len, dv, ql), keys(bk_len, dv, true));
+                    self.gemm((&om, &os), (&vtm, &vs), None, &dpm, unshared(&mut dp_buf))?;
+                    // P = exp(scale·S − lse), dS = P ⊙ (dP − δ) · scale (over S)
+                    let params = bytes(&TileParams {
+                        bq: bq_len as i32,
+                        bk: bk_len as i32,
+                        ql: ql as i32,
+                        i0: i0 as i32,
+                        j0: j0 as i32,
+                        scale,
+                        diag_off,
+                        causal: i32::from(causal),
+                    });
+                    {
+                        let args = [
+                            Arg::Same(4, 0),
+                            Arg::read(dp_buf.metal().expect("device storage")),
+                            Arg::Read(lse.buffer.metal().expect("checked"), lse_off),
+                            Arg::read(odo.metal().expect("device storage")),
+                            Arg::write(unshared(&mut s_buf).metal_mut().expect("device storage")),
+                            Arg::write(unshared(&mut p_buf).metal_mut().expect("device storage")),
+                            Arg::bytes(&params),
+                        ];
+                        self.encode_threads(&ds_pipeline, &args, [bk_len, bq_len, bh], [32, 8, 1])?;
+                        self.counted()?;
+                    }
+                    // dQ = dS·K, dK = dSᵀ·Q, dV = Pᵀ·dO
+                    let (ds, p) = (own(&s_buf), own(&p_buf));
+                    let km = keys(bk_len, d, false);
+                    let dqm = product(bq_len, d);
+                    let dsm = scores(bq_len, bk_len, false);
+                    self.gemm((&dsm, &ds), (&km, &ks), None, &dqm, unshared(&mut dq_tile))?;
+                    let dstm = scores(bq_len, bk_len, true);
+                    let dkm = product(bk_len, d);
+                    self.gemm((&dstm, &ds), (&qm, &qs), None, &dkm, unshared(&mut dk_tile))?;
+                    let dvm = product(bk_len, dv);
+                    self.gemm((&dstm, &p), (&om, &os), None, &dvm, unshared(&mut dv_tile))?;
+                    drop((ds, p));
+                    // dQ[i0] (+)= dQ_tile, dK[j0] (+)= Σ_G dK_tile, dV[j0] (+)= Σ_G dV_tile
+                    let [dq, dk, dvg] = &mut grads;
+                    let [dq_acc, dk_acc, dv_acc] = &mut accs;
+                    let jobs = [
+                        (&dq_tile, dq_acc, dq, bq_len, d, 1, ql, i0, bh, j0 != 0),
+                        (&dk_tile, dk_acc, dk, bk_len, d, g, kl, j0, bhk, kv_accum),
+                        (&dv_tile, dv_acc, dvg, bk_len, dv, g, kl, j0, bhk, kv_accum),
+                    ];
+                    for (src, acc, out, r, dim, group, acc_rows, row_off, nbh, accum) in jobs {
+                        let consts = [r, dim, group, acc_rows, row_off].map(|x| bytes(&(x as i32)));
+                        let mut args = vec![
+                            Arg::read(src.metal().expect("device storage")),
+                            Arg::write(acc.metal_mut().expect("device storage")),
+                            Arg::write(out.metal_mut().expect("device storage")),
+                        ];
+                        args.extend(consts.iter().map(|c| Arg::bytes(c)));
+                        let pipeline = &reduce[usize::from(accum)];
+                        self.encode_threads(pipeline, &args, [dim, r, nbh], [dim.min(32), 8, 1])?;
+                        self.counted()?;
+                    }
+                    kv_accum = true;
+                }
+            }
+            Ok(grads.into_iter().map(Data::new).collect())
         }
 
         /// MLX's `affine_quantize`: one simdgroup per group of values.

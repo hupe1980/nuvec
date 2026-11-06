@@ -3,7 +3,6 @@
 //! followed by an all-gather around the ring, so every segment is reduced once, in ring
 //! order, and then copied: all ranks get the same bits, and reruns repeat them.
 
-use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,14 +11,15 @@ use nuvec_core::distributed::{AllReduce, Communicator};
 use nuvec_core::{DType, Error, Result};
 
 use crate::reduce::combine;
+use crate::seal::{Link, Moved};
 
 pub(crate) struct Ring {
     rank: usize,
     size: usize,
     /// Connections to the right neighbour (this rank connected), one per address.
-    right: Vec<TcpStream>,
+    right: Vec<Link>,
     /// Connections from the left neighbour (this rank accepted).
-    left: Vec<TcpStream>,
+    left: Vec<Link>,
     /// Receive buffers of a split all-reduce's parts, kept between calls.
     scratch: Vec<std::sync::Mutex<Vec<u8>>>,
     /// The first transport error: a failed transfer leaves unread bytes in the sockets, so
@@ -54,12 +54,14 @@ fn configure(s: &TcpStream, timeout: Duration, peer: usize) -> Result<()> {
 }
 
 impl Ring {
-    /// Connects rank `rank` of the ring described by `nodes` (the addresses per rank).
+    /// Connects rank `rank` of the ring described by `nodes` (the addresses per rank),
+    /// authenticated with `key` when given and then, with `encrypt`, encrypted.
     pub(crate) fn connect(
         nodes: &[Vec<String>],
         rank: usize,
         timeout: Duration,
         key: Option<&crate::auth::Key>,
+        encrypt: bool,
     ) -> Result<Self> {
         let size = nodes.len();
         if rank >= size {
@@ -85,7 +87,7 @@ impl Ring {
                 Ok(l)
             })
             .collect::<Result<Vec<_>>>()?;
-        let accept = || -> Result<Vec<TcpStream>> {
+        let accept = || -> Result<Vec<Link>> {
             listeners
                 .iter()
                 .map(|l| {
@@ -108,8 +110,9 @@ impl Ring {
                         };
                         configure(&s, timeout, left)?;
                         let who = format!("rank {left}");
-                        match crate::auth::accept(&s, key, rank as u64, Some(left as u64), &who) {
-                            Ok(_) => return Ok(s),
+                        let expected = Some(left as u64);
+                        match crate::auth::accept(&s, key, encrypt, rank as u64, expected, &who) {
+                            Ok((_, keys)) => return Ok(Link::new(s, keys)),
                             Err(e) if key.is_some() => refused = Some(e),
                             Err(e) => return Err(e),
                         }
@@ -117,7 +120,7 @@ impl Ring {
                 })
                 .collect()
         };
-        let connect = || -> Result<Vec<TcpStream>> {
+        let connect = || -> Result<Vec<Link>> {
             nodes[right]
                 .iter()
                 .map(|a| {
@@ -133,8 +136,9 @@ impl Ring {
                     };
                     configure(&s, timeout, right)?;
                     let who = format!("rank {right}");
-                    crate::auth::connect(&s, key, rank as u64, right as u64, &who)?;
-                    Ok(s)
+                    let keys =
+                        crate::auth::connect(&s, key, encrypt, rank as u64, right as u64, &who)?;
+                    Ok(Link::new(s, keys))
                 })
                 .collect()
         };
@@ -148,7 +152,7 @@ impl Ring {
         };
         // Non-blocking from here on: every transfer waits in poll(2) (see `duplex`).
         for s in right_s.iter().chain(&left_s) {
-            s.set_nonblocking(true).map_err(|e| {
+            s.stream().set_nonblocking(true).map_err(|e| {
                 Error::Backend(format!("distributed: configuring a connection: {e}"))
             })?;
         }
@@ -173,7 +177,7 @@ impl Ring {
     }
 
     /// The sockets to `dst` for sending, or `src` for receiving (direct neighbours only).
-    fn sockets(&self, peer: usize, sending: bool) -> Result<&[TcpStream]> {
+    fn sockets(&self, peer: usize, sending: bool) -> Result<&[Link]> {
         let (first, second) = if sending {
             (
                 (self.right_rank(), &self.right),
@@ -246,7 +250,7 @@ fn transient(e: &std::io::Error) -> bool {
 /// the buffers `slot` hands out (`None` while none is free; with `true`, it waits for one)
 /// and passed to `full` (their offset in the received bytes and the buffer) once filled.
 struct Receive<'a, S, F> {
-    from: &'a TcpStream,
+    from: &'a Link,
     rank: usize,
     len: usize,
     slot: S,
@@ -256,9 +260,10 @@ struct Receive<'a, S, F> {
 /// Sends `data` to `to` (rank `to_rank`) and receives as `recv` says, both on this thread:
 /// it waits in poll(2) for whichever socket is ready and moves what the kernel takes (on
 /// macOS loopback, two threads sending and receiving on one socket at once halve its
-/// throughput). Fails once neither socket has made progress for `timeout`.
+/// throughput). Fails once neither socket has made progress for `timeout`. Received
+/// plaintext already buffered by an encrypted link is taken without waiting on its socket.
 fn duplex<'b, S, F>(
-    to: &TcpStream,
+    to: &Link,
     data: &[u8],
     to_rank: usize,
     mut recv: Option<Receive<'_, S, F>>,
@@ -294,8 +299,10 @@ where
             timeout.saturating_sub(progress.elapsed())
         };
         let read = recv.as_ref().filter(|_| current.is_some()).map(|r| r.from);
-        let ready = crate::socket::wait(sending.then_some(to), read, wait)
-            .map_err(|e| peer_error(to_rank, "waiting for the connection", e))?;
+        let buffered = read.is_some_and(Link::buffered);
+        let ready = buffered
+            || crate::socket::wait(sending.then_some(to.stream()), read.map(Link::stream), wait)
+                .map_err(|e| peer_error(to_rank, "waiting for the connection", e))?;
         if !ready && progress.elapsed() >= timeout {
             let peer = match &recv {
                 Some(r) if !sending => r.rank,
@@ -304,9 +311,11 @@ where
             return Err(peer_error(peer, "transferring", "timed out"));
         }
         if let (Some(r), Some((buf, filled))) = (recv.as_mut(), current.as_mut()) {
-            match (&*r.from).read(&mut buf[*filled..]) {
-                Ok(0) => return Err(peer_error(r.rank, "receiving", "connection closed")),
-                Ok(n) => {
+            match r.from.read(&mut buf[*filled..]) {
+                Ok(Moved::Closed) => {
+                    return Err(peer_error(r.rank, "receiving", "connection closed"));
+                }
+                Ok(Moved::Bytes { plain: n, .. }) => {
                     progress = Instant::now();
                     *filled += n;
                     if *filled == buf.len() {
@@ -320,9 +329,11 @@ where
             }
         }
         if sending {
-            match (&*to).write(&data[sent..]) {
-                Ok(0) => return Err(peer_error(to_rank, "sending", "connection closed")),
-                Ok(n) => {
+            match to.write(&data[sent..]) {
+                Ok(Moved::Closed) => {
+                    return Err(peer_error(to_rank, "sending", "connection closed"));
+                }
+                Ok(Moved::Bytes { plain: n, .. }) => {
                     progress = Instant::now();
                     sent += n;
                 }
@@ -343,11 +354,11 @@ type NoSlot<'b> = fn(bool) -> Option<&'b mut [u8]>;
 type NoFull<'b> = fn(usize, &'b mut [u8]) -> Result<()>;
 
 impl Ring {
-    fn write_all(&self, s: &TcpStream, data: &[u8], peer: usize) -> Result<()> {
+    fn write_all(&self, s: &Link, data: &[u8], peer: usize) -> Result<()> {
         duplex::<NoSlot, NoFull>(s, data, peer, None, self.timeout)
     }
 
-    fn read_exact(&self, s: &TcpStream, data: &mut [u8], peer: usize) -> Result<()> {
+    fn read_exact(&self, s: &Link, data: &mut [u8], peer: usize) -> Result<()> {
         self.exchange(s, &[], peer, s, data, peer, usize::MAX, |_, _| Ok(()))
     }
 
@@ -359,10 +370,10 @@ impl Ring {
     #[allow(clippy::too_many_arguments)]
     fn exchange(
         &self,
-        to: &TcpStream,
+        to: &Link,
         data: &[u8],
         to_rank: usize,
-        from: &TcpStream,
+        from: &Link,
         into: &mut [u8],
         from_rank: usize,
         packet: usize,
@@ -449,8 +460,8 @@ impl Ring {
         dtype: DType,
         forward: &mut [u8],
         back: &mut [u8],
-        right: &TcpStream,
-        left: &TcpStream,
+        right: &Link,
+        left: &Link,
         incoming: (&mut Vec<u8>, &mut Vec<u8>),
     ) -> Result<()> {
         let (size, elem) = (self.size, dtype.size());
@@ -547,8 +558,8 @@ impl Ring {
         op: AllReduce,
         dtype: DType,
         buf: &mut [u8],
-        to: &TcpStream,
-        from: &TcpStream,
+        to: &Link,
+        from: &Link,
         reverse: bool,
         incoming: &mut Vec<u8>,
     ) -> Result<()> {
@@ -592,13 +603,7 @@ impl Ring {
     /// The reduce-scatter of `buf` (`size` equal segments) over one socket pair, shifted so
     /// that this rank ends holding segment `rank` (the all-reduce's first half ends on
     /// `rank + 1`).
-    fn scatter_part(
-        &self,
-        dtype: DType,
-        buf: &mut [u8],
-        to: &TcpStream,
-        from: &TcpStream,
-    ) -> Result<()> {
+    fn scatter_part(&self, dtype: DType, buf: &mut [u8], to: &Link, from: &Link) -> Result<()> {
         let (size, rank) = (self.size, self.rank);
         let len = buf.len() / size;
         let segment = |s: usize| s * len..(s + 1) * len;
@@ -686,7 +691,7 @@ impl Communicator for Ring {
                 .map(|s| (s, self.right_rank()))
                 .chain(self.left.iter().map(|s| (s, self.left_rank())));
             for (s, peer) in sockets {
-                probe(s, peer)?;
+                probe(s.stream(), peer)?;
             }
             Ok(())
         })

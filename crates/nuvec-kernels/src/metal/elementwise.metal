@@ -296,6 +296,28 @@ template <typename T>
     out[out3s(p, shape)] = (a + a_off)[loc3s(p, a_strides)];
 }
 
+// One element broadcast to `n`, 16 bytes per thread (MLX's scalar copy, `copy_s`).
+template <typename T>
+[[kernel]] void fill(
+    device const T* a [[buffer(0)]],
+    device T* out [[buffer(1)]],
+    constant long& a_off [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+    constexpr uint N = 16 / sizeof(T);
+    const T v = a[a_off];
+    const uint base = i * N;
+    if (base + N <= n) {
+        for (uint k = 0; k < N; k++) {
+            out[base + k] = v;
+        }
+    } else {
+        for (uint k = base; k < n; k++) {
+            out[k] = v;
+        }
+    }
+}
+
 template <typename T>
 [[kernel]] void select_g3s(
     device const uchar* c [[buffer(0)]],
@@ -471,7 +493,9 @@ NUVEC_BINARY(ne, Ne, complex64, complex64_t, nbool)
     template [[host_name("nuvec_copy_" #bits "_g3")]] [[kernel]] void copy_g3<T>(                  \
         device const T*, device T*, constant long&, constant int*, constant long*, constant int&, uint3); \
     template [[host_name("nuvec_copy_" #bits "_g3s")]] [[kernel]] void copy_g3s<T>(                \
-        device const T*, device T*, constant long&, constant int*, constant long*, constant int&, uint3);
+        device const T*, device T*, constant long&, constant int*, constant long*, constant int&, uint3); \
+    template [[host_name("nuvec_fill_" #bits)]] [[kernel]] void fill<T>(                          \
+        device const T*, device T*, constant long&, constant uint&, uint);
 
 NUVEC_MOVE(8, uchar)
 NUVEC_MOVE(16, ushort)

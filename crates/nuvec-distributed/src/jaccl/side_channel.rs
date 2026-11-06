@@ -75,7 +75,9 @@ impl Star {
                             .map_err(|e| Error::Backend(format!("jaccl: side channel: {e}")))?;
                         configure(&s, 0)?;
                         // With a key, a connection that fails the handshake is dropped.
-                        let peer = match crate::auth::accept(&s, key, 0, None, "a peer") {
+                        let peer = match crate::auth::accept(&s, key, false, 0, None, "a peer")
+                            .map(|(r, _)| r)
+                        {
                             Ok(p) => p,
                             Err(e) if key.is_some() => {
                                 refused = Some(e);
@@ -139,7 +141,7 @@ impl Star {
                 }
             };
             configure(&s, 0)?;
-            crate::auth::connect(&s, key, rank as u64, 0, "rank 0")?;
+            crate::auth::connect(&s, key, false, rank as u64, 0, "rank 0")?;
             Ok(Self {
                 rank,
                 size,

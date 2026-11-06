@@ -531,6 +531,7 @@ fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (Fas
                 blocks: [0, 1, 32, 128, 2048][rng.below(5)],
                 gqa_kernel: rng.coin(),
                 tk1: rng.coin(),
+                lse: rng.coin(),
             };
             (op, 3 + usize::from(mask) + usize::from(sinks))
         }

@@ -178,6 +178,19 @@ pub enum FastOp {
         gqa_kernel: bool,
         /// The one-key-per-step variant of the two-pass kernel.
         tk1: bool,
+        /// The tiled kernel also writes each query row's log-sum-exp (a second output,
+        /// `[B, Hq, Lq, 1]` float32) for the backward ([`FastOp::AttentionVjp`]), as MLX's
+        /// `save_lse` under gradient tracing.
+        lse: bool,
+    },
+    /// `(q, k, v, o, lse, do)`: the attention backward (MLX's `ScaledDotProductAttentionVJP`)
+    /// from the forward's output `o` and row log-sum-exp `lse` (float32 `[B, Hq, Lq, 1]`),
+    /// as the outputs `(dq, dk, dv)`.
+    AttentionVjp {
+        /// `f32::to_bits` of the score scale.
+        scale: u32,
+        /// Later keys are hidden (the queries are the last `Lq` positions).
+        causal: bool,
     },
     /// `(q, k, v, g, beta, state)`: the gated delta rule (see
     /// [`gated_delta`](crate::fast::gated_delta)), with the outputs and the final state (or
@@ -623,6 +636,7 @@ impl FastOp {
             Self::CrossEntropy => "cross_entropy",
             Self::CrossEntropyVjp => "cross_entropy_vjp",
             Self::Attention { .. } => "scaled_dot_product_attention",
+            Self::AttentionVjp { .. } => "scaled_dot_product_attention_vjp",
             Self::GatedDelta { .. } | Self::GatedDeltaSlots => "gated_delta",
             Self::GatherQmm { .. } => "gather_qmm",
             Self::GatherMm => "gather_mm",
@@ -657,6 +671,7 @@ impl FastOp {
                 inputs.len().clamp(n, n + 1)
             }
             Self::Attention { mask, sinks, .. } => 3 + usize::from(*mask) + usize::from(*sinks),
+            Self::AttentionVjp { .. } => 6,
             Self::GatedDelta { .. } => 6,
             Self::GatedDeltaSlots => 7,
             Self::GatherQmm {
@@ -723,10 +738,16 @@ impl FastOp {
             Self::LayerNormVjp { .. } => vec![like(x), like(&inputs[1]), like(&inputs[2])],
             Self::CrossEntropy => vec![(DType::F32, inputs[1].dims().to_vec())],
             Self::CrossEntropyVjp => vec![like(x)],
-            Self::Attention { .. } => {
+            Self::AttentionVjp { .. } => vec![like(x), like(&inputs[1]), like(&inputs[2])],
+            Self::Attention { lse, .. } => {
                 let mut shape = x.dims().to_vec();
                 shape[3] = inputs[2].dims()[3];
-                vec![(x.dtype(), shape)]
+                let mut out = vec![(x.dtype(), shape)];
+                if *lse {
+                    let d = x.dims();
+                    out.push((DType::F32, vec![d[0], d[1], d[2], 1]));
+                }
+                out
             }
             Self::GatedDeltaSlots => {
                 vec![(x.dtype(), inputs[2].dims().to_vec()), like(&inputs[5])]
@@ -974,7 +995,42 @@ impl FastOp {
                     .all(|a| a.dtype() == DType::F32 && a.dims() == rows);
                 targets.dtype() == DType::I32 && targets.dims() == rows && rest
             }
-            Self::Attention { mask, sinks, .. } => {
+            Self::AttentionVjp { .. } => {
+                let (q, k, v, o, lse, dout) = (
+                    &inputs[0], &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
+                );
+                let four = [q, k, v]
+                    .iter()
+                    .all(|a| a.ndim() == 4 && a.dtype() == q.dtype());
+                four && {
+                    let (qd, kd, vd) = (q.dims(), k.dims(), v.dims());
+                    let od = [qd[0], qd[1], qd[2], vd[3]];
+                    kd[0] == qd[0]
+                        && kd[1] > 0
+                        && qd[1] % kd[1] == 0
+                        && kd[3] == qd[3]
+                        && vd[..3] == kd[..3]
+                        && [o, dout]
+                            .iter()
+                            .all(|a| a.dims() == od && a.dtype() == q.dtype())
+                        && lse.dtype() == DType::F32
+                        && lse.dims() == [qd[0], qd[1], qd[2], 1]
+                }
+            }
+            Self::Attention {
+                mask,
+                sinks,
+                lse,
+                passes,
+                window,
+                ..
+            } => {
+                // The log-sum-exp is the tiled kernel's, without masks, sinks or windows.
+                if *lse && (*mask || *sinks || *passes != 0 || *window != 0) {
+                    return invalid(
+                        "the log-sum-exp output needs the tiled kernel without masks, sinks or windows".into(),
+                    );
+                }
                 let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
                 if [q, k, v]
                     .iter()
@@ -1208,23 +1264,38 @@ impl FastOp {
                 };
                 vec![dx, dw, db]
             }
+            Self::AttentionVjp { scale, causal } => attention_vjp_graph(
+                &inputs[..3],
+                &inputs[3],
+                &inputs[4],
+                &inputs[5],
+                float(*scale),
+                *causal,
+            )?,
             Self::Attention {
                 scale,
                 causal,
                 mask,
                 sinks,
                 window,
+                lse,
                 ..
-            } => vec![attention_graph(
-                inputs,
-                float(*scale),
-                *causal,
-                *mask,
-                *sinks,
-                None,
-                (*window > 0).then_some(*window as usize),
-                false,
-            )?],
+            } => {
+                let out = attention_graph(
+                    inputs,
+                    float(*scale),
+                    *causal,
+                    *mask,
+                    *sinks,
+                    None,
+                    (*window > 0).then_some(*window as usize),
+                    false,
+                )?;
+                match lse {
+                    false => vec![out],
+                    true => vec![out, attention_lse(inputs, float(*scale), *causal)?],
+                }
+            }
             Self::Rope {
                 dims,
                 traditional,
@@ -1500,11 +1571,48 @@ impl FastOp {
             | Self::RmsNormVjp { .. }
             | Self::LayerNormVjp { .. }
             | Self::CrossEntropyVjp
-            | Self::Attention { .. }
+            | Self::AttentionVjp { .. }
             | Self::GatedDelta { .. }
             | Self::GatedDeltaSlots
             | Self::GatherQmm { .. }
             | Self::GatherMm => self.fallback_vjp(inputs, cotangents, wanted),
+            // With the forward's log-sum-exp: MLX's backward (its cotangent is not used:
+            // the log-sum-exp is internal). Otherwise the fallback graph's. Causal queries
+            // beyond the keys meet no key tile: the graph.
+            Self::Attention {
+                scale,
+                causal,
+                lse: true,
+                ..
+            } if outputs.len() == 2 => {
+                let all = vec![
+                    inputs[0].clone(),
+                    inputs[1].clone(),
+                    inputs[2].clone(),
+                    outputs[0].clone(),
+                    outputs[1].clone(),
+                    g.clone(),
+                ];
+                let grads = match *causal && inputs[0].dims()[2] > inputs[1].dims()[2] {
+                    true => attention_vjp_graph(
+                        inputs,
+                        &outputs[0],
+                        &outputs[1],
+                        g,
+                        float(*scale),
+                        *causal,
+                    )?,
+                    false => record_or_fallback(
+                        Self::AttentionVjp {
+                            scale: *scale,
+                            causal: *causal,
+                        },
+                        all,
+                    )?,
+                };
+                Ok(pick(grads))
+            }
+            Self::Attention { .. } => self.fallback_vjp(inputs, cotangents, wanted),
         }
     }
 
@@ -1638,8 +1746,9 @@ impl FastOp {
         if let Self::Attention { passes: 0, .. } = self {
             // Laid out as `output_strides` declares: `[B, L, H, D]` in memory.
             return run_on_cpu(operands, |leaves| {
-                let out = self.fallback(leaves)?.swap_remove(0);
-                Ok(vec![crate::ops::transpose(&out, [0, 2, 1, 3])])
+                let mut outs = self.fallback(leaves)?;
+                outs[0] = crate::ops::transpose(&outs[0], [0, 2, 1, 3]);
+                Ok(outs)
             });
         }
         run_on_cpu(operands, |leaves| self.fallback(leaves))
@@ -1730,6 +1839,61 @@ mod tests {
                 .flags
                 .row_contiguous
         );
+    }
+
+    /// The tiled kernel's log-sum-exp (MLX's `save_lse`) equals the fallback's, causal and
+    /// not, with grouped heads and lengths off the tile sizes, in every float dtype.
+    #[test]
+    fn tiled_attention_saves_the_rows_log_sum_exp() {
+        let gpu = Stream::default_for(Device::gpu(0));
+        crate::set_default_stream(gpu);
+        if (&Array::from(1.0f32) + 1.0).eval().is_err() {
+            crate::set_default_stream(Stream::default_for(Device::cpu()));
+            return;
+        }
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for (causal, lq, lk) in [(false, 37, 70), (true, 64, 64), (true, 33, 80)] {
+                let u = |s: &[i32]| {
+                    crate::random::uniform(-1.0, 1.0, s, DType::F32, None).astype(dtype)
+                };
+                let (q, k, v) = (u(&[2, 4, lq, 64]), u(&[2, 2, lk, 64]), u(&[2, 2, lk, 64]));
+                let op = FastOp::Attention {
+                    scale: 0.125f32.to_bits(),
+                    causal,
+                    mask: false,
+                    sinks: false,
+                    window: 0,
+                    passes: 0,
+                    blocks: 1,
+                    gqa_kernel: false,
+                    tk1: false,
+                    lse: true,
+                };
+                let got = Array::from_op(
+                    Primitive::Fast(op.clone()),
+                    vec![q.clone(), k.clone(), v.clone()],
+                )
+                .unwrap();
+                let want = op.fallback(&[q, k, v]).unwrap();
+                for (g, w, what) in [(&got[0], &want[0], "output"), (&got[1], &want[1], "lse")] {
+                    let (g, w) = (
+                        g.astype(DType::F32).to_vec::<f32>().unwrap(),
+                        w.astype(DType::F32).to_vec::<f32>().unwrap(),
+                    );
+                    let tol = if dtype == DType::F32 { 1e-4 } else { 2e-2 };
+                    let worst = g
+                        .iter()
+                        .zip(&w)
+                        .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        worst <= tol,
+                        "{what} {dtype} causal={causal} {lq}x{lk}: {worst}"
+                    );
+                }
+            }
+        }
+        crate::set_default_stream(Stream::default_for(Device::cpu()));
     }
 
     #[test]
@@ -2857,6 +3021,14 @@ impl Call<'_> {
                 tk1,
             } => (passes, blocks, gqa_kernel, tk1),
         };
+        // Under gradient tracing the tiled kernel keeps each row's log-sum-exp for MLX's
+        // backward, which covers neither masks, sinks nor windows.
+        let lse = passes == 0
+            && mask.is_none()
+            && self.sinks.is_none()
+            && self.key.window.is_none()
+            && matches!(q.dtype(), DType::F32 | DType::F16 | DType::BF16)
+            && crate::transforms::in_reverse();
         let op = FastOp::Attention {
             scale: self.scale.to_bits(),
             causal: self.key.mask == MaskKind::Causal,
@@ -2867,6 +3039,7 @@ impl Call<'_> {
             blocks: blocks as u32,
             gqa_kernel,
             tk1,
+            lse,
         };
         let mut inputs = vec![q, k, v];
         inputs.extend(mask);
@@ -3001,6 +3174,218 @@ fn attention_config(op: &FastOp, inputs: &[Array]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Query and key rows per tile of the attention backward (MLX's `sdpa_vjp_blocks`).
+pub(crate) const VJP_BLOCK: usize = 1024;
+
+/// MLX's attention backward (`ScaledDotProductAttentionVJP`, `sdpa_vjp_blocked`) from the
+/// forward's output `o` and log-sum-exp `lse`: per query × key tile, `S = Q·Kᵀ` and
+/// `dP = dO·Vᵀ` in the inputs' dtype, `P = exp(scale·S − lse)` and `dS = P ⊙ (dP − δ) ·
+/// scale` from float32 (`δ = rowsum(O ⊙ dO)`), then `dQ += dS·K`, `dK += dSᵀ·Q` and `dV +=
+/// Pᵀ·dO` accumulated in float32, the query heads of a key head summed. Causal tiles wholly
+/// above the diagonal are skipped. Returns `(dq, dk, dv)` in the inputs' dtype.
+fn attention_vjp_graph(
+    inputs: &[Array],
+    o: &Array,
+    lse: &Array,
+    dout: &Array,
+    scale: f32,
+    causal: bool,
+) -> Result<Vec<Array>> {
+    let (q, k, v) = (&inputs[0], &inputs[1], &inputs[2]);
+    let dtype = q.dtype();
+    let (b, hq, lq, d) = (q.dims()[0], q.dims()[1], q.dims()[2], q.dims()[3]);
+    let (hkv, lk, dv) = (k.dims()[1], k.dims()[2], v.dims()[3]);
+    let rep = hq / hkv;
+    let i = |n: usize| n as isize;
+    let f32 = |a: &Array| astype(a, DType::F32);
+    let delta = sum(&multiply(&f32(o)?, &f32(dout)?)?, &[-1], true)?;
+    // A key head's grouped queries as one block of rows (`[B, Hkv, rep·L, ·]`): no
+    // broadcast of the keys, and dK = dSᵀ·Q sums the group in its contraction.
+    let tile = |a: &Array, from: usize, to: usize, w: usize| -> Result<Array> {
+        let a = match (from, to) {
+            (0, end) if end == lq => a.clone(),
+            _ => slice(
+                a,
+                &[
+                    SliceArg::full(),
+                    SliceArg::full(),
+                    SliceArg::new(Some(from as isize), Some(to as isize), 1),
+                    SliceArg::full(),
+                ],
+            )?,
+        };
+        reshape(&a, &[i(b), i(hkv), i(rep * (to - from)), i(w)])
+    };
+    let keys = |a: &Array, from: usize, to: usize| -> Result<Array> {
+        match (from, to) {
+            (0, end) if end == lk => Ok(a.clone()),
+            _ => slice(
+                a,
+                &[
+                    SliceArg::full(),
+                    SliceArg::full(),
+                    SliceArg::new(Some(from as isize), Some(to as isize), 1),
+                    SliceArg::full(),
+                ],
+            ),
+        }
+    };
+    let swap = |a: &Array| crate::ops::imp::transpose(a, &[0, 1, 3, 2]);
+    let diag = lk as isize - lq as isize;
+    let blocks = lk.div_ceil(VJP_BLOCK);
+    let mut dq_rows: Vec<Array> = Vec::new();
+    let mut dk_acc: Vec<Option<Array>> = vec![None; blocks];
+    let mut dv_acc: Vec<Option<Array>> = vec![None; blocks];
+    for i0 in (0..lq).step_by(VJP_BLOCK) {
+        let i1 = (i0 + VJP_BLOCK).min(lq);
+        let n = i1 - i0;
+        let (qi, doi) = (tile(q, i0, i1, d)?, tile(dout, i0, i1, dv)?);
+        let (lsei, deltai) = (tile(lse, i0, i1, 1)?, tile(&delta, i0, i1, 1)?);
+        let mut dq_i: Option<Array> = None;
+        for (t, j0) in (0..lk).step_by(VJP_BLOCK).enumerate() {
+            let j1 = (j0 + VJP_BLOCK).min(lk);
+            if causal && j0 as isize > i1 as isize - 1 + diag {
+                continue;
+            }
+            let (kj, vj) = (keys(k, j0, j1)?, keys(v, j0, j1)?);
+            let s = crate::ops::imp::matmul(&qi, &swap(&kj)?)?;
+            let dp = crate::ops::imp::matmul(&doi, &swap(&vj)?)?;
+            // P and dS over the tile (`[B·Hkv, rep·n, keys]`).
+            let g = b * hkv;
+            let flat = |a: &Array, w: usize| reshape(a, &[i(g), i(rep * n), i(w)]);
+            let mut out = attention_ds_graph(
+                &[
+                    flat(&s, j1 - j0)?,
+                    flat(&dp, j1 - j0)?,
+                    flat(&lsei, 1)?,
+                    flat(&deltai, 1)?,
+                ],
+                scale,
+                causal,
+                n,
+                (i0 as isize + diag) as i32,
+                j0 as u32,
+            )?;
+            let shape = [i(b), i(hkv), i(rep * n), i(j1 - j0)];
+            let p = reshape(&out.pop().expect("p"), &shape)?;
+            let ds = reshape(&out.pop().expect("ds"), &shape)?;
+            let dq_t = f32(&crate::ops::imp::matmul(&ds, &kj)?)?;
+            dq_i = Some(match dq_i {
+                Some(acc) => add(&acc, &dq_t)?,
+                None => dq_t,
+            });
+            let dk_t = f32(&crate::ops::imp::matmul(&swap(&ds)?, &qi)?)?;
+            let dv_t = f32(&crate::ops::imp::matmul(&swap(&p)?, &doi)?)?;
+            for (acc, x) in [(&mut dk_acc[t], dk_t), (&mut dv_acc[t], dv_t)] {
+                *acc = Some(match acc.take() {
+                    Some(a) => add(&a, &x)?,
+                    None => x,
+                });
+            }
+        }
+        let dq_i = match dq_i {
+            Some(x) => x,
+            None => crate::ops::imp::zeros(&[b, hkv, rep * n, d], DType::F32)?,
+        };
+        dq_rows.push(reshape(&dq_i, &[i(b), i(hq), i(n), i(d)])?);
+    }
+    let fill = |acc: Vec<Option<Array>>, w: usize| -> Result<Vec<Array>> {
+        acc.into_iter()
+            .enumerate()
+            .map(|(t, a)| match a {
+                Some(a) => Ok(a),
+                None => {
+                    let n = (lk - t * VJP_BLOCK).min(VJP_BLOCK);
+                    crate::ops::imp::zeros(&[b, hkv, n, w], DType::F32)
+                }
+            })
+            .collect()
+    };
+    let cat = |parts: Vec<Array>| crate::indexing::concatenate(&parts, 2);
+    let (dq, dk, dvv) = (
+        cat(dq_rows)?,
+        cat(fill(dk_acc, d)?)?,
+        cat(fill(dv_acc, dv)?)?,
+    );
+    Ok(vec![
+        astype(&dq, dtype)?,
+        astype(&dk, dtype)?,
+        astype(&dvv, dtype)?,
+    ])
+}
+
+/// One tile of the attention backward (MLX's `sdpa_vjp_ds`) as a graph: `(ds, p)` in
+/// `s`'s dtype from `(s, dp, lse, delta)`, with `s` and `dp` `[G, R, C]` (row `r·n + l` is
+/// query `l` of group member `r`) and `lse` and `delta` float32 `[G, R, 1]`. Under `causal`,
+/// key `kpos0 + c` is hidden from query position `qpos0 + l` when it is later.
+fn attention_ds_graph(
+    inputs: &[Array],
+    scale: f32,
+    causal: bool,
+    n: usize,
+    qpos0: i32,
+    kpos0: u32,
+) -> Result<Vec<Array>> {
+    let (s, dp, lse, delta) = (&inputs[0], &inputs[1], &inputs[2], &inputs[3]);
+    let dtype = s.dtype();
+    let (rows, cols) = (s.dims()[1], s.dims()[2]);
+    let f32 = |a: &Array| astype(a, DType::F32);
+    let logit = subtract(&multiply(&f32(s)?, f64::from(scale))?, lse)?;
+    // A fully masked row (lse = -inf) gives 0, not NaN.
+    let live = crate::ops::imp::greater(lse, f64::NEG_INFINITY)?;
+    let mut p = where_(&live, &exp(&logit)?, 0.0)?;
+    if causal {
+        let l = (0..rows)
+            .map(|r| qpos0 + (r % n) as i32)
+            .collect::<Vec<_>>();
+        let qpos = Array::from_slice(&l, [rows as i32, 1]);
+        let kpos = expand_dims(
+            &arange(
+                f64::from(kpos0),
+                f64::from(kpos0) + cols as f64,
+                1.0,
+                DType::I32,
+            )?,
+            0,
+        )?;
+        p = where_(&crate::ops::imp::greater_equal(&qpos, &kpos)?, &p, 0.0)?;
+    }
+    let ds = multiply(
+        &multiply(&p, &subtract(&f32(dp)?, delta)?)?,
+        f64::from(scale),
+    )?;
+    Ok(vec![astype(&ds, dtype)?, astype(&p, dtype)?])
+}
+
+/// Each query row's log-sum-exp of its scaled (and, under `causal`, masked) scores,
+/// `[B, Hq, Lq, 1]` float32: what the tiled kernel writes for the backward. A row that sees
+/// no key gives `-inf`.
+fn attention_lse(inputs: &[Array], scale: f32, causal: bool) -> Result<Array> {
+    let (q, k) = (&inputs[0], &inputs[1]);
+    let (b, hq, lq, d) = (q.dims()[0], q.dims()[1], q.dims()[2], q.dims()[3]);
+    let (hkv, lk) = (k.dims()[1], k.dims()[2]);
+    let rep = hq / hkv;
+    let i = |n: usize| n as isize;
+    let q = reshape(
+        &multiply(&crate::ops::imp::astype(q, DType::F32)?, f64::from(scale))?,
+        &[i(b), i(hkv), i(rep * lq), i(d)],
+    )?;
+    let k = crate::ops::imp::astype(k, DType::F32)?;
+    let kt = crate::ops::imp::transpose(&k, &[0, 1, 3, 2])?;
+    let mut scores = reshape(
+        &crate::ops::imp::matmul(&q, &kt)?,
+        &[i(b), i(hq), i(lq), i(lk)],
+    )?;
+    if causal {
+        let offset = (lk as isize - lq as isize) as f64;
+        let qi = expand_dims(&arange(offset, offset + lq as f64, 1.0, DType::I32)?, 1)?;
+        let ki = expand_dims(&arange(0.0, lk as f64, 1.0, DType::I32)?, 0)?;
+        let seen = crate::ops::imp::greater_equal(&qi, &ki)?;
+        scores = where_(&seen, &scores, f64::NEG_INFINITY)?;
+    }
+    crate::ops::imp::logsumexp(&scores, &[-1], true)
 }
 
 /// MLX's attention fallback, with sinks folded into the softmax.

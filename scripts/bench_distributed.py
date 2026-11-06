@@ -10,7 +10,8 @@ Builds `cargo bench -p nuvec-distributed --bench all_sum`, then for each rank co
 the ranks of nuvec's bench and of the same loop in MLX (`mx.distributed.init(backend=
 "ring")`, `all_sum` on the CPU stream, one evaluation per sum, the best of three bursts
 after a warm-up) with one hostfile each, alternating the two programs twice. Prints
-microseconds per sum, throughput and the nuvec/MLX time ratios.
+microseconds per sum, throughput and the nuvec/MLX time ratios, for nuvec unencrypted and
+encrypted (a key set), and a 32 MB pipeline hop (`send` from rank 0 to rank 1) for each.
 
 Usage: `just bench-distributed`; on several Macs
 `uv run scripts/bench_distributed.py --hostfile hosts.json --backend jaccl` (MLX's hostfile;
@@ -60,12 +61,39 @@ def mlx_decode(group) -> None:
         print(f"decode\t{best:.1f}", flush=True)
 
 
+def mlx_hop(group) -> None:
+    """32 MB float32 from rank 0 to rank 1 on the CPU stream: µs per send, the best of five
+    bursts of five ending in a barrier."""
+    import mlx.core as mx
+
+    x = mx.ones(((32 << 20) // 4,), dtype=mx.float32)
+    mx.eval(x)
+    best = float("inf")
+    for burst in range(6):
+        mx.eval(mx.distributed.all_sum(mx.ones((1,)), stream=mx.cpu))
+        t = time.perf_counter()
+        for _ in range(5):
+            if group.rank() == 0:
+                mx.eval(mx.distributed.send(x, 1, stream=mx.cpu))
+            elif group.rank() == 1:
+                mx.eval(mx.distributed.recv_like(x, 0, stream=mx.cpu))
+        mx.eval(mx.distributed.all_sum(mx.ones((1,)), stream=mx.cpu))
+        us = (time.perf_counter() - t) / 5 * 1e6
+        if burst > 0:
+            best = min(best, us)
+    if group.rank() == 0:
+        print(f"hop\t{best:.1f}", flush=True)
+
+
 def mlx_rank() -> None:
     import mlx.core as mx
 
     group = mx.distributed.init(backend=os.environ.get("NUVEC_BENCH_BACKEND", "ring"), strict=True)
     if os.environ.get("NUVEC_BENCH_DECODE"):
         mlx_decode(group)
+        return
+    if os.environ.get("NUVEC_BENCH_HOP"):
+        mlx_hop(group)
         return
     for nbytes in SIZES:
         x = mx.ones((nbytes // 4,), dtype=mx.float32)
@@ -94,14 +122,17 @@ def free_ports(n: int) -> list[int]:
     return ports
 
 
-def run(cmd: list[str], n: int) -> dict[int, float]:
+KEY = "bench-secret-0123456789abcdef"
+
+
+def run(cmd: list[str], n: int, env: dict[str, str] | None = None) -> dict[int, float]:
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump([[f"127.0.0.1:{p}"] for p in free_ports(n)], f)
         hostfile = f.name
     procs = [
         subprocess.Popen(
             cmd,
-            env={**os.environ, "MLX_HOSTFILE": hostfile, "MLX_RANK": str(r)},
+            env={**os.environ, **(env or {}), "MLX_HOSTFILE": hostfile, "MLX_RANK": str(r)},
             stdout=subprocess.PIPE,
             text=True,
         )
@@ -182,20 +213,32 @@ def main() -> None:
         print(f"MLX / nuvec time: {min(ml) / min(nv):.2f}x")
         return
 
+    sealed = {"NUVEC_DISTRIBUTED_KEY": KEY}
     print(f"all_sum over a TCP ring on loopback, MLX {mx.__version__}; µs per sum (best of 3 bursts x 2 alternating runs)")
-    print("| ranks | bytes | nuvec µs | MLX µs | nuvec GB/s | MLX GB/s | nuvec / MLX time |")
-    print("|---:|---:|---:|---:|---:|---:|---:|")
+    print("| ranks | bytes | nuvec µs | encrypted µs | MLX µs | nuvec GB/s | encrypted GB/s | nuvec / MLX | encrypted / MLX |")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for n in (2, 4):
         nv: dict[int, float] = {}
+        ne: dict[int, float] = {}
         ml: dict[int, float] = {}
         for _ in range(2):
             for k, v in run(nuvec_cmd, n).items():
                 nv[k] = min(nv.get(k, float("inf")), v)
+            for k, v in run(nuvec_cmd, n, sealed).items():
+                ne[k] = min(ne.get(k, float("inf")), v)
             for k, v in run(mlx_cmd, n).items():
                 ml[k] = min(ml.get(k, float("inf")), v)
         for b in SIZES:
-            print(f"| {n} | {b} | {nv[b]:.1f} | {ml[b]:.1f} | {b / nv[b] / 1e3:.2f} | "
-                  f"{b / ml[b] / 1e3:.2f} | {nv[b] / ml[b]:.2f}× |")
+            print(f"| {n} | {b} | {nv[b]:.1f} | {ne[b]:.1f} | {ml[b]:.1f} | {b / nv[b] / 1e3:.2f} | "
+                  f"{b / ne[b] / 1e3:.2f} | {nv[b] / ml[b]:.2f}× | {ne[b] / ml[b]:.2f}× |")
+    hops = {"nuvec": [], "encrypted": [], "MLX": []}
+    for _ in range(3):
+        hops["nuvec"].append(run([*nuvec_cmd, "--hop"], 2)["hop"])
+        hops["encrypted"].append(run([*nuvec_cmd, "--hop"], 2, sealed)["hop"])
+        hops["MLX"].append(run(mlx_cmd, 2, {"NUVEC_BENCH_HOP": "1"})["hop"])
+    print("\n32 MB hop (send from rank 0 to rank 1), 2 ranks on loopback; µs (best of 3 runs)")
+    for name, v in hops.items():
+        print(f"{name}: {min(v):.0f} µs, {(32 << 20) / min(v) / 1e3:.2f} GB/s ({', '.join(f'{x:.0f}' for x in v)})")
 
 
 if __name__ == "__main__":

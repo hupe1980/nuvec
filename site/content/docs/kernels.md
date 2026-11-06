@@ -19,7 +19,7 @@ The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each 
 | `rope(x, dims, traditional, base, scale, offset, freqs)` | Rotary position embeddings, optionally on the first `dims` features only |
 | `norm_rope(x, norm, rotation, offset, cache)` | Per-head RMS normalization and RoPE, optionally written straight into a KV cache |
 | `norm_rope_at(x, norm, rotation, positions, pool)` | The same with each sequence at its own position, optionally written straight into a paged KV cache's slots |
-| `scaled_dot_product_attention(q, k, v, scale, &options)` | Attention with grouped-query heads; `AttentionOptions` holds the mask (causal, boolean or additive), attention sinks, a sliding window and a cap on score memory |
+| `scaled_dot_product_attention(q, k, v, scale, &options)` | Attention with grouped-query heads; `AttentionOptions` holds the mask (causal, boolean or additive), attention sinks, a sliding window and a cap on score memory. Where the forward runs the tiled kernel, the backward is MLX's tiled backward from the forward's log-sum-exp |
 | `cross_entropy(logits, targets)` | Fused log-softmax and negative log-likelihood |
 | `gated_delta(q, k, v, g, beta, state)` | The Gated DeltaNet recurrence (Qwen 3.5's linear attention), returning the outputs and the new state |
 | `gated_delta_steps(q, k, v, g, beta, state)` | The same, returning the state after every step (to roll the recurrence back) |

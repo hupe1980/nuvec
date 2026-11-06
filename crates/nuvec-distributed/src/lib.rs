@@ -36,6 +36,7 @@ mod keepalive;
 mod pool;
 mod reduce;
 mod ring;
+mod seal;
 mod socket;
 
 use std::sync::Arc;
@@ -55,6 +56,7 @@ pub struct Options {
     /// [`init`]).
     pub timeout: Duration,
     key: auth::Secret,
+    encrypt: Option<bool>,
 }
 
 impl Default for Options {
@@ -62,6 +64,7 @@ impl Default for Options {
         Self {
             timeout: Duration::from_secs(30),
             key: auth::Secret::default(),
+            encrypt: None,
         }
     }
 }
@@ -74,11 +77,22 @@ impl Options {
     }
 
     /// Authenticates every connection with this pre-shared secret (at least 16 bytes, the
-    /// same on every rank; `NUVEC_DISTRIBUTED_KEY` for [`init`]): a host without it cannot
-    /// join the group. The traffic itself is not encrypted; on an untrusted network, run the
-    /// group over a VPN.
+    /// same on every rank; `NUVEC_DISTRIBUTED_KEY` for [`init`]), and encrypts it unless
+    /// [`Options::encrypt`] says otherwise: a host without the secret cannot join the group,
+    /// read the traffic or change it unnoticed.
     pub fn key(mut self, secret: impl AsRef<[u8]>) -> Self {
         self.key = auth::Secret(Some(secret.as_ref().to_vec()));
+        self
+    }
+
+    /// Whether a keyed ring encrypts its traffic (default: yes; `NUVEC_DISTRIBUTED_ENCRYPT=0`
+    /// for [`init`] turns it off). Every frame is sealed with ChaCha20-Poly1305 under a key
+    /// per connection and direction (HKDF-SHA256 over the secret and the handshake's
+    /// challenges), and a changed, replayed or reordered frame fails the transfer with an
+    /// error naming the peer. Every rank must agree: a rank in the other mode is refused.
+    /// Encrypting needs [`Options::key`]. Frame sizes and timing stay visible.
+    pub fn encrypt(mut self, on: bool) -> Self {
+        self.encrypt = Some(on);
         self
     }
 }
@@ -97,6 +111,12 @@ pub fn init_with(nodes: &[Vec<String>], rank: usize, options: &Options) -> Resul
         return Ok(Group::single());
     }
     let key = options.key.key()?;
-    let ring = ring::Ring::connect(nodes, rank, options.timeout, key.as_ref())?;
+    if options.encrypt == Some(true) && key.is_none() {
+        return Err(nuvec_core::Error::InvalidArgument(
+            "distributed: encryption needs a key (Options::key, NUVEC_DISTRIBUTED_KEY)".into(),
+        ));
+    }
+    let encrypt = key.is_some() && options.encrypt != Some(false);
+    let ring = ring::Ring::connect(nodes, rank, options.timeout, key.as_ref(), encrypt)?;
     Ok(Group::new(Arc::new(ring)))
 }

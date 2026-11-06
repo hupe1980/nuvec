@@ -138,3 +138,144 @@ fn printing() {
     slot = std::mem::take(&mut slot).at(0).set(9);
     assert_eq!(slot.to_vec::<i32>().unwrap(), [9, 2, 3]);
 }
+
+/// The devices these tests evaluate on: the CPU, and the GPU when there is one.
+fn devices() -> Vec<Device> {
+    let gpu = !cfg!(miri)
+        && with_stream(Stream::default_for(Device::gpu(0)), || {
+            (&Array::from(1.0f32) + 1.0).eval().is_ok()
+        });
+    [Some(Device::cpu()), gpu.then(|| Device::gpu(0))]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// `zeros`, `ones` and `full` with a number give the same elements in every dtype and
+/// shape (0-d, empty, small, and large enough to be filled at evaluation), on each device.
+#[test]
+fn constant_creations_in_every_dtype_shape_and_device() {
+    let shapes: [&[i32]; 6] = [&[], &[0], &[3, 0, 2], &[7], &[2, 3, 5], &[1 << 22]];
+    let values = [0.0, 1.0, -2.5, 7.0, f64::NAN, f64::INFINITY, -0.0];
+    for device in devices() {
+        with_stream(Stream::default_for(device), || {
+            for dtype in [
+                DType::Bool,
+                DType::U8,
+                DType::U16,
+                DType::U32,
+                DType::U64,
+                DType::I8,
+                DType::I16,
+                DType::I32,
+                DType::I64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ] {
+                for shape in shapes {
+                    let n: usize = shape.iter().map(|&d| d as usize).product();
+                    let check = |a: Array, want: f64, what: &str| {
+                        assert_eq!((a.shape(), a.dtype()), (shape, dtype), "{what}");
+                        // The expectation: the value converted once, as a 0-d host array.
+                        let one = ops::full((), want).astype(dtype);
+                        let got = a.astype(DType::F64).reshape([-1]);
+                        let want = ops::broadcast_to(&one.astype(DType::F64), [n as i32]);
+                        let (g, w) = (got.to_vec::<f64>().unwrap(), want.to_vec::<f64>().unwrap());
+                        assert_eq!(g.len(), n, "{what}");
+                        assert!(
+                            g.iter()
+                                .zip(&w)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()
+                                    || (a.is_nan() && b.is_nan())),
+                            "{what} on {device:?}"
+                        );
+                    };
+                    check(
+                        ops::zeros(shape, dtype),
+                        0.0,
+                        &format!("zeros {dtype} {shape:?}"),
+                    );
+                    check(
+                        ops::ones(shape, dtype),
+                        1.0,
+                        &format!("ones {dtype} {shape:?}"),
+                    );
+                    for &v in &values {
+                        let float = matches!(dtype.category(), Category::Float);
+                        if dtype == DType::Bool
+                            || !float && (!v.is_finite() || v.fract() != 0.0 || v < 0.0)
+                        {
+                            continue;
+                        }
+                        check(
+                            ops::full(shape, v).astype(dtype),
+                            v,
+                            &format!("full {v} {dtype} {shape:?}"),
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Creations under `vmap`, `grad`, `jvp` and `checkpoint` give the eager results, and a
+/// gradient through a creation is zero; a created array updated in place keeps the rest.
+#[test]
+fn creations_under_transforms_and_in_place_updates() {
+    for device in devices() {
+        with_stream(Stream::default_for(device), || {
+            let x = Array::from([1.0f32, 2.0, 3.0, 4.0]);
+            let f = |x: &Array| {
+                Ok(x * ops::ones([4], DType::F32)
+                    + ops::full([4], 0.5)
+                    + ops::zeros([4], DType::F32))
+            };
+            let g = grad(|x: &Array| Ok(f(x)?.sum(..)))(&x).unwrap();
+            assert_eq!(g.to_vec::<f32>().unwrap(), [1.0; 4]);
+            // d/dx of a creation alone is zero.
+            let z = grad(|x: &Array| Ok((x * 0.0 + ops::full([4], 3.0)).sum(..)))(&x).unwrap();
+            assert_eq!(z.to_vec::<f32>().unwrap(), [0.0; 4]);
+            let (y, t) = jvp(|x: &Array| f(x), &x, &ops::ones([4], DType::F32)).unwrap();
+            assert_eq!(y.to_vec::<f32>().unwrap(), [1.5, 2.5, 3.5, 4.5]);
+            assert_eq!(t.to_vec::<f32>().unwrap(), [1.0; 4]);
+            let rows = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]);
+            let v = vmap(|r: &Array| f(r)).in_axes(0).out_axes(0);
+            assert_eq!(
+                v.call(&rows).unwrap().to_vec::<f32>().unwrap(),
+                [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
+            );
+            let c = checkpoint(move |x: &Array| f(x));
+            assert_eq!(
+                c(&x).unwrap().to_vec::<f32>().unwrap(),
+                [1.5, 2.5, 3.5, 4.5]
+            );
+            // A large created pool written in place, as nuvec-lm's caches.
+            let pool = ops::zeros([1 << 20], DType::F32);
+            let written = pool.slice_update(&Array::from([9.0f32, 9.0]), 10..12);
+            let back = written.to_vec::<f32>().unwrap();
+            assert_eq!(
+                (back[9], back[10], back[11], back[12]),
+                (0.0, 9.0, 9.0, 0.0)
+            );
+        });
+    }
+}
+
+/// Argument errors are located at the creation's call site.
+#[test]
+fn creation_errors_are_located_at_the_call() {
+    let line = line!() + 1;
+    let a = ops::zeros([-2, 3], DType::F32);
+    let e = a.eval().unwrap_err();
+    assert!(
+        format!("{e}").contains(&format!("creation.rs:{line}")),
+        "{e}"
+    );
+    let line = line!() + 1;
+    let b = ops::full([usize::MAX as i64 as i32, 2], 1.0);
+    let _ = line;
+    assert!(b.eval().is_err());
+}

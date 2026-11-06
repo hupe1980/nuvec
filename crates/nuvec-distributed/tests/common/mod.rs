@@ -25,6 +25,18 @@ pub(crate) fn ranks_with(
     env: &[(&str, &str)],
     body: impl FnOnce(Group),
 ) -> Option<Vec<String>> {
+    ranks_vanishing(test, n, env, None, body)
+}
+
+/// [`ranks_with`] where rank `vanishing` stops itself (a Mac that sleeps: [`stop_self`]):
+/// it is not waited for, and is killed once the others have finished.
+pub(crate) fn ranks_vanishing(
+    test: &str,
+    n: usize,
+    env: &[(&str, &str)],
+    vanishing: Option<usize>,
+    body: impl FnOnce(Group),
+) -> Option<Vec<String>> {
     if let Ok(name) = std::env::var(CHILD) {
         if name == test {
             body(nuvec_distributed::init(true).expect("init"));
@@ -62,7 +74,16 @@ pub(crate) fn ranks_with(
         .collect();
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut results = Vec::new();
-    for child in &mut children {
+    // The vanishing rank last, once the others are done.
+    let mut order: Vec<usize> = (0..n).filter(|&r| Some(r) != vanishing).collect();
+    order.extend(vanishing);
+    let mut outputs: Vec<Option<_>> = (0..n).map(|_| None).collect();
+    for rank in order {
+        let child = &mut children[rank];
+        if Some(rank) == vanishing {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break Some(status);
@@ -89,8 +110,14 @@ pub(crate) fn ranks_with(
         if status.is_none() {
             let _ = child.kill();
         }
-        results.push((status, out, err));
+        // A killed vanishing rank succeeded if it reached its stop.
+        let status = match Some(rank) == vanishing {
+            true => out.contains("BITS").then(success),
+            false => status,
+        };
+        outputs[rank] = Some((status, out, err));
     }
+    results.extend(outputs.into_iter().map(|r| r.expect("every rank")));
     let _ = std::fs::remove_file(&hostfile);
     // On a failure, every rank's output: the first rank to fail is often not rank 0.
     if results
@@ -128,4 +155,19 @@ pub(crate) fn free_addresses(n: usize) -> Vec<String> {
         .iter()
         .map(|l| format!("127.0.0.1:{}", l.local_addr().unwrap().port()))
         .collect()
+}
+
+/// A successful exit status.
+fn success() -> std::process::ExitStatus {
+    Command::new("true").status().unwrap()
+}
+
+/// Stops this process (SIGSTOP), as a sleeping Mac: its sockets stay open and send nothing,
+/// with no FIN. The harness kills it ([`ranks_vanishing`]).
+pub(crate) fn stop_self() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let pid = std::process::id().to_string();
+    Command::new("kill").args(["-STOP", &pid]).status().unwrap();
+    unreachable!("a stopped process is killed, never continued");
 }

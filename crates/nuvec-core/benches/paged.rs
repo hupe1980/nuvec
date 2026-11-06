@@ -18,11 +18,20 @@ fn main() -> Result<()> {
     }
     set_default_stream(Stream::default_for(Device::gpu(0)));
     // (name, sequences, query heads, key heads, head size, window, sinks, positions)
-    type Case = (&'static str, i32, i32, i32, i32, Option<i32>, bool, i32);
-    let cases: [Case; 3] = [
-        ("paged-window-sinks-4k", 8, 64, 8, 64, Some(128), true, 4096),
+    type Case = (String, i32, i32, i32, i32, Option<i32>, bool, i32);
+    let mut cases: Vec<Case> = vec![
         (
-            "paged-window-sinks-32k",
+            "paged-window-sinks-4k".into(),
+            8,
+            64,
+            8,
+            64,
+            Some(128),
+            true,
+            4096,
+        ),
+        (
+            "paged-window-sinks-32k".into(),
             8,
             64,
             8,
@@ -31,14 +40,35 @@ fn main() -> Result<()> {
             true,
             32768,
         ),
-        ("paged-qwen3-0.6b-b4", 4, 16, 8, 128, None, false, 640),
+        (
+            "paged-qwen3-0.6b-b4".into(),
+            4,
+            16,
+            8,
+            128,
+            None,
+            false,
+            640,
+        ),
     ];
-    let bs = 16i32;
+    // With `NUVEC_BENCH_GRID=1`: 1, 4 and 8 sequences, 256 to 8,192 keys, heads 64 to 256.
+    if std::env::var_os("NUVEC_BENCH_GRID").is_some() {
+        cases.clear();
+        for b in [1, 4, 8] {
+            for len in [256, 640, 2048, 8192] {
+                for d in [64, 128, 256] {
+                    cases.push((format!("b{b}-n{len}-d{d}"), b, 16, 8, d, None, false, len));
+                }
+            }
+        }
+    }
+    // Positions per block (a power of two; `NUVEC_BENCH_BLOCK`, default the Batcher's 16).
+    let bs: i32 = std::env::var("NUVEC_BENCH_BLOCK").map_or(16, |v| v.parse().expect("a number"));
     for (dtype, label) in [(DType::F16, "float16"), (DType::BF16, "bfloat16")] {
-        for (name, b, hq, hkv, d, w, with_sinks, len) in cases {
+        for (name, b, hq, hkv, d, w, with_sinks, len) in cases.iter().cloned() {
             let uniform = |s: &[i32]| random::uniform(-1.0, 1.0, s, DType::F32, None).astype(dtype);
             let q = uniform(&[b, hq, 1, d]);
-            let blocks = len / bs;
+            let blocks = (len + bs - 1) / bs;
             // Sequence `i` owns blocks `i·blocks..(i + 1)·blocks`, in order.
             let pool = uniform(&[b * blocks, hkv, bs, d]);
             let tables = nuvec_core::ops::arange(0, b * blocks, 1).reshape([b, blocks]);
@@ -46,7 +76,8 @@ fn main() -> Result<()> {
             let keys = pool
                 .reshape([b, blocks, hkv, bs, d])
                 .transpose([0, 2, 1, 3, 4])
-                .reshape([b, hkv, len, d])
+                .reshape([b, hkv, blocks * bs, d])
+                .i((.., .., 0..len))
                 .contiguous();
             let sinks = uniform(&[hq]);
             eval(&[&q, &pool, &tables, &lengths, &keys, &sinks])?;

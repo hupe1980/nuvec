@@ -1049,7 +1049,8 @@ pub fn conv1d(
 
 // ── Creation ────────────────────────────────────────────────────────────────
 
-/// An array of zeros of `shape`.
+/// An array of zeros of `shape`. As MLX's, it is filled when evaluated, on the evaluating
+/// stream's device (arrays under 64 KB are filled at once).
 ///
 /// ```
 /// use nuvec_core::{DType, ops::zeros};
@@ -1065,7 +1066,7 @@ pub fn zeros(shape: impl IntoShape, dtype: DType) -> Array {
     })
 }
 
-/// An array of ones of `shape`.
+/// An array of ones of `shape`, filled when evaluated as [`zeros`].
 #[track_caller]
 pub fn ones(shape: impl IntoShape, dtype: DType) -> Array {
     let spec = shape.shape_spec();
@@ -1076,6 +1077,7 @@ pub fn ones(shape: impl IntoShape, dtype: DType) -> Array {
 
 /// An array of `shape` with every element `value`: a Rust number is weak, as in MLX (`0.5`
 /// gives float32, `1` int32), and an array keeps its dtype (`Array::from(7u8)` gives uint8).
+/// It is filled when evaluated, as [`zeros`].
 ///
 /// ```
 /// use nuvec_core::{Array, DType, ops::full};
@@ -1100,9 +1102,18 @@ fn full_op(at: &'static Location<'static>, spec: &[i64], value: ScalarOrArray) -
         return Array::failed(e, dtype, &axes::dims(spec).unwrap_or_default());
     }
     Array::constructor("full", at, dtype, spec, |shape| match &value {
-        // A number: the buffer is filled now, on the host (unified memory), as `zeros`.
-        ScalarOrArray::Scalar(s) => imp::filled(shape, dtype, |_| s.canon()),
-        ScalarOrArray::Array(v) => imp::contiguous(&imp::broadcast_to(v, shape)?),
+        // A number: filled when evaluated, as `zeros` (small arrays at once, on the host).
+        ScalarOrArray::Scalar(s) => imp::constant(shape, dtype, s.canon()),
+        // An array: from `LAZY_FILL_BYTES`, filled into a buffer of its own when evaluated
+        // (MLX's `Full`), never a broadcast view.
+        ScalarOrArray::Array(v) => {
+            let wide = imp::broadcast_to(v, shape)?;
+            if wide.nbytes() >= imp::LAZY_FILL_BYTES {
+                imp::copy(&wide)
+            } else {
+                imp::contiguous(&wide)
+            }
+        }
     })
 }
 
