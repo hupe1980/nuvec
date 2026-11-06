@@ -557,10 +557,12 @@ mod tests {
                 }
             })
         };
-        let eps = 1e-2;
+        let eps = 1e-1;
         let up = loss(&shifted(eps)).item::<f32>().unwrap();
         let down = loss(&shifted(-eps)).item::<f32>().unwrap();
         let fd = (up - down) / (2.0 * eps);
-        assert!((fd - g).abs() <= 2e-2 * g.abs().max(1e-3), "{g} vs {fd}");
+        // Plus the float32 loss's rounding over 2·eps.
+        let rounding = 4.0 * f32::EPSILON * up.abs().max(down.abs()) / (2.0 * eps);
+        assert!((fd - g).abs() <= 2e-2 * g.abs() + rounding, "{g} vs {fd}");
     }
 }
