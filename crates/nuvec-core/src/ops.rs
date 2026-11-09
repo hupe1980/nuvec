@@ -24,7 +24,25 @@
 //! ```
 
 // The implementation functions behind the public operations (they return `Result`).
+mod compose;
 pub(crate) mod imp;
+mod shape;
+
+pub use shape::{
+    DTypeCategory, Norm, PadMode, Unique, as_strided, atleast_1d, atleast_2d, atleast_3d, bartlett,
+    blackman, broadcast_arrays, can_cast, diag, diagonal, diff, einsum, einsum_path, empty,
+    empty_like, eye, flatten, flip, hamming, hanning, identity, inner, isdtype, issubdtype, kron,
+    linspace, matrix_norm, matrix_transpose, median, meshgrid, moveaxis, outer, pad, result_type,
+    roll, searchsorted, swapaxes, tensordot, tensordot_n, tile, trace, tri, tril, triu, unflatten,
+    unique, unstack, vecdot,
+};
+
+pub use compose::{
+    CloseOptions, NanToNum, acos, acosh, allclose, array_equal, asin, asinh, atan, atan2, atanh,
+    bitwise_left_shift, bitwise_right_shift, clip, conj, count_nonzero, degrees, divmod, imag,
+    isclose, isfinite, isinf, isnan, isneginf, isposinf, logical_and, logical_not, logical_or,
+    logical_xor, minmax, nan_to_num, positive, radians, real, reciprocal, square, trunc,
+};
 
 use std::panic::Location;
 
@@ -125,6 +143,13 @@ binary_ops! {
     less_equal => LessEqual,
     greater => Greater,
     greater_equal => GreaterEqual,
+    arctan2 => ArcTan2,
+    remainder => Remainder,
+    bitwise_and => BitwiseAnd,
+    bitwise_or => BitwiseOr,
+    bitwise_xor => BitwiseXor,
+    left_shift => LeftShift,
+    right_shift => RightShift,
 }
 
 // ── Element-wise unary ──────────────────────────────────────────────────────
@@ -150,12 +175,53 @@ unary_ops!(
     tanh,
     sigmoid,
     erfinv,
+    erf,
+    expm1,
+    log1p,
+    log2,
+    log10,
+    tan,
+    sinh,
+    cosh,
+    arccos,
+    arccosh,
+    arcsin,
+    arcsinh,
+    arctan,
+    arctanh,
+    rsqrt,
+    floor,
+    ceil,
+    bitwise_invert,
     sign,
     conjugate,
     stop_gradient,
     contiguous,
     copy
 );
+
+/// Element-wise rounding to `decimals` decimal places, ties to even (MLX's `round`:
+/// `round(a · 10^d) · 10^−d` in `a`'s dtype for `d ≠ 0`); integers and booleans are returned
+/// unchanged.
+///
+/// ```
+/// use nuvec_core::{array, ops};
+///
+/// assert_eq!(ops::round(&array![0.5f32, 1.5, 2.5, -0.5], 0).to_vec::<f32>().unwrap(), [0.0, 2.0, 2.0, -0.0]);
+/// assert_eq!(ops::round(&array![1.2345f32], 2).to_vec::<f32>().unwrap(), [1.23]);
+/// ```
+#[track_caller]
+pub fn round(a: &Array, decimals: i32) -> Array {
+    Array::sticky("round", Location::caller(), &[a], || {
+        if decimals == 0 || !matches!(a.dtype().category(), Category::Float) {
+            return imp::round(a);
+        }
+        imp::multiply(
+            &imp::round(&imp::multiply(a, 10f64.powi(decimals))?)?,
+            10f64.powi(-decimals),
+        )
+    })
+}
 
 /// `x`, evaluated only after `deps` (MLX's `depends`): evaluating the result evaluates the
 /// dependencies first, without using their values. Its gradient goes to `x`.
@@ -974,6 +1040,97 @@ pub fn gather_qmm(
     })
 }
 
+/// `x [..., K]` times `wᵀ` (`w [N, K]`) with both quantized in a floating-point mode
+/// (MLX's `qqmm`): the activations are rounded to the values the mode represents, the
+/// weights quantized (a dense `w` in NVFP4 by default, or `(&w, QuantMode::Mxfp8)`) or
+/// taken quantized (`&Quantized`). With a dense weight both gradients are quantized
+/// products too, as MLX's.
+///
+/// ```
+/// use nuvec_core::{ops, random, DType, QuantMode};
+/// let x = random::normal([4, 64], DType::F32, 0.0, 1.0, None);
+/// let w = random::normal([8, 64], DType::F32, 0.0, 1.0, None);
+/// assert_eq!(ops::qqmm(&x, &w).shape(), [4, 8]);
+/// assert_eq!(ops::qqmm(&x, (&w, QuantMode::Mxfp8)).shape(), [4, 8]);
+/// ```
+#[track_caller]
+pub fn qqmm<'a>(x: &Array, w: impl Into<crate::QqmmWeight<'a>>) -> Array {
+    let w = w.into();
+    let mut ins: SmallVec<[&Array; 4]> = SmallVec::from_slice(&[x]);
+    match &w {
+        crate::QqmmWeight::Dense(a, _) => ins.push(a),
+        crate::QqmmWeight::Quantized(q) => ins.extend(q.arrays()),
+    }
+    Array::sticky("qqmm", Location::caller(), &ins, || {
+        crate::products::qqmm(x, w)
+    })
+}
+
+/// [`gather_qmm`] of quantized activations with experts `w [E, N, K]` (dense or quantized,
+/// a floating-point mode; MLX's `gather_qqmm`), transposed.
+#[track_caller]
+pub fn gather_qqmm<'a>(
+    x: &Array,
+    w: impl Into<crate::QqmmWeight<'a>>,
+    lhs_indices: Option<&Array>,
+    rhs_indices: Option<&Array>,
+    sorted_indices: bool,
+) -> Array {
+    let w = w.into();
+    let mut ins: SmallVec<[&Array; 6]> = SmallVec::from_slice(&[x]);
+    match &w {
+        crate::QqmmWeight::Dense(a, _) => ins.push(a),
+        crate::QqmmWeight::Quantized(q) => ins.extend(q.arrays()),
+    }
+    ins.extend(lhs_indices);
+    ins.extend(rhs_indices);
+    Array::sticky("gather_qqmm", Location::caller(), &ins, || {
+        crate::products::gather_qqmm(x, w, lhs_indices, rhs_indices, sorted_indices)
+    })
+}
+
+/// `a [M, K] · b [K, N]` once per segment `[start, end)` of the inner axis (`segments
+/// [..., 2]`, integers), giving `[..., M, N]` (MLX's `segmented_mm`).
+///
+/// ```
+/// use nuvec_core::{array, ops};
+/// let a = array![[1.0f32, 2.0, 3.0]];
+/// let b = array![[1.0f32], [1.0], [1.0]];
+/// let y = ops::segmented_mm(&a, &b, &array![[0, 1], [1, 3]]);
+/// assert_eq!(y.to_vec::<f32>().unwrap(), [1.0, 5.0]);
+/// ```
+#[track_caller]
+pub fn segmented_mm(a: &Array, b: &Array, segments: &Array) -> Array {
+    Array::sticky(
+        "segmented_mm",
+        Location::caller(),
+        &[a, b, segments],
+        || crate::products::segmented_mm(a, b, segments),
+    )
+}
+
+/// `a · b` with block masks (MLX's `block_masked_mm`): `block_size` 32 or 64, an output
+/// mask `[..., ⌈M/bs⌉, ⌈N/bs⌉]`, a left mask `[..., ⌈M/bs⌉, ⌈K/bs⌉]` and a right mask
+/// `[..., ⌈K/bs⌉, ⌈N/bs⌉]`, each optional; boolean masks select blocks, float masks scale
+/// them.
+#[track_caller]
+pub fn block_masked_mm(
+    a: &Array,
+    b: &Array,
+    block_size: i32,
+    mask_out: Option<&Array>,
+    mask_lhs: Option<&Array>,
+    mask_rhs: Option<&Array>,
+) -> Array {
+    let mut ins: SmallVec<[&Array; 5]> = SmallVec::from_slice(&[a, b]);
+    ins.extend(mask_out);
+    ins.extend(mask_lhs);
+    ins.extend(mask_rhs);
+    Array::sticky("block_masked_mm", Location::caller(), &ins, || {
+        crate::products::block_masked_mm(a, b, block_size, [mask_out, mask_lhs, mask_rhs])
+    })
+}
+
 /// `x`'s bits as `dtype` (MLX's `view`); see [`Array::view`].
 #[track_caller]
 pub fn view(x: &Array, dtype: DType) -> Array {
@@ -1019,6 +1176,47 @@ pub fn gather_mm(
     })
 }
 
+/// `a` times the Hadamard matrix of its last axis's size `n = m · 2^k` (`m` in 1, 12, 20 or
+/// 28; MLX's `hadamard_transform`), times `scale` (default `1/√n`, the orthonormal
+/// transform). Integers are converted to float32. The transform is its own transpose, so
+/// its derivative is the transform of the cotangent.
+///
+/// ```
+/// use nuvec_core::{array, ops};
+/// let y = ops::hadamard_transform(&array![1.0f32, 0.0, 0.0, 0.0], Some(1.0));
+/// assert_eq!(y.to_vec::<f32>().unwrap(), [1.0, 1.0, 1.0, 1.0]);
+/// ```
+#[track_caller]
+pub fn hadamard_transform(a: &Array, scale: Option<f32>) -> Array {
+    Array::sticky("hadamard_transform", Location::caller(), &[a], || {
+        if a.size() == 0 {
+            return Err(Error::InvalidArgument(
+                "hadamard_transform: the array is empty".into(),
+            ));
+        }
+        let n = a.dims().last().copied().unwrap_or(1);
+        crate::hadamard::decompose(n)?;
+        let scale = scale.unwrap_or(1.0 / (n as f32).sqrt());
+        let dtype = if a.dtype().category() == crate::Category::Float {
+            a.dtype()
+        } else {
+            DType::F32
+        };
+        let x = a.try_astype(dtype)?;
+        if n == 1 {
+            return if scale == 1.0 {
+                Ok(x)
+            } else {
+                imp::multiply(&x, &imp::astype(&Array::from(scale), dtype)?)
+            };
+        }
+        let op = crate::fast::imp::FastOp::Hadamard {
+            scale: scale.to_bits(),
+        };
+        Ok(crate::fast::imp::record_or_fallback(op, vec![x])?.swap_remove(0))
+    })
+}
+
 /// A 1-D convolution of `[N, L, C_in]` with `[C_out, K, C_in / groups]`; see
 /// [`Array::conv1d`].
 #[track_caller]
@@ -1044,6 +1242,400 @@ pub fn conv1d(
             p("dilation", dilation)?,
             p("groups", groups)?,
         )
+    })
+}
+
+/// A spatial parameter of a convolution: one number for every axis, or one per axis
+/// (`2`, `[2, 1]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvArg<const N: usize>(pub [i32; N]);
+
+impl<const N: usize> From<i32> for ConvArg<N> {
+    fn from(v: i32) -> Self {
+        Self([v; N])
+    }
+}
+
+impl<const N: usize> From<[i32; N]> for ConvArg<N> {
+    fn from(v: [i32; N]) -> Self {
+        Self(v)
+    }
+}
+
+fn non_negative(name: &str, what: &str, v: &[i32]) -> Result<Vec<usize>> {
+    v.iter()
+        .map(|&x| {
+            usize::try_from(x).map_err(|_| {
+                Error::InvalidArgument(format!("{name}: {what} must not be negative, got {x}"))
+            })
+        })
+        .collect()
+}
+
+/// A 2-D convolution of `[N, H, W, C_in]` with `[C_out, KH, KW, C_in / groups]` (MLX's
+/// `conv2d`): output `[N, H_out, W_out, C_out]`. `stride`, `padding` (symmetric) and
+/// `dilation` are one number or one per axis.
+///
+/// ```
+/// use nuvec_core::{DType, ops};
+///
+/// let x = ops::ones([1, 4, 4, 1], DType::F32);
+/// let w = ops::ones([1, 3, 3, 1], DType::F32);
+/// assert_eq!(ops::conv2d(&x, &w, 1, 1, 1, 1).shape(), [1, 4, 4, 1]);
+/// ```
+#[track_caller]
+pub fn conv2d(
+    input: &Array,
+    weight: &Array,
+    stride: impl Into<ConvArg<2>>,
+    padding: impl Into<ConvArg<2>>,
+    dilation: impl Into<ConvArg<2>>,
+    groups: i32,
+) -> Array {
+    conv_n(
+        "conv2d",
+        input,
+        weight,
+        stride.into().0,
+        padding.into().0,
+        dilation.into().0,
+        groups,
+    )
+}
+
+/// A 3-D convolution of `[N, D, H, W, C_in]` with `[C_out, KD, KH, KW, C_in / groups]`
+/// (MLX's `conv3d`).
+#[track_caller]
+pub fn conv3d(
+    input: &Array,
+    weight: &Array,
+    stride: impl Into<ConvArg<3>>,
+    padding: impl Into<ConvArg<3>>,
+    dilation: impl Into<ConvArg<3>>,
+    groups: i32,
+) -> Array {
+    conv_n(
+        "conv3d",
+        input,
+        weight,
+        stride.into().0,
+        padding.into().0,
+        dilation.into().0,
+        groups,
+    )
+}
+
+#[track_caller]
+fn conv_n<const N: usize>(
+    name: &'static str,
+    input: &Array,
+    weight: &Array,
+    stride: [i32; N],
+    padding: [i32; N],
+    dilation: [i32; N],
+    groups: i32,
+) -> Array {
+    Array::sticky(name, Location::caller(), &[input, weight], || {
+        let conv = crate::conv::Conv::plain(
+            &non_negative(name, "stride", &stride)?,
+            &non_negative(name, "padding", &padding)?,
+            &non_negative(name, "dilation", &dilation)?,
+            non_negative(name, "groups", &[groups])?[0],
+        );
+        crate::conv::conv_general(name, input, weight, &conv)
+    })
+}
+
+/// The parameters of [`conv_general`] (MLX's): per spatial axis, or one value for all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConvOptions {
+    /// Kernel strides (default 1).
+    pub stride: Vec<i32>,
+    /// Padding before each axis (default 0; negative crops).
+    pub padding_lo: Vec<i32>,
+    /// Padding after each axis (default 0; negative crops).
+    pub padding_hi: Vec<i32>,
+    /// Kernel dilation (default 1).
+    pub kernel_dilation: Vec<i32>,
+    /// Input dilation: `d − 1` zeros between input elements (default 1).
+    pub input_dilation: Vec<i32>,
+    /// Channel groups (default 1).
+    pub groups: i32,
+    /// Flips the kernels' spatial axes: a true convolution (default false).
+    pub flip: bool,
+}
+
+impl Default for ConvOptions {
+    fn default() -> Self {
+        Self {
+            stride: vec![1],
+            padding_lo: vec![0],
+            padding_hi: vec![0],
+            kernel_dilation: vec![1],
+            input_dilation: vec![1],
+            groups: 1,
+            flip: false,
+        }
+    }
+}
+
+impl ConvOptions {
+    /// MLX's defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the strides.
+    pub fn stride(mut self, v: &[i32]) -> Self {
+        self.stride = v.to_vec();
+        self
+    }
+
+    /// Sets symmetric padding.
+    pub fn padding(mut self, v: &[i32]) -> Self {
+        self.padding_lo = v.to_vec();
+        self.padding_hi = v.to_vec();
+        self
+    }
+
+    /// Sets the padding before and after each axis.
+    pub fn padding_lo_hi(mut self, lo: &[i32], hi: &[i32]) -> Self {
+        self.padding_lo = lo.to_vec();
+        self.padding_hi = hi.to_vec();
+        self
+    }
+
+    /// Sets the kernel dilation.
+    pub fn kernel_dilation(mut self, v: &[i32]) -> Self {
+        self.kernel_dilation = v.to_vec();
+        self
+    }
+
+    /// Sets the input dilation.
+    pub fn input_dilation(mut self, v: &[i32]) -> Self {
+        self.input_dilation = v.to_vec();
+        self
+    }
+
+    /// Sets the groups.
+    pub fn groups(mut self, g: i32) -> Self {
+        self.groups = g;
+        self
+    }
+
+    /// Flips the kernels.
+    pub fn flip(mut self, flip: bool) -> Self {
+        self.flip = flip;
+        self
+    }
+}
+
+/// MLX's general convolution of `[N, spatial…, C_in]` with `[C_out, kernel…, C_in / groups]`
+/// over any number of spatial axes ([`ConvOptions`]).
+#[track_caller]
+pub fn conv_general(input: &Array, weight: &Array, options: &ConvOptions) -> Array {
+    Array::sticky("conv_general", Location::caller(), &[input, weight], || {
+        let d = input.ndim().saturating_sub(2);
+        let spread = |name: &str, v: &[i32]| -> Result<Vec<i32>> {
+            match v.len() {
+                1 => Ok(vec![v[0]; d]),
+                n if n == d => Ok(v.to_vec()),
+                n => Err(Error::InvalidArgument(format!(
+                    "conv_general: {n} {name} values for {d} spatial axes"
+                ))),
+            }
+        };
+        let o = options;
+        let conv = crate::conv::Conv {
+            stride: non_negative("conv_general", "stride", &spread("stride", &o.stride)?)?,
+            pad_lo: spread("padding", &o.padding_lo)?
+                .iter()
+                .map(|&p| p as isize)
+                .collect(),
+            pad_hi: spread("padding", &o.padding_hi)?
+                .iter()
+                .map(|&p| p as isize)
+                .collect(),
+            kernel_dilation: non_negative(
+                "conv_general",
+                "kernel dilation",
+                &spread("dilation", &o.kernel_dilation)?,
+            )?,
+            input_dilation: non_negative(
+                "conv_general",
+                "input dilation",
+                &spread("dilation", &o.input_dilation)?,
+            )?,
+            groups: non_negative("conv_general", "groups", &[o.groups])?[0],
+            flip: o.flip,
+        };
+        crate::conv::conv_general("conv_general", input, weight, &conv)
+    })
+}
+
+#[track_caller]
+#[allow(clippy::too_many_arguments)]
+/// Per spatial axis: `[stride, padding, dilation, output_padding]`.
+fn conv_transpose_n<const N: usize>(
+    name: &'static str,
+    input: &Array,
+    weight: &Array,
+    [stride, padding, dilation, output_padding]: [[i32; N]; 4],
+    groups: i32,
+) -> Array {
+    Array::sticky(name, Location::caller(), &[input, weight], || {
+        let (s, p) = (
+            non_negative(name, "stride", &stride)?,
+            non_negative(name, "padding", &padding)?,
+        );
+        let d = non_negative(name, "dilation", &dilation)?;
+        let o = non_negative(name, "output padding", &output_padding)?;
+        crate::conv::conv_transpose(
+            name,
+            input,
+            weight,
+            [&s, &p, &d, &o],
+            non_negative(name, "groups", &[groups])?[0],
+        )
+    })
+}
+
+/// A 1-D transposed convolution of `[N, L, C_in]` with `[C_out, K, C_in / groups]` (MLX's
+/// `conv_transpose1d`): output length `(L − 1)·stride − 2·padding + dilation·(K − 1) +
+/// output_padding + 1`.
+#[track_caller]
+pub fn conv_transpose1d(
+    input: &Array,
+    weight: &Array,
+    stride: i32,
+    padding: i32,
+    dilation: i32,
+    output_padding: i32,
+    groups: i32,
+) -> Array {
+    conv_transpose_n(
+        "conv_transpose1d",
+        input,
+        weight,
+        [[stride], [padding], [dilation], [output_padding]],
+        groups,
+    )
+}
+
+/// A 2-D transposed convolution of `[N, H, W, C_in]` with `[C_out, KH, KW, C_in / groups]`
+/// (MLX's `conv_transpose2d`).
+#[track_caller]
+pub fn conv_transpose2d(
+    input: &Array,
+    weight: &Array,
+    stride: impl Into<ConvArg<2>>,
+    padding: impl Into<ConvArg<2>>,
+    dilation: impl Into<ConvArg<2>>,
+    output_padding: impl Into<ConvArg<2>>,
+    groups: i32,
+) -> Array {
+    conv_transpose_n(
+        "conv_transpose2d",
+        input,
+        weight,
+        [
+            stride.into().0,
+            padding.into().0,
+            dilation.into().0,
+            output_padding.into().0,
+        ],
+        groups,
+    )
+}
+
+/// A 3-D transposed convolution of `[N, D, H, W, C_in]` with `[C_out, KD, KH, KW, C_in /
+/// groups]` (MLX's `conv_transpose3d`).
+#[track_caller]
+pub fn conv_transpose3d(
+    input: &Array,
+    weight: &Array,
+    stride: impl Into<ConvArg<3>>,
+    padding: impl Into<ConvArg<3>>,
+    dilation: impl Into<ConvArg<3>>,
+    output_padding: impl Into<ConvArg<3>>,
+    groups: i32,
+) -> Array {
+    conv_transpose_n(
+        "conv_transpose3d",
+        input,
+        weight,
+        [
+            stride.into().0,
+            padding.into().0,
+            dilation.into().0,
+            output_padding.into().0,
+        ],
+        groups,
+    )
+}
+
+/// How [`convolve`] trims its output (NumPy's modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ConvolveMode {
+    /// Every overlap: length `M + N − 1`.
+    #[default]
+    Full,
+    /// Centred, length `max(M, N)`.
+    Same,
+    /// Full overlaps only: length `max(M, N) − min(M, N) + 1`.
+    Valid,
+}
+
+/// The discrete convolution of 1-D arrays (MLX's and NumPy's `convolve`): the shorter one is
+/// flipped and slid over the longer one.
+///
+/// ```
+/// use nuvec_core::{array, ops};
+///
+/// let c = ops::convolve(&array![1.0f32, 2.0, 3.0], &array![0.0f32, 1.0, 0.5], ops::ConvolveMode::Full);
+/// assert_eq!(c.to_vec::<f32>().unwrap(), [0.0, 1.0, 2.5, 4.0, 1.5]);
+/// ```
+#[track_caller]
+pub fn convolve(a: &Array, v: &Array, mode: ConvolveMode) -> Array {
+    Array::sticky("convolve", Location::caller(), &[a, v], || {
+        if a.ndim() != 1 || v.ndim() != 1 {
+            return Err(Error::InvalidArgument(
+                "convolve: the inputs must be 1-D".into(),
+            ));
+        }
+        let (a, v) = if v.size() > a.size() { (v, a) } else { (a, v) };
+        let (m, k) = (a.size(), v.size());
+        let x = imp::reshape(a, &[1, m as isize, 1])?;
+        let w = imp::reshape(v, &[1, k as isize, 1])?;
+        let pad = match mode {
+            ConvolveMode::Valid => 0,
+            _ => k as isize - 1,
+        };
+        let conv = crate::conv::Conv {
+            stride: vec![1],
+            pad_lo: vec![pad],
+            pad_hi: vec![pad],
+            kernel_dilation: vec![1],
+            input_dilation: vec![1],
+            groups: 1,
+            flip: true,
+        };
+        let y = crate::conv::conv_general("convolve", &x, &w, &conv)?;
+        let y = imp::reshape(&y, &[-1])?;
+        if mode == ConvolveMode::Same {
+            let start = ((k - 1) / 2) as isize;
+            return imp::slice(
+                &y,
+                &[crate::SliceArg::new(
+                    Some(start),
+                    Some(start + m as isize),
+                    1,
+                )],
+            );
+        }
+        Ok(y)
     })
 }
 
@@ -1325,6 +1917,50 @@ methods! {
         fn greater(&self, other: impl Into<ScalarOrArray>) -> Array;
         /// Element-wise `self >= other` as a bool array.
         fn greater_equal(&self, other: impl Into<ScalarOrArray>) -> Array;
+        /// Element-wise `atan2(self, other)`: the angle of the point `(other, self)`, in at
+        /// least float32.
+        ///
+        /// ```
+        /// use nuvec_core::array;
+        ///
+        /// let y = array![1.0f32, -1.0].arctan2(array![-1.0f32, 0.0]);
+        /// assert_eq!(y.to_vec::<f32>().unwrap(), [2.3561945, -1.5707964]);
+        /// ```
+        fn arctan2(&self, other: impl Into<ScalarOrArray>) -> Array;
+        /// Element-wise remainder of floor division (Python's `%`): the result has the
+        /// divisor's sign. An integer division by zero gives 0 (MLX leaves it undefined).
+        ///
+        /// ```
+        /// use nuvec_core::array;
+        ///
+        /// assert_eq!(array![7, -7, 7].remainder(array![3, 3, -3]).to_vec::<i32>().unwrap(), [1, 2, -2]);
+        /// assert_eq!(array![-7.5f32].remainder(2.0).to_vec::<f32>().unwrap(), [0.5]);
+        /// ```
+        fn remainder(&self, other: impl Into<ScalarOrArray>) -> Array;
+        /// Element-wise `self & other` of integers or booleans.
+        ///
+        /// ```
+        /// use nuvec_core::array;
+        ///
+        /// assert_eq!(array![12u8, 10].bitwise_and(6).to_vec::<u8>().unwrap(), [4, 2]);
+        /// ```
+        fn bitwise_and(&self, other: impl Into<ScalarOrArray>) -> Array;
+        /// Element-wise `self | other` of integers or booleans.
+        fn bitwise_or(&self, other: impl Into<ScalarOrArray>) -> Array;
+        /// Element-wise `self ^ other` of integers or booleans.
+        fn bitwise_xor(&self, other: impl Into<ScalarOrArray>) -> Array;
+        /// Element-wise `self << other` of integers or booleans (the shift taken modulo the
+        /// bit width).
+        ///
+        /// ```
+        /// use nuvec_core::array;
+        ///
+        /// assert_eq!(array![1, 3].left_shift(array![4, 1]).to_vec::<i32>().unwrap(), [16, 6]);
+        /// ```
+        fn left_shift(&self, other: impl Into<ScalarOrArray>) -> Array;
+        /// Element-wise `self >> other` of integers or booleans, arithmetic for signed
+        /// integers (the shift taken modulo the bit width).
+        fn right_shift(&self, other: impl Into<ScalarOrArray>) -> Array;
     }
 
     /// # Element-wise unary operations
@@ -1385,6 +2021,58 @@ methods! {
         fn sigmoid(&self) -> Array;
         /// Element-wise inverse error function, in at least float32.
         fn erfinv(&self) -> Array;
+        /// Element-wise error function, in at least float32 (MLX's approximation, within
+        /// one unit in the last place).
+        ///
+        /// ```
+        /// use nuvec_core::array;
+        ///
+        /// let y = array![0.0f32, 1.0].erf().to_vec::<f32>().unwrap();
+        /// assert_eq!(y, [0.0, 0.8427008]);
+        /// ```
+        fn erf(&self) -> Array;
+        /// Element-wise `e^self − 1`, accurate near 0, in at least float32.
+        fn expm1(&self) -> Array;
+        /// Element-wise `ln(1 + self)`, accurate near 0, in at least float32.
+        fn log1p(&self) -> Array;
+        /// Element-wise base-2 logarithm, in at least float32.
+        fn log2(&self) -> Array;
+        /// Element-wise base-10 logarithm, in at least float32.
+        fn log10(&self) -> Array;
+        /// Element-wise tangent, in at least float32.
+        fn tan(&self) -> Array;
+        /// Element-wise hyperbolic sine, in at least float32.
+        fn sinh(&self) -> Array;
+        /// Element-wise hyperbolic cosine, in at least float32.
+        fn cosh(&self) -> Array;
+        /// Element-wise inverse cosine, in at least float32.
+        fn arccos(&self) -> Array;
+        /// Element-wise inverse hyperbolic cosine, in at least float32.
+        fn arccosh(&self) -> Array;
+        /// Element-wise inverse sine, in at least float32.
+        fn arcsin(&self) -> Array;
+        /// Element-wise inverse hyperbolic sine, in at least float32.
+        fn arcsinh(&self) -> Array;
+        /// Element-wise inverse tangent, in at least float32.
+        fn arctan(&self) -> Array;
+        /// Element-wise inverse hyperbolic tangent, in at least float32.
+        fn arctanh(&self) -> Array;
+        /// Element-wise `1 / √self`, in at least float32.
+        fn rsqrt(&self) -> Array;
+        /// Element-wise floor; integers and booleans are returned unchanged.
+        ///
+        /// ```
+        /// use nuvec_core::array;
+        ///
+        /// assert_eq!(array![-1.5f32, 2.5].floor().to_vec::<f32>().unwrap(), [-2.0, 2.0]);
+        /// ```
+        fn floor(&self) -> Array;
+        /// Element-wise ceiling; integers and booleans are returned unchanged.
+        fn ceil(&self) -> Array;
+        /// Element-wise rounding to `decimals` decimal places, ties to even; see [`round`].
+        fn round(&self, decimals: i32) -> Array;
+        /// Element-wise `~self` of integers or booleans.
+        fn bitwise_invert(&self) -> Array;
         /// Element-wise sign: `-1`, `0` or `1` in the array's dtype (NaN gives 0).
         fn sign(&self) -> Array;
         /// Element-wise complex conjugate; real arrays are returned unchanged.

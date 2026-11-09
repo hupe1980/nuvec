@@ -6,6 +6,129 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-09
+
+### Added
+
+- The rest of `mlx.core`: `hadamard_transform` (MLX's kernels, its bits on the GPU),
+  `segmented_mm` (MLX's segmented GEMM), `block_masked_mm`, `qqmm` and `gather_qqmm`
+  (activations and weights quantized in MXFP4, MXFP8 or NVFP4; `QqmmWeight` takes a dense
+  or a quantized weight; MLX's quantized backward) and `einsum_path`. Every `mlx.core` and
+  `mx.linalg` function now has a nuvec counterpart.
+- MLX's convolutions: `conv2d`, `conv3d`, `conv_general` (`ConvOptions`: asymmetric and
+  negative padding, kernel and input dilation, groups, flip), `conv_transpose1d`, `2d`, `3d`
+  and `convolve` (`ConvolveMode`); `ConvArg` takes one value or one per axis. The GPU routes
+  as MLX: implicit GEMM (2-D, 3-D), the general 2-D kernel, Winograd F(6×6, 3×3), the
+  depthwise 2-D kernel, otherwise unfold and GEMM; nuvec's depthwise kernel covers 1-D, 3-D
+  and depth multipliers. Winograd keeps float32 tiles for half-precision inputs
+  (`NUVEC_CONV_WINOGRAD=fast`: MLX's half tiles, `0`: off). Differentiable, batched under
+  `vmap`.
+- nuvec-nn: `Conv1d`, `Conv2d`, `Conv3d`, `ConvTranspose1d`, `ConvTranspose2d`,
+  `ConvTranspose3d`, `MaxPool1d`, `MaxPool2d`, `MaxPool3d`, `AvgPool1d`, `AvgPool2d` and
+  `AvgPool3d`, as MLX's `nn` (initialisation, padding values, names).
+- The `conv` and `special` benchmarks against MLX's GPU (`scripts/bench_conv.py`,
+  `scripts/bench_special.py`).
+- `nuvec::linalg`, MLX's `mx.linalg`: `qr`, `svd` (and `svd_values`), `eigh`, `eigvalsh`,
+  `eig`, `eigvals`, `lu`, `lu_factor`, `cholesky`, `inv`, `tri_inv`, `cholesky_inv`, `pinv`,
+  `solve`, `solve_triangular`, `det`, `slogdet`, `cross` and `norm`, in float32 and float64,
+  batched, with MLX's conventions (LU pivots included). The decompositions run on the CPU
+  (pure-Rust `faer`, or Accelerate's LAPACK with the feature `accelerate`), also on a GPU
+  stream, without a copy. Unlike MLX's, they are differentiable: `inv`, `solve`,
+  `solve_triangular`, `tri_inv`, `cholesky`, `cholesky_inv`, `qr`, `eigh`, `eigvalsh`,
+  `svd`, `pinv`, `det` and `slogdet`.
+- `matrix_norm`: the 2, −2 and nuclear orders.
+- The feature `accelerate` (`nuvec`, `nuvec-core`, `nuvec-cpu`): Accelerate's LAPACK for
+  `linalg` on Apple targets.
+- MLX's missing element-wise functions as primitives, with CPU and Metal kernels, MLX's
+  derivatives, vmap and fusion under `compile`: `erf`, `expm1`, `log1p`, `log2`, `log10`,
+  `tan`, `sinh`, `cosh`, `arccos`, `arccosh`, `arcsin`, `arcsinh`, `arctan`, `arctanh`,
+  `rsqrt`, `floor`, `ceil`, `round` (with decimals), `arctan2`, `remainder`, `bitwise_and`,
+  `bitwise_or`, `bitwise_xor`, `bitwise_invert`, `left_shift`, `right_shift`, with MLX's
+  NumPy-style aliases (`acos`, `atan2`, …).
+- MLX's compositions: `square`, `reciprocal`, `trunc`, `degrees`, `radians`, `positive`,
+  `real`, `imag`, `conj`, `divmod`, the logical operations, `isnan`, `isinf`, `isfinite`,
+  `isposinf`, `isneginf`, `nan_to_num`, `isclose`, `allclose`, `array_equal`, `clip`,
+  `count_nonzero`, `minmax`.
+- MLX's shape, creation and linear-algebra functions: `flip`, `roll`, `tile`, `pad` (four
+  modes), `moveaxis`, `swapaxes`, `matrix_transpose`, `flatten`, `unflatten`, `unstack`,
+  `atleast_1d`/`2d`/`3d`, `broadcast_arrays`, `tri`, `tril`, `triu`, `eye`, `identity`,
+  `diag`, `diagonal`, `trace`, `linspace`, `meshgrid`, the windows, `tensordot`, `inner`,
+  `outer`, `kron`, `vecdot`, `einsum`, `diff`, `median`, `searchsorted`, `unique`,
+  `as_strided`, `empty`, `empty_like`, `matrix_norm` (without the SVD-based orders), and the
+  dtype predicates `issubdtype`, `isdtype`, `can_cast`, `result_type`.
+- nuvec-nn: MLX's activations `gelu`, `relu2`, `relu6`, `leaky_relu`, `prelu`, `elu`,
+  `selu`, `celu`, `softplus`, `softsign`, `softshrink`, `hard_shrink`, `hard_tanh`,
+  `hardswish`, `mish`, `log_sigmoid`, `log_softmax`, `softmin`, `glu`, `step`.
+- `scripts/op_coverage.py`: `mlx.core`'s functions against nuvec's.
+- `fast::linear_cross_entropy` and `nuvec_nn::losses::linear_cross_entropy`: the cross
+  entropy of an output head computed in row chunks, so the `[N, vocab]` logits never exist.
+  Under a gradient transform each chunk's hidden-state gradient comes from the same logits
+  (no extra product); a trainable head's gradient is computed only when used.
+- `Model::token_losses` (the chunked loss over a model's head: dense, quantized, tied, or
+  Gemma 4's soft-capped) and `Model::forward_hidden_uncached`.
+- Fine-tuning options of `mlx_lm.lora`, in `nuvec_lm::tuner` and the `lora` example:
+  `--fine-tune-type` (`lora`, `dora`, `full`), `--optimizer` (`adam`, `adamw`, `muon`,
+  `sgd`, `adafactor`), `--grad-checkpoint`, `--resume-adapter-file`, `--test` and
+  `--test-batches`, and `--config` YAML files with `lora_parameters`, `optimizer_config`
+  and `lr_schedule`. `tuner::build_optimizer`, `tuner::build_schedule`, `tuner::read_config`
+  and `lora::apply` are the library side.
+- `Model::set_grad_checkpoint`: blocks recompute their activations in the backward pass.
+- DoRA: `LoraLinear::dora` (mlx-lm's `DoRALinear`) and `lora::linear_to_dora_layers`;
+  DoRA and full fine-tuning adapter directories load in mlx-lm and nuvec-lm.
+- `nuvec_nn::optim::Adafactor`, as MLX's `optimizers.Adafactor`.
+- `lora::save_weights` and `lora::load_weights` (trained weights, mlx-lm's numbered
+  checkpoints and `resume_adapter_file`).
+- Chat templates (`nuvec_lm::chat`, feature `chat`, on by default): `ChatTemplate` renders a
+  checkpoint's templates as transformers' `apply_chat_template` (its environment, template
+  selection, special tokens, tools, reasoning fields and `continue_final_message`), with
+  `minijinja`. Text and ids equal transformers 5.22.1's for 33 mlx-community checkpoints.
+  `chat::prompt_ids` builds `mlx_lm.generate`'s prompt.
+- `TokenizerConfig`: `tokenizer_config.json`'s special tokens and chat templates.
+- mlx-lm's chat (`{"messages", "tools"}`) and completion (`{"prompt", "completion"}`)
+  training data and `--mask-prompt` (`tuner::DataOptions`, `Dataset::from_rows`,
+  `Dataset::load_with`, `Dataset::rows`), with the `*_feature` keys of the `--config` file.
+- Tekken's split pattern (Mistral NeMo, Ministral, Mistral Small 3): these tokenizers load.
+- The `generate` example takes `mlx_lm.generate`'s template options: `--system-prompt`,
+  `--prefill-response`, `--chat-template-config` and `--ignore-chat-template`.
+
+### Changed
+
+- `einsum` contracts three operands or more in MLX's greedy order (opt_einsum's), as
+  `einsum_path` reports, instead of left to right.
+- `conv1d` runs MLX's convolution kernels on the GPU (its depthwise kernel stays nuvec's).
+  `graph::FastOp::DepthwiseConv1d` is now `graph::FastOp::Conv`, every convolution's fused
+  operation.
+- Adafactor, Adam and the fast operations' fallbacks use `square` and `rsqrt`.
+- The `generate` example renders the prompt with the checkpoint's chat template by default,
+  as `mlx_lm.generate` (`--chat` and its hard-coded ChatML are gone).
+- Batches come in `mlx_lm.lora`'s order: a loaded dataset is sorted by its raw rows' number
+  of keys (mlx-lm's `CacheDataset`; tokenized datasets stay sorted by length), and batches
+  are visited in numpy's `np.random.permutation` order, from one `np.random.seed(seed)`
+  state shared by training and validation. `TrainingArgs::seed` and `iterate_batches`'s
+  seed are `u32`, as numpy's.
+- The `lora` and `generate` examples need the `chat` feature.
+- LoRA training: `default_loss` uses the chunked loss; a LoRA layer's backward pass keeps
+  only its input (not its float32 copy) and frees its cotangent before the layer below;
+  `swiglu` keeps only its two inputs. Against `mlx_lm.lora` (batch 4, 50 iterations):
+  Qwen3-0.6B-4bit trains at 1.13× its speed at 0.42× its peak memory (from 0.98× and
+  0.86×), Llama-3.2-3B-Instruct-4bit at 1.02× and 0.60×, and Qwen3-0.6B with rows of
+  about 2,000 tokens and gradient checkpointing in both at 1.03× and 0.28×.
+
+### Fixed
+
+- The `lora` example seeds the generator with `--seed` before drawing the adapters, as
+  mlx-lm; its losses no longer change from run to run.
+- Text training rows end with the tokenizer's EOS (`tokenizer_config.json`), as mlx-lm's,
+  not `config.json`'s first: Llama 3.x rows ended with `<|end_of_text|>` instead of
+  `<|eot_id|>` (`tuner::eos_token_id`).
+- A gradient checkpoint differentiates only the inputs whose gradients are used, so a
+  checkpointed block over frozen quantized weights no longer fails.
+- `tuner::train` takes any optimizer, compiles the accumulated steps too (as mlx-lm), saves
+  the trainable weights (mlx-lm's `trainable_parameters`) and numbered checkpoints.
+- The `lora` example trains only with `--train`, as `mlx_lm.lora`.
+- `AdapterConfig` has a `fine_tune_type`; `adapter_config.json` records it.
+- `Model::forward_hidden` and `Model::logits` work for Gemma 4 (the soft-capped head).
+
 ## [0.7.0] - 2026-11-06
 
 ### Added
@@ -494,7 +617,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/hupe1980/nuvec/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hupe1980/nuvec/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/hupe1980/nuvec/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/hupe1980/nuvec/compare/v0.5.0...v0.6.0

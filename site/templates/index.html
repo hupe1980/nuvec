@@ -107,7 +107,7 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
       <article class="card">
         <div class="icon" aria-hidden="true">🔥</div>
         <h3>MLX's Metal kernels</h3>
-        <p>Tiled GEMM with split-K, GEMV, 1- to 6-bit and 8-bit affine and MXFP4, MXFP8 and NVFP4 quantized products, flash-style attention, RMSNorm, RoPE, sort, scan and mixture-of-experts gather kernels — or your own kernel from source.</p>
+        <p>Tiled GEMM with split-K, GEMV, 1- to 6-bit and 8-bit affine and MXFP4, MXFP8 and NVFP4 quantized products, flash-style attention, RMSNorm, RoPE, convolutions, sort, scan and mixture-of-experts gather kernels — or your own kernel from source.</p>
       </article>
       <article class="card">
         <div class="icon" aria-hidden="true">🤖</div>
@@ -122,7 +122,7 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
       <article class="card">
         <div class="icon" aria-hidden="true">🧪</div>
         <h3>Verified against MLX</h3>
-        <p>Over a thousand recorded MLX results — random strides, offsets and dtypes, gradients and batching — replay on every test run, plus tiny reference models from mlx-lm.</p>
+        <p>About 3,000 recorded MLX results — random strides, offsets and dtypes, gradients and batching — replay on every test run, plus tiny reference models from mlx-lm.</p>
       </article>
     </div>
   </div>
@@ -219,8 +219,8 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
     <h2 class="section-title">Pick the layer you need</h2>
     <div class="crates">
       <a class="crate" href="{{ get_url(path='@/docs/arrays.md') }}"><strong>nuvec</strong><span>Arrays, transforms, kernels, I/O — one import</span></a>
-      <a class="crate" href="{{ get_url(path='@/docs/neural-networks.md') }}"><strong>nuvec-nn</strong><span>Modules, layers, LoRA, optimizers</span></a>
-      <a class="crate" href="{{ get_url(path='@/docs/llm.md') }}"><strong>nuvec-lm</strong><span>Models, tokenizer, sampling, speculative decoding, batching, LoRA training, multi-Mac</span></a>
+      <a class="crate" href="{{ get_url(path='@/docs/neural-networks.md') }}"><strong>nuvec-nn</strong><span>Modules, layers, LoRA and DoRA, optimizers</span></a>
+      <a class="crate" href="{{ get_url(path='@/docs/llm.md') }}"><strong>nuvec-lm</strong><span>Models, tokenizer, sampling, speculative decoding, batching, fine-tuning, multi-Mac</span></a>
       <a class="crate" href="{{ get_url(path='@/docs/compile.md') }}"><strong>nuvec-compile</strong><span>Tracing, simplification, kernel fusion</span></a>
       <a class="crate" href="{{ get_url(path='@/docs/gpu.md') }}"><strong>nuvec::memory, metal</strong><span>Memory limits, wired memory, profiler, GPU captures</span></a>
       <a class="crate" href="{{ get_url(path='@/docs/io.md') }}"><strong>nuvec-io</strong><span>safetensors, npy and IDX, memory-mapped</span></a>

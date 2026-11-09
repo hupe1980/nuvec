@@ -12,4 +12,6 @@ const CONTRACTED: &[&str] = &[
     "gemm.metal",
     "gemv.metal",
     "gather_gemm.metal",
+    "steel_conv.metal",
+    "steel_segmented.metal",
 ];

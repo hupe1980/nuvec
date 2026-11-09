@@ -12,7 +12,10 @@ use crate::tree::Tree;
 use crate::{Array, Error, Result};
 
 type Body = dyn Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync;
-type VjpRule = dyn Fn(&[Array], &[Array], &[Array]) -> Result<Vec<Array>> + Send + Sync;
+/// `(primals, outputs, cotangents, wanted)`: `wanted[i]` says whether primal `i`'s cotangent
+/// is used (the others may be any array).
+pub(crate) type VjpRule =
+    dyn Fn(&[Array], &[Array], &[Array], &[bool]) -> Result<Vec<Array>> + Send + Sync;
 type JvpRule = dyn Fn(&[Array], &[Array]) -> Result<Vec<Array>> + Send + Sync;
 type VmapRule = dyn Fn(&[Array], &[Option<usize>]) -> Result<(Vec<Array>, usize)> + Send + Sync;
 
@@ -109,6 +112,22 @@ impl CustomFunctionFlat {
     pub fn with_vjp(
         self,
         rule: impl Fn(&[Array], &[Array], &[Array]) -> Result<Vec<Array>> + Send + Sync + 'static,
+    ) -> Self {
+        self.with(|r| {
+            r.vjp = Some(Arc::new(
+                move |p: &[Array], o: &[Array], c: &[Array], _: &[bool]| rule(p, o, c),
+            ))
+        })
+    }
+
+    /// [`CustomFunctionFlat::with_vjp`] with the mask of the primals whose cotangents are
+    /// used, so a rule can skip the others' work.
+    pub(crate) fn with_masked_vjp(
+        self,
+        rule: impl Fn(&[Array], &[Array], &[Array], &[bool]) -> Result<Vec<Array>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.with(|r| r.vjp = Some(Arc::new(rule)))
     }
@@ -342,7 +361,7 @@ where
         };
         let vjp: Option<Arc<VjpRule>> = self.vjp.clone().map(|rule| {
             let (template, out_template) = (template.clone(), out_template.clone());
-            Arc::new(move |p: &[Array], o: &[Array], c: &[Array]| {
+            Arc::new(move |p: &[Array], o: &[Array], c: &[Array], _: &[bool]| {
                 let tpl = out_template()?;
                 let i = template.unflatten(p.iter().cloned())?;
                 let o = tpl.unflatten(o.iter().cloned())?;

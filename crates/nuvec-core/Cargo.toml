@@ -20,6 +20,10 @@ bytemuck.workspace = true
 half.workspace = true
 smallvec.workspace = true
 
+[features]
+# Accelerate's LAPACK for `linalg` on Apple targets (AMX); the pure-Rust `faer` otherwise.
+accelerate = ["nuvec-cpu/accelerate"]
+
 [dev-dependencies]
 # `#[derive(Tree)]` in the tree module's doc examples (`#[tree(crate = "nuvec_core")]`).
 nuvec-macros.workspace = true
@@ -33,6 +37,18 @@ workspace = true
 
 [[bench]]
 name = "vs_mlx"
+harness = false
+
+[[bench]]
+name = "linalg"
+harness = false
+
+[[bench]]
+name = "special"
+harness = false
+
+[[bench]]
+name = "conv"
 harness = false
 
 [[bench]]

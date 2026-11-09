@@ -30,6 +30,25 @@ NUVEC_UNARY_OP(Tanh, op_tanh)
 NUVEC_UNARY_OP(Sigmoid, op_sigmoid)
 NUVEC_UNARY_OP(Conj, op_conj)
 NUVEC_UNARY_OP(ErfInv, op_erfinv)
+NUVEC_UNARY_OP(Erf, op_erf)
+NUVEC_UNARY_OP(Expm1, op_expm1)
+NUVEC_UNARY_OP(Log1p, op_log1p)
+NUVEC_UNARY_OP(Log2, op_log2)
+NUVEC_UNARY_OP(Log10, op_log10)
+NUVEC_UNARY_OP(Tan, op_tan)
+NUVEC_UNARY_OP(Sinh, op_sinh)
+NUVEC_UNARY_OP(Cosh, op_cosh)
+NUVEC_UNARY_OP(ArcCos, op_arccos)
+NUVEC_UNARY_OP(ArcCosh, op_arccosh)
+NUVEC_UNARY_OP(ArcSin, op_arcsin)
+NUVEC_UNARY_OP(ArcSinh, op_arcsinh)
+NUVEC_UNARY_OP(ArcTan, op_arctan)
+NUVEC_UNARY_OP(ArcTanh, op_arctanh)
+NUVEC_UNARY_OP(Rsqrt, op_rsqrt)
+NUVEC_UNARY_OP(Floor, op_floor)
+NUVEC_UNARY_OP(Ceil, op_ceil)
+NUVEC_UNARY_OP(Round, op_round)
+NUVEC_UNARY_OP(BitwiseInvert, op_bitwise_invert)
 
 #define NUVEC_BINARY_OP(Name, expr)                                          \
     struct Name {                                                            \
@@ -44,6 +63,13 @@ NUVEC_BINARY_OP(Min, op_min(a, b))
 NUVEC_BINARY_OP(LogAddExp, op_logaddexp(a, b))
 NUVEC_BINARY_OP(FloorDivide, op_floordiv(a, b))
 NUVEC_BINARY_OP(Power, op_pow(a, b))
+NUVEC_BINARY_OP(Remainder, op_remainder(a, b))
+NUVEC_BINARY_OP(ArcTan2, op_arctan2(a, b))
+NUVEC_BINARY_OP(BitwiseAnd, op_bitwise_and(a, b))
+NUVEC_BINARY_OP(BitwiseOr, op_bitwise_or(a, b))
+NUVEC_BINARY_OP(BitwiseXor, op_bitwise_xor(a, b))
+NUVEC_BINARY_OP(LeftShift, op_left_shift(a, b))
+NUVEC_BINARY_OP(RightShift, op_right_shift(a, b))
 NUVEC_BINARY_OP(Eq, nbool{uchar(op_eq(a, b))})
 NUVEC_BINARY_OP(Ne, nbool{uchar(!op_eq(a, b))})
 NUVEC_BINARY_OP(Lt, nbool{uchar(op_lt(a, b))})
@@ -411,12 +437,22 @@ template <typename T>
     NUVEC_BINARY(min, Min, name, T, T)          \
     NUVEC_BINARY(floor_divide, FloorDivide, name, T, T) \
     NUVEC_BINARY(power, Power, name, T, T)      \
+    NUVEC_BINARY(remainder, Remainder, name, T, T) \
     NUVEC_BINARY(eq, Eq, name, T, nbool)        \
     NUVEC_BINARY(ne, Ne, name, T, nbool)        \
     NUVEC_BINARY(lt, Lt, name, T, nbool)        \
     NUVEC_BINARY(le, Le, name, T, nbool)        \
     NUVEC_BINARY(gt, Gt, name, T, nbool)        \
     NUVEC_BINARY(ge, Ge, name, T, nbool)
+
+// Integers only: bitwise operations and shifts.
+#define NUVEC_BITS_KERNELS(name, T)             \
+    NUVEC_UNARY(bitwise_invert, BitwiseInvert, name, T, T) \
+    NUVEC_BINARY(bitwise_and, BitwiseAnd, name, T, T) \
+    NUVEC_BINARY(bitwise_or, BitwiseOr, name, T, T) \
+    NUVEC_BINARY(bitwise_xor, BitwiseXor, name, T, T) \
+    NUVEC_BINARY(left_shift, LeftShift, name, T, T) \
+    NUVEC_BINARY(right_shift, RightShift, name, T, T)
 
 // Floats: everything integers have, plus division and transcendental functions.
 #define NUVEC_FLOAT_KERNELS(name, T)            \
@@ -430,7 +466,26 @@ template <typename T>
     NUVEC_UNARY(cos, Cos, name, T, T)           \
     NUVEC_UNARY(tanh, Tanh, name, T, T)         \
     NUVEC_UNARY(sigmoid, Sigmoid, name, T, T)    \
-    NUVEC_UNARY(erfinv, ErfInv, name, T, T)
+    NUVEC_UNARY(erfinv, ErfInv, name, T, T)    \
+    NUVEC_UNARY(erf, Erf, name, T, T) \
+    NUVEC_UNARY(expm1, Expm1, name, T, T) \
+    NUVEC_UNARY(log1p, Log1p, name, T, T) \
+    NUVEC_UNARY(log2, Log2, name, T, T) \
+    NUVEC_UNARY(log10, Log10, name, T, T) \
+    NUVEC_UNARY(tan, Tan, name, T, T) \
+    NUVEC_UNARY(sinh, Sinh, name, T, T) \
+    NUVEC_UNARY(cosh, Cosh, name, T, T) \
+    NUVEC_UNARY(arccos, ArcCos, name, T, T) \
+    NUVEC_UNARY(arccosh, ArcCosh, name, T, T) \
+    NUVEC_UNARY(arcsin, ArcSin, name, T, T) \
+    NUVEC_UNARY(arcsinh, ArcSinh, name, T, T) \
+    NUVEC_UNARY(arctan, ArcTan, name, T, T) \
+    NUVEC_UNARY(arctanh, ArcTanh, name, T, T) \
+    NUVEC_UNARY(rsqrt, Rsqrt, name, T, T) \
+    NUVEC_UNARY(floor, Floor, name, T, T) \
+    NUVEC_UNARY(ceil, Ceil, name, T, T) \
+    NUVEC_UNARY(round, Round, name, T, T) \
+    NUVEC_BINARY(arctan2, ArcTan2, name, T, T)
 
 NUVEC_INT_KERNELS(uint8, uchar)
 NUVEC_INT_KERNELS(uint16, ushort)
@@ -440,6 +495,18 @@ NUVEC_INT_KERNELS(int8, char)
 NUVEC_INT_KERNELS(int16, short)
 NUVEC_INT_KERNELS(int32, int)
 NUVEC_INT_KERNELS(int64, long)
+NUVEC_BITS_KERNELS(uint8, uchar)
+NUVEC_BITS_KERNELS(uint16, ushort)
+NUVEC_BITS_KERNELS(uint32, uint)
+NUVEC_BITS_KERNELS(uint64, ulong)
+NUVEC_BITS_KERNELS(int8, char)
+NUVEC_BITS_KERNELS(int16, short)
+NUVEC_BITS_KERNELS(int32, int)
+NUVEC_BITS_KERNELS(int64, long)
+NUVEC_UNARY(bitwise_invert, BitwiseInvert, bool, nbool, nbool)
+NUVEC_BINARY(bitwise_and, BitwiseAnd, bool, nbool, nbool)
+NUVEC_BINARY(bitwise_or, BitwiseOr, bool, nbool, nbool)
+NUVEC_BINARY(bitwise_xor, BitwiseXor, bool, nbool, nbool)
 NUVEC_FLOAT_KERNELS(float16, half)
 NUVEC_FLOAT_KERNELS(bfloat16, bfloat)
 NUVEC_FLOAT_KERNELS(float32, float)

@@ -112,10 +112,13 @@ fn transcendental(case: &Case) -> bool {
 }
 
 fn cpu_differs(case: &Case) -> bool {
-    matches!(case.op.as_str(), "quantized_matmul" | "gather_qmm")
-        || case.name.starts_with("affine-dequantize-")
+    matches!(
+        case.op.as_str(),
+        "quantized_matmul" | "gather_qmm" | "qqmm" | "gather_qqmm"
+    ) || case.name.starts_with("affine-dequantize-")
         || case.name.starts_with("sdpa-d512-")
         || case.name.starts_with("power-gpu-")
+        || case.name.starts_with("hadamard-gpu-")
 }
 
 /// FR-008's bound against MLX's GPU output, `|a - b| <= atol · max|b| + rtol · |b|`: the

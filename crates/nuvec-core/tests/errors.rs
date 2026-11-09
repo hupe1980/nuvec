@@ -159,6 +159,58 @@ fn every_op_family_reports_the_callers_location() {
         OpErrorKind::InvalidArgument(_)
     );
     case!(x.conv1d(&x, 1, 0, 1, 1), "conv1d", _);
+    let img = ops::zeros([1, 4, 4, 3], DType::F32);
+    let k = ops::zeros([2, 3, 3, 3], DType::F32);
+    case!(
+        ops::conv2d(&img, &ops::zeros([2, 3, 3, 2], DType::F32), 1, 0, 1, 1),
+        "conv2d",
+        OpErrorKind::InvalidArgument(_)
+    );
+    case!(
+        ops::conv2d(&img, &k, 0, 0, 1, 1),
+        "conv2d",
+        OpErrorKind::InvalidArgument(_)
+    );
+    case!(
+        ops::conv2d(&img, &ops::zeros([2, 5, 5, 3], DType::F32), 1, 0, 1, 1),
+        "conv2d",
+        OpErrorKind::InvalidArgument(_)
+    );
+    case!(
+        ops::conv2d(&img, &k, 1, 0, 1, 2),
+        "conv2d",
+        OpErrorKind::InvalidArgument(_)
+    );
+    case!(
+        ops::conv3d(&img, &k, 1, 0, 1, 1),
+        "conv3d",
+        OpErrorKind::InvalidArgument(_)
+    );
+    case!(
+        ops::conv_general(&img, &k, &ops::ConvOptions::new().stride(&[1, 1, 1])),
+        "conv_general",
+        OpErrorKind::InvalidArgument(_)
+    );
+    case!(
+        ops::conv_transpose2d(&img, &k, 1, -1, 1, 0, 1),
+        "conv_transpose2d",
+        OpErrorKind::InvalidArgument(_)
+    );
+    case!(
+        ops::convolve(&img, &k, ops::ConvolveMode::Full),
+        "convolve",
+        OpErrorKind::InvalidArgument(_)
+    );
+    case!(
+        ops::hadamard_transform(&ops::zeros([2, 36], DType::F32), None),
+        "hadamard_transform",
+        OpErrorKind::InvalidArgument(_)
+    );
+    case!(
+        ops::hadamard_transform(&ops::zeros([0, 8], DType::F32), None),
+        "hadamard_transform",
+        OpErrorKind::InvalidArgument(_)
+    );
     // fast and random.
     case!(fast::rms_norm(&x, &i, 1e-5), "rms_norm", _);
     case!(fast::cross_entropy(&x, &x), "cross_entropy", _);

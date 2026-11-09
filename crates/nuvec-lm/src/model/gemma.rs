@@ -243,6 +243,7 @@ pub(super) fn model(b: &Builder<'_>, c: &Config, g: &Gemma4) -> Result<Model> {
         stage: None,
         sharding: None,
         vocab_sharded: false,
+        grad_checkpoint: false,
     })
 }
 
@@ -322,7 +323,7 @@ fn embed(m: &Model, tokens: &Array) -> (Array, Option<Array>) {
 
 /// The head and soft cap on the final norm's output.
 #[track_caller]
-fn logits(m: &Model, normed: &Array) -> Array {
+pub(super) fn logits(m: &Model, normed: &Array) -> Array {
     let logits = m.head(normed);
     match m.config.gemma4.as_ref().and_then(|g| g.final_logit_softcap) {
         Some(cap) => nuvec_nn::logit_softcap(&logits, cap),
@@ -341,6 +342,12 @@ fn parts(layer: &Block) -> (&Attention, &Parts) {
 /// [`Model::forward`] of a Gemma 4 model.
 #[track_caller]
 pub(super) fn forward(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array {
+    logits(m, &hidden(m, tokens, cache))
+}
+
+/// The final norm's output of a Gemma 4 model ([`Model::forward_hidden`]).
+#[track_caller]
+pub(super) fn hidden(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array {
     let (mut h, per_layer) = embed(m, tokens);
     let mask = match tokens.shape().get(1) {
         Some(&l) if l > 1 => AttentionMask::Causal,
@@ -365,7 +372,7 @@ pub(super) fn forward(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array
         let (next, n) = after_attention(layer, p, (&h, &o), per_layer.as_ref(), i, next_norm(m, i));
         (h, normed) = (next, Some(n));
     }
-    logits(m, &normed.unwrap_or_else(|| m.model.norm.forward(&h)))
+    normed.unwrap_or_else(|| m.model.norm.forward(&h))
 }
 
 /// [`Model::forward_paged`] of a Gemma 4 model: KV-shared layers attend to their source

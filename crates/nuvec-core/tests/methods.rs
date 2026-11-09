@@ -29,11 +29,21 @@ macro_rules! pairs {
     };
 }
 
+/// Integer operands for the bitwise operations.
+fn ints(c: &Ctx) -> (Array, Array) {
+    (
+        c.x.multiply(8.0).astype(DType::I32),
+        c.y.multiply(3.0).abs().astype(DType::I32),
+    )
+}
+
 fn table() -> Vec<(&'static str, Op, Op)> {
     let mut t = pairs! { c =>
         add(&c.y); subtract(&c.y); multiply(&c.y); divide(&c.y); maximum(&c.y); minimum(&c.y); logaddexp(&c.y); floor_divide(&c.y); power(&c.y);
         equal(&c.y); not_equal(&c.y); less(&c.y); less_equal(&c.y); greater(&c.y); greater_equal(&c.y);
         negative(); abs(); exp(); log(); sqrt(); sin(); cos(); tanh(); sigmoid(); erfinv();
+        erf(); expm1(); log1p(); log2(); log10(); tan(); sinh(); cosh(); arccos(); arccosh(); arcsin();
+        arcsinh(); arctan(); arctanh(); rsqrt(); floor(); ceil(); round(1); arctan2(&c.y); remainder(&c.y);
         sign(); conjugate(); stop_gradient(); contiguous(); copy();
         astype(DType::F16);
         matmul(&c.y.t());
@@ -57,6 +67,66 @@ fn table() -> Vec<(&'static str, Op, Op)> {
         zeros_like(); ones_like(); full_like(7);
     };
     // Operations with other result types or operands: compared through one array.
+    t.push((
+        "bitwise_and",
+        |c| {
+            let (a, b) = ints(c);
+            a.bitwise_and(&b)
+        },
+        |c| {
+            let (a, b) = ints(c);
+            ops::bitwise_and(&a, &b)
+        },
+    ));
+    t.push((
+        "bitwise_or",
+        |c| {
+            let (a, b) = ints(c);
+            a.bitwise_or(&b)
+        },
+        |c| {
+            let (a, b) = ints(c);
+            ops::bitwise_or(&a, &b)
+        },
+    ));
+    t.push((
+        "bitwise_xor",
+        |c| {
+            let (a, b) = ints(c);
+            a.bitwise_xor(&b)
+        },
+        |c| {
+            let (a, b) = ints(c);
+            ops::bitwise_xor(&a, &b)
+        },
+    ));
+    t.push((
+        "left_shift",
+        |c| {
+            let (a, b) = ints(c);
+            a.left_shift(&b)
+        },
+        |c| {
+            let (a, b) = ints(c);
+            ops::left_shift(&a, &b)
+        },
+    ));
+    t.push((
+        "right_shift",
+        |c| {
+            let (a, b) = ints(c);
+            a.right_shift(&b)
+        },
+        |c| {
+            let (a, b) = ints(c);
+            ops::right_shift(&a, &b)
+        },
+    ));
+    t.push((
+        "bitwise_invert",
+        |c| ints(c).0.bitwise_invert(),
+        |c| ops::bitwise_invert(&ints(c).0),
+    ));
     t.push((
         "select",
         |c| c.x.greater(0.0).select(&c.x, &c.y),

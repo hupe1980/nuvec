@@ -131,6 +131,7 @@ fn quantization_parameters_are_validated() {
         Primitive::QuantizedMatmul {
             quant: Quant::affine(64, 7),
             transpose: true,
+            rows: false,
         },
         vec![
             f32s(&[1, 64]),
@@ -283,6 +284,16 @@ fn case(rng: &mut SplitMix64) -> (Primitive, Vec<Array>) {
         UnaryOp::Sigmoid,
         UnaryOp::Conjugate,
         UnaryOp::ErfInv,
+        UnaryOp::Erf,
+        UnaryOp::Expm1,
+        UnaryOp::Log1p,
+        UnaryOp::Log2,
+        UnaryOp::Tan,
+        UnaryOp::ArcSinh,
+        UnaryOp::Rsqrt,
+        UnaryOp::Floor,
+        UnaryOp::Round,
+        UnaryOp::BitwiseInvert,
     ];
     let binary = [
         BinaryOp::Add,
@@ -297,6 +308,10 @@ fn case(rng: &mut SplitMix64) -> (Primitive, Vec<Array>) {
         BinaryOp::Equal,
         BinaryOp::Less,
         BinaryOp::GreaterEqual,
+        BinaryOp::ArcTan2,
+        BinaryOp::Remainder,
+        BinaryOp::BitwiseAnd,
+        BinaryOp::LeftShift,
     ];
     let scan = [
         ScanOp::Sum,
@@ -411,7 +426,14 @@ fn case(rng: &mut SplitMix64) -> (Primitive, Vec<Array>) {
                 }
                 _ => {
                     let transpose = rng.coin();
-                    (Primitive::QuantizedMatmul { quant, transpose }, 3 + biases)
+                    (
+                        Primitive::QuantizedMatmul {
+                            quant,
+                            transpose,
+                            rows: false,
+                        },
+                        3 + biases,
+                    )
                 }
             }
         }
@@ -505,10 +527,16 @@ fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (Fas
             )
         }
         7 => {
-            let op = FastOp::DepthwiseConv1d {
-                stride: rng.size(),
-                padding: rng.size(),
-                dilation: rng.size(),
+            let d = 1 + rng.below(3);
+            let pad = |rng: &mut SplitMix64| (0..d).map(|_| rng.isize()).collect();
+            let op = FastOp::Conv {
+                stride: rng.sizes(d),
+                pad_lo: pad(rng),
+                pad_hi: pad(rng),
+                kernel_dilation: rng.sizes(d),
+                input_dilation: rng.sizes(d),
+                groups: rng.size(),
+                flip: rng.coin(),
             };
             (op, 2)
         }

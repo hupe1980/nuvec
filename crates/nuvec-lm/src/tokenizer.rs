@@ -44,6 +44,9 @@ enum Pattern {
     /// in both), each with an optional contraction, runs of at most 3 digits, punctuation
     /// with trailing newlines or slashes, newlines, then whitespace.
     O200k,
+    /// Tekken (Mistral NeMo, Ministral, Mistral Small 3): o200k without the contractions,
+    /// digits one at a time.
+    Tekken,
 }
 
 const GPT2: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
@@ -57,6 +60,11 @@ const O200K: &str = concat!(
     r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}",
     r"| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 );
+const TEKKEN: &str = concat!(
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+",
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+);
 
 impl Pattern {
     fn parse(regex: &str) -> Result<Self> {
@@ -65,6 +73,9 @@ impl Pattern {
         }
         if regex == O200K {
             return Ok(Self::O200k);
+        }
+        if regex == TEKKEN {
+            return Ok(Self::Tekken);
         }
         let quantified = |prefix: &str, suffix: &str| {
             regex
@@ -92,7 +103,8 @@ impl Pattern {
             let n = match self {
                 Self::Gpt2 => gpt2_match(&chars, i),
                 Self::Gpt4 { digits, marks } => gpt4_match(&chars, i, digits, marks),
-                Self::O200k => o200k_match(&chars, i),
+                Self::O200k => o200k_match(&chars, i, true, 3),
+                Self::Tekken => o200k_match(&chars, i, false, 1),
             }
             .max(1);
             let start = chars[i].0;
@@ -251,8 +263,13 @@ fn is_lower_class(c: char) -> bool {
 
 /// o200k's two word alternatives at `j` (after the optional prefix), as the regular
 /// expression backtracks: `U*L+` (the longest `U*` that leaves an `L`), then `U+L*`; each
-/// with an optional contraction. Their length, or `None`.
-fn o200k_word(chars: &[(usize, char)], j: usize, upper_first: bool) -> Option<usize> {
+/// with an optional contraction (if `contractions`). Their length, or `None`.
+fn o200k_word(
+    chars: &[(usize, char)],
+    j: usize,
+    upper_first: bool,
+    contractions: bool,
+) -> Option<usize> {
     let ups = run(chars, j, is_upper_class);
     let end = if upper_first {
         // `U*L+`: give back upper-class characters until an `L` follows.
@@ -268,7 +285,7 @@ fn o200k_word(chars: &[(usize, char)], j: usize, upper_first: bool) -> Option<us
         }
         j + ups + run(chars, j + ups, is_lower_class)
     };
-    let tail = if end < chars.len() {
+    let tail = if contractions && end < chars.len() {
         contraction(chars, end, true)
     } else {
         0
@@ -276,25 +293,26 @@ fn o200k_word(chars: &[(usize, char)], j: usize, upper_first: bool) -> Option<us
     Some(end + tail - j)
 }
 
-fn o200k_match(chars: &[(usize, char)], i: usize) -> usize {
+/// o200k's (or Tekken's, without contractions and with single digits) match at `i`.
+fn o200k_match(chars: &[(usize, char)], i: usize, contractions: bool, digits: usize) -> usize {
     let c = chars[i].1;
     // `[^\r\n\p{L}\p{N}]?`, with the prefix tried first.
     let prefix = !matches!(c, '\r' | '\n') && !is_letter(c) && !is_number(c);
     for upper_first in [true, false] {
         if prefix
             && i + 1 < chars.len()
-            && let Some(n) = o200k_word(chars, i + 1, upper_first)
+            && let Some(n) = o200k_word(chars, i + 1, upper_first, contractions)
         {
             return 1 + n;
         }
-        if let Some(n) = o200k_word(chars, i, upper_first) {
+        if let Some(n) = o200k_word(chars, i, upper_first, contractions) {
             return n;
         }
     }
-    // `\p{N}{1,3}`
+    // `\p{N}{1,3}` (o200k) or `\p{N}` (Tekken)
     let n = run(chars, i, is_number);
     if n > 0 {
-        return n.min(3);
+        return n.min(digits);
     }
     // ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
     let space = usize::from(c == ' ');

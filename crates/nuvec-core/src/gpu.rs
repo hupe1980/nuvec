@@ -878,7 +878,7 @@ mod metal {
             UnaryOp::Tanh => "tanh",
             UnaryOp::Sigmoid => "sigmoid",
             UnaryOp::Conjugate => "conj",
-            UnaryOp::ErfInv => "erfinv",
+            op => op.name(),
         }
     }
 
@@ -899,6 +899,7 @@ mod metal {
             BinaryOp::LessEqual => "le",
             BinaryOp::Greater => "gt",
             BinaryOp::GreaterEqual => "ge",
+            op => op.name(),
         }
     }
 
@@ -950,6 +951,201 @@ mod metal {
         offset: usize,
         shape: Vec<usize>,
         strides: Vec<isize>,
+    }
+
+    impl<'a> Packed<'a> {
+        /// A whole new buffer (no shape: read through [`Packed::arg`] only).
+        fn owned(buffer: Buffer) -> Self {
+            Self {
+                buffer: GemmBuffer::Copy(buffer),
+                offset: 0,
+                shape: Vec::new(),
+                strides: Vec::new(),
+            }
+        }
+
+        /// `p` read from `bytes` further on.
+        fn offset(p: &'a Packed<'_>, bytes: usize) -> Packed<'a> {
+            let b = match &p.buffer {
+                GemmBuffer::View(b) => *b,
+                GemmBuffer::Copy(b) => b.metal().expect("device storage"),
+            };
+            Packed {
+                buffer: GemmBuffer::View(b),
+                offset: p.offset + bytes,
+                shape: Vec::new(),
+                strides: Vec::new(),
+            }
+        }
+    }
+
+    /// Winograd for 3 × 3 convolutions (`NUVEC_CONV_WINOGRAD`, as MLX's `MLX_CONV_WINOGRAD`):
+    /// `0` off; `fast` MLX's half-precision tiles for float16 and bfloat16 (MLX's speed and
+    /// bits, up to 2% and 13% of the output's scale off); otherwise float32 tiles, as
+    /// accurate as the direct convolution.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Winograd {
+        Off,
+        Accurate,
+        Fast,
+    }
+
+    fn winograd_mode() -> Winograd {
+        static MODE: std::sync::OnceLock<Winograd> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("NUVEC_CONV_WINOGRAD").as_deref() {
+            Ok("0") => Winograd::Off,
+            Ok("fast") => Winograd::Fast,
+            _ => Winograd::Accurate,
+        })
+    }
+
+    /// `⌈a / b⌉` for positive `i32`s.
+    fn cdiv(a: i32, b: i32) -> i32 {
+        (a + b - 1) / b
+    }
+
+    /// MLX's `MLXConvParams<2>` or `<3>` for a [`FastOp::Conv`](crate::fast::imp::FastOp::Conv)
+    /// over contiguous operands (a 1-D convolution as 2-D with a unit width, as MLX).
+    #[derive(Clone)]
+    struct MlxConv {
+        /// Whether the padding after each axis equals the padding before it.
+        symmetric: bool,
+        spatial: usize,
+        one_d: bool,
+        n: i32,
+        c: i32,
+        o: i32,
+        is: Vec<i32>,
+        ws: Vec<i32>,
+        os: Vec<i32>,
+        str: Vec<i32>,
+        pad: Vec<i32>,
+        kdil: Vec<i32>,
+        idil: Vec<i32>,
+        ins: Vec<i64>,
+        wts: Vec<i64>,
+        outs: Vec<i64>,
+        groups: i32,
+        flip: bool,
+    }
+
+    impl MlxConv {
+        fn new(x: &Output, w: &Output, o: &Output, op: &crate::fast::imp::FastOp) -> Result<Self> {
+            let crate::fast::imp::FastOp::Conv {
+                stride,
+                pad_lo,
+                pad_hi,
+                kernel_dilation,
+                input_dilation,
+                groups,
+                flip,
+            } = op
+            else {
+                unreachable!("a convolution")
+            };
+            let int = |v: usize| {
+                i32::try_from(v).map_err(|_| Error::InvalidArgument("conv: too large".into()))
+            };
+            let d = stride.len();
+            let ints = |v: &[usize]| v.iter().map(|&v| int(v)).collect::<Result<Vec<i32>>>();
+            let mut is = ints(&x.shape[1..=d])?;
+            let mut ws = ints(&w.shape[1..=d])?;
+            let mut os = ints(&o.shape[1..=d])?;
+            let mut st = ints(stride)?;
+            let mut pad = pad_lo.iter().map(|&p| p as i32).collect::<Vec<_>>();
+            let mut kdil = ints(kernel_dilation)?;
+            let mut idil = ints(input_dilation)?;
+            let contiguous = |shape: &[usize]| -> Vec<i64> {
+                let mut s = vec![1i64; shape.len()];
+                for i in (0..shape.len() - 1).rev() {
+                    s[i] = s[i + 1] * shape[i + 1] as i64;
+                }
+                s
+            };
+            let (mut ins, mut wts, mut outs) = (
+                contiguous(&x.shape),
+                contiguous(&w.shape),
+                contiguous(&o.shape),
+            );
+            let one_d = d == 1;
+            if one_d {
+                // [N, L, C] as [N, L, 1, C] with a zero width stride (MLX's `conv_1D_gpu`).
+                for v in [&mut is, &mut ws, &mut os, &mut st, &mut kdil, &mut idil] {
+                    v.push(1);
+                }
+                pad.push(0);
+                for s in [&mut ins, &mut wts, &mut outs] {
+                    s.insert(2, 0);
+                }
+            }
+            Ok(Self {
+                symmetric: pad_lo == pad_hi,
+                spatial: if d == 3 { 3 } else { 2 },
+                one_d,
+                n: int(x.shape[0])?,
+                c: int(x.shape[d + 1])?,
+                o: int(w.shape[0])?,
+                is,
+                ws,
+                os,
+                str: st,
+                pad,
+                kdil,
+                idil,
+                ins,
+                wts,
+                outs,
+                groups: int(*groups)?,
+                flip: *flip,
+            })
+        }
+
+        /// The parameters with `c` input channels (MLX's `with_padded_channels`, inputs only).
+        fn with_channels(&self, c: i32) -> Self {
+            let mut q = self.clone();
+            let scale = |s: &mut Vec<i64>| {
+                let last = s.len() - 1;
+                for v in &mut s[..last] {
+                    *v = *v / i64::from(self.c) * i64::from(c);
+                }
+            };
+            scale(&mut q.ins);
+            scale(&mut q.wts);
+            q.c = c;
+            q
+        }
+
+        /// MLX's `winograd_padded_size`: the input padded to whole 6 × 6 output tiles.
+        fn winograd_padded(&self) -> (i32, i32) {
+            let side = |i: usize| 6 * cdiv(self.is[i] + 2 * self.pad[i] - 2, 6) + 2;
+            (side(0), side(1))
+        }
+
+        /// The C layout: the `int`s, the `int64_t` strides aligned to 8, `groups`, `flip`,
+        /// padded to 8.
+        fn bytes(&self) -> Vec<u8> {
+            let mut b: Vec<u8> = Vec::with_capacity(224);
+            for v in [self.n, self.c, self.o] {
+                b.extend(v.to_ne_bytes());
+            }
+            for v in [
+                &self.is, &self.ws, &self.os, &self.str, &self.pad, &self.kdil, &self.idil,
+            ] {
+                for x in v.iter() {
+                    b.extend(x.to_ne_bytes());
+                }
+            }
+            b.resize(b.len().next_multiple_of(8), 0);
+            for v in [&self.ins, &self.wts, &self.outs] {
+                for x in v.iter() {
+                    b.extend(x.to_ne_bytes());
+                }
+            }
+            b.extend(self.groups.to_ne_bytes());
+            b.push(u8::from(self.flip));
+            b.resize(b.len().next_multiple_of(8), 0);
+            b
+        }
     }
 
     /// Metal's name of a kernel dtype.
@@ -1349,6 +1545,7 @@ mod metal {
                             UnaryOp::Negative => d != DType::Bool,
                             UnaryOp::Abs => d != DType::Complex64,
                             UnaryOp::Conjugate => d == DType::Complex64,
+                            UnaryOp::BitwiseInvert => !is_float(d) && d != DType::Complex64,
                             _ => is_float(d),
                         }
                 }
@@ -1356,7 +1553,8 @@ mod metal {
                     not64(d)
                         && match op {
                             BinaryOp::Divide => is_float(d) || d == DType::Complex64,
-                            BinaryOp::LogAddExp => is_float(d),
+                            BinaryOp::LogAddExp | BinaryOp::ArcTan2 => is_float(d),
+                            op if op.is_bitwise() => !is_float(d) && d != DType::Complex64,
                             BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => true,
                             BinaryOp::Equal | BinaryOp::NotEqual => true,
                             _ => d != DType::Complex64,
@@ -1518,7 +1716,11 @@ mod metal {
                         mode => self.fp_dequantize(operands, out, mode, bits, &mut buffer)?,
                     }
                 }
-                Primitive::QuantizedMatmul { quant, transpose } => {
+                Primitive::QuantizedMatmul {
+                    quant,
+                    transpose,
+                    rows,
+                } => {
                     let (group_size, bits) = quant.checked("quantized_matmul")?;
                     if quant.mode == crate::QuantMode::Affine {
                         self.quantized_matmul(
@@ -1528,7 +1730,13 @@ mod metal {
                             &mut buffer,
                         )?
                     } else {
-                        self.fp_quantized_matmul(operands, out, *quant, *transpose, &mut buffer)?
+                        self.fp_quantized_matmul(
+                            operands,
+                            out,
+                            *quant,
+                            (*transpose, *rows),
+                            &mut buffer,
+                        )?
                     }
                 }
                 _ => unreachable!("supports() rejects other primitives"),
@@ -3099,6 +3307,824 @@ mod metal {
             self.reduce(ReduceOp::Sum, &[0], (&meta, &data), out)
         }
 
+        /// MLX's `segmented_mm`: one steel GEMM per segment of the inner axis (MLX's tiles).
+        fn segmented_mm(&mut self, operands: &[Operand<'_>], o: &Output) -> Result<Vec<Data>> {
+            let mut out = Buffer::try_alloc_gpu(o.size * o.dtype.size())?;
+            if o.size == 0 {
+                return Ok(vec![Data::new(out)]);
+            }
+            let a = self.packed(operands[0], true)?;
+            let b = self.packed(operands[1], true)?;
+            let segments = self.packed(operands[2], true)?;
+            let (m, k, n) = (a.shape[0], a.shape[1], b.shape[1]);
+            let batch = o.size / (m * n);
+            let class = self
+                .device()
+                .and_then(|d| d.info().architecture.chars().last())
+                .unwrap_or('s');
+            let (bm, bn, bk, wm, wn) = gemm_tiles(class, o.dtype, false, false, o.size, m, n, k);
+            let (tiles_n, tiles_m) = (n.div_ceil(bn), m.div_ceil(bm));
+            let params = GemmParams {
+                m: m as i32,
+                n: n as i32,
+                k: k as i32,
+                lda: k as i32,
+                ldb: n as i32,
+                ldd: n as i32,
+                tiles_n: tiles_n as i32,
+                tiles_m: tiles_m as i32,
+                batch_stride_a: 0,
+                batch_stride_b: 0,
+                batch_stride_d: (m * n) as i64,
+                swizzle_log: 0,
+                gemm_k_iterations_aligned: 0,
+                batch_ndim: 0,
+                _pad: 0,
+            };
+            let name = format!(
+                "nuvec_segmented_mm_nn_{}_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}",
+                o.dtype.name()
+            );
+            let constants = [
+                (199, true),
+                (200, m.is_multiple_of(bm)),
+                (201, n.is_multiple_of(bn)),
+            ];
+            let pipeline = self.pipeline_with(&name, &constants)?;
+            let args = [
+                a.arg(),
+                b.arg(),
+                segments.arg(),
+                Arg::write(out.metal_mut().expect("device storage")),
+                Arg::bytes(bytemuck::bytes_of(&params)),
+            ];
+            self.encode_groups(&pipeline, &args, [tiles_n, tiles_m, batch], [32, wn, wm])?;
+            self.counted()?;
+            Ok(vec![Data::new(out)])
+        }
+
+        /// MLX's `hadamard_mn_contiguous`: `n = m · n1 · n2` with passes over `n1` (strided by
+        /// `n2`) and `n2` of at most 8,192, then the order-`m` stage, in place.
+        fn hadamard(&mut self, x: Operand<'_>, o: &Output, scale: f32) -> Result<Vec<Data>> {
+            let dtype = o.dtype;
+            let n = *o.shape.last().expect("an axis");
+            let (pow2, m) = crate::hadamard::decompose(n)?;
+            let (mut n1, mut n2) = (1usize, pow2);
+            if pow2 > 8192 {
+                n2 = 2;
+                while n2 * n2 < pow2 {
+                    n2 *= 2;
+                }
+                n1 = pow2 / n2;
+            }
+            let size = o.size;
+            let mut out = Buffer::try_alloc_gpu(size * dtype.size())?;
+            // The passes in order, each (kind, N, stride, scale).
+            let mut stages: Vec<(char, usize, usize, f32)> = Vec::new();
+            if n1 > 1 {
+                stages.push(('n', n1, n2, 1.0));
+            }
+            if n2 > 1 {
+                stages.push(('n', n2, 1, if m == 1 { scale } else { 1.0 }));
+            }
+            if m > 1 {
+                stages.push(('m', m, pow2, scale));
+            }
+            let x = self.packed(x, true)?;
+            let dt = dtype.name();
+            for (s, &(kind, k, stride, sc)) in stages.iter().enumerate() {
+                // One dtype throughout (MLX rounds to it between passes).
+                let (ti, to) = (dt, dt);
+                let (name, grid, group, arg) = if kind == 'n' {
+                    let r = k.min(16);
+                    let threads = k / r;
+                    let grid = if stride == 1 {
+                        [threads, size / k, 1]
+                    } else {
+                        [threads, size / (k * stride), stride]
+                    };
+                    (
+                        format!("nuvec_hadamard_n{k}_{ti}_{to}"),
+                        grid,
+                        [threads, 1, 1],
+                        stride as i32,
+                    )
+                } else {
+                    let rw = if pow2 == 1 {
+                        1
+                    } else if pow2 == 2 || m == 28 {
+                        2
+                    } else {
+                        4
+                    };
+                    let g = (pow2 / rw).min(256);
+                    (
+                        format!("nuvec_hadamard_m{m}_r{rw}_{ti}_{to}"),
+                        [g, size / m / rw / g, 1],
+                        [g, 1, 1],
+                        pow2 as i32,
+                    )
+                };
+                let pipeline = self.pipeline(&name)?;
+                let (sc, arg) = (
+                    bytemuck::bytes_of(&sc).to_vec(),
+                    bytemuck::bytes_of(&arg).to_vec(),
+                );
+                // The first pass from the input, the others in place (each threadgroup
+                // owns its elements).
+                let args = if s == 0 {
+                    vec![
+                        x.arg(),
+                        Arg::write(out.metal_mut().expect("device storage")),
+                        Arg::bytes(&sc),
+                        Arg::bytes(&arg),
+                    ]
+                } else {
+                    vec![
+                        Arg::write(out.metal_mut().expect("device storage")),
+                        Arg::Same(0, 0),
+                        Arg::bytes(&sc),
+                        Arg::bytes(&arg),
+                    ]
+                };
+                self.encode_threads(&pipeline, &args, grid, group)?;
+                self.counted()?;
+            }
+            Ok(vec![Data::new(out)])
+        }
+
+        /// MLX's convolution routing (`dispatch_conv_2D_gpu`, 1-D as 2-D with a unit
+        /// width, and `dispatch_conv_3D_gpu`) over its Winograd, depthwise and implicit-GEMM
+        /// kernels: `false` where MLX unfolds explicitly (the caller's columns and GEMM).
+        fn mlx_conv(
+            &mut self,
+            p: &MlxConv,
+            x: &Packed<'_>,
+            w: &Packed<'_>,
+            out: &mut Buffer,
+            dtype: DType,
+        ) -> Result<bool> {
+            let (cg, og) = (p.c / p.groups, p.o / p.groups);
+            let unit = |v: &[i32]| v.iter().all(|&v| v == 1);
+            let idil_one = unit(&p.idil);
+            let channels = (cg <= 4 || cg == 8 || cg % 16 == 0) && (og <= 16 || og % 16 == 0);
+            let dt = dtype.name();
+            if p.spatial == 3 {
+                let mod16 = cg % 16 == 0 && (og <= 16 || og % 16 == 0);
+                if !(idil_one && mod16 && p.groups == 1) {
+                    return Ok(false);
+                }
+                self.implicit_conv(p, x, w, out, dt)?;
+                return Ok(true);
+            }
+            if p.groups > 1 {
+                if !idil_one {
+                    return Ok(false);
+                }
+                let depthwise = cg == 1
+                    && og == 1
+                    && unit(&p.kdil)
+                    && p.ws.iter().all(|&k| k <= 7)
+                    && p.str.iter().all(|&s| s <= 2)
+                    && p.c % 8 == 0
+                    && p.c == p.o;
+                if depthwise {
+                    self.depthwise_conv_2d(p, x, w, out, dt)?;
+                    return Ok(true);
+                }
+                if !channels {
+                    return Ok(false);
+                }
+                self.implicit_conv(p, x, w, out, dt)?;
+                return Ok(true);
+            }
+            if p.one_d {
+                // MLX's `conv_1D_gpu`: the 2-D routing only for these channels.
+                if !(idil_one && channels) {
+                    return Ok(false);
+                }
+            }
+            let stride_one = unit(&p.str);
+            let in_large = i64::from(p.n) * i64::from(p.is[0]) * i64::from(p.is[1]) >= 4096;
+            // Half precision takes float32 tiles unless `fast`: MLX's half-precision tiles
+            // lose up to 2% (float16) and 13% (bfloat16) of the output's scale.
+            let winograd = winograd_mode() != Winograd::Off
+                && !p.flip
+                && !p.one_d
+                && stride_one
+                && unit(&p.kdil)
+                && idil_one
+                && p.ws == [3, 3]
+                && p.symmetric
+                && p.c % 32 == 0
+                && p.o % 32 == 0
+                && in_large
+                && p.c + p.o >= 256;
+            if winograd && let Some(step) = self.winograd_step(p, dtype) {
+                self.winograd_conv(p, x, w, out, dtype, step)?;
+                return Ok(true);
+            }
+            let specialized = (p.c <= 4 || p.c % 16 == 0) && (p.o <= 16 || p.o % 16 == 0);
+            let out_large = i64::from(p.n) * i64::from(p.os[0]) * i64::from(p.os[1]) >= 256;
+            let o_aligned = p.o <= 16 || p.o % 16 == 0;
+            if idil_one
+                && stride_one
+                && out_large
+                && !specialized
+                && o_aligned
+                && p.ws[0] * p.ws[1] >= 9
+            {
+                // MLX's `pad_in_channels_conv_2D_gpu`: zero channels up to a multiple of 16.
+                let c16 = cdiv(p.c, 16) * 16;
+                let xp = self.conv_pad(
+                    x,
+                    [p.n * p.is[0], p.is[1], p.c],
+                    [p.is[0] * p.n, p.is[1], c16],
+                    (0, 0),
+                    dtype,
+                    p.n,
+                )?;
+                let wp = self.conv_pad(
+                    w,
+                    [p.o * p.ws[0], p.ws[1], p.c],
+                    [p.o * p.ws[0], p.ws[1], c16],
+                    (0, 0),
+                    dtype,
+                    p.o,
+                )?;
+                let q = p.with_channels(c16);
+                let (xp, wp) = (Packed::owned(xp), Packed::owned(wp));
+                self.implicit_conv(&q, &xp, &wp, out, dt)?;
+                return Ok(true);
+            }
+            if idil_one && specialized {
+                self.implicit_conv(p, x, w, out, dt)?;
+            } else if (p.c % 16 == 0 && p.o % 16 == 0) || out_large {
+                self.implicit_conv_general(p, x, w, out, dt)?;
+            } else {
+                return Ok(false);
+            }
+            Ok(true)
+        }
+
+        /// `x` (`[N · H_x, W_x, C_x]` as `[n, H_x / n, W_x, C_x]` rows) zero-padded into a new
+        /// `[n, H_y, W_y, C_y]` buffer at `(top, left)`; `hy` and `hx` count all `n` images.
+        fn conv_pad(
+            &mut self,
+            x: &Packed<'_>,
+            [hx, wx, cx]: [i32; 3],
+            [hy, wy, cy]: [i32; 3],
+            (top, left): (i32, i32),
+            dtype: DType,
+            n: i32,
+        ) -> Result<Buffer> {
+            let (hx1, hy1) = (hx / n, hy / n);
+            let size = (hy as usize) * (wy as usize) * (cy as usize);
+            let mut y = Buffer::try_alloc_gpu(size * dtype.size())?;
+            let sizes = [hx1, wx, cx, hy1, wy, cy, top, left];
+            let args = [
+                x.arg(),
+                Arg::write(y.metal_mut().expect("device storage")),
+                Arg::bytes(bytemuck::cast_slice(&sizes)),
+            ];
+            let grid = [cy as usize, wy as usize, hy as usize];
+            let pipeline = self.pipeline(&format!("nuvec_conv_pad_{}", dtype.name()))?;
+            self.encode_threads(&pipeline, &args, grid, block_dims(grid))?;
+            self.counted()?;
+            Ok(y)
+        }
+
+        /// MLX's `winograd_batch_step`: images per step whose scratch fits three quarters
+        /// of the working set, `None` where the steps would be too small to pay off.
+        fn winograd_step(&mut self, p: &MlxConv, dtype: DType) -> Option<i32> {
+            let size = dtype.size();
+            // The transformed weights and tiles: float32 unless `fast`.
+            let tsize = if winograd_mode() == Winograd::Fast {
+                size
+            } else {
+                4
+            };
+            let (ph, pw) = p.winograd_padded();
+            let tiles = (cdiv(p.os[0], 6) * cdiv(p.os[1], 6)) as usize;
+            let working = self.device()?.info().recommended_working_set as usize;
+            let limit = working / 4 * 3;
+            let (n, c, o) = (p.n as usize, p.c as usize, p.o as usize);
+            let filt = 64 * c * o * tsize;
+            let io = size
+                * (n * (p.is[0] * p.is[1]) as usize * c + n * (p.os[0] * p.os[1]) as usize * o);
+            let budget = limit.saturating_sub(io + filt);
+            let per_n = (ph * pw) as usize * c * size + 64 * tiles * (c + o) * tsize;
+            let step = (budget / per_n).min(n);
+            if step == 0 || (step < n && step * tiles < 32) {
+                return None;
+            }
+            Some(step as i32)
+        }
+
+        /// MLX's `winograd_conv_2D_gpu`: F(6×6, 3×3) with the weights transformed once, then
+        /// per step of images the padded input transformed, 64 batched GEMMs and the output
+        /// transform.
+        fn winograd_conv(
+            &mut self,
+            p: &MlxConv,
+            x: &Packed<'_>,
+            w: &Packed<'_>,
+            out: &mut Buffer,
+            dtype: DType,
+            step: i32,
+        ) -> Result<()> {
+            // Half-precision inputs take float32 tiles and a float32 product unless `fast`.
+            let fast = winograd_mode() == Winograd::Fast;
+            let tiles_dtype = if fast { dtype } else { DType::F32 };
+            let kt = match dtype {
+                DType::F32 => "float32".to_string(),
+                d if fast => d.name().to_string(),
+                d => format!("{}_tf32", d.name()),
+            };
+            let (size, tsize) = (dtype.size(), tiles_dtype.size());
+            let (c, o) = (p.c, p.o);
+            let (ph, pw) = p.winograd_padded();
+            let (th, tw) = (cdiv(p.os[0], 6), cdiv(p.os[1], 6));
+            let tiles = th * tw;
+            // The weights as [64, C, O].
+            let mut filt = Buffer::try_alloc_gpu(64 * (c * o) as usize * tsize)?;
+            {
+                let args = [
+                    w.arg(),
+                    Arg::write(filt.metal_mut().expect("device storage")),
+                    Arg::bytes(bytemuck::bytes_of(&c)),
+                    Arg::bytes(bytemuck::bytes_of(&o)),
+                ];
+                let name = format!("nuvec_winograd_conv_2d_weight_transform_{kt}_bc32");
+                self.dispatch_groups(&name, &args, [(o / 4) as usize, 1, 1], [32, 4, 1])?;
+            }
+            let filt = Data::new(filt);
+            let image = (p.is[0] * p.is[1] * c) as usize;
+            let out_image = (p.os[0] * p.os[1] * o) as usize;
+            let mut n0 = 0;
+            while n0 < p.n {
+                let tile_n = step.min(p.n - n0);
+                let n_tiles = tile_n * tiles;
+                // This step's images, zero-padded to the tiles.
+                let xs = Packed::offset(x, n0 as usize * image * size);
+                let padded = self.conv_pad(
+                    &xs,
+                    [tile_n * p.is[0], p.is[1], c],
+                    [tile_n * ph, pw, c],
+                    (p.pad[0], p.pad[1]),
+                    dtype,
+                    tile_n,
+                )?;
+                let mut q = p.clone();
+                q.n = tile_n;
+                q.is = vec![ph, pw];
+                q.pad = vec![0, 0];
+                q.ins = vec![i64::from(ph * pw * c), i64::from(pw * c), i64::from(c), 1];
+                let params = q.bytes();
+                let mut inp = Buffer::try_alloc_gpu(64 * (n_tiles * c) as usize * tsize)?;
+                {
+                    let args = [
+                        Arg::read(padded.metal().expect("device storage")),
+                        Arg::write(inp.metal_mut().expect("device storage")),
+                        Arg::bytes(&params),
+                    ];
+                    let name = format!("nuvec_winograd_conv_2d_input_transform_{kt}_bc32");
+                    self.dispatch_groups(
+                        &name,
+                        &args,
+                        [tw as usize, th as usize, tile_n as usize],
+                        [32, 2, 2],
+                    )?;
+                }
+                // [64, tiles, C] · [64, C, O].
+                let (nt, cu, ou) = (n_tiles as usize, c as usize, o as usize);
+                let a_meta = crate::kernels::strided(
+                    tiles_dtype,
+                    &[64, nt, cu],
+                    &[(nt * cu) as isize, cu as isize, 1],
+                );
+                let b_meta = crate::kernels::strided(
+                    tiles_dtype,
+                    &[64, cu, ou],
+                    &[(cu * ou) as isize, ou as isize, 1],
+                );
+                let y_meta = crate::kernels::strided(
+                    tiles_dtype,
+                    &[64, nt, ou],
+                    &[(nt * ou) as isize, ou as isize, 1],
+                );
+                let inp = Data::new(inp);
+                let mut prod = Buffer::try_alloc_gpu(64 * nt * ou * tsize)?;
+                self.gemm((&a_meta, &inp), (&b_meta, &filt), None, &y_meta, &mut prod)?;
+                {
+                    let offset = n0 as usize * out_image * size;
+                    let args = [
+                        Arg::read(prod.metal().expect("device storage")),
+                        Arg::Write(out.metal_mut().expect("device storage"), offset),
+                        Arg::bytes(&params),
+                    ];
+                    let name = format!("nuvec_winograd_conv_2d_output_transform_{kt}_bo32");
+                    self.dispatch_groups(
+                        &name,
+                        &args,
+                        [tw as usize, th as usize, tile_n as usize],
+                        [32, 2, 2],
+                    )?;
+                }
+                n0 += tile_n;
+            }
+            Ok(())
+        }
+
+        /// MLX's `implicit_gemm_conv_2D_gpu` and `implicit_gemm_conv_3D_gpu`.
+        fn implicit_conv(
+            &mut self,
+            p: &MlxConv,
+            x: &Packed<'_>,
+            w: &Packed<'_>,
+            out: &mut Buffer,
+            dt: &str,
+        ) -> Result<()> {
+            let (cg, og) = (p.c / p.groups, p.o / p.groups);
+            let taps: i32 = p.ws.iter().product();
+            let m: i64 = i64::from(p.n) * p.os.iter().map(|&v| i64::from(v)).product::<i64>();
+            let m =
+                i32::try_from(m).map_err(|_| Error::InvalidArgument("conv: too large".into()))?;
+            let (n, k) = (og, taps * cg);
+            let (mut wm, mut wn) = (2, 2);
+            let mut bm = if m >= 8192 && cg >= 64 { 64 } else { 32 };
+            let mut bn = if bm == 64 || n >= 64 { 64 } else { 32 };
+            let bk = 16;
+            if n <= 16 {
+                (bn, wm, wn) = (8, 4, 1);
+            }
+            let three = p.spatial == 3;
+            if !three && cg == 8 {
+                bm = 64;
+            }
+            let (tn, tm) = (cdiv(n, bn), cdiv(m, bm));
+            let mut channel = 0;
+            let mut k_iters = taps * cdiv(cg, bk);
+            if !three {
+                if cg <= 2 {
+                    k_iters = cdiv(k, bk);
+                    channel = cg;
+                } else if cg <= 4 {
+                    k_iters = cdiv(taps * 4, bk);
+                    channel = cg;
+                } else if cg == 8 {
+                    k_iters = cdiv(taps * 8, bk);
+                    channel = 8;
+                }
+            }
+            let small = channel == 0 && p.ws.iter().all(|&s| s <= 16);
+            let sign = if p.flip { -1 } else { 1 };
+            let d = p.ws.len();
+            // Input jumps per kernel axis (innermost last), then to the next channel block.
+            let ij: Vec<i32> = (0..d)
+                .map(|i| (p.ins[1 + i] * i64::from(p.kdil[i])) as i32)
+                .collect();
+            let mut jumps = Vec::with_capacity(d + 1);
+            jumps.push(sign * ij[d - 1]);
+            for i in (0..d - 1).rev() {
+                let inner: i32 = (i + 1..d).map(|j| (p.ws[j] - 1) * ij[j]).sum();
+                jumps.push(sign * (ij[i] - inner));
+            }
+            let all: i32 = (0..d).map(|j| (p.ws[j] - 1) * ij[j]).sum();
+            jumps.push(bk - sign * all);
+            // `ImplicitGemmConv{2,3}DParams`: M, N, K, iterations, jumps (w, h[, d], c),
+            // tiles_n, tiles_m, swizzle_log.
+            let mut gp = vec![m, n, k, k_iters];
+            gp.extend(&jumps);
+            gp.extend([tn, tm, 0]);
+            let name = if three {
+                format!(
+                    "nuvec_implicit_gemm_conv_3d_{dt}_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}_filter_{}",
+                    if small { 's' } else { 'l' }
+                )
+            } else {
+                let ch = if channel == 0 {
+                    "l".to_string()
+                } else {
+                    channel.to_string()
+                };
+                format!(
+                    "nuvec_implicit_gemm_conv_2d_{dt}_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}_channel_{ch}_filter_{}",
+                    if small { 's' } else { 'l' }
+                )
+            };
+            let params = p.bytes();
+            let args = [
+                x.arg(),
+                w.arg(),
+                Arg::write(out.metal_mut().expect("device storage")),
+                Arg::bytes(&params),
+                Arg::bytes(bytemuck::cast_slice(&gp)),
+            ];
+            let groups = [tn as usize, tm as usize, p.groups as usize];
+            self.dispatch_groups(&name, &args, groups, [32, wn as usize, wm as usize])
+        }
+
+        /// MLX's `implicit_gemm_conv_2D_general_gpu` (strides, dilations and flips, one
+        /// group).
+        fn implicit_conv_general(
+            &mut self,
+            p: &MlxConv,
+            x: &Packed<'_>,
+            w: &Packed<'_>,
+            out: &mut Buffer,
+            dt: &str,
+        ) -> Result<()> {
+            fn gcd(a: i32, b: i32) -> i32 {
+                if b == 0 { a } else { gcd(b, a % b) }
+            }
+            let lcm = |a: i32, b: i32| a / gcd(a, b) * b;
+            let m = i64::from(p.n) * i64::from(p.os[0]) * i64::from(p.os[1]);
+            let m =
+                i32::try_from(m).map_err(|_| Error::InvalidArgument("conv: too large".into()))?;
+            let (n, k) = (p.o, p.ws[0] * p.ws[1] * p.c);
+            let (wm, wn) = (2, 2);
+            let f_wgt = [
+                lcm(p.idil[0], p.kdil[0]) / p.kdil[0],
+                lcm(p.idil[1], p.kdil[1]) / p.kdil[1],
+            ];
+            let f_out = [
+                lcm(p.idil[0], p.str[0]) / p.str[0],
+                lcm(p.idil[1], p.str[1]) / p.str[1],
+            ];
+            let adj = [cdiv(p.os[0], f_out[0]), cdiv(p.os[1], f_out[1])];
+            let adj_m = p.n * adj[0] * adj[1];
+            let jump = [
+                f_wgt[0],
+                f_wgt[1],
+                f_out[0],
+                f_out[1],
+                adj[0],
+                adj[1],
+                adj[0] * adj[1],
+                adj_m,
+            ];
+            // Per output phase: the first kernel offset reading a real input row, and how
+            // many offsets (every `f_wgt`-th) follow.
+            let base = |a: usize| -> Vec<i32> {
+                let step = if p.flip { -p.kdil[a] } else { p.kdil[a] };
+                let init = if p.flip { (p.ws[a] - 1) * p.kdil[a] } else { 0 };
+                let mut v = Vec::with_capacity(2 * f_out[a] as usize);
+                for i in 0..f_out[a] {
+                    let mut at = i * p.str[a] - p.pad[a] + init;
+                    let mut b = 0;
+                    while b < p.ws[a] && at % p.idil[a] != 0 {
+                        b += 1;
+                        at += step;
+                    }
+                    v.extend([b, cdiv(p.ws[a] - b, f_wgt[a])]);
+                }
+                v
+            };
+            let (base_h, base_w) = (base(0), base(1));
+            let bm = if adj_m >= 8192 && p.c >= 64 { 64 } else { 32 };
+            let bn = if bm == 64 && n >= 64 { 64 } else { 32 };
+            let bk = 16;
+            let (tn, tm) = (cdiv(n, bn), cdiv(adj_m, bm));
+            let k_iters = cdiv(p.c, bk);
+            let align_c = p.c % bk == 0;
+            let sign = if p.flip { -1 } else { 1 };
+            let ijw = (p.ins[2] * i64::from(p.kdil[1])) as i32;
+            let ijh = (p.ins[1] * i64::from(p.kdil[0])) as i32;
+            let gp = [
+                m,
+                n,
+                k,
+                k_iters,
+                sign * ijw,
+                sign * (ijh - (p.ws[1] - 1) * ijw),
+                bk - sign * (p.ws[0] - 1) * ijh - sign * (p.ws[1] - 1) * ijw,
+                tn,
+                tm,
+                0,
+            ];
+            let name = format!(
+                "nuvec_implicit_gemm_conv_2d_general_{dt}_bm{bm}_bn{bn}_bk{bk}_wm{wm}_wn{wn}"
+            );
+            let pipeline = self
+                .device()
+                .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?
+                .pipeline_with_constants(&name, &[(400, nuvec_gpu::Constant::Bool(align_c))])
+                .map_err(backend)?;
+            let params = p.bytes();
+            let args = [
+                x.arg(),
+                w.arg(),
+                Arg::write(out.metal_mut().expect("device storage")),
+                Arg::bytes(&params),
+                Arg::bytes(bytemuck::cast_slice(&gp)),
+                Arg::bytes(bytemuck::cast_slice(&jump)),
+                Arg::bytes(bytemuck::cast_slice(&base_h)),
+                Arg::bytes(bytemuck::cast_slice(&base_w)),
+            ];
+            let groups = [tn as usize, tm as usize, (f_out[0] * f_out[1]) as usize];
+            self.encode_groups(&pipeline, &args, groups, [32, wn, wm])?;
+            self.counted()
+        }
+
+        /// MLX's `depthwise_conv_2D_gpu`: 4 × 8 output pixels of 8 channels per threadgroup.
+        fn depthwise_conv_2d(
+            &mut self,
+            p: &MlxConv,
+            x: &Packed<'_>,
+            w: &Packed<'_>,
+            out: &mut Buffer,
+            dt: &str,
+        ) -> Result<()> {
+            use nuvec_gpu::Constant::{Bool, Int};
+            let (tc, tw, th) = (8, 8, 4);
+            let constants = [
+                (410, Int(p.ws[0])),
+                (411, Int(p.ws[1])),
+                (412, Int(p.str[0])),
+                (413, Int(p.str[1])),
+                (414, Int(th)),
+                (415, Int(tw)),
+                (416, Bool(p.flip)),
+            ];
+            let pipeline = self
+                .device()
+                .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?
+                .pipeline_with_constants(&format!("nuvec_depthwise_conv_2d_{dt}"), &constants)
+                .map_err(backend)?;
+            let params = p.bytes();
+            let args = [
+                x.arg(),
+                w.arg(),
+                Arg::write(out.metal_mut().expect("device storage")),
+                Arg::bytes(&params),
+            ];
+            let groups = [
+                (p.c / tc) as usize,
+                cdiv(p.os[1], tw) as usize,
+                (cdiv(p.os[0], th) * p.n) as usize,
+            ];
+            self.encode_groups(
+                &pipeline,
+                &args,
+                groups,
+                [tc as usize, tw as usize, th as usize],
+            )?;
+            self.counted()
+        }
+
+        /// [`FastOp::Conv`]: MLX's kernels where MLX routes to them (`mlx_conv`);
+        /// otherwise one kernel for depthwise convolutions, or the columns (unfold) and one
+        /// GEMM per group, the columns skipped when they are the input.
+        fn conv(
+            &mut self,
+            op: &crate::fast::imp::FastOp,
+            operands: &[Operand<'_>],
+            outputs: &[Output],
+        ) -> Result<Vec<Data>> {
+            let crate::fast::imp::FastOp::Conv {
+                stride,
+                pad_lo,
+                pad_hi,
+                kernel_dilation,
+                input_dilation,
+                groups,
+                flip,
+            } = op
+            else {
+                unreachable!("a convolution")
+            };
+            let (xm, wm, o) = (operands[0].0, operands[1].0, &outputs[0]);
+            let (dtype, d, groups) = (xm.dtype, stride.len(), *groups);
+            let i32_ = |v: isize| {
+                i32::try_from(v).map_err(|_| Error::InvalidArgument("conv: too large".into()))
+            };
+            let (n, c_in, c_out) = (xm.shape[0], xm.shape[d + 1], wm.shape[0]);
+            let (cg, per_out) = (c_in / groups, c_out / groups);
+            let taps: usize = wm.shape[1..=d].iter().product();
+            let pixels: usize = o.shape[1..=d].iter().product();
+            let rows = n * pixels;
+            // The kernel's `ConvGeometry`: unused leading axes have size 1.
+            let mut geo = [1i32; 25];
+            geo[12..15].fill(0);
+            let lead = 3 - d;
+            for i in 0..d {
+                let at = lead + i;
+                geo[at] = i32_(xm.shape[1 + i] as isize)?;
+                geo[3 + at] = i32_(o.shape[1 + i] as isize)?;
+                geo[6 + at] = i32_(wm.shape[1 + i] as isize)?;
+                geo[9 + at] = i32_(stride[i] as isize)?;
+                geo[12 + at] = i32_(pad_lo[i])?;
+                geo[15 + at] = i32_(kernel_dilation[i] as isize)?;
+                geo[18 + at] = i32_(input_dilation[i] as isize)?;
+            }
+            geo[21] = i32_(c_in as isize)?;
+            geo[22] = i32_(c_out as isize)?;
+            geo[23] = i32_(groups as isize)?;
+            geo[24] = i32::from(*flip);
+            let mut out = Buffer::try_alloc_gpu(o.size * dtype.size())?;
+            if o.size == 0 {
+                return Ok(vec![Data::new(out)]);
+            }
+            // MLX's kernels where MLX routes to them (1-D depthwise keeps nuvec's kernel,
+            // bit for bit with the composition).
+            let depthwise = groups == c_in && cg == 1;
+            if pad_lo.iter().all(|&p| p >= 0) && !(depthwise && d == 1) {
+                let p = MlxConv::new(xm, wm, o, op)?;
+                let x = self.packed(operands[0], true)?;
+                let w = self.packed(operands[1], true)?;
+                if self.mlx_conv(&p, &x, &w, &mut out, dtype)? {
+                    return Ok(vec![Data::new(out)]);
+                }
+            }
+            if depthwise {
+                let x = self.packed(operands[0], true)?;
+                let w = self.packed(operands[1], true)?;
+                let args = [
+                    x.arg(),
+                    w.arg(),
+                    Arg::write(out.metal_mut().expect("device storage")),
+                    Arg::bytes(bytemuck::bytes_of(&geo)),
+                ];
+                let grid = [c_out, pixels, n];
+                let pipeline = self.pipeline(&format!("nuvec_depthwise_conv_{}", dtype.name()))?;
+                self.encode_threads(&pipeline, &args, grid, block_dims(grid))?;
+                self.counted()?;
+                return Ok(vec![Data::new(out)]);
+            }
+            let k = taps * cg;
+            // The columns `[groups, rows, k]`: the input itself for an unpadded, undilated
+            // single tap with unit strides.
+            let identity = taps == 1
+                && groups == 1
+                && stride
+                    .iter()
+                    .chain(kernel_dilation)
+                    .chain(input_dilation)
+                    .all(|&v| v == 1)
+                && pad_lo.iter().chain(pad_hi).all(|&p| p == 0)
+                && xm.flags.row_contiguous
+                && operands[0].1.offset >= 0;
+            let cols_meta = crate::kernels::strided(
+                dtype,
+                &[groups, rows, k],
+                &[(rows * k) as isize, k as isize, 1],
+            );
+            let cols = if identity {
+                None
+            } else {
+                let mut cols = Buffer::try_alloc_gpu(groups * rows * k * dtype.size())?;
+                let x = self.packed(operands[0], true)?;
+                let args = [
+                    x.arg(),
+                    Arg::write(cols.metal_mut().expect("device storage")),
+                    Arg::bytes(bytemuck::bytes_of(&geo)),
+                ];
+                // MLX's `naive_unfold_Nd` launch: channels across 32 to 64 threads.
+                let grid = [cg, taps, groups * rows];
+                let x_group = 32 * cg.clamp(1, 64).div_ceil(32);
+                let group_dims = [x_group.min(cg), (256 / x_group).min(taps), 1];
+                let pipeline = self.pipeline(&format!("nuvec_conv_unfold_{}", dtype.name()))?;
+                self.encode_threads(&pipeline, &args, grid, group_dims)?;
+                self.counted()?;
+                Some(Data::new(cols))
+            };
+            let a = (&cols_meta, cols.as_ref().unwrap_or(operands[0].1));
+            // The weight `[C_out, k]` read as `[groups, k, C_out / groups]`.
+            let w_copy = if wm.flags.row_contiguous && operands[1].1.offset >= 0 {
+                None
+            } else {
+                let mut copy = Buffer::try_alloc_gpu(wm.size * dtype.size())?;
+                self.copy(operands[1], &mut copy)?;
+                Some(Data::new(copy))
+            };
+            let w_meta = crate::kernels::strided(
+                dtype,
+                &[groups, k, per_out],
+                &[(per_out * k) as isize, 1, k as isize],
+            );
+            let b = (&w_meta, w_copy.as_ref().unwrap_or(operands[1].1));
+            let y_meta = crate::kernels::strided(
+                dtype,
+                &[groups, rows, per_out],
+                &[(rows * per_out) as isize, per_out as isize, 1],
+            );
+            if groups == 1 {
+                self.gemm(a, b, None, &y_meta, &mut out)?;
+                return Ok(vec![Data::new(out)]);
+            }
+            // `[groups, rows, C_out / groups]` → `[rows, groups, C_out / groups]`.
+            let mut y = Buffer::try_alloc_gpu(o.size * dtype.size())?;
+            self.gemm(a, b, None, &y_meta, &mut y)?;
+            let view = crate::kernels::strided(
+                dtype,
+                &[rows, groups, per_out],
+                &[per_out as isize, (rows * per_out) as isize, 1],
+            );
+            self.copy((&view, &Data::new(y)), &mut out)?;
+            Ok(vec![Data::new(out)])
+        }
+
         /// The fused operations (MLX's `fast` kernels and its softmax and log-sum-exp).
         fn fast(
             &mut self,
@@ -3190,35 +4216,14 @@ mod metal {
             if let FastOp::ResidualRmsNorm { eps, scaled, next } = *op {
                 return self.residual_rms_norm(operands, outputs, (eps, scaled, next));
             }
-            if let FastOp::DepthwiseConv1d {
-                stride,
-                padding,
-                dilation,
-            } = *op
-            {
-                let mut out = alloc(&outputs[0])?;
-                let x = self.packed(operands[0], true)?;
-                let w = self.packed(operands[1], true)?;
-                let (n, l, c) = (x.shape[0], x.shape[1], x.shape[2]);
-                let (k, l_out) = (w.shape[1], outputs[0].shape[1]);
-                let as_i32 = |v: usize| {
-                    i32::try_from(v).map_err(|_| Error::InvalidArgument("conv1d: too large".into()))
-                };
-                let sizes = [as_i32(l)?, as_i32(c)?, as_i32(k)?, as_i32(l_out)?];
-                let params = [as_i32(stride)?, as_i32(padding)?, as_i32(dilation)?];
-                let args = [
-                    x.arg(),
-                    w.arg(),
-                    Arg::write(out.metal_mut().expect("device storage")),
-                    Arg::bytes(bytemuck::bytes_of(&sizes)),
-                    Arg::bytes(bytemuck::bytes_of(&params)),
-                ];
-                let grid = [c, l_out, n];
-                let name = format!("nuvec_depthwise_conv1d_{}", operands[0].0.dtype.name());
-                let pipeline = self.pipeline(&name)?;
-                self.encode_threads(&pipeline, &args, grid, block_dims(grid))?;
-                self.counted()?;
-                return Ok(vec![Data::new(out)]);
+            if let FastOp::Conv { .. } = op {
+                return self.conv(op, operands, outputs);
+            }
+            if *op == FastOp::SegmentedMm {
+                return self.segmented_mm(operands, &outputs[0]);
+            }
+            if let FastOp::Hadamard { scale } = *op {
+                return self.hadamard(operands[0], &outputs[0], f32::from_bits(scale));
             }
             if let FastOp::PagedAttention {
                 scale,
@@ -3459,7 +4464,9 @@ mod metal {
                 | FastOp::AddRmsNorm { .. }
                 | FastOp::ResidualRmsNorm { .. }
                 | FastOp::NormRope { .. }
-                | FastOp::DepthwiseConv1d { .. }
+                | FastOp::Conv { .. }
+                | FastOp::Hadamard { .. }
+                | FastOp::SegmentedMm
                 | FastOp::PagedAttention { .. }
                 | FastOp::PagedWrite
                 | FastOp::MoeRoute { .. }
@@ -4993,7 +6000,7 @@ mod metal {
             operands: &[Operand<'_>],
             out: &Output,
             quant: crate::Quant,
-            transpose: bool,
+            (transpose, vector_rows): (bool, bool),
             buffer: &mut Buffer,
         ) -> Result<()> {
             let (group_size, bits) = quant.checked("quantized_matmul")?;
@@ -5037,7 +6044,9 @@ mod metal {
             // MLX's routing, with `qmv_wide` from 2 rows.
             let exact = crate::row_exact();
             if transpose {
-                let limit = if exact {
+                let limit = if vector_rows {
+                    usize::MAX
+                } else if exact {
                     qmv_batch_limit(k, n, generation, class).max(rows + 1)
                 } else {
                     qmv_batch_limit(k, n, generation, class)

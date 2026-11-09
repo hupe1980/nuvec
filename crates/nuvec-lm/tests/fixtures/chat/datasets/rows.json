@@ -1,0 +1,475 @@
+{
+ "text": [
+  {
+   "text": "The quick brown fox jumps over the lazy dog."
+  },
+  {
+   "text": "Hello, world!"
+  },
+  {
+   "text": "Grüße, 世界 🌍"
+  },
+  {
+   "text": "Line one\nLine two"
+  },
+  {
+   "text": "A"
+  },
+  {
+   "text": "Numbers: 1 2 3 4 5"
+  }
+ ],
+ "chat": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello! How can I help?"
+    }
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly."
+    },
+    {
+     "role": "user",
+     "content": "Capital of France?"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris."
+    }
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4"
+    },
+    {
+     "role": "user",
+     "content": "Times 3?"
+    },
+    {
+     "role": "assistant",
+     "content": "12"
+    }
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What's the weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_0",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "location": "Paris",
+         "unit": "celsius"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "name": "get_weather",
+     "content": "{\"temperature\": 21.5}"
+    },
+    {
+     "role": "assistant",
+     "content": "It is 21.5 °C in Paris."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather in a location.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "location": {
+         "type": "string",
+         "description": "A city, e.g. Paris"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 7,
+         "default": 1
+        }
+       },
+       "required": [
+        "location"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web <fast> & 'safe'.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        },
+        "limits": {
+         "type": "object",
+         "properties": {
+          "top_k": {
+           "type": "number",
+           "default": 1.0
+          }
+         }
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Grüße 🌍"
+    },
+    {
+     "role": "assistant",
+     "content": "Hallo, Welt!"
+    }
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Say nothing."
+    },
+    {
+     "role": "assistant",
+     "content": ""
+    }
+   ]
+  }
+ ],
+ "completions": [
+  {
+   "prompt": "Translate 'cat' to German.",
+   "completion": "Katze"
+  },
+  {
+   "prompt": "What is the boiling point of water?",
+   "completion": "100 °C at sea level."
+  },
+  {
+   "prompt": "List two colors.",
+   "completion": "Red and blue."
+  },
+  {
+   "prompt": "Weather in Paris?",
+   "completion": "Sunny.",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather in a location.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "location": {
+         "type": "string",
+         "description": "A city, e.g. Paris"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 7,
+         "default": 1
+        }
+       },
+       "required": [
+        "location"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web <fast> & 'safe'.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        },
+        "limits": {
+         "type": "object",
+         "properties": {
+          "top_k": {
+           "type": "number",
+           "default": 1.0
+          }
+         }
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "prompt": "Count to three.",
+   "completion": "1, 2, 3"
+  },
+  {
+   "prompt": "Hi",
+   "completion": "Hello!"
+  }
+ ],
+ "chat_custom": [
+  {
+   "conversation": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello! How can I help?"
+    }
+   ]
+  },
+  {
+   "conversation": [
+    {
+     "role": "system",
+     "content": "Answer briefly."
+    },
+    {
+     "role": "user",
+     "content": "Capital of France?"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris."
+    }
+   ]
+  },
+  {
+   "conversation": [
+    {
+     "role": "user",
+     "content": "2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4"
+    },
+    {
+     "role": "user",
+     "content": "Times 3?"
+    },
+    {
+     "role": "assistant",
+     "content": "12"
+    }
+   ]
+  },
+  {
+   "conversation": [
+    {
+     "role": "user",
+     "content": "What's the weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_0",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "location": "Paris",
+         "unit": "celsius"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "name": "get_weather",
+     "content": "{\"temperature\": 21.5}"
+    },
+    {
+     "role": "assistant",
+     "content": "It is 21.5 °C in Paris."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather in a location.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "location": {
+         "type": "string",
+         "description": "A city, e.g. Paris"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 7,
+         "default": 1
+        }
+       },
+       "required": [
+        "location"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web <fast> & 'safe'.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        },
+        "limits": {
+         "type": "object",
+         "properties": {
+          "top_k": {
+           "type": "number",
+           "default": 1.0
+          }
+         }
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "conversation": [
+    {
+     "role": "user",
+     "content": "Grüße 🌍"
+    },
+    {
+     "role": "assistant",
+     "content": "Hallo, Welt!"
+    }
+   ]
+  },
+  {
+   "conversation": [
+    {
+     "role": "user",
+     "content": "Say nothing."
+    },
+    {
+     "role": "assistant",
+     "content": ""
+    }
+   ]
+  }
+ ],
+ "completions_custom": [
+  {
+   "question": "Translate 'cat' to German.",
+   "answer": "Katze"
+  },
+  {
+   "question": "What is the boiling point of water?",
+   "answer": "100 °C at sea level."
+  },
+  {
+   "question": "List two colors.",
+   "answer": "Red and blue."
+  },
+  {
+   "question": "Weather in Paris?",
+   "answer": "Sunny."
+  },
+  {
+   "question": "Count to three.",
+   "answer": "1, 2, 3"
+  },
+  {
+   "question": "Hi",
+   "answer": "Hello!"
+  }
+ ]
+}

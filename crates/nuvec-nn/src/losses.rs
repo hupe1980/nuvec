@@ -44,6 +44,29 @@ pub fn cross_entropy(logits: &Array, targets: &Array, reduction: Reduction) -> A
     }
 }
 
+/// [`cross_entropy`] of an output head's logits `head(h, weights)` without the full logits:
+/// [`nuvec::fast::linear_cross_entropy`] (row chunks, the hidden-state gradient from the same
+/// pass), reduced as `reduction`. `h` is `[..., D]` and `targets` its shape without the last
+/// axis.
+#[track_caller]
+pub fn linear_cross_entropy<F>(
+    h: &Array,
+    targets: &Array,
+    weights: &[Array],
+    head: F,
+    reduction: Reduction,
+) -> Array
+where
+    F: Fn(&Array, &[Array]) -> Array + Send + Sync + 'static,
+{
+    let loss = fast::linear_cross_entropy(h, targets, weights, head, None);
+    match reduction {
+        Reduction::None => loss,
+        Reduction::Mean => loss.mean(..),
+        Reduction::Sum => loss.sum(..),
+    }
+}
+
 /// Class indices are integers (not one-hot floats).
 fn is_index_dtype(d: DType) -> bool {
     !matches!(

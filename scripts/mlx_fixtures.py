@@ -108,6 +108,82 @@ def qparams(p: dict[str, str]) -> dict[str, object]:
     return out
 
 
+def _signs(cols: mx.array) -> mx.array:
+    """Per column, the sign of its largest-magnitude entry (decompositions' free signs)."""
+    idx = mx.argmax(mx.abs(cols), axis=-2, keepdims=True)
+    return mx.sign(mx.take_along_axis(cols, idx, axis=-2))
+
+
+def linalg_case(fn: str, p: dict[str, str], xs: list[mx.array]) -> list[mx.array]:
+    """MLX's linalg outputs, with the free signs normalised (and full `U`/`Vt` cut to `k`)."""
+    L = mx.linalg
+    up = p.get("upper") == "1"
+    if fn == "qr":
+        q, r = L.qr(xs[0])
+        s = _signs(q)
+        return [q * s, r * mx.swapaxes(s, -1, -2)]
+    if fn == "svd":
+        u, s, vt = L.svd(xs[0])
+        k = s.shape[-1]
+        u, vt = u[..., :k], vt[..., :k, :]
+        g = _signs(u)
+        return [u * g, s, vt * mx.swapaxes(g, -1, -2)]
+    if fn == "svd_values":
+        return [L.svd(xs[0], compute_uv=False)]
+    if fn == "eigh":
+        w, v = L.eigh(xs[0], UPLO="U" if up else "L")
+        return [w, v * _signs(v)]
+    if fn == "eigvalsh":
+        return [L.eigvalsh(xs[0], UPLO="U" if up else "L")]
+    if fn == "eigvals":
+        w = L.eigvals(xs[0])
+        return [mx.sort(mx.real(w)), mx.sort(mx.imag(w))]
+    if fn == "lu":
+        return list(L.lu(xs[0]))
+    if fn == "lu_factor":
+        return list(L.lu_factor(xs[0]))
+    if fn == "slogdet":
+        return list(L.slogdet(xs[0]))
+    if fn in ("cholesky", "tri_inv", "cholesky_inv"):
+        return [getattr(L, fn)(xs[0], upper=up)]
+    if fn == "solve_triangular":
+        return [L.solve_triangular(xs[0], xs[1], upper=up)]
+    if fn == "cross":
+        return [L.cross(xs[0], xs[1], axis=int(p["axis"]))]
+    if fn == "norm":
+        o = p["ord"]
+        return [L.norm(xs[0], ord=o if o == "nuc" else float(o))]
+    return [getattr(L, fn)(*xs)]
+
+
+def einsum_path_arrays(subscripts: str, xs: list[mx.array]) -> list[mx.array]:
+    """`mx.einsum_path` as arrays: the path (int32, rows padded with -1) and the report's
+    naive and optimized scaling and FLOP counts (int64)."""
+    path, report = mx.einsum_path(subscripts, *xs)
+    width = max(len(step) for step in path)
+    rows = [list(step) + [-1] * (width - len(step)) for step in path]
+    nums = [int(line.split(":")[1]) for line in report.splitlines()[1:5]]
+    return [mx.array(rows, dtype=mx.int32), mx.array(nums, dtype=mx.int64)]
+
+
+def block_masked(p: dict[str, str], xs: list[mx.array]) -> mx.array:
+    """`block_masked_mm` with the masks `p["masks"]` names (`o`, `l`, `r`) after `a`, `b`."""
+    masks = dict(zip(p["masks"], xs[2:]))
+    return mx.block_masked_mm(xs[0], xs[1], int(p["block_size"]), masks.get("o"), masks.get("l"),
+                              masks.get("r"))
+
+
+def qq(p: dict[str, str], xs: list[mx.array]) -> mx.array:
+    """`qqmm` (x, w) or `gather_qqmm` (x, w, rhs_indices), `w` quantized first with `q=1`."""
+    mode = p["mode"]
+    w, scales = xs[1], None
+    if p.get("q") == "1":
+        w, scales = mx.quantize(w, mode=mode)
+    if len(xs) == 2:
+        return mx.qqmm(xs[0], w, scales, mode=mode)
+    return mx.gather_qqmm(xs[0], w, scales, rhs_indices=xs[2], mode=mode)
+
+
 def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
     if xs:
         xs = [pre_view(xs[0], p.get("pre"))] + xs[1:]
@@ -115,18 +191,111 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         "add": mx.add, "subtract": mx.subtract, "multiply": mx.multiply, "divide": mx.divide,
         "maximum": mx.maximum, "minimum": mx.minimum, "logaddexp": mx.logaddexp,
         "floor_divide": mx.floor_divide, "power": mx.power, "equal": mx.equal,
+        "arctan2": mx.arctan2, "remainder": mx.remainder, "bitwise_and": mx.bitwise_and,
+        "bitwise_or": mx.bitwise_or, "bitwise_xor": mx.bitwise_xor, "left_shift": mx.left_shift,
+        "right_shift": mx.right_shift,
         "not_equal": mx.not_equal, "less": mx.less, "less_equal": mx.less_equal,
         "greater": mx.greater, "greater_equal": mx.greater_equal, "matmul": mx.matmul,
     }
     unary = {
         "negative": mx.negative, "abs": mx.abs, "exp": mx.exp, "log": mx.log, "sqrt": mx.sqrt,
         "sin": mx.sin, "cos": mx.cos, "tanh": mx.tanh, "sigmoid": mx.sigmoid,
-        "conjugate": mx.conjugate, "erfinv": mx.erfinv,
+        "conjugate": mx.conjugate, "erfinv": mx.erfinv, "erf": mx.erf, "expm1": mx.expm1,
+        "log1p": mx.log1p, "log2": mx.log2, "log10": mx.log10, "tan": mx.tan, "sinh": mx.sinh,
+        "cosh": mx.cosh, "arccos": mx.arccos, "arccosh": mx.arccosh, "arcsin": mx.arcsin,
+        "arcsinh": mx.arcsinh, "arctan": mx.arctan, "arctanh": mx.arctanh, "rsqrt": mx.rsqrt,
+        "floor": mx.floor, "ceil": mx.ceil, "round": mx.round, "bitwise_invert": mx.bitwise_invert,
     }
     reductions = {
         "sum": mx.sum, "prod": mx.prod, "max": mx.max, "min": mx.min, "mean": mx.mean,
         "all": mx.all, "any": mx.any,
     }
+    composed = {
+        "square": mx.square, "reciprocal": mx.reciprocal, "degrees": mx.degrees,
+        "radians": mx.radians, "trunc": mx.trunc, "real": mx.real, "imag": mx.imag,
+        "logical_not": mx.logical_not, "isnan": mx.isnan, "isinf": mx.isinf,
+        "isfinite": mx.isfinite, "isposinf": mx.isposinf, "isneginf": mx.isneginf,
+    }
+    if op in composed:
+        return composed[op](xs[0])
+    if op in ("logical_and", "logical_or", "logical_xor"):
+        return getattr(mx, op)(xs[0], xs[1])
+    if op == "divmod":
+        return list(mx.divmod(xs[0], xs[1]))
+    if op == "round_decimals":
+        return mx.round(xs[0], decimals=int(p["decimals"]))
+    if op == "nan_to_num":
+        kw = {k: float(p[k]) for k in ("nan", "posinf", "neginf") if k in p}
+        return mx.nan_to_num(xs[0], **kw)
+    if op in ("isclose", "allclose"):
+        return getattr(mx, op)(xs[0], xs[1], rtol=float(p["rtol"]), atol=float(p["atol"]),
+                               equal_nan=p["equal_nan"] == "1")
+    if op == "array_equal":
+        return mx.array_equal(xs[0], xs[1], equal_nan=p["equal_nan"] == "1")
+    if op == "clip":
+        return mx.clip(xs[0], xs[1], xs[2])
+    if op == "count_nonzero":
+        axis = None if p["axes"] == "all" else nums(p["axes"])
+        return mx.count_nonzero(xs[0], axis=axis, keepdims=p["keepdims"] == "1")
+    if op == "minmax":
+        axis = None if p["axes"] == "all" else nums(p["axes"])
+        return list(mx.minmax(xs[0], axis=axis, keepdims=p["keepdims"] == "1"))
+    shape_ops = {
+        "flip": lambda: mx.flip(xs[0], axis=None if p["axes"] == "all" else nums(p["axes"])),
+        "roll": lambda: mx.roll(xs[0], nums(p["shift"]) if "," in p["shift"] else int(p["shift"]),
+                                axis=None if p["axes"] == "all" else nums(p["axes"])),
+        "tile": lambda: mx.tile(xs[0], nums(p["reps"])),
+        "moveaxis": lambda: mx.moveaxis(xs[0], int(p["source"]), int(p["destination"])),
+        "swapaxes": lambda: mx.swapaxes(xs[0], int(p["axis1"]), int(p["axis2"])),
+        "atleast_1d": lambda: mx.atleast_1d(xs[0]), "atleast_2d": lambda: mx.atleast_2d(xs[0]),
+        "atleast_3d": lambda: mx.atleast_3d(xs[0]),
+        "unflatten": lambda: mx.unflatten(xs[0], int(p["axis"]), nums(p["shape"])),
+        "unstack": lambda: list(mx.unstack(xs[0], axis=int(p["axis"]))),
+        "broadcast_arrays": lambda: list(mx.broadcast_arrays(*xs)),
+        "pad": lambda: mx.pad(xs[0], [tuple(nums(w)) for w in p["widths"].split(";")], mode=p["mode"],
+                              constant_values=float(p.get("value", "0"))),
+        "tri": lambda: mx.tri(int(p["n"]), int(p["m"]), int(p["k"]), dtype=MX[p["dtype"]]),
+        "tril": lambda: mx.tril(xs[0], int(p["k"])), "triu": lambda: mx.triu(xs[0], int(p["k"])),
+        "eye": lambda: mx.eye(int(p["n"]), int(p["m"]), int(p["k"]), dtype=MX[p["dtype"]]),
+        "identity": lambda: mx.identity(int(p["n"]), dtype=MX[p["dtype"]]),
+        "diag": lambda: mx.diag(xs[0], int(p["k"])),
+        "diagonal": lambda: mx.diagonal(xs[0], int(p["offset"]), int(p["axis1"]), int(p["axis2"])),
+        "trace": lambda: mx.trace(xs[0], int(p["offset"]), int(p["axis1"]), int(p["axis2"])),
+        "linspace": lambda: mx.linspace(float(p["start"]), float(p["stop"]), int(p["num"]),
+                                        dtype=MX[p["dtype"]]),
+        "meshgrid": lambda: list(mx.meshgrid(*xs, sparse=p["sparse"] == "1", indexing=p["indexing"])),
+        "hanning": lambda: mx.hanning(int(p["m"])), "hamming": lambda: mx.hamming(int(p["m"])),
+        "blackman": lambda: mx.blackman(int(p["m"])), "bartlett": lambda: mx.bartlett(int(p["m"])),
+        "tensordot": lambda: mx.tensordot(xs[0], xs[1], axes=[nums(p["axes_a"]), nums(p["axes_b"])]),
+        "tensordot_n": lambda: mx.tensordot(xs[0], xs[1], axes=int(p["n"])),
+        "inner": lambda: mx.inner(xs[0], xs[1]), "outer": lambda: mx.outer(xs[0], xs[1]),
+        "kron": lambda: mx.kron(xs[0], xs[1]),
+        "vecdot": lambda: mx.vecdot(xs[0], xs[1], axis=int(p["axis"])),
+        "matrix_transpose": lambda: mx.matrix_transpose(xs[0]),
+        "einsum": lambda: mx.einsum(p["subscripts"], *xs),
+        "einsum_path": lambda: einsum_path_arrays(p["subscripts"], xs),
+        "segmented_mm": lambda: mx.segmented_mm(xs[0], xs[1], xs[2]),
+        "block_masked_mm": lambda: block_masked(p, xs),
+        "qqmm": lambda: qq(p, xs),
+        "gather_qqmm": lambda: qq(p, xs),
+        "hadamard_transform": lambda: mx.hadamard_transform(
+            xs[0], scale=None if p.get("scale", "none") == "none" else float(p["scale"])),
+        "diff": lambda: mx.diff(xs[0], n=int(p["n"]), axis=int(p["axis"])),
+        "median": lambda: mx.median(xs[0], axis=None if p["axes"] == "all" else nums(p["axes"]),
+                                    keepdims=p["keepdims"] == "1"),
+        "searchsorted": lambda: mx.searchsorted(xs[0], xs[1], side=p["side"]),
+        "unique": lambda: list(mx.unique(xs[0], size=int(p["size"]), return_index=True,
+                                         return_inverse=True, return_counts=True,
+                                         **({"fill_value": float(p["fill"])} if "fill" in p else {}))),
+        "flatten": lambda: mx.flatten(xs[0], int(p["start"]), int(p["end"])),
+        "matrix_norm": lambda: mx.linalg.norm(xs[0], ord=None if p["ord"] == "none" else (p["ord"] if p["ord"] == "fro" else float(p["ord"])),
+                                              axis=None if p["axes"] == "all" else nums(p["axes"]), keepdims=p["keepdims"] == "1"),
+        "as_strided": lambda: mx.as_strided(xs[0], nums(p["shape"]), nums(p["strides"]), int(p["offset"])),
+    }
+    if op in shape_ops:
+        return shape_ops[op]()
+    if op.startswith("linalg_"):
+        return linalg_case(op[7:], p, xs)
     if op in binary and "scalar" in p:
         v = scalar(p["scalar"])
         return binary[op](v, xs[0]) if p.get("side") == "left" else binary[op](xs[0], v)
@@ -224,6 +393,22 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         return xs[0][parse_slice(p["args"])]
     if op == "broadcast_to":
         return mx.broadcast_to(xs[0], nums(p["shape"]))
+    if op in ("conv2d", "conv3d"):
+        t = lambda k: tuple(nums(p[k]))  # noqa: E731
+        return getattr(mx, op)(xs[0], xs[1], stride=t("stride"), padding=t("padding"),
+                               dilation=t("dilation"), groups=int(p["groups"]))
+    if op == "conv_general":
+        return mx.conv_general(xs[0], xs[1], stride=nums(p["stride"]),
+                               padding=(nums(p["lo"]), nums(p["hi"])),
+                               kernel_dilation=nums(p["kd"]), input_dilation=nums(p["id"]),
+                               groups=int(p["groups"]), flip=p["flip"] == "1")
+    if op.startswith("conv_transpose"):
+        t = (lambda k: int(p[k])) if op.endswith("1d") else (lambda k: tuple(nums(p[k])))  # noqa: E731
+        return getattr(mx, op)(xs[0], xs[1], stride=t("stride"), padding=t("padding"),
+                               dilation=t("dilation"), output_padding=t("output_padding"),
+                               groups=int(p["groups"]))
+    if op == "convolve":
+        return mx.convolve(xs[0], xs[1], mode=p["mode"])
     if op == "conv1d":
         return mx.conv1d(xs[0], xs[1], stride=int(p["stride"]), padding=int(p["padding"]),
                          dilation=int(p["dilation"]), groups=int(p["groups"]))
@@ -614,6 +799,7 @@ case("softmax-last", "softmax", [make("float32", (3, 5))], axes="-1")
 case("softmax-axes", "softmax", [make("float32", (2, 3, 4))], axes="0,2")
 case("softmax-f16", "softmax", [make("float16", (4, 6))], axes="1")
 derivative("vjp", "vjp-erfinv", "erfinv", [mx.array(np.linspace(-0.9, 0.9, 7, dtype=np.float32))])
+
 derivative("vjp", "vjp-logsumexp", "logsumexp", [make("float32", (3, 4))], axes="1", keepdims=0)
 derivative("jvp", "jvp-logsumexp", "logsumexp", [make("float32", (3, 4))], axes="1", keepdims=0)
 derivative("vjp", "vjp-softmax", "softmax", [make("float32", (3, 4))], axes="1")
@@ -1320,6 +1506,385 @@ for dt, lk in [("bfloat16", 1100), ("float16", 1030), ("float32", 1030)]:
     q, k, v = (mx.array(dv.standard_normal((1, h, n, 512)).astype(np.float32)).astype(getattr(mx, dt))
                for h, n in [(8, 1), (1, lk), (1, lk)])
     case_gpu(f"sdpa-d512-decode-{dt}-{lk}", "sdpa", [q, k, v], scale=round(512 ** -0.5, 6))
+
+# MLX's element-wise functions: every float type with edges, integers promoted (or kept,
+# for rounding), their derivatives.
+def domain(op: str, dt: str, shape: tuple[int, ...]) -> mx.array:
+    x = make("float32", shape, edge=True)
+    if op in ("arccos", "arcsin", "arctanh"):
+        x = mx.clip(x / 5, -1.2, 1.2)
+    elif op == "arccosh":
+        x = mx.abs(x) + 0.8
+    elif op in ("log2", "log10", "rsqrt", "log1p"):
+        x = mx.abs(x) - 0.3 if op == "log1p" else mx.abs(x)
+    return x.astype(MX[dt])
+
+
+UNARY_092 = ["log2", "log10", "tan", "sinh", "cosh", "arccos", "arccosh", "arcsin", "arcsinh",
+             "arctan", "arctanh", "rsqrt", "floor", "ceil", "round"]
+for op in UNARY_092:
+    for dt in FLOATS:
+        case(f"{op}-{dt}", op, [domain(op, dt, (3, 7))])
+    case(f"{op}-int32", op, [ints("int32", (5,), -3, 9)])
+case("round-halves", "round", [mx.array(np.array([0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 3.49999, 1e8 + 0.5],
+                                                 np.float32))])
+for op in ["floor", "ceil", "round"]:
+    case(f"{op}-uint8", op, [ints("uint8", (6,), 0, 255)])
+    case(f"{op}-bool", op, [make("bool", (5,))])
+# MLX's CPU: its erf is Abramowitz and Stegun's (1.5e-7 absolute); its GPU's expm1 drops
+# the low part of ln 2. nuvec is faithfully rounded on both devices.
+for dt in FLOATS:
+    for op in ["erf", "expm1", "log1p"]:
+        case(f"{op}-{dt}", op, [domain(op, dt, (4, 9))])
+case("erf-small", "erf", [mx.array(np.array([0.0, -0.0, 1e-30, 1e-8, -1e-4, 0.92, 0.93, 4.0, 10.0],
+                                                np.float32))])
+case("expm1-range", "expm1", [mx.array(np.array([0.0, -0.0, 1e-7, -1e-3, 0.5, 1.0, 20.0, 88.0, 89.0, -90.0],
+                                                    np.float32))])
+for dt in ["float32", "float16", "bfloat16", "float64"]:
+    case(f"arctan2-{dt}", "arctan2", [make(dt, (3, 4), edge=True), make(dt, (4,), edge=True)])
+case("arctan2-zeros", "arctan2", [mx.array(np.array([0.0, -0.0, 0.0, -0.0], np.float32)),
+                                  mx.array(np.array([0.0, 0.0, -0.0, -0.0], np.float32))])
+case("arctan2-int", "arctan2", [ints("int32", (2, 3), -5, 5), ints("int32", (3,), -5, 5)])
+for dt in ["float32", "float16", "bfloat16", "float64"]:
+    case(f"remainder-{dt}", "remainder", [make(dt, (3, 4)), positive(dt, (4,)) * mx.array([1, -1, 2, -3]).astype(MX[dt])])
+for dt in INTS:
+    lo = -50 if dt.startswith("int") else 0
+    b = ints(dt, (4,), 1, 9)
+    if dt.startswith("int"):
+        b = b * mx.array([1, -1, 1, -1]).astype(MX[dt])
+    case(f"remainder-{dt}", "remainder", [ints(dt, (3, 4), lo, 50), b])
+    for op in ["bitwise_and", "bitwise_or", "bitwise_xor"]:
+        case(f"{op}-{dt}", op, [make(dt, (3, 4), edge=True), make(dt, (4,))])
+    bits = np.dtype(dt).itemsize * 8
+    shifts = ints(dt, (bits,), 0, bits)
+    case(f"left_shift-{dt}", "left_shift", [ints(dt, (bits,), lo, 100), shifts])
+    case(f"right_shift-{dt}", "right_shift", [make(dt, (bits,), edge=True), shifts])
+    case(f"bitwise_invert-{dt}", "bitwise_invert", [make(dt, (6,), edge=True)])
+for dt in ["uint8", "int8", "int16"]:
+    # Narrow types shift as promoted ints (C++).
+    case(f"left_shift-{dt}-promoted", "left_shift", [ints(dt, (4,), 1, 3), mx.array([8, 9, 12, 15]).astype(MX[dt])])
+for op in ["bitwise_and", "bitwise_or", "bitwise_xor", "left_shift", "right_shift"]:
+    case(f"{op}-bool", op, [make("bool", (8,)), make("bool", (8,))])
+case("bitwise_invert-bool", "bitwise_invert", [make("bool", (6,))])
+case("remainder-scalar", "remainder", [make("float32", (5,))], scalar="float:-1.5")
+case("left_shift-scalar", "left_shift", [ints("int32", (4,), 0, 9)], scalar="int:3")
+for op in ["log2", "log10", "tan", "sinh", "cosh", "arccos", "arccosh", "arcsin", "arcsinh", "arctan",
+           "arctanh", "rsqrt", "floor", "ceil", "round"]:
+    x = domain(op, "float32", (2, 3))
+    if op in ("arccos", "arcsin", "arctanh"):
+        x = mx.clip(x, -0.9, 0.9)
+    elif op in ("log2", "log10", "rsqrt"):
+        x = x + 0.5
+    derivative("vjp", f"vjp-{op}", op, [x])
+    derivative("jvp", f"jvp-{op}", op, [x])
+for op in ["erf", "expm1", "log1p"]:
+    derivative("vjp", f"vjp-{op}", op, [mx.abs(make("float32", (2, 3))) * 0.5])
+derivative("vjp", "vjp-arctan2", "arctan2", [make("float32", (2, 3)), make("float32", (3,))])
+derivative("jvp", "jvp-arctan2", "arctan2", [make("float32", (4,)), make("float32", (4,))])
+derivative("vjp", "vjp-remainder", "remainder", [make("float32", (2, 3)), positive("float32", (3,))])
+derivative("jvp", "jvp-remainder", "remainder", [make("float32", (4,)), positive("float32", (4,))])
+
+
+# Element-wise compositions.
+for dt in ["float32", "float16", "bfloat16", "float64", "int8", "int32", "uint16", "bool"]:
+    for op in ["square", "reciprocal", "degrees", "radians", "trunc", "logical_not", "isnan", "isinf",
+               "isfinite", "isposinf", "isneginf"]:
+        if op in ("square", "reciprocal", "degrees", "radians") and dt == "bool":
+            continue
+        case(f"{op}-{dt}", op, [make(dt, (3, 5), edge=True)])
+    case(f"nan_to_num-{dt}", "nan_to_num", [make(dt, (2, 4), edge=True)])
+case("nan_to_num-values", "nan_to_num", [make("float32", (2, 4), edge=True)], nan=1.5, posinf=7.0, neginf=-7.0)
+case("real-complex", "real", [make("complex64", (4,))])
+case("imag-complex", "imag", [make("complex64", (4,))])
+case("real-float", "real", [make("float32", (4,))])
+case("imag-float", "imag", [make("float32", (4,))])
+for dt in ["float32", "int32", "bool"]:
+    for op in ["logical_and", "logical_or", "logical_xor"]:
+        case(f"{op}-{dt}", op, [make(dt, (3, 4), edge=True), make("float32", (4,), edge=True)])
+case("divmod-int", "divmod", [ints("int32", (2, 5), -20, 20), ints("int32", (5,), 1, 6) * mx.array([1, -1, 1, -1, 1])])
+case("divmod-float", "divmod", [make("float32", (2, 5)), positive("float32", (5,))])
+for d in [-1, 1, 2, 3]:
+    case(f"round-decimals-{d}", "round_decimals", [make("float32", (6,)) * 37], decimals=d)
+for dt in ["float32", "float16", "int32"]:
+    for rtol, atol, en in [(1e-5, 1e-8, 0), (0.1, 0.5, 1)]:
+        a = make(dt, (3, 4), edge=True)
+        b = a + make("float32", (3, 4)).astype(MX[dt]) * (0.01 if dt != "int32" else 1)
+        case(f"isclose-{dt}-{rtol}-{en}", "isclose", [a, b], rtol=rtol, atol=atol, equal_nan=en)
+        case(f"allclose-{dt}-{rtol}-{en}", "allclose", [a, a], rtol=rtol, atol=atol, equal_nan=en)
+    x = make(dt, (2, 3), edge=True)
+    case(f"array_equal-{dt}-self", "array_equal", [x, x], equal_nan=0)
+    case(f"array_equal-{dt}-nan", "array_equal", [x, x], equal_nan=1)
+case("array_equal-shapes", "array_equal", [make("float32", (2, 3)), make("float32", (3, 2))], equal_nan=0)
+case("array_equal-dtypes", "array_equal", [ints("int32", (4,), 0, 3), ints("int32", (4,), 0, 3).astype(mx.float32)], equal_nan=0)
+for dt in ["float32", "int32", "float16"]:
+    case(f"clip-{dt}", "clip", [make(dt, (3, 4)), make(dt, (4,)) - 2, make(dt, (3, 1)) + 2])
+for dt in ["float32", "int32", "bool"]:
+    for axes, keep in [("all", 0), ("1", 1), ("0,2", 0)]:
+        case(f"count_nonzero-{dt}-{axes}-{keep}", "count_nonzero", [make(dt, (2, 3, 4)) * (make("float32", (2, 3, 4)) > 0).astype(MX[dt])], axes=axes, keepdims=keep)
+        case(f"minmax-{dt}-{axes}-{keep}", "minmax", [make(dt, (2, 3, 4))], axes=axes, keepdims=keep)
+derivative("vjp", "vjp-clip", "clip", [make("float32", (3, 4))], [mx.array(-0.5), mx.array(0.5)])
+derivative("vjp", "vjp-square", "square", [make("float32", (5,))])
+derivative("vjp", "vjp-reciprocal", "reciprocal", [positive("float32", (5,))])
+derivative("vjp", "vjp-nan_to_num", "nan_to_num", [make("float32", (6,))])
+
+
+# Shape, creation and products.
+x234 = make("float32", (2, 3, 4))
+for axes in ["all", "1", "0,2"]:
+    case(f"flip-{axes}", "flip", [x234], axes=axes)
+for shift, axes in [("2", "all"), ("-1", "1"), ("1,5", "0,2"), ("3", "2")]:
+    case(f"roll-{shift}-{axes}", "roll", [x234], shift=shift, axes=axes)
+for reps in ["2", "2,1", "1,2,1,3", "0,2"]:
+    case(f"tile-{reps}", "tile", [make("int32", (2, 3))], reps=reps)
+case("moveaxis", "moveaxis", [x234], source=0, destination=-1)
+case("swapaxes", "swapaxes", [x234], axis1=0, axis2=2)
+for k in ["1d", "2d", "3d"]:
+    for shape in [(), (3,), (2, 3)]:
+        case(f"atleast_{k}-{len(shape)}", f"atleast_{k}", [make("float32", shape)])
+case("unflatten", "unflatten", [make("float32", (2, 12))], axis=1, shape="3,-1")
+case("unstack", "unstack", [x234], axis=1)
+case("broadcast_arrays", "broadcast_arrays", [make("float32", (3, 1)), make("float32", (1, 4)), make("float32", (4,))])
+for mode in ["constant", "edge", "reflect", "symmetric"]:
+    case(f"pad-{mode}", "pad", [make("float32", (3, 4))], widths="1,2;3,0", mode=mode, value=2.5)
+    case(f"pad-{mode}-wide", "pad", [make("float32", (3,))], widths="5,7", mode=mode)
+case("pad-int", "pad", [make("int32", (2, 2))], widths="1,1", mode="constant", value=7)
+for n, m, k, dt in [(3, 4, 0, "float32"), (4, 3, -1, "int32"), (3, 3, 2, "bool")]:
+    case(f"tri-{n}-{m}-{k}", "tri", [], n=n, m=m, k=k, dtype=dt)
+    case(f"eye-{n}-{m}-{k}", "eye", [], n=n, m=m, k=k, dtype=dt)
+case("identity", "identity", [], n=4, dtype="float16")
+for k in [-2, 0, 1]:
+    case(f"tril-{k}", "tril", [x234], k=k)
+    case(f"triu-{k}", "triu", [x234], k=k)
+    case(f"diag-vec-{k}", "diag", [make("float32", (3,))], k=k)
+    case(f"diag-mat-{k}", "diag", [make("float32", (3, 4))], k=k)
+for off, a1, a2 in [(0, 0, 1), (1, 1, 2), (-1, 2, 0)]:
+    case(f"diagonal-{off}-{a1}-{a2}", "diagonal", [x234], offset=off, axis1=a1, axis2=a2)
+    case(f"trace-{off}-{a1}-{a2}", "trace", [x234], offset=off, axis1=a1, axis2=a2)
+case("trace-int", "trace", [make("int32", (3, 3))], offset=0, axis1=0, axis2=1)
+for start, stop, num, dt in [(0, 1, 7, "float32"), (-3.3, 7.1, 9, "float32"), (2, 10, 5, "int32"), (1, 2, 1, "float32"), (0, 1, 0, "float32")]:
+    case(f"linspace-{start}-{stop}-{num}-{dt}", "linspace", [], start=start, stop=stop, num=num, dtype=dt)
+for sparse in [0, 1]:
+    for indexing in ["xy", "ij"]:
+        case(f"meshgrid-{sparse}-{indexing}", "meshgrid", [make("float32", (3,)), make("float32", (4,)), make("float32", (2,))], sparse=sparse, indexing=indexing)
+for w in ["hanning", "hamming", "blackman", "bartlett"]:
+    for m in [1, 5, 12]:
+        case(f"{w}-{m}", w, [], m=m)
+case("tensordot-axes", "tensordot", [x234, make("float32", (4, 3, 5))], axes_a="1,2", axes_b="1,0")
+case("tensordot-n", "tensordot_n", [x234, make("float32", (3, 4, 2))], n=2)
+case("inner", "inner", [make("float32", (2, 3)), make("float32", (4, 3))])
+case("outer", "outer", [make("float32", (3,)), make("float32", (2, 2))])
+case("kron", "kron", [make("float32", (2, 3)), make("float32", (2, 1, 2))])
+case("vecdot", "vecdot", [make("float32", (3, 4)), make("float32", (3, 4))], axis=0)
+case("vecdot-complex", "vecdot", [make("complex64", (4,)), make("complex64", (4,))], axis=-1)
+case("matrix_transpose", "matrix_transpose", [x234])
+for sub, shapes in [("ij,jk->ik", [(3, 4), (4, 5)]), ("ii->i", [(4, 4)]), ("ii", [(4, 4)]), ("ij->", [(3, 4)]),
+                    ("i,j->ij", [(3,), (4,)]), ("bij,bjk->bik", [(2, 3, 4), (2, 4, 5)]), ("ij,ij->i", [(3, 4), (3, 4)]),
+                    ("...ij,...jk", [(2, 3, 4), (4, 2)]), ("ijk,kj->i", [(2, 3, 4), (4, 3)]), ("ij,jk,kl->il", [(2, 3), (3, 4), (4, 5)]),
+                    ("ji", [(3, 4)]), ("iij->j", [(3, 3, 2)])]:
+    case(f"einsum-{sub}", "einsum", [make("float32", sh) for sh in shapes], subscripts=sub)
+for n, ax in [(1, -1), (2, 0), (0, 1)]:
+    case(f"diff-{n}-{ax}", "diff", [x234], n=n, axis=ax)
+for axes, keep in [("all", 0), ("1", 1), ("0,2", 0), ("2", 0)]:
+    case(f"median-{axes}-{keep}", "median", [x234], axes=axes, keepdims=keep)
+case("median-int", "median", [make("int32", (5,))], axes="all", keepdims=0)
+for side in ["left", "right"]:
+    case(f"searchsorted-{side}", "searchsorted", [mx.array([1.0, 2.0, 2.0, 3.5, 7.0]), mx.array([[0.0, 2.0], [3.5, 9.0]])], side=side)
+uq = mx.array([3, 1, 3, 2, 7, 1, 1, 9]).astype(mx.int32)
+case("unique-8", "unique", [uq], size=8)
+case("unique-3", "unique", [uq], size=3)
+case("unique-fill", "unique", [uq.reshape(2, 4)], size=6, fill=-1)
+case("as_strided", "as_strided", [make("float32", (4, 5))], shape="3,3", strides="5,1", offset=1)
+case("as_strided-overlap", "as_strided", [make("float32", (10,))], shape="4,3", strides="2,1", offset=0)
+for fn, params, ins in [("flip", {"axes": "1"}, [make("float32", (2, 3))]),
+                        ("roll", {"shift": "1", "axes": "1"}, [make("float32", (2, 3))]),
+                        ("tile", {"reps": "2,1"}, [make("float32", (2, 3))]),
+                        ("pad", {"widths": "1,2", "mode": "reflect"}, [make("float32", (4,))]),
+                        ("pad", {"widths": "1,1;2,0", "mode": "constant"}, [make("float32", (2, 3))]),
+                        ("tril", {"k": "0"}, [make("float32", (3, 3))]),
+                        ("diag", {"k": "1"}, [make("float32", (3,))]),
+                        ("trace", {"offset": "0", "axis1": "0", "axis2": "1"}, [make("float32", (3, 3))]),
+                        ("kron", {}, [make("float32", (2, 2)), make("float32", (2,))]),
+                        ("einsum", {"subscripts": "ij,jk->ik"}, [make("float32", (2, 3)), make("float32", (3, 2))]),
+                        ("einsum", {"subscripts": "ii->i"}, [make("float32", (3, 3))]),
+                        ("tensordot", {"axes_a": "1", "axes_b": "0"}, [make("float32", (2, 3)), make("float32", (3, 2))]),
+                        ("median", {"axes": "1", "keepdims": "0"}, [make("float32", (2, 5))]),
+                        ("diff", {"n": "1", "axis": "0"}, [make("float32", (4, 2))])]:
+    name = "-".join(f"{k}{v}" for k, v in params.items())
+    derivative("vjp", f"vjp-{fn}-{name}", fn, ins, **params)
+
+
+case("flatten-mid", "flatten", [make("float32", (2, 3, 4, 5))], start=1, end=2)
+case("flatten-all", "flatten", [make("float32", (2, 3))], start=0, end=-1)
+for ordr, axes, keep, shape in [("none", "all", 0, (3, 4)), ("none", "1", 0, (3, 4)), ("inf", "0", 1, (3, 4)),
+                                ("-inf", "1", 0, (3, 4)), ("0", "1", 0, (3, 4)), ("1", "1", 0, (3, 4)), ("3", "0", 0, (3, 4)),
+                                ("fro", "all", 0, (3, 4)), ("1", "all", 0, (3, 4)), ("-1", "all", 1, (3, 4)),
+                                ("inf", "all", 0, (3, 4)), ("-inf", "1,2", 0, (2, 3, 4)), ("none", "0,2", 1, (2, 3, 4))]:
+    case(f"matrix_norm-{ordr}-{axes}-{keep}-{len(shape)}", "matrix_norm", [make("float32", shape) * (make("float32", shape) > 0)], ord=ordr, axes=axes, keepdims=keep)
+derivative("vjp", "vjp-matrix_norm-none", "matrix_norm", [make("float32", (3, 4))], ord="none", axes="all", keepdims=0)
+
+
+# linalg on MLX's CPU; free signs normalised in `linalg_case`.
+for dt in ["float32", "float64"]:
+    sq, tall, wide, bat = make(dt, (4, 4)), make(dt, (5, 3)), make(dt, (3, 5)), make(dt, (2, 4, 4))
+    spd = sq @ mx.swapaxes(sq, -1, -2) + 4 * mx.eye(4, dtype=MX[dt])
+    spdb = bat @ mx.swapaxes(bat, -1, -2) + 4 * mx.eye(4, dtype=MX[dt])
+    low = mx.tril(sq) + 3 * mx.eye(4, dtype=MX[dt])
+    for nm, x in [("sq", sq), ("tall", tall), ("wide", wide), ("batch", bat)]:
+        case(f"linalg-qr-{dt}-{nm}", "linalg_qr", [x])
+        case(f"linalg-svd-{dt}-{nm}", "linalg_svd", [x])
+        case(f"linalg-svd_values-{dt}-{nm}", "linalg_svd_values", [x])
+        case(f"linalg-pinv-{dt}-{nm}", "linalg_pinv", [x])
+    for nm, x in [("sq", sq), ("batch", bat)]:
+        case(f"linalg-inv-{dt}-{nm}", "linalg_inv", [x])
+        case(f"linalg-det-{dt}-{nm}", "linalg_det", [x])
+        case(f"linalg-slogdet-{dt}-{nm}", "linalg_slogdet", [x])
+        case(f"linalg-lu-{dt}-{nm}", "linalg_lu", [x])
+        case(f"linalg-lu_factor-{dt}-{nm}", "linalg_lu_factor", [x])
+        case(f"linalg-eigvals-{dt}-{nm}", "linalg_eigvals", [x])
+    for nm, x in [("sq", spd), ("batch", spdb)]:
+        for up in [0, 1]:
+            case(f"linalg-eigh-{dt}-{nm}-{up}", "linalg_eigh", [x], upper=up)
+            case(f"linalg-eigvalsh-{dt}-{nm}-{up}", "linalg_eigvalsh", [x], upper=up)
+            case(f"linalg-cholesky-{dt}-{nm}-{up}", "linalg_cholesky", [x], upper=up)
+    for up in [0, 1]:
+        tri = low if not up else mx.swapaxes(low, -1, -2)
+        case(f"linalg-tri_inv-{dt}-{up}", "linalg_tri_inv", [tri], upper=up)
+        case(f"linalg-cholesky_inv-{dt}-{up}", "linalg_cholesky_inv", [tri], upper=up)
+        case(f"linalg-solve_triangular-{dt}-{up}", "linalg_solve_triangular", [tri, make(dt, (4, 2))], upper=up)
+    case(f"linalg-solve-{dt}", "linalg_solve", [sq, make(dt, (4, 3))])
+    case(f"linalg-solve-vector-{dt}", "linalg_solve", [sq, make(dt, (4,))])
+    case(f"linalg-solve-batch-{dt}", "linalg_solve", [bat, make(dt, (2, 4, 2))])
+    case(f"linalg-cross-{dt}", "linalg_cross", [make(dt, (2, 3)), make(dt, (2, 3))], axis=-1)
+    case(f"linalg-cross2-{dt}", "linalg_cross", [make(dt, (3, 2)), make(dt, (3, 2))], axis=-1)
+    for o in ["2", "-2", "nuc"]:
+        case(f"linalg-norm-{o}-{dt}", "linalg_norm", [tall], ord=o)
+case("linalg-det-singular", "linalg_det", [mx.array([[1.0, 2.0], [2.0, 4.0]])])
+case("linalg-slogdet-singular", "linalg_slogdet", [mx.array([[1.0, 2.0], [2.0, 4.0]])])
+
+
+# Convolutions: channels last, weights [C_out, kernel…, C_in / groups].
+cv = np.random.default_rng(SEED + 94)
+def crand(dt, shape):
+    return mx.array(cv.standard_normal(shape).astype(np.float32)).astype(MX[dt])
+for dt in ["float32", "float16", "bfloat16"]:
+    for name, (x, w, st, pad, dil, g) in {
+        "3x3": ((2, 9, 8, 6), (5, 3, 3, 6), "1,1", "1,1", "1,1", 1),
+        "stride2": ((1, 11, 10, 4), (6, 3, 2, 4), "2,3", "1,0", "1,1", 1),
+        "dilated": ((1, 12, 12, 3), (4, 3, 3, 3), "1,1", "2,2", "2,3", 1),
+        "groups": ((2, 7, 7, 6), (9, 3, 3, 2), "1,1", "1,1", "1,1", 3),
+        "depthwise": ((1, 8, 8, 4), (4, 3, 3, 1), "1,1", "1,1", "1,1", 4),
+        "multiplier": ((1, 8, 8, 3), (6, 3, 3, 1), "2,2", "1,1", "1,1", 3),
+        "1x1": ((2, 5, 5, 8), (7, 1, 1, 8), "1,1", "0,0", "1,1", 1),
+        "patch": ((1, 28, 28, 3), (16, 14, 14, 3), "14,14", "0,0", "1,1", 1),
+    }.items():
+        case(f"conv2d-{name}-{dt}", "conv2d", [crand(dt, x), crand(dt, w)], stride=st, padding=pad, dilation=dil, groups=g)
+    case(f"conv3d-{dt}", "conv3d", [crand(dt, (1, 5, 6, 6, 3)), crand(dt, (4, 2, 3, 3, 3))], stride="1,2,1", padding="1,1,0", dilation="1,1,2", groups=1)
+    case(f"conv3d-patch-{dt}", "conv3d", [crand(dt, (1, 4, 8, 8, 3)), crand(dt, (8, 2, 4, 4, 3))], stride="2,4,4", padding="0,0,0", dilation="1,1,1", groups=1)
+for name, (x, w, st, lo, hi, kd, idl, g, fl) in {
+    "general": ((1, 9, 8, 4), (5, 3, 2, 4), "2,1", "1,0", "2,1", "1,2", "1,1", 1, 0),
+    "input-dilated": ((1, 5, 6, 3), (4, 3, 3, 3), "1,1", "2,2", "2,2", "1,1", "2,3", 1, 0),
+    "flipped": ((2, 6, 6, 2), (3, 3, 3, 2), "1,1", "1,1", "1,1", "1,1", "1,1", 1, 1),
+    "crop": ((1, 9, 9, 2), (2, 3, 3, 2), "1,1", "-1,0", "0,-2", "1,1", "1,1", 1, 0),
+    "1d": ((2, 10, 3), (4, 3, 3), "2", "1", "0", "2", "2", 1, 1),
+}.items():
+    case(f"conv_general-{name}", "conv_general", [crand("float32", x), crand("float32", w)], stride=st, lo=lo, hi=hi, kd=kd, id=idl, groups=g, flip=fl)
+case("conv_transpose1d", "conv_transpose1d", [crand("float32", (2, 7, 4)), crand("float32", (3, 3, 4))], stride=2, padding=1, dilation=1, output_padding=1, groups=1)
+case("conv_transpose1d-dilated", "conv_transpose1d", [crand("float32", (1, 6, 2)), crand("float32", (4, 3, 2))], stride=3, padding=2, dilation=2, output_padding=0, groups=1)
+for dt in ["float32", "float16"]:
+    case(f"conv_transpose2d-{dt}", "conv_transpose2d", [crand(dt, (1, 5, 6, 4)), crand(dt, (3, 3, 3, 4))], stride="2,2", padding="1,0", dilation="1,1", output_padding="1,0", groups=1)
+case("conv_transpose2d-stride1", "conv_transpose2d", [crand("float32", (2, 6, 6, 3)), crand("float32", (5, 3, 3, 3))], stride="1,1", padding="1,1", dilation="1,1", output_padding="0,0", groups=1)
+case("conv_transpose3d", "conv_transpose3d", [crand("float32", (1, 3, 4, 4, 2)), crand("float32", (3, 2, 3, 3, 2))], stride="2,1,2", padding="0,1,1", dilation="1,1,1", output_padding="1,0,1", groups=1)
+for mode in ["full", "same", "valid"]:
+    case(f"convolve-{mode}", "convolve", [crand("float32", (9,)), crand("float32", (4,))], mode=mode)
+    case(f"convolve-{mode}-swap", "convolve", [crand("float32", (3,)), crand("float32", (8,))], mode=mode)
+for name, op, ins, params in [
+    ("conv2d", "conv2d", [crand("float32", (1, 6, 6, 3)), crand("float32", (4, 3, 3, 3))], dict(stride="2,1", padding="1,1", dilation="1,2", groups=1)),
+    ("conv2d-depthwise", "conv2d", [crand("float32", (1, 6, 6, 3)), crand("float32", (3, 3, 3, 1))], dict(stride="1,1", padding="1,1", dilation="1,1", groups=3)),
+    ("conv2d-patch", "conv2d", [crand("float32", (1, 8, 8, 2)), crand("float32", (3, 4, 4, 2))], dict(stride="4,4", padding="0,0", dilation="1,1", groups=1)),
+    ("conv3d", "conv3d", [crand("float32", (1, 4, 4, 4, 2)), crand("float32", (2, 2, 2, 2, 2))], dict(stride="1,1,1", padding="0,1,0", dilation="1,1,1", groups=1)),
+    ("conv_transpose2d", "conv_transpose2d", [crand("float32", (1, 4, 4, 2)), crand("float32", (3, 3, 3, 2))], dict(stride="2,2", padding="1,1", dilation="1,1", output_padding="1,1", groups=1)),
+]:
+    derivative("vjp", f"vjp-{name}", op, ins, **params)
+
+# Negative padding with input dilation: MLX slices the input before dilating it.
+case("conv_general-crop-input-dilated", "conv_general", [crand("float32", (1, 6, 7, 3)), crand("float32", (4, 2, 3, 3))], stride="1,1", lo="-1,1", hi="0,-1", kd="1,1", id="2,2", groups=1, flip=0)
+case("conv_transpose1d-overpadded", "conv_transpose1d", [crand("float32", (2, 9, 4)), crand("float32", (3, 3, 4))], stride=2, padding=3, dilation=1, output_padding=0, groups=1)
+
+# einsum's contraction order: the greedy path, and values where it differs
+# from left to right.
+for sub, shapes in [("ij,jk,kl->il", [(2, 300), (300, 400), (400, 5)]),
+                    ("ij,jk,kl->il", [(50, 2), (2, 60), (60, 3)]),
+                    ("ab,bc,cd,de->ae", [(8, 64), (64, 2), (2, 64), (64, 8)]),
+                    ("ijk,jl,lk->i", [(4, 5, 6), (5, 7), (7, 6)]),
+                    ("i,i,i->", [(5,), (5,), (5,)]),
+                    ("ij,kl,jl->ik", [(3, 4), (5, 6), (4, 6)]),
+                    ("ab,cd,ef->abcdef", [(2, 2), (2, 3), (3, 2)]),
+                    ("bij,bjk,bkl->bil", [(2, 3, 30), (2, 30, 40), (2, 40, 2)])]:
+    xs_e = [make("float32", sh) for sh in shapes]
+    tag = "-".join("x".join(map(str, sh)) for sh in shapes)
+    case(f"einsum_path-{sub}-{tag}", "einsum_path", xs_e, subscripts=sub)
+    case(f"einsum-greedy-{sub}-{tag}", "einsum", xs_e, subscripts=sub)
+
+# hadamard_transform: every size path (a power of 2, two passes above 8192, and
+# the orders 12, 20, 28), dtypes, scales, integers, batches, strided inputs, derivatives.
+for n in [1, 2, 4, 16, 64, 256, 1024, 8192, 16384, 65536, 12, 20, 28, 24, 192, 1280, 896, 12288]:
+    rows = 3 if n <= 8192 else 1
+    for dt in (["float32", "float16", "bfloat16"] if n in (64, 1024, 192, 896, 16384) else ["float32"]):
+        case(f"hadamard_transform-{n}-{dt}", "hadamard_transform", [make(dt, (rows, n))])
+case("hadamard_transform-scale", "hadamard_transform", [make("float32", (2, 3, 32))], scale=0.5)
+case("hadamard_transform-int", "hadamard_transform", [mx.arange(16, dtype=mx.int32).reshape(2, 8)])
+case("hadamard_transform-strided", "hadamard_transform", [make("float32", (16, 4))], pre="t")
+# MLX's vjp is its jvp, the transform itself: right for 2^k (Sylvester's matrices are
+# symmetric), not for 12, 20 and 28 (Sloane's are not), which tests/autodiff.rs checks.
+derivative("vjp", "vjp-hadamard_transform", "hadamard_transform", [make("float32", (3, 32))])
+derivative("jvp", "jvp-hadamard_transform", "hadamard_transform", [make("float32", (2, 16))], scale=0.25)
+
+# segmented_mm and block_masked_mm.
+seg = mx.array([[0, 3], [3, 10], [2, 2], [5, 9]], dtype=mx.int32)
+case("segmented_mm", "segmented_mm", [make("float32", (5, 10)), make("float32", (10, 6)), seg])
+case("segmented_mm-batched", "segmented_mm", [make("float32", (3, 8)), make("float32", (8, 2)),
+                                               mx.array([[[0, 8], [1, 4]], [[4, 8], [0, 0]]], dtype=mx.int32)])
+# (No float16 case: MLX 0.32.4's CPU segmented_mm is wrong in float16; its GPU is right.)
+for masks, bs, shape in [("o", 32, (70, 40, 50)), ("lr", 32, (64, 96, 33)), ("olr", 64, (65, 130, 70))]:
+    m, k, n = shape
+    blocks = lambda v: (v + bs - 1) // bs  # noqa: E731
+    dims = {"o": (blocks(m), blocks(n)), "l": (blocks(m), blocks(k)), "r": (blocks(k), blocks(n))}
+    for kind in ["bool", "float32"]:
+        ms = [make(kind, dims[c]) for c in masks]
+        case(f"block_masked_mm-{masks}-{bs}-{kind}", "block_masked_mm",
+             [make("float32", (m, k)), make("float32", (k, n))] + ms, block_size=bs, masks=masks)
+case("block_masked_mm-batched", "block_masked_mm",
+     [make("float32", (2, 40, 33)), make("float32", (33, 20)), make("bool", (2, 2, 1))],
+     block_size=32, masks="o")
+
+# qqmm and gather_qqmm on MLX's GPU: dense and quantized weights, vectors and
+# batches, each floating-point mode.
+for mode in ["nvfp4", "mxfp8", "mxfp4"]:
+    for dt in ["bfloat16", "float16", "float32"]:
+        for q in ["0", "1"]:
+            for rows in [1, 5, 40]:
+                case_gpu(f"qqmm-{mode}-{dt}-q{q}-{rows}", "qqmm",
+                         [make(dt, (rows, 128)), make(dt, (24, 128))], mode=mode, q=q)
+        case_gpu(f"gather_qqmm-dense-{mode}-{dt}", "gather_qqmm",
+                 [make(dt, (6, 1, 64)), make(dt, (3, 16, 64)), mx.array([2, 0, 1, 1, 2, 0], dtype=mx.uint32)],
+                 mode=mode, q="0")
+        case_gpu(f"gather_qqmm-{mode}-{dt}", "gather_qqmm",
+                 [make(dt, (6, 1, 64)), make(dt, (3, 16, 64)), mx.array([0, 2, 1, 1, 0, 2], dtype=mx.uint32)],
+                 mode=mode, q="1")
+
+# qqmm's quantized backward (MLX's QQMatmul::vjp) on the GPU: (x, w, cotangent) -> (dx, dw).
+for mode in ["nvfp4", "mxfp8"]:
+    xg, wg = make("bfloat16", (32, 64)), make("bfloat16", (32, 64))
+    cg = make("bfloat16", (32, 32))
+    with mx.stream(mx.gpu):
+        _, grads = mx.vjp(lambda a, b: [mx.qqmm(a, b, mode=mode)], [xg, wg], [cg])
+        mx.eval(grads)
+    gpu_cases.append((f"vjp-qqmm-{mode}", f"vjp|fn=qqmm|mode={mode}|q=0", [xg, wg, cg], list(grads)))
+
+# hadamard_transform on MLX's GPU, bit for bit: one pass, two passes, the order-m stage.
+for n in [64, 4096, 16384, 28 * 128, 12 * 1024, 20 * 16384]:
+    for dt in ["float32", "float16", "bfloat16"]:
+        case_gpu(f"hadamard-gpu-{n}-{dt}", "hadamard_transform", [make(dt, (2, n))])
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 

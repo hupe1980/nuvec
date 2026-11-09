@@ -1,4 +1,4 @@
-//! PTX that nuvec generates (constitution I: kernels in Rust, no CUDA C): element-wise
+//! PTX that nuvec generates (kernels in Rust, no CUDA C): element-wise
 //! kernels and row reductions, for sm_80 and newer. Half types load to f32, compute in f32
 //! and round to nearest even on store, so an f16/bf16 add or multiply is the IEEE result.
 //! Transcendentals use range reduction and polynomials, not the hardware approximations.

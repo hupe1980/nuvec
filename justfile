@@ -24,6 +24,8 @@ doc:
 test:
     RUSTFLAGS="-D warnings" cargo test --workspace --all-targets --all-features
     RUSTDOCFLAGS="-D warnings" cargo test --workspace --doc --all-features
+    # `--all-features` takes Accelerate's LAPACK for `linalg`: the pure-Rust path (`faer`) too.
+    RUSTFLAGS="-D warnings" cargo test -p nuvec-core --test linalg --test mlx
 
 # On the latest stable toolchain, to catch upcoming breakage early.
 test-stable:
@@ -121,6 +123,14 @@ bench-quant *filter:
 # GPU fused operations (norms, RoPE, softmax, log-sum-exp, cross entropy): nuvec vs MLX.
 bench-fast *filter:
     uv run scripts/bench_fast.py '{{filter}}'
+
+# GPU convolutions (implicit GEMM, Winograd, depthwise, transposed): nuvec vs MLX.
+bench-conv *filter:
+    uv run scripts/bench_conv.py {{filter}}
+
+# GPU Hadamard, einsum, qqmm, segmented and block-masked products: nuvec vs MLX.
+bench-special *filter:
+    uv run scripts/bench_special.py {{filter}}
 
 # Paged decode attention (window and sinks) against the same keys stored contiguously.
 bench-paged:

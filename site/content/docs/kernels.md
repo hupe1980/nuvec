@@ -1,6 +1,6 @@
 +++
 title = "Fused and custom Metal kernels"
-description = "nuvec's fast module: fused RMSNorm, LayerNorm, RoPE, attention, cross entropy and Gated DeltaNet kernels, plus custom Metal kernels written from source."
+description = "nuvec's fast module: fused RMSNorm, LayerNorm, RoPE, attention, cross entropy (also chunked over an output head) and Gated DeltaNet kernels, plus custom Metal kernels written from source."
 weight = 60
 [extra]
 group = "GPU"
@@ -21,6 +21,7 @@ The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each 
 | `norm_rope_at(x, norm, rotation, positions, pool)` | The same with each sequence at its own position, optionally written straight into a paged KV cache's slots |
 | `scaled_dot_product_attention(q, k, v, scale, &options)` | Attention with grouped-query heads; `AttentionOptions` holds the mask (causal, boolean or additive), attention sinks, a sliding window and a cap on score memory. Where the forward runs the tiled kernel, the backward is MLX's tiled backward from the forward's log-sum-exp |
 | `cross_entropy(logits, targets)` | Fused log-softmax and negative log-likelihood |
+| `linear_cross_entropy(h, targets, weights, head, rows)` | The cross entropy of an output head (`head(h, weights)`: dense, quantized, soft-capped) in row chunks, so the `[N, vocab]` logits never exist. Under a gradient transform each chunk also gives its rows' hidden-state gradient from the same logits; a trainable head's gradient is computed only when used. One chunk of 64 MiB of logits is alive at a time |
 | `gated_delta(q, k, v, g, beta, state)` | The Gated DeltaNet recurrence (Qwen 3.5's linear attention), returning the outputs and the new state |
 | `gated_delta_steps(q, k, v, g, beta, state)` | The same, returning the state after every step (to roll the recurrence back) |
 | `gated_delta_slots(q, k, v, g, beta, pool, slots)` | The same for a batch whose states live at slots of a pool, updated in place |

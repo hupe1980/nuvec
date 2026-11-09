@@ -18,11 +18,24 @@ nuvec.workspace = true
 nuvec-nn.workspace = true
 unicode-general-category.workspace = true
 unicode-normalization.workspace = true
+minijinja = { workspace = true, optional = true }
+minijinja-contrib = { workspace = true, optional = true }
 
 [features]
+default = ["chat"]
+# Chat templates (`chat::ChatTemplate`), and chat and completion training data.
+chat = ["dep:minijinja", "dep:minijinja-contrib"]
 # Routing diagnostics (`model::record_routes`, the `route_overlap` example); off by default
 # (it adds a check to every mixture-of-experts forward pass).
 diagnostics = []
+
+[[example]]
+name = "lora"
+required-features = ["chat"]
+
+[[example]]
+name = "generate"
+required-features = ["chat"]
 
 [[example]]
 name = "route_overlap"

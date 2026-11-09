@@ -31,6 +31,7 @@
 //! assert!((v[0] - 1.0 / 2.5f32.sqrt()).abs() < 1e-5);
 //! ```
 
+mod chunked;
 pub(crate) mod imp;
 pub(crate) mod plan;
 
@@ -181,6 +182,51 @@ pub fn cross_entropy(logits: &Array, targets: &Array) -> Array {
         &[logits, targets],
         || imp::cross_entropy(logits, targets),
     )
+}
+
+/// Cross entropy of an output head's logits, computed in row chunks so the full
+/// `[N, vocab]` logits never exist: per-token losses `head(h)` against `targets`, shaped as
+/// `targets` (`h` without its last axis), in the logits' dtype, equal to
+/// `cross_entropy(head(h, weights), targets)` cast to the logits' dtype (as
+/// `nn.losses.cross_entropy`).
+///
+/// `head` gives the logits `[R, vocab]` of a chunk of rows `[R, D]` from `weights` (a dense
+/// projection, [`crate::Array::quantized_matmul`], a soft-cap…). Each chunk's logits are
+/// evaluated once: under a gradient transform, the same pass gives the chunk's hidden-state
+/// gradient (`[N, D]` kept, not `[N, vocab]`). A head weight's gradient is computed, chunk by
+/// chunk, only when it is differentiated.
+///
+/// `rows` per chunk defaults to the largest power of two whose logits fit 64 MiB (64 to
+/// 4,096). Zero, mismatched shapes and non-integer targets give a failed array.
+///
+/// ```
+/// use nuvec_core::{Array, DType, fast, random};
+///
+/// let h = random::normal([6, 4], DType::F32, 0.0, 1.0, None);
+/// let w = random::normal([10, 4], DType::F32, 0.0, 1.0, None);
+/// let t = Array::from_slice(&[1i32, 2, 3, 4, 5, 6], [6]);
+/// let chunked = fast::linear_cross_entropy(&h, &t, &[w.clone()], |x, w| x.matmul(&w[0].t()), Some(4));
+/// let full = fast::cross_entropy(&h.matmul(&w.t()), &t);
+/// let diff = chunked.subtract(&full).abs().max(..).item::<f32>().unwrap();
+/// assert!(diff < 1e-5);
+/// ```
+#[track_caller]
+pub fn linear_cross_entropy<F>(
+    h: &Array,
+    targets: &Array,
+    weights: &[Array],
+    head: F,
+    rows: Option<usize>,
+) -> Array
+where
+    F: Fn(&Array, &[Array]) -> Array + Send + Sync + 'static,
+{
+    let mut ins: SmallVec<[&Array; 6]> = SmallVec::new();
+    ins.extend([h, targets]);
+    ins.extend(weights.iter());
+    Array::sticky("linear_cross_entropy", Location::caller(), &ins, || {
+        chunked::linear_cross_entropy(h, targets, weights, std::sync::Arc::new(head), rows)
+    })
 }
 
 /// An attention layer's query or key preparation in one kernel: each head's features of

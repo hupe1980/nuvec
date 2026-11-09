@@ -363,9 +363,12 @@ fn step<S: Tree>(
             .slots
             .entry(path.to_owned())
             .or_insert_with(|| new_slot(p));
-        let mut mismatch = false;
-        slot.for_each(|_, s| mismatch |= s.shape() != p.shape());
-        if mismatch {
+        // A slot's shapes are those of a fresh slot (built, never evaluated).
+        let mut have = Vec::new();
+        slot.for_each(|_, s| have.push(s.shape().to_vec()));
+        let mut want = Vec::new();
+        new_slot(p).for_each(|_, s| want.push(s.shape().to_vec()));
+        if have != want {
             return Err(Error::InvalidArgument(format!(
                 "parameter {path:?} changed its shape to {:?}",
                 p.shape()
@@ -591,7 +594,7 @@ fn adam_step(
         p.clone()
     };
     s.m = s.m.multiply(b1).add(g.multiply(1.0 - b1));
-    s.v = s.v.multiply(b2).add(g.multiply(g).multiply(1.0 - b2));
+    s.v = s.v.multiply(b2).add(g.square().multiply(1.0 - b2));
     if h.bias_correction {
         // In float32, as MLX (`1 - b ** step` on a float32 array).
         let c1 = lr.divide(one_minus_power(b1, step)).astype(g.dtype());
@@ -755,6 +758,265 @@ impl Optimizer for AdamW {
     }
 
     state_access!(AdamSlot);
+}
+
+/// Adafactor's state: factored second moments for parameters of rank ≥ 2 (row and column
+/// means), a full one for vectors, and the first moment with `beta_1`.
+#[derive(Debug, Clone, Tree)]
+pub struct AdafactorSlot {
+    /// The rows' second moments, `shape[..-1]` (rank ≥ 2).
+    pub exp_avg_sq_row: Option<Array>,
+    /// The columns' second moments, `shape[..-2] + shape[-1:]` (rank ≥ 2).
+    pub exp_avg_sq_col: Option<Array>,
+    /// The second moment (rank < 2).
+    pub exp_avg_sq: Option<Array>,
+    /// The first moment (with `beta_1`).
+    pub exp_avg: Option<Array>,
+}
+
+impl AdafactorSlot {
+    fn new(p: &Array, first_moment: bool) -> Self {
+        let shape = p.shape();
+        let like = |s: &[i32]| Some(ops::zeros(s, p.dtype()));
+        let factored = shape.len() >= 2;
+        let n = shape.len();
+        let col: Vec<i32> = shape[..n.saturating_sub(2)]
+            .iter()
+            .chain(shape.last())
+            .copied()
+            .collect();
+        Self {
+            exp_avg_sq_row: if factored {
+                like(&shape[..n - 1])
+            } else {
+                None
+            },
+            exp_avg_sq_col: if factored { like(&col) } else { None },
+            exp_avg_sq: if factored { None } else { Some(zeros(p)) },
+            exp_avg: first_moment.then(|| zeros(p)),
+        }
+    }
+}
+
+/// Adafactor's hyperparameters.
+#[derive(Debug, Clone, Copy)]
+struct AdafactorParams {
+    eps: (f64, f64),
+    clip_threshold: f64,
+    decay_rate: f64,
+    beta_1: Option<f64>,
+    weight_decay: f64,
+    scale_parameter: bool,
+    relative_step: bool,
+    warmup_init: bool,
+}
+
+/// `sqrt(mean(x²))`.
+fn rms(x: &Array) -> Array {
+    x.square().mean(..).sqrt()
+}
+
+fn rsqrt(x: &Array) -> Array {
+    x.rsqrt()
+}
+
+/// One Adafactor step (MLX's `Adafactor.apply_single`).
+fn adafactor_step(
+    p: &Array,
+    g: &Array,
+    s: &mut AdafactorSlot,
+    lr: &Array,
+    step: &Array,
+    h: AdafactorParams,
+) -> Array {
+    let dtype = p.dtype();
+    let p_rms = rms(p);
+    let t = step.astype(DType::F32);
+    let relative = if h.relative_step {
+        let min_step = if h.warmup_init {
+            t.multiply(1e-6)
+        } else {
+            Array::from(1e-2f32)
+        };
+        ops::minimum(&min_step, rsqrt(&t))
+    } else {
+        lr.clone()
+    };
+    let relative = relative.astype(p_rms.dtype());
+    let lr = if h.scale_parameter {
+        ops::maximum(Array::from(h.eps.1 as f32).astype(p_rms.dtype()), &p_rms).multiply(&relative)
+    } else {
+        relative
+    };
+    let beta_2 = ops::subtract(1.0, t.power(h.decay_rate).astype(p_rms.dtype()));
+    let one_minus = ops::subtract(1.0, &beta_2);
+    let update = g.square().add(h.eps.0);
+    let mut update = match (&s.exp_avg_sq_row, &s.exp_avg_sq_col) {
+        (Some(row), Some(col)) => {
+            let row = beta_2
+                .multiply(row)
+                .add(one_minus.multiply(update.mean(-1)));
+            let col = beta_2
+                .multiply(col)
+                .add(one_minus.multiply(update.mean(-2)));
+            let r = rsqrt(&row.divide(row.mean_keepdims(-1)));
+            let c = rsqrt(&col);
+            let approx = r.expand_dims(-1).multiply(c.expand_dims(-2));
+            s.exp_avg_sq_row = Some(row);
+            s.exp_avg_sq_col = Some(col);
+            approx.multiply(g)
+        }
+        _ => {
+            let v = s.exp_avg_sq.as_ref().expect("an unfactored slot");
+            let v = beta_2.multiply(v).add(one_minus.multiply(&update));
+            let u = rsqrt(&v).multiply(g);
+            s.exp_avg_sq = Some(v);
+            u
+        }
+    };
+    update = update.divide(ops::maximum(1.0, rms(&update).divide(h.clip_threshold)));
+    update = lr.multiply(&update);
+    if let (Some(b1), Some(m)) = (h.beta_1, &s.exp_avg) {
+        let m = m.multiply(b1).add(update.multiply(1.0 - b1));
+        update = m.clone();
+        s.exp_avg = Some(m);
+    }
+    let p = if h.weight_decay != 0.0 {
+        p.add(p.multiply(lr.multiply(-h.weight_decay)))
+    } else {
+        p.clone()
+    };
+    p.subtract(&update).astype(dtype)
+}
+
+/// Adafactor, as MLX's `optimizers.Adafactor` (Shazeer and Stern, 2018): factored second
+/// moments for matrices, a relative step size from the step count (unless
+/// [`Adafactor::relative_step`] is off, when the learning rate is used), scaled by the
+/// parameter's RMS, and the update clipped to RMS `clip_threshold`. MLX's defaults: `eps`
+/// `(1e-30, 1e-3)`, `clip_threshold` 1, `decay_rate` -0.8, no first moment, no weight
+/// decay.
+#[derive(Debug, Clone, Tree)]
+pub struct Adafactor {
+    #[tree(skip, static_unchecked)]
+    schedule: LearningRate,
+    #[tree(skip, static_unchecked)]
+    params: AdafactorParams,
+    #[tree(rename = "")]
+    state: OptimizerState<AdafactorSlot>,
+}
+
+impl Adafactor {
+    /// Adafactor with MLX's defaults; `learning_rate` is used only without the relative
+    /// step.
+    pub fn new(learning_rate: impl Into<LearningRate>) -> Self {
+        let schedule = learning_rate.into();
+        Self {
+            state: fresh(&schedule),
+            schedule,
+            params: AdafactorParams {
+                eps: (1e-30, 1e-3),
+                clip_threshold: 1.0,
+                decay_rate: -0.8,
+                beta_1: None,
+                weight_decay: 0.0,
+                scale_parameter: true,
+                relative_step: true,
+                warmup_init: false,
+            },
+        }
+    }
+
+    /// Sets `eps`: added to the squared gradient, and the parameter scale's floor.
+    pub fn eps(mut self, eps1: f64, eps2: f64) -> Self {
+        self.params.eps = (eps1, eps2);
+        self
+    }
+
+    /// Sets the update's RMS clip.
+    pub fn clip_threshold(mut self, clip: f64) -> Self {
+        self.params.clip_threshold = clip;
+        self
+    }
+
+    /// Sets the second moment's decay exponent (`beta_2 = 1 - step^decay_rate`).
+    pub fn decay_rate(mut self, rate: f64) -> Self {
+        self.params.decay_rate = rate;
+        self
+    }
+
+    /// Keeps a first moment with this coefficient.
+    pub fn beta_1(mut self, beta_1: f64) -> Self {
+        self.params.beta_1 = Some(beta_1);
+        self
+    }
+
+    /// Sets the weight decay.
+    pub fn weight_decay(mut self, weight_decay: f64) -> Self {
+        self.params.weight_decay = weight_decay;
+        self
+    }
+
+    /// Whether the step size is scaled by the parameter's RMS.
+    pub fn scale_parameter(mut self, on: bool) -> Self {
+        self.params.scale_parameter = on;
+        self
+    }
+
+    /// Whether the step size comes from the step count (else the learning rate).
+    pub fn relative_step(mut self, on: bool) -> Self {
+        self.params.relative_step = on;
+        self
+    }
+
+    /// Whether the relative step grows from `1e-6 · step` (warm-up).
+    pub fn warmup_init(mut self, on: bool) -> Self {
+        self.params.warmup_init = on;
+        self
+    }
+}
+
+impl Optimizer for Adafactor {
+    fn apply(&mut self, params: &[(&str, &Array)], grads: &[&Array]) -> Result<Vec<Array>> {
+        let h = self.params;
+        let first = h.beta_1.is_some();
+        let f = |p: &Array, g: &Array, s: &mut AdafactorSlot, lr: &Array, t: &Array| {
+            adafactor_step(p, g, s, lr, t, h)
+        };
+        step(
+            &mut self.state,
+            &self.schedule,
+            params,
+            grads,
+            |p| AdafactorSlot::new(p, first),
+            f,
+        )
+    }
+
+    fn init_params(&mut self, params: &[(&str, &Array)]) {
+        let first = self.params.beta_1.is_some();
+        for &(path, p) in params {
+            self.state
+                .slots
+                .entry(path.to_owned())
+                .or_insert_with(|| AdafactorSlot::new(p, first));
+        }
+    }
+    fn visit_state(&self, v: &mut Visit<'_>) {
+        v.static_field("optimizer", &std::any::type_name::<Self>());
+        Leaves::visit(self, v);
+    }
+    fn visit_state_mut(&mut self, v: &mut VisitMut<'_>) {
+        Tree::visit_mut(self, v);
+    }
+    fn learning_rate(&self) -> Array {
+        self.state.learning_rate.clone()
+    }
+    fn set_learning_rate(&mut self, lr: f32) {
+        self.state.learning_rate = Array::from(lr);
+    }
+    fn clone_box(&self) -> Box<dyn Optimizer> {
+        Box::new(self.clone())
+    }
 }
 
 /// Lion's (and Muon's) state: one momentum.
