@@ -364,7 +364,7 @@ release version:
     just ci
     cargo publish --workspace --dry-run --locked --allow-dirty
     just api-check
-    git commit -qam "release: $v"
+    git diff --quiet || git commit -qam "release: $v"
     git tag "v$v"
     echo "tagged v$v; push with: git push origin main v$v"
 
