@@ -24,7 +24,7 @@ nuvec follows MLX, JAX and NumPy, where gradients come from transforming functio
 
 ## How fast is it?
 
-On par with MLX. On an M4 Pro (nuvec 0.5.0 against mlx-lm 0.32.2, 12 models), nuvec-lm decodes at 0.98–1.10× mlx-lm's speed on dense, hybrid, mixture-of-experts, gpt-oss and Gemma 4 models (geometric mean 1.01×); time to first token is 1.02× at 2,048 and 32,768 tokens (0.98× at 64K), serving four or eight requests at once is 1.00×, and warm loads are 1.80× faster. See [benchmarks](@/docs/benchmarks.md).
+On par with MLX. On an Apple M4 Pro, nuvec-lm decodes at 1.01× mlx-lm's speed (geometric mean over dense, hybrid, mixture-of-experts, gpt-oss and Gemma 4 models), reaches the first token as fast, and loads 1.5–1.8× faster. The [benchmarks](@/docs/benchmarks.md) page has the dated records.
 
 ## Which Macs are supported?
 

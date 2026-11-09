@@ -27,9 +27,11 @@ Sections (`--sections`, default all):
 
 Tiers (`--tier`):
 
+- `smoke` (about 10 minutes, fine on a busy machine): a dense and a mixture-of-experts
+  model (`SMOKE_MODELS`), decode and time to first token at 2,048 tokens; regressions
+  below 0.95. The check before a release that touches kernels, the scheduler or models.
 - `quick` (default, about 45 minutes): one model per architecture (`QUICK_MODELS`), decode,
-  time to first token at 2,048 tokens, memory, warm load and 4 concurrent requests. The
-  release gate.
+  time to first token at 2,048 tokens, memory, warm load and 4 concurrent requests.
 - `full`: every roster model, 32K tokens and each model's longer extras, cold loads and 1, 4
   and 8 requests: hours; run it in pieces with `--budget` and `--resume`.
 
@@ -44,7 +46,7 @@ Ratios are oriented so that above 1.00 favours nuvec (speeds nuvec / mlx-lm, tim
 memory mlx-lm / nuvec). Speed and time cells are marked against the gate (0.98) and the
 goal (1.0).
 
-Usage: `just bench-parity [models…] [--tier quick|full] [--baseline REF | --no-baseline]
+Usage: `just bench-parity [models…] [--tier smoke|quick|full] [--baseline REF | --no-baseline]
 [--sections decode,ttft] [--out PATH] [--release]
 [--resume] [--budget SECONDS] [--nuvec-ref REF] [--no-cold] [--no-max-context]
 [--prompt-tokens 2048,32768] [--concurrency 1,4,8]`.
@@ -110,12 +112,16 @@ SPEC_DRAFTERS = {"lookup": ["--draft", "4", "--drafter", "lookup", "--policy", "
 MTP_WEIGHTS = {"mlx-community/Qwen3.5-9B-4bit": "Qwen--Qwen3.5-9B",
                "mlx-community/Qwen3.8-27B-4bit": "Qwen--Qwen3.8-27B",
                "mlx-community/Qwen3.6-35B-A3B-4bit": "Qwen--Qwen3.6-35B-A3B"}
-# The quick tier (the default): one model per architecture and the cells that move with
-# kernel and scheduler changes, in about 45 minutes with the baseline. The full tier adds
-# the long contexts, cold loads and the whole roster.
+# The smoke tier: two architectures, decode and first token, in about 10 minutes. The quick
+# tier (the default): one model per architecture and the cells that move with kernel and
+# scheduler changes, in about 45 minutes. The full tier adds the long contexts, cold loads
+# and the whole roster.
+SMOKE_MODELS = ["mlx-community/Qwen3-8B-4bit", "mlx-community/Qwen3-30B-A3B-4bit"]
 QUICK_MODELS = ["mlx-community/Qwen3-8B-4bit", "mlx-community/Qwen3.5-9B-4bit",
                 "mlx-community/Qwen3-30B-A3B-4bit", "mlx-community/gpt-oss-20b-MXFP4-Q8"]
-TIERS = {"quick": {"prompt_tokens": "2048", "concurrency": "4"},
+TIERS = {"smoke": {"prompt_tokens": "2048", "concurrency": "", "sections": "decode,ttft",
+                   "regression": 0.95},
+         "quick": {"prompt_tokens": "2048", "concurrency": "4"},
          "full": {"prompt_tokens": "2048,32768", "concurrency": "1,4,8"}}
 # A cell below this ratio to the baseline release is measured once more, then reported.
 REGRESSION = 0.97
@@ -201,7 +207,7 @@ def environment(nuvec_ref: str | None) -> dict:
         ver = re.search(r'^version = "([^"]+)"', git("show", f"{nuvec_ref}:Cargo.toml"),
                         re.M).group(1)
     else:
-        commit, dirty, ver = git("rev-parse", "HEAD"), bool(git("status", "--porcelain")), \
+        commit, dirty, ver = git("rev-parse", "HEAD"), bool(tree_changes()), \
             workspace_version()
     return {
         "machine": sh("sysctl", "-n", "hw.model"),
@@ -959,6 +965,12 @@ def markdown(record: dict) -> str:
 
 # ── Release index ─────────────────────────────────────────────────────────────
 
+def tree_changes() -> list[str]:
+    """Uncommitted changes outside the benchmark records (which runs add themselves)."""
+    return [line for line in git("status", "--porcelain").splitlines()
+            if "site/static/benchmarks/" not in line]
+
+
 def add_to_index(version: str, machine: str, path: str, kind: str) -> None:
     index_path = BENCH_DIR / "index.json"
     index = json.loads(index_path.read_text()) if index_path.exists() else \
@@ -1002,12 +1014,12 @@ def build(ref: str | None, skip: bool = False) -> tuple[Path, str]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("models", nargs="*")
-    ap.add_argument("--sections", default=",".join(SECTIONS))
+    ap.add_argument("--sections")
     ap.add_argument("--tier", choices=sorted(TIERS), default="quick")
     ap.add_argument("--baseline", help="release to compare against (default: the latest "
                     "v* tag before HEAD)")
     ap.add_argument("--no-baseline", action="store_true")
-    ap.add_argument("--regression-threshold", type=float, default=REGRESSION)
+    ap.add_argument("--regression-threshold", type=float)
     ap.add_argument("--prompt-tokens")
     ap.add_argument("--no-max-context", action="store_true")
     ap.add_argument("--concurrency")
@@ -1025,14 +1037,18 @@ def main() -> int:
     ap.add_argument("--no-build", action="store_true", help="use the built bench example")
     args = ap.parse_args()
 
-    sections = [s for s in args.sections.split(",") if s]
+    tier = TIERS[args.tier]
+    sections = [s for s in (args.sections or tier.get("sections", ",".join(SECTIONS)))
+                .split(",") if s]
+    if args.regression_threshold is None:
+        args.regression_threshold = tier.get("regression", REGRESSION)
     if unknown := set(sections) - set(SECTIONS):
         ap.error(f"unknown sections {sorted(unknown)}")
     if args.nuvec_ref:
         sections = [s for s in sections if s == "decode"]
-    if args.release and not args.allow_dirty and git("status", "--porcelain"):
+    if args.release and not args.allow_dirty and tree_changes():
         ap.error("--release needs a clean working tree (or --allow-dirty)")
-    quick = args.tier == "quick"
+    quick = args.tier != "full"
     if quick:
         args.no_cold = True
     bench, tag = build(args.nuvec_ref, args.no_build)
@@ -1046,8 +1062,8 @@ def main() -> int:
     runner = Runner(args, bench, tag, base, base_tag)
     env = environment(args.nuvec_ref)
     roster = {m: (k, e) for m, k, e in ROSTER}
-    models = args.models or (QUICK_MODELS if quick else [m for m, _, _ in ROSTER])
-    tier = TIERS[args.tier]
+    models = args.models or {"smoke": SMOKE_MODELS, "quick": QUICK_MODELS}.get(
+        args.tier, [m for m, _, _ in ROSTER])
     prompt_tokens = [int(n) for n in (args.prompt_tokens or tier["prompt_tokens"]).split(",")
                      if n]
     levels = [int(n) for n in (args.concurrency or tier["concurrency"]).split(",") if n]
@@ -1104,8 +1120,7 @@ def main() -> int:
     validate(record, "parity-record-v1.schema.json")
     out = args.out
     if args.release:
-        if (unexpected := [line for line in git("status", "--porcelain").splitlines()
-                           if "site/static/benchmarks/" not in line]) and not args.allow_dirty:
+        if (unexpected := tree_changes()) and not args.allow_dirty:
             print(f"unexpected changes during the run: {unexpected}", file=sys.stderr)
             return 1
         suffix = "" if args.tier == "full" else f"-{args.tier}"

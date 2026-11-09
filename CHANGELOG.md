@@ -26,8 +26,10 @@ All notable changes to nuvec are documented here. The format follows
 - nuvec-nn: `Conv1d`, `Conv2d`, `Conv3d`, `ConvTranspose1d`, `ConvTranspose2d`,
   `ConvTranspose3d`, `MaxPool1d`, `MaxPool2d`, `MaxPool3d`, `AvgPool1d`, `AvgPool2d` and
   `AvgPool3d`, as MLX's `nn` (initialisation, padding values, names).
-- The `conv` and `special` benchmarks against MLX's GPU (`scripts/bench_conv.py`,
-  `scripts/bench_special.py`).
+- The `conv` and `special` benchmarks against MLX's GPU (`just bench-conv`, `just bench-special`).
+- `just release X.Y.Z` (version, changelog, every gate, commit and tag) and
+  `just bench-parity --tier smoke` (two models, about 10 minutes): releases no longer wait
+  for the long benchmarks.
 - `nuvec::linalg`, MLX's `mx.linalg`: `qr`, `svd` (and `svd_values`), `eigh`, `eigvalsh`,
   `eig`, `eigvals`, `lu`, `lu_factor`, `cholesky`, `inv`, `tri_inv`, `cholesky_inv`, `pinv`,
   `solve`, `solve_triangular`, `det`, `slogdet`, `cross` and `norm`, in float32 and float64,
@@ -116,6 +118,8 @@ All notable changes to nuvec are documented here. The format follows
 
 ### Fixed
 
+- `just bench-parity --release` runs again after a release run: its own records no longer
+  count as uncommitted changes.
 - The `lora` example seeds the generator with `--seed` before drawing the adapters, as
   mlx-lm; its losses no longer change from run to run.
 - Text training rows end with the tokenizer's EOS (`tokenizer_config.json`), as mlx-lm's,

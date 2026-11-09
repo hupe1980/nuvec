@@ -224,6 +224,7 @@
         },
         "tier": {
           "enum": [
+            "smoke",
             "quick",
             "full"
           ]

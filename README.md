@@ -37,28 +37,12 @@ nuvec brings [MLX](https://github.com/ml-explore/mlx)'s programming model to Rus
 
 ## 📊 Performance
 
-nuvec-lm against mlx-lm 0.32.2 with the same token ids on an Apple M4 Pro (48 GB), measured on 2026-10-31 with nuvec 0.5.0 (`just bench-parity --tier full`). Decoding is greedy; ratios above 1 favour nuvec.
+nuvec-lm against mlx-lm 0.32.2 with the same token ids on an Apple M4 Pro (48 GB); above 1.00× favours nuvec.
 
-| Model | Kind | Decode (25 / 961 / 3,841-token prompt) | Time to first token (2K / 32K tokens) | 4 requests |
-|---|---|---:|---:|---:|
-| Qwen3-0.6B 4-bit | dense | 1.10× / 1.10× / 1.06× | 1.01× / 1.01× | 0.98× |
-| Llama 3.2 3B 4-bit | dense | 0.99× / 1.00× / 1.00× | 1.00× / 1.01× | 1.00× |
-| Llama 3.1 8B 4-bit | dense | 1.01× / 1.00× / 1.00× | 1.00× / 1.00× | 1.01× |
-| Qwen3-8B 4-bit | dense | 1.00× / 1.01× / 1.01× | 1.00× / 1.01× | 1.01× |
-| Qwen3.5-9B 4-bit | hybrid | 1.00× / 1.00× / 1.00× | 1.00× / 0.99× | 1.00× |
-| Qwen3.8-27B 4-bit | hybrid | 1.00× / 1.01× / 1.05× | 1.01× / 1.00× | 1.00× |
-| Qwen3-30B-A3B 4-bit | MoE | 1.00× / 1.00× / 1.00× | 0.99× / 1.00× | 0.98× |
-| Qwen3.6-35B-A3B 4-bit | hybrid MoE | 0.99× / 1.00× / 1.00× | 1.01× / 0.98× | 0.98× |
-| gpt-oss-20b MXFP4 | MoE, sliding window | 0.99× / 0.99× / 0.98× | 1.04× / 1.03× | 1.00× |
-| gpt-oss-20b 8-bit | MoE, sliding window | 1.01× / 1.01× / 1.00× | 1.02× / 1.02× | 1.08× |
-| Gemma 4 E4B 4-bit | dense, sliding window | 0.98× / 1.00× / 1.00× | 1.07× / 1.07× | 1.02× |
-| Gemma 4 26B-A4B 4-bit | MoE, sliding window | 1.01× / 1.01× / 1.01× | 1.06× / 1.08× | 0.99× |
+- **nuvec 0.8.0, quick tier** (2026-11-09; Qwen3-8B, Qwen3.5-9B, Qwen3-30B-A3B, gpt-oss-20b): decode 1.01×, time to first token 1.00× at 2K tokens, warm load 1.50×, 4 concurrent requests 1.02×, peak memory 1.01×. Qwen3.5-9B's multi-token-prediction head decodes 1.37× faster than mlx-lm's plain decode, with identical output.
+- **nuvec 0.5.0, full tier** (2026-10-31; 12 models from 0.6B to 35B): decode 1.01×, time to first token 1.02× at 2K and 32K tokens. At 261,952 tokens nuvec prefills Qwen3.6-35B-A3B in 20.4 minutes; mlx-lm runs out of GPU memory.
 
-- **Geometric means:** decode 1.01×, time to first token 1.02× at 2K and 32K tokens, peak memory 1.02× (nuvec uses slightly less), warm load to the first token 1.80×, 1 / 4 / 8 concurrent requests 1.01× / 1.00× / 1.00×.
-- **Longest contexts:** Qwen3.6-35B-A3B's first token at 64K tokens is 0.98×. At 261,952 tokens nuvec prefills it in 20.4 minutes; mlx-lm runs out of GPU memory on the same machine.
-- **Speculative decoding** with the model's multi-token-prediction head: Qwen3.8-27B 1.66× and Qwen3.5-9B 1.36× faster than plain decoding on natural text, with identical output.
-
-The full record (JSON) and method are on the [benchmarks](https://hupe1980.github.io/nuvec/docs/benchmarks/) page.
+Tables, records (JSON) and method: [benchmarks](https://hupe1980.github.io/nuvec/docs/benchmarks/).
 
 ## 🚀 Quick start
 
@@ -216,7 +200,7 @@ Building and testing need no Python: the MLX fixtures are checked in. With [uv](
 
 | Command | Compares |
 |---|---|
-| `just bench-parity` | nuvec-lm vs mlx-lm and the previous release, one model per architecture (about 45 minutes); `--tier full` for all models and long contexts (the table above) |
+| `just bench-parity` | nuvec-lm vs mlx-lm and the previous release: `--tier smoke` (two models, about 10 minutes), the quick tier (one model per architecture, about 45 minutes), `--tier full` (all models and long contexts, hours) |
 | `just bench-gemm` / `bench-quant` / `bench-fast` / `bench-conv` / `bench-special` | matrix products, quantized products, fused kernels, convolutions, Hadamard, einsum and the special products |
 | `just bench-compile`, `just bench-load`, `just mnist` | compiled functions, checkpoint loading, MNIST training |
 | `just fixtures`, `lm-fixtures`, `nn-fixtures`, `io-fixtures` | re-record the reference results |

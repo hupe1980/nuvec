@@ -162,8 +162,8 @@ spec-chi-square:
 test-large:
     cargo test --release -p nuvec-core --test large -- --ignored --nocapture
 
-# Parity record: nuvec-lm vs mlx-lm and vs the previous release (quick tier, ~45 min; exit 4
-# on a confirmed regression). `--tier full` for every roster model and long contexts.
+# Parity record: nuvec-lm vs mlx-lm and vs the previous release (exit 4 on a confirmed
+# regression). `--tier smoke` ~10 min, quick (default) ~45 min, `--tier full` hours.
 bench-parity *args:
     uv run scripts/bench_parity.py {{args}}
 
@@ -346,6 +346,27 @@ semver:
 api-check:
     cargo test -p nuvec --test api_surface
     just semver
+
+# A release: version bump, changelog section, every gate, then a commit and tag `vX.Y.Z`
+# (not pushed). Benchmarks are separate (RELEASING.md).
+release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v="{{version}}"; prev=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    [ -z "$(git status --porcelain)" ] || { echo "commit or stash your changes first"; exit 1; }
+    if [ "$prev" != "$v" ]; then
+        perl -pi -e "s/^version = \"\Q$prev\E\"/version = \"$v\"/; s/(path = \"crates\/nuvec[a-z-]*\", version = )\"\Q$prev\E\"/\${1}\"$v\"/" Cargo.toml
+        cargo update -w -q
+    fi
+    if ! grep -q "^## \[$v\]" CHANGELOG.md; then
+        perl -0pi -e "s/^## \[Unreleased\]\n/## [Unreleased]\n\n## [$v] - $(date +%F)\n/m; s|^\[Unreleased\]: (.*)v\Q$prev\E\.\.\.HEAD|[Unreleased]: \${1}v$v...HEAD\n[$v]: \${1}v$prev...v$v|m" CHANGELOG.md
+    fi
+    just ci
+    cargo publish --workspace --dry-run --locked --allow-dirty
+    just api-check
+    git commit -qam "release: $v"
+    git tag "v$v"
+    echo "tagged v$v; push with: git push origin main v$v"
 
 # ── Everything ────────────────────────────────────────────────────────────────
 
