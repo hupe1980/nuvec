@@ -1,0 +1,497 @@
+{
+ "repo": "mlx-community/DeepSeek-R1-0528-Qwen3-8B-4bit",
+ "special_tokens": {
+  "bos_token": "<｜begin▁of▁sentence｜>",
+  "eos_token": "<｜end▁of▁sentence｜>",
+  "pad_token": "<｜end▁of▁sentence｜>"
+ },
+ "templates": [
+  "default"
+ ],
+ "cases": [
+  {
+   "conversation": "user",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Hello, who are you?<｜Assistant｜>"
+  },
+  {
+   "conversation": "user",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Hello, who are you?<｜Assistant｜>"
+  },
+  {
+   "conversation": "user",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Hello, who are you?<｜Assistant｜>",
+   "ids": [
+    151643,
+    151669,
+    9707,
+    11,
+    879,
+    525,
+    498,
+    30,
+    151670
+   ]
+  },
+  {
+   "conversation": "user",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Hello, who are you?<｜Assistant｜>"
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜>You are a concise assistant.<｜User｜>Name three primes.<｜Assistant｜>"
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜>You are a concise assistant.<｜User｜>Name three primes.<｜Assistant｜>"
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜>You are a concise assistant.<｜User｜>Name three primes.<｜Assistant｜>",
+   "ids": [
+    151643,
+    2610,
+    525,
+    264,
+    63594,
+    17847,
+    13,
+    151669,
+    675,
+    2326,
+    49433,
+    13,
+    151670
+   ]
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜>You are a concise assistant.<｜User｜>Name three primes.<｜Assistant｜>"
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>What is 2 + 2?<｜Assistant｜>2 + 2 = 4.<｜end▁of▁sentence｜><｜User｜>  And times three?\n<｜Assistant｜>"
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>What is 2 + 2?<｜Assistant｜>2 + 2 = 4.<｜end▁of▁sentence｜><｜User｜>  And times three?\n<｜Assistant｜>"
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>What is 2 + 2?<｜Assistant｜>2 + 2 = 4.<｜end▁of▁sentence｜><｜User｜>  And times three?\n<｜Assistant｜>",
+   "ids": [
+    151643,
+    151669,
+    3838,
+    374,
+    220,
+    17,
+    488,
+    220,
+    17,
+    30,
+    151670,
+    17,
+    488,
+    220,
+    17,
+    284,
+    220,
+    19,
+    13,
+    151645,
+    151669,
+    220,
+    1597,
+    3039,
+    2326,
+    5267,
+    151670
+   ]
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>What is 2 + 2?<｜Assistant｜>2 + 2 = 4.<｜end▁of▁sentence｜><｜User｜>  And times three?\n<｜Assistant｜>"
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "can only concatenate str (not \"dict\") to str"
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "can only concatenate str (not \"dict\") to str"
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "can only concatenate str (not \"dict\") to str"
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "can only concatenate str (not \"dict\") to str"
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"location\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜><｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>sunny<｜tool▁output▁end｜><｜tool▁outputs▁end｜>"
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"location\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜><｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>sunny<｜tool▁output▁end｜><｜tool▁outputs▁end｜>"
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"location\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜><｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>sunny<｜tool▁output▁end｜><｜tool▁outputs▁end｜>",
+   "ids": [
+    151643,
+    151669,
+    28981,
+    304,
+    12095,
+    30,
+    151670,
+    27,
+    130957,
+    14172,
+    10417,
+    223,
+    44620,
+    10417,
+    223,
+    7265,
+    130957,
+    1784,
+    130957,
+    14172,
+    10417,
+    223,
+    6659,
+    10417,
+    223,
+    7265,
+    130957,
+    29,
+    1688,
+    27,
+    130957,
+    14172,
+    10417,
+    223,
+    28036,
+    130957,
+    29,
+    455,
+    69364,
+    198,
+    73594,
+    2236,
+    198,
+    4913,
+    2527,
+    788,
+    330,
+    59604,
+    16707,
+    73594,
+    27,
+    130957,
+    14172,
+    10417,
+    223,
+    6659,
+    10417,
+    223,
+    408,
+    130957,
+    1784,
+    130957,
+    14172,
+    10417,
+    223,
+    44620,
+    10417,
+    223,
+    408,
+    130957,
+    29,
+    151645,
+    27,
+    130957,
+    14172,
+    10417,
+    223,
+    41006,
+    10417,
+    223,
+    7265,
+    130957,
+    1784,
+    130957,
+    14172,
+    10417,
+    223,
+    3006,
+    10417,
+    223,
+    7265,
+    130957,
+    29,
+    82,
+    27297,
+    27,
+    130957,
+    14172,
+    10417,
+    223,
+    3006,
+    10417,
+    223,
+    408,
+    130957,
+    1784,
+    130957,
+    14172,
+    10417,
+    223,
+    41006,
+    10417,
+    223,
+    408,
+    130957,
+    29
+   ]
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Weather in Paris?<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"location\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜><｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>sunny<｜tool▁output▁end｜><｜tool▁outputs▁end｜>"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>What is 2 + 2?<｜Assistant｜>4<｜end▁of▁sentence｜><｜User｜>And 3 + 3?<｜Assistant｜>6<｜end▁of▁sentence｜>"
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>What is 2 + 2?<｜Assistant｜>4<｜end▁of▁sentence｜><｜User｜>And 3 + 3?<｜Assistant｜>6<｜end▁of▁sentence｜>"
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>What is 2 + 2?<｜Assistant｜>4<｜end▁of▁sentence｜><｜User｜>And 3 + 3?<｜Assistant｜>6<｜end▁of▁sentence｜><｜Assistant｜>",
+   "ids": [
+    151643,
+    151669,
+    3838,
+    374,
+    220,
+    17,
+    488,
+    220,
+    17,
+    30,
+    151670,
+    19,
+    151645,
+    151669,
+    3036,
+    220,
+    18,
+    488,
+    220,
+    18,
+    30,
+    151670,
+    21,
+    151645,
+    151670
+   ]
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>What is 2 + 2?<｜Assistant｜>4<｜end▁of▁sentence｜><｜User｜>And 3 + 3?<｜Assistant｜>6<｜end▁of▁sentence｜><｜Assistant｜>"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab<｜Assistant｜>"
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab<｜Assistant｜>"
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab<｜Assistant｜>",
+   "ids": [
+    151643,
+    151669,
+    6464,
+    2391,
+    23455,
+    11,
+    220,
+    99489,
+    11162,
+    234,
+    235,
+    366,
+    4578,
+    29,
+    609,
+    364,
+    15338,
+    6,
+    330,
+    4331,
+    1,
+    1124,
+    1182,
+    58149,
+    151670
+   ]
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab<｜Assistant｜>"
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜>"
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜>"
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜>",
+   "ids": [
+    151643,
+    151669,
+    13048,
+    151670
+   ]
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜>"
+  },
+  {
+   "conversation": "turns_prefill",
+   "continue_final_message": true,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>What is 2 + 2?<｜Assistant｜>2 + 2 = 4.<｜end▁of▁sentence｜><｜User｜>  And times three?\n<｜Assistant｜>Twelve"
+  },
+  {
+   "conversation": "turns",
+   "continue_final_message": true,
+   "add_generation_prompt": true,
+   "error": "continue_final_message and add_generation_prompt are not compatible. Use continue_final_message when you want the model to continue the final message, and add_generation_prompt when you want to add a "
+  }
+ ]
+}

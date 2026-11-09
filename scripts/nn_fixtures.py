@@ -81,8 +81,15 @@ q = rand(1, 2, 5, 12)
 put("rope", x=q, out=nn.RoPE(8)(q, offset=3), traditional=nn.RoPE(12, traditional=True)(q, offset=0))
 
 a = rand(4, 6) * 3
+alpha = mx.array([0.25, -0.5, 1.5, 0.0, 2.0, 0.1])
 put("activations", x=a, silu=nn.silu(a), gelu_approx=nn.gelu_approx(a),
-    gelu_fast_approx=nn.gelu_fast_approx(a), relu=nn.relu(a))
+    gelu_fast_approx=nn.gelu_fast_approx(a), relu=nn.relu(a), gelu=nn.gelu(a),
+    relu2=nn.relu2(a), relu6=nn.relu6(a), leaky_relu=nn.leaky_relu(a, 0.01),
+    log_softmax=nn.log_softmax(a, axis=-1), softmin=nn.softmin(a, axis=-1), elu=nn.elu(a, 1.0),
+    selu=nn.selu(a), celu=nn.celu(a, 1.3), softplus=nn.softplus(a), log_sigmoid=nn.log_sigmoid(a),
+    softsign=nn.softsign(a), softshrink=nn.softshrink(a, 0.5), hard_shrink=nn.hard_shrink(a, 0.5),
+    hard_tanh=nn.hard_tanh(a, -1.0, 1.0), hardswish=nn.hardswish(a), mish=nn.mish(a),
+    prelu=nn.prelu(a, alpha), alpha=alpha, glu=nn.glu(a, axis=-1), step=nn.step(a, 0.2))
 
 w, b, la, lb = rand(5, 6), rand(5), rand(6, 3), rand(3, 5)
 xl = rand(2, 6)
@@ -227,6 +234,41 @@ for mode in ("mxfp4", "mxfp8", "nvfp4"):
             rows=qe(ids), linear=qe.as_linear(x1))
         mx.eval(out)
 
+# ── Convolution and pooling layers ─────────────────────────────────────────
+
+# Their own generator, so the cases above keep their draws.
+conv_rng = np.random.default_rng(20261108)
+
+
+def c_rand(*shape: int) -> mx.array:
+    return mx.array(conv_rng.normal(size=shape).astype(np.float32))
+
+
+mx.random.seed(3)
+put("init_conv", conv2d=nn.Conv2d(3, 4, (3, 2)).weight, conv1d_groups=nn.Conv1d(4, 6, 3, groups=2).weight,
+    conv3d=nn.Conv3d(2, 3, 2).weight, conv_transpose2d=nn.ConvTranspose2d(3, 5, 3).weight)
+
+
+def layer_case(name, layer, x):
+    layer.weight = c_rand(*layer.weight.shape)
+    layer.bias = c_rand(*layer.bias.shape)
+    put(name, x=x, weight=layer.weight, bias=layer.bias, out=layer(x))
+
+
+layer_case("conv1d_layer", nn.Conv1d(4, 6, 3, stride=1, padding=1, dilation=2, groups=2), c_rand(2, 9, 4))
+layer_case("conv2d_layer", nn.Conv2d(3, 4, 3, stride=2, padding=1), c_rand(2, 7, 7, 3))
+layer_case("conv3d_layer", nn.Conv3d(2, 3, 2, stride=1, padding=1), c_rand(1, 3, 4, 4, 2))
+layer_case("conv_transpose1d_layer", nn.ConvTranspose1d(3, 2, 3, stride=2, padding=1, output_padding=1), c_rand(2, 5, 3))
+layer_case("conv_transpose2d_layer", nn.ConvTranspose2d(3, 4, 3, stride=2, padding=1), c_rand(1, 4, 5, 3))
+layer_case("conv_transpose3d_layer", nn.ConvTranspose3d(2, 2, 2, stride=2), c_rand(1, 2, 3, 2, 2))
+
+xp1, xp2, xp3 = c_rand(2, 9, 3), c_rand(2, 7, 8, 3), c_rand(1, 4, 5, 6, 2)
+put("pool", x1=xp1, x2=xp2, x3=xp3,
+    max1d=nn.MaxPool1d(2)(xp1), avg1d=nn.AvgPool1d(3, stride=1)(xp1),
+    max2d=nn.MaxPool2d(3, stride=2, padding=1)(xp2), avg2d_tiled=nn.AvgPool2d(2)(xp2[:, :6]),
+    avg2d_padded=nn.AvgPool2d(3, stride=2, padding=1)(xp2), max3d=nn.MaxPool3d(2)(xp3),
+    avg3d=nn.AvgPool3d((2, 1, 2), stride=(1, 1, 2), padding=(1, 0, 0))(xp3))
+
 mx.eval(out)
 OUT.parent.mkdir(parents=True, exist_ok=True)
 mx.save_safetensors(str(OUT), out)
@@ -278,6 +320,10 @@ NAMES = {
     "QuantizedEmbedding": names(nn.QuantizedEmbedding.from_embedding(nn.Embedding(10, 64))),
     "QuantizedLinear_mxfp4": names(nn.QuantizedLinear.from_linear(nn.Linear(64, 8), mode="mxfp4")),
     "QuantizedEmbedding_nvfp4": names(nn.QuantizedEmbedding.from_embedding(nn.Embedding(10, 64), mode="nvfp4")),
+    "Conv2d": names(nn.Conv2d(3, 4, 3)),
+    "Conv2d_no_bias": names(nn.Conv2d(3, 4, 3, bias=False)),
+    "ConvTranspose1d": names(nn.ConvTranspose1d(3, 4, 3)),
+    "MaxPool2d": names(nn.MaxPool2d(2)),
     "RMSNorm": names(nn.RMSNorm(8)),
     "LayerNorm": names(nn.LayerNorm(8)),
     "LayerNorm_no_bias": names(nn.LayerNorm(8, bias=False)),

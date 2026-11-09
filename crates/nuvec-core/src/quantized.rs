@@ -444,6 +444,20 @@ pub(crate) fn quantized_matmul(
     transpose: bool,
     quant: Quant,
 ) -> Result<Array> {
+    quantized_product(x, w, scales, biases, transpose, quant, false)
+}
+
+/// [`quantized_matmul`], with `rows` taking MLX's matrix-vector kernels for any number
+/// of rows (MLX's `dispatch_qmv`, as its `qqmm` does).
+pub(crate) fn quantized_product(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    transpose: bool,
+    quant: Quant,
+    rows: bool,
+) -> Result<Array> {
     quant.checked("quantized_matmul")?;
     check_groups("quantized_matmul", quant.mode, scales, biases)?;
     let dtype = match biases {
@@ -479,7 +493,11 @@ pub(crate) fn quantized_matmul(
     }
     let mut inputs = vec![x];
     inputs.extend(groups);
-    let primitive = Primitive::QuantizedMatmul { quant, transpose };
+    let primitive = Primitive::QuantizedMatmul {
+        quant,
+        transpose,
+        rows,
+    };
     let out = Array::from_op(primitive, inputs)?.swap_remove(0);
     if vector {
         squeeze(&out, &[-2])

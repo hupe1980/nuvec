@@ -108,6 +108,31 @@ fn layers_equal_mlx() {
     close(&gelu_approx(&a), "activations.gelu_approx", 1e-6);
     close(&gelu_fast_approx(&a), "activations.gelu_fast_approx", 1e-6);
     close(&relu(&a), "activations.relu", 0.0);
+    use nuvec_nn as nn;
+    close(&nn::gelu(&a), "activations.gelu", 1e-6);
+    close(&nn::relu2(&a), "activations.relu2", 0.0);
+    close(&nn::relu6(&a), "activations.relu6", 0.0);
+    close(&nn::leaky_relu(&a, 0.01), "activations.leaky_relu", 0.0);
+    close(&nn::log_softmax(&a, -1), "activations.log_softmax", 1e-6);
+    close(&nn::softmin(&a, -1), "activations.softmin", 1e-6);
+    close(&nn::elu(&a, 1.0), "activations.elu", 1e-6);
+    close(&nn::selu(&a), "activations.selu", 1e-6);
+    close(&nn::celu(&a, 1.3), "activations.celu", 1e-6);
+    close(&nn::softplus(&a), "activations.softplus", 1e-6);
+    close(&nn::log_sigmoid(&a), "activations.log_sigmoid", 1e-6);
+    close(&nn::softsign(&a), "activations.softsign", 1e-6);
+    close(&nn::softshrink(&a, 0.5), "activations.softshrink", 0.0);
+    close(&nn::hard_shrink(&a, 0.5), "activations.hard_shrink", 0.0);
+    close(&nn::hard_tanh(&a, -1.0, 1.0), "activations.hard_tanh", 0.0);
+    close(&nn::hardswish(&a), "activations.hardswish", 1e-6);
+    close(&nn::mish(&a), "activations.mish", 1e-6);
+    close(
+        &nn::prelu(&a, &get("activations.alpha")),
+        "activations.prelu",
+        1e-6,
+    );
+    close(&nn::glu(&a, -1), "activations.glu", 1e-6);
+    close(&nn::step(&a, 0.2), "activations.step", 0.0);
 
     let mut lora = LoraLinear::from_base(
         Linear {
@@ -762,4 +787,104 @@ fn fp_quantized_layers_equal_mlx() {
         )),
         fixture_names("QuantizedEmbedding_nvfp4")
     );
+}
+
+/// The convolution and pooling layers equal `mlx.nn`'s: seeded initialisation bit for bit,
+/// forward values with MLX's weights, and parameter names.
+#[test]
+fn convolution_and_pooling_layers_equal_mlx() {
+    use nuvec_nn::{
+        AvgPool1d, AvgPool2d, AvgPool3d, Conv1d, Conv2d, Conv3d, ConvTranspose1d, ConvTranspose2d,
+        ConvTranspose3d, MaxPool1d, MaxPool2d, MaxPool3d,
+    };
+    random::seed(3);
+    let bits = |a: &Array, name: &str| assert_eq!(f32s(a), f32s(&get(name)), "{name}: bit for bit");
+    bits(&Conv2d::new(3, 4, [3, 2]).weight, "init_conv.conv2d");
+    bits(
+        &Conv1d::grouped(4, 6, 3, 2).weight,
+        "init_conv.conv1d_groups",
+    );
+    bits(&Conv3d::new(2, 3, 2).weight, "init_conv.conv3d");
+    bits(
+        &ConvTranspose2d::new(3, 5, 3).weight,
+        "init_conv.conv_transpose2d",
+    );
+
+    let set = |weight: &mut Param, bias: &mut Option<Param>, name: &str| {
+        *weight = Param::new(get(&format!("{name}.weight")));
+        *bias = Some(Param::new(get(&format!("{name}.bias"))));
+    };
+    let x = |name: &str| get(&format!("{name}.x"));
+    let mut l = Conv1d::grouped(4, 6, 3, 2).padding(1).dilation(2);
+    set(&mut l.weight, &mut l.bias, "conv1d_layer");
+    close(&l.forward(&x("conv1d_layer")), "conv1d_layer.out", 1e-5);
+    let mut l = Conv2d::new(3, 4, 3).stride(2).padding(1);
+    set(&mut l.weight, &mut l.bias, "conv2d_layer");
+    close(&l.forward(&x("conv2d_layer")), "conv2d_layer.out", 1e-5);
+    let mut l = Conv3d::new(2, 3, 2).padding(1);
+    set(&mut l.weight, &mut l.bias, "conv3d_layer");
+    close(&l.forward(&x("conv3d_layer")), "conv3d_layer.out", 1e-5);
+    let mut l = ConvTranspose1d::new(3, 2, 3)
+        .stride(2)
+        .padding(1)
+        .output_padding(1);
+    set(&mut l.weight, &mut l.bias, "conv_transpose1d_layer");
+    close(
+        &l.forward(&x("conv_transpose1d_layer")),
+        "conv_transpose1d_layer.out",
+        1e-5,
+    );
+    let mut l = ConvTranspose2d::new(3, 4, 3).stride(2).padding(1);
+    set(&mut l.weight, &mut l.bias, "conv_transpose2d_layer");
+    close(
+        &l.forward(&x("conv_transpose2d_layer")),
+        "conv_transpose2d_layer.out",
+        1e-5,
+    );
+    let mut l = ConvTranspose3d::new(2, 2, 2).stride(2);
+    set(&mut l.weight, &mut l.bias, "conv_transpose3d_layer");
+    close(
+        &l.forward(&x("conv_transpose3d_layer")),
+        "conv_transpose3d_layer.out",
+        1e-5,
+    );
+
+    let (x1, x2, x3) = (get("pool.x1"), get("pool.x2"), get("pool.x3"));
+    close(&MaxPool1d::new(2).forward(&x1), "pool.max1d", 0.0);
+    close(
+        &AvgPool1d::new(3).stride(1).forward(&x1),
+        "pool.avg1d",
+        1e-6,
+    );
+    close(
+        &MaxPool2d::new(3).stride(2).padding(1).forward(&x2),
+        "pool.max2d",
+        0.0,
+    );
+    close(
+        &AvgPool2d::new(2).forward(&x2.i((.., 0..6))),
+        "pool.avg2d_tiled",
+        1e-6,
+    );
+    close(
+        &AvgPool2d::new(3).stride(2).padding(1).forward(&x2),
+        "pool.avg2d_padded",
+        1e-6,
+    );
+    close(&MaxPool3d::new(2).forward(&x3), "pool.max3d", 0.0);
+    let avg3 = AvgPool3d::new([2, 1, 2])
+        .stride([1, 1, 2])
+        .padding([1, 0, 0]);
+    close(&avg3.forward(&x3), "pool.avg3d", 1e-6);
+
+    assert_eq!(names(&Conv2d::new(3, 4, 3)), fixture_names("Conv2d"));
+    assert_eq!(
+        names(&Conv2d::new(3, 4, 3).without_bias()),
+        fixture_names("Conv2d_no_bias")
+    );
+    assert_eq!(
+        names(&ConvTranspose1d::new(3, 4, 3)),
+        fixture_names("ConvTranspose1d")
+    );
+    assert_eq!(names(&MaxPool2d::new(2)), fixture_names("MaxPool2d"));
 }

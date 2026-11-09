@@ -35,7 +35,7 @@ impl F32Mode {
 }
 
 /// Tile sizes `(BM, BN, BK)` for a GEMM of `m × n` with elements of `dtype` on compute
-/// capability `cc` (constitution II: dispatch heuristics ship with the kernel), or
+/// capability `cc` (dispatch heuristics ship with the kernel), or
 /// `NUVEC_CUDA_GEMM_TILES=bm,bn,bk` for measurements.
 pub fn gemm_tiles(dtype: DType, m: usize, n: usize, _cc: (u32, u32)) -> (usize, usize, usize) {
     if let Ok(v) = std::env::var("NUVEC_CUDA_GEMM_TILES") {

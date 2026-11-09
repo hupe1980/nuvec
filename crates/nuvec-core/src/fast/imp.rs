@@ -7,8 +7,8 @@ use crate::kernels::Operand;
 use crate::ops::imp::zeros;
 use crate::ops::imp::{
     self as ops, add, arange, astype, broadcast_to, cos, divide, equal, exp, expand_dims, filled,
-    less, log, max, mean, multiply, reshape, sin, slice, sqrt, squeeze, stop_gradient, subtract,
-    sum, where_,
+    less, log, max, mean, multiply, reshape, sin, slice, squeeze, stop_gradient, subtract, sum,
+    where_,
 };
 use crate::primitive::Primitive;
 
@@ -100,14 +100,31 @@ pub enum FastOp {
         /// `[B, L]` (int32; out-of-range slots skipped). Implies `cache`.
         paged: bool,
     },
-    /// `(x, w)`: [`conv1d`](crate::Array::conv1d) with `groups` equal to the channels (depthwise).
-    DepthwiseConv1d {
-        /// Positions between outputs.
-        stride: usize,
-        /// Zeros before and after the input.
-        padding: usize,
-        /// Positions between taps.
-        dilation: usize,
+    /// `(a, b, segments)`: [`segmented_mm`](crate::ops::segmented_mm), `a [M, K]` and `b [K, N]`
+    /// of one dtype, `segments [..., 2]` uint32.
+    SegmentedMm,
+    /// `(x)`: [`hadamard_transform`](crate::ops::hadamard_transform) over the last axis.
+    Hadamard {
+        /// `f32::to_bits` of the scale.
+        scale: u32,
+    },
+    /// `(x, w)`: [`conv_general`](crate::ops::conv_general), `x` `[N, spatial…, C_in]` and `w`
+    /// `[C_out, kernel…, C_in / groups]` of one dtype, one to three spatial axes.
+    Conv {
+        /// Positions between outputs, per spatial axis.
+        stride: Vec<usize>,
+        /// Zeros before the (dilated) input, per axis; negative amounts crop.
+        pad_lo: Vec<isize>,
+        /// Zeros after the (dilated) input, per axis; negative amounts crop.
+        pad_hi: Vec<isize>,
+        /// Positions between taps, per axis.
+        kernel_dilation: Vec<usize>,
+        /// Positions between input elements (zeros between them), per axis.
+        input_dilation: Vec<usize>,
+        /// Channel groups.
+        groups: usize,
+        /// Whether the kernel is reversed (a convolution, not a correlation).
+        flip: bool,
     },
     /// `(q, k_cache, v_cache, block_tables, lengths[, sinks])`:
     /// [`paged_attention`](crate::fast::paged_attention).
@@ -554,7 +571,7 @@ fn last(x: &Array, start: usize, step: isize, len: usize) -> Result<Array> {
 
 /// `1 / sqrt(x)`.
 fn rsqrt(x: &Array) -> Result<Array> {
-    divide(1.0, sqrt(x)?)
+    crate::ops::imp::rsqrt(x)
 }
 
 /// `softmax` over the last axis from ordinary operations, in float32 for half types
@@ -614,6 +631,30 @@ fn wrap(y: &Array, classes: usize) -> Result<Array> {
 }
 
 impl FastOp {
+    /// A [`FastOp::Conv`]'s parameters.
+    fn conv(&self) -> Option<crate::conv::Conv> {
+        match self {
+            Self::Conv {
+                stride,
+                pad_lo,
+                pad_hi,
+                kernel_dilation,
+                input_dilation,
+                groups,
+                flip,
+            } => Some(crate::conv::Conv {
+                stride: stride.clone(),
+                pad_lo: pad_lo.clone(),
+                pad_hi: pad_hi.clone(),
+                kernel_dilation: kernel_dilation.clone(),
+                input_dilation: input_dilation.clone(),
+                groups: *groups,
+                flip: *flip,
+            }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::RmsNorm { .. } => "rms_norm",
@@ -624,7 +665,9 @@ impl FastOp {
             Self::LayerNormVjp { .. } => "layer_norm_vjp",
             Self::Rope { .. } => "rope",
             Self::NormRope { .. } => "norm_rope",
-            Self::DepthwiseConv1d { .. } => "conv1d",
+            Self::Conv { .. } => "conv",
+            Self::Hadamard { .. } => "hadamard_transform",
+            Self::SegmentedMm => "segmented_mm",
             Self::PagedAttention { .. } => "paged_attention",
             Self::PagedWrite => "paged_write",
             Self::MoeRoute { .. } => "moe_route",
@@ -649,12 +692,14 @@ impl FastOp {
             Self::Softmax
             | Self::CausalSoftmax { .. }
             | Self::LogSumExp
+            | Self::Hadamard { .. }
             | Self::MoeRoute { .. } => 1,
             Self::WeightedSum => 2,
             Self::ResidualRmsNorm { scaled, next, .. } => {
                 3 + usize::from(*scaled) + usize::from(next.is_some())
             }
-            Self::RmsNorm { .. } | Self::CrossEntropy | Self::DepthwiseConv1d { .. } => 2,
+            Self::RmsNorm { .. } | Self::CrossEntropy | Self::Conv { .. } => 2,
+            Self::SegmentedMm => 3,
             Self::PagedAttention { sinks, .. } => 5 + usize::from(*sinks),
             Self::PagedWrite => 3,
             Self::ConvSlots { .. } => 4,
@@ -725,14 +770,19 @@ impl FastOp {
                 vec![(x.dtype(), shape)]
             }
             Self::ConvSlots { .. } => vec![like(x), like(&inputs[2])],
-            Self::DepthwiseConv1d {
-                stride,
-                padding,
-                dilation,
-            } => {
-                let (l, k) = (x.dims()[1], inputs[1].dims()[1]);
-                let l_out = (l + 2 * padding - dilation * (k - 1) - 1) / stride + 1;
-                vec![(x.dtype(), vec![x.dims()[0], l_out, x.dims()[2]])]
+            Self::Hadamard { .. } => vec![like(x)],
+            Self::SegmentedMm => {
+                let s = inputs[2].dims();
+                let mut shape = s[..s.len() - 1].to_vec();
+                shape.extend([x.dims()[0], inputs[1].dims()[1]]);
+                vec![(x.dtype(), shape)]
+            }
+            Self::Conv { .. } => {
+                let conv = self.conv().expect("a convolution");
+                let mut shape = vec![x.dims()[0]];
+                shape.extend(crate::conv::out_dims(x.dims(), inputs[1].dims(), &conv));
+                shape.push(inputs[1].dims()[0]);
+                vec![(x.dtype(), shape)]
             }
             Self::RmsNormVjp { .. } => vec![like(x), like(&inputs[1])],
             Self::LayerNormVjp { .. } => vec![like(x), like(&inputs[1]), like(&inputs[2])],
@@ -894,28 +944,45 @@ impl FastOp {
                     && weight()
                     && rotation(*dims, y, inputs.get(at + 2 + usize::from(*positions)))
             }
-            Self::DepthwiseConv1d {
-                stride,
-                padding,
-                dilation,
-            } => {
+            Self::Hadamard { .. } => {
+                crate::hadamard::decompose(last(x)).is_ok() && x.size() <= u32::MAX as usize
+            }
+            Self::SegmentedMm => {
+                let (b, s) = (&inputs[1], &inputs[2]);
+                x.ndim() == 2
+                    && b.ndim() == 2
+                    && b.dtype() == x.dtype()
+                    && x.dims()[1] == b.dims()[0]
+                    && s.dtype() == DType::U32
+                    && s.dims().last() == Some(&2)
+                    && x.size().max(b.size()) <= i32::MAX as usize
+                    && (s.size() / 2).saturating_mul(x.dims()[0] * b.dims()[1]) <= i32::MAX as usize
+            }
+            Self::Conv { .. } => {
                 let w = &inputs[1];
-                let span = w
-                    .dims()
-                    .get(1)
-                    .and_then(|&k| k.checked_sub(1))
-                    .and_then(|k| dilation.checked_mul(k)?.checked_add(1));
-                let padded = padding
-                    .checked_mul(2)
-                    .and_then(|p| p.checked_add(x.dims().get(1).copied()?));
-                x.ndim() == 3
-                    && w.ndim() == 3
+                let conv = self.conv().expect("a convolution");
+                let d = conv.stride.len();
+                let fits = |v: usize| i32::try_from(v).is_ok();
+                (1..=3).contains(&d)
                     && w.dtype() == x.dtype()
-                    && w.dims()[0] == x.dims()[2]
-                    && w.dims()[2] == 1
-                    && *stride > 0
-                    && *dilation > 0
-                    && matches!((span, padded), (Some(s), Some(p)) if p >= s)
+                    && x.size() <= i32::MAX as usize
+                    && w.size() <= i32::MAX as usize
+                    && conv
+                        .stride
+                        .iter()
+                        .chain(&conv.kernel_dilation)
+                        .all(|&v| fits(v))
+                    && conv
+                        .pad_lo
+                        .iter()
+                        .chain(&conv.pad_hi)
+                        .all(|&v| i32::try_from(v).is_ok())
+                    && crate::conv::valid(x, w, &conv)
+                    && crate::conv::out_dims(x.dims(), w.dims(), &conv)
+                        .iter()
+                        .chain([&x.dims()[0], &w.dims()[0]])
+                        .try_fold(1usize, |p, &v| p.checked_mul(v))
+                        .is_some_and(fits)
             }
             Self::PagedAttention { sinks, .. } => {
                 let [q, k, v, tables, lengths] = &inputs[..5] else {
@@ -1115,6 +1182,7 @@ impl FastOp {
                         let product = crate::primitive::Primitive::QuantizedMatmul {
                             quant: *quant,
                             transpose: *transpose,
+                            rows: false,
                         };
                         let columns = product.quantized_columns(w, &inputs[2..], *quant)?;
                         // Affine kernels take transposed weights (`x · wᵀ`) and the scales'
@@ -1358,18 +1426,14 @@ impl FastOp {
                     false => r,
                 }]
             }
-            Self::DepthwiseConv1d {
-                stride,
-                padding,
-                dilation,
-            } => {
-                let c = x.dims()[2];
-                vec![crate::conv::general(
-                    x,
-                    &inputs[1],
-                    (*stride, *padding, *dilation, c),
-                )?]
+            Self::Conv { .. } => {
+                let conv = self.conv().expect("a convolution");
+                vec![crate::conv::compose(x, &inputs[1], &conv)?]
             }
+            Self::Hadamard { scale } => vec![crate::hadamard::compose(x, f32::from_bits(*scale))?],
+            Self::SegmentedMm => vec![crate::products::segmented_compose(
+                x, &inputs[1], &inputs[2],
+            )?],
             Self::PagedAttention { scale, window, .. } => {
                 vec![paged_attention_graph(inputs, float(*scale), *window)?]
             }
@@ -1567,7 +1631,9 @@ impl FastOp {
             | Self::MoeRoute { .. }
             | Self::WeightedSum
             | Self::ConvSlots { .. }
-            | Self::DepthwiseConv1d { .. }
+            | Self::Conv { .. }
+            | Self::Hadamard { .. }
+            | Self::SegmentedMm
             | Self::RmsNormVjp { .. }
             | Self::LayerNormVjp { .. }
             | Self::CrossEntropyVjp

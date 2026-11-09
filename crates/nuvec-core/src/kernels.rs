@@ -501,7 +501,8 @@ pub(crate) fn unary(op: UnaryOp, a: Operand<'_>) -> Result<Buffer> {
             UnaryOp::Tanh => go!(|x: T| x.float_(UnaryOp::Tanh)),
             UnaryOp::Sigmoid => go!(|x: T| x.float_(UnaryOp::Sigmoid)),
             UnaryOp::Conjugate => go!(T::conj_),
-            UnaryOp::ErfInv => go!(|x: T| x.float_(UnaryOp::ErfInv)),
+            UnaryOp::BitwiseInvert => go!(T::bitnot_),
+            op => go!(|x: T| x.float_(op)),
         }
         Ok(out)
     })
@@ -542,6 +543,9 @@ pub(crate) fn binary(op: BinaryOp, a: Operand<'_>, b: Operand<'_>) -> Result<Buf
                 BinaryOp::LogAddExp => go!(T::logaddexp_),
                 BinaryOp::FloorDivide => go!(T::floordiv_),
                 BinaryOp::Power => go!(T::pow_),
+                BinaryOp::Remainder => go!(T::rem_),
+                BinaryOp::ArcTan2 => go!(T::atan2_),
+                op if op.is_bitwise() => go!(|x: T, y: T| x.bits_(op, y)),
                 _ => go!(T::min_),
             }
             Ok(out)
@@ -1138,6 +1142,18 @@ trait Num: Scalar {
     fn pow_(self, _: Self) -> Self {
         unreachable!("power of bool or complex: {REJECTED}")
     }
+    fn rem_(self, _: Self) -> Self {
+        unreachable!("remainder of bool or complex: {REJECTED}")
+    }
+    fn atan2_(self, _: Self) -> Self {
+        unreachable!("arctan2 of a non-float type: {REJECTED}")
+    }
+    fn bits_(self, _: BinaryOp, _: Self) -> Self {
+        unreachable!("bitwise operation of a float or complex type: {REJECTED}")
+    }
+    fn bitnot_(self) -> Self {
+        unreachable!("bitwise_invert of a float or complex type: {REJECTED}")
+    }
 }
 
 const REJECTED: &str = "rejected by the ops layer";
@@ -1178,6 +1194,18 @@ impl Num for B8 {
     }
     fn float_(self, _: UnaryOp) -> Self {
         unreachable!("bool transcendental: {REJECTED}")
+    }
+    fn bits_(self, op: BinaryOp, o: Self) -> Self {
+        // Shifts of booleans run as uint8 (the ops layer promotes them).
+        match op {
+            BinaryOp::BitwiseAnd => B8(self.0 & o.0),
+            BinaryOp::BitwiseOr => B8(self.0 | o.0),
+            _ => B8(self.0 ^ o.0),
+        }
+    }
+    fn bitnot_(self) -> Self {
+        // MLX's `bitwise_invert` of a boolean is its negation.
+        B8(self.0 ^ 1)
     }
 }
 
@@ -1220,6 +1248,29 @@ macro_rules! int_num {
                 let negative = |v: Self| (v as i128) < 0;
                 if self.wrapping_rem(o) != 0 && negative(self) != negative(o) { q - 1 } else { q }
             }
+            fn rem_(self, o: Self) -> Self {
+                // MLX's Remainder: the remainder takes the divisor's sign.
+                if o == 0 {
+                    return 0;
+                }
+                let r = self.wrapping_rem(o);
+                let negative = |v: Self| (v as i128) < 0;
+                if r != 0 && negative(r) != negative(o) { r.wrapping_add(o) } else { r }
+            }
+            fn bits_(self, op: BinaryOp, o: Self) -> Self {
+                match op {
+                    BinaryOp::BitwiseAnd => self & o,
+                    BinaryOp::BitwiseOr => self | o,
+                    BinaryOp::BitwiseXor => self ^ o,
+                    // C++'s shifts (MLX): types narrower than `int` are promoted first;
+                    // the shift is taken modulo the (promoted) width.
+                    BinaryOp::LeftShift if Self::BITS < 32 => ((self as i32) << (o as u32 & 31)) as Self,
+                    BinaryOp::RightShift if Self::BITS < 32 => ((self as i32) >> (o as u32 & 31)) as Self,
+                    BinaryOp::LeftShift => self.wrapping_shl(o as u32),
+                    _ => self.wrapping_shr(o as u32),
+                }
+            }
+            fn bitnot_(self) -> Self { !self }
         }
     )*};
 }
@@ -1243,6 +1294,12 @@ macro_rules! float_num {
             fn is_nan_(self) -> bool { self.is_nan() }
             fn floordiv_(self, o: Self) -> Self { (self / o).floor() }
             fn pow_(self, o: Self) -> Self { self.powf(o) }
+            fn rem_(self, o: Self) -> Self {
+                // MLX's Remainder: `fmod`, then the divisor's sign.
+                let r = self % o;
+                if r != 0.0 && (r < 0.0) != (o < 0.0) { r + o } else { r }
+            }
+            fn atan2_(self, o: Self) -> Self { self.atan2(o) }
             fn logaddexp_(self, o: Self) -> Self {
                 if self.is_nan() || o.is_nan() {
                     return <$t>::NAN;
@@ -1263,9 +1320,29 @@ macro_rules! float_num {
                     UnaryOp::Cos => self.cos(),
                     UnaryOp::Tanh => self.tanh(),
                     UnaryOp::Sigmoid => sigmoid(self),
-                    // MLX computes erfinv in float32 for every float type.
+                    // MLX computes erfinv and erf in float32 for every float type.
                     UnaryOp::ErfInv => erfinv(self as f32) as $t,
-                    UnaryOp::Negative | UnaryOp::Abs | UnaryOp::Conjugate => unreachable!("not transcendental"),
+                    UnaryOp::Erf => erf(self as f32) as $t,
+                    UnaryOp::Expm1 => self.exp_m1(),
+                    UnaryOp::Log1p => self.ln_1p(),
+                    UnaryOp::Log2 => self.log2(),
+                    UnaryOp::Log10 => self.log10(),
+                    UnaryOp::Tan => self.tan(),
+                    UnaryOp::Sinh => self.sinh(),
+                    UnaryOp::Cosh => self.cosh(),
+                    UnaryOp::ArcCos => self.acos(),
+                    UnaryOp::ArcCosh => self.acosh(),
+                    UnaryOp::ArcSin => self.asin(),
+                    UnaryOp::ArcSinh => self.asinh(),
+                    UnaryOp::ArcTan => self.atan(),
+                    UnaryOp::ArcTanh => self.atanh(),
+                    UnaryOp::Rsqrt => 1.0 / self.sqrt(),
+                    UnaryOp::Floor => self.floor(),
+                    UnaryOp::Ceil => self.ceil(),
+                    UnaryOp::Round => self.round_ties_even(),
+                    UnaryOp::Negative | UnaryOp::Abs | UnaryOp::Conjugate | UnaryOp::BitwiseInvert => {
+                        unreachable!("not transcendental")
+                    }
                 }
             }
         }
@@ -1312,6 +1389,74 @@ pub(crate) fn erfinv(a: f32) -> f32 {
 }
 
 /// Numerically stable logistic function.
+/// The error function: Norbert Juffa's faithfully rounded approximation (MLX's Metal
+/// `erf.h`), with the same fused multiply-adds and [`expm1f`], on the CPU too.
+pub(crate) fn erf(a: f32) -> f32 {
+    let t = a.abs();
+    let s = a * a;
+    if t > 0.927_734_4 {
+        let mut r = (-1.728_534_7e-5f32).mul_add(t, 3.831_971_3e-4);
+        let u = (-3.883_964_4e-3f32).mul_add(t, 2.425_462_2e-2);
+        r = r.mul_add(s, u);
+        r = r.mul_add(t, -1.067_778_8e-1);
+        r = r.mul_add(t, -6.348_467e-1);
+        r = r.mul_add(t, -1.287_175_1e-1);
+        r = r.mul_add(t, -t);
+        (-expm1f(r)).copysign(a)
+    } else {
+        let mut r = -5.967_617e-4f32;
+        r = r.mul_add(s, 4.991_194_2e-3);
+        r = r.mul_add(s, -2.676_813_5e-2);
+        r = r.mul_add(s, 1.128_199_3e-1);
+        r = r.mul_add(s, -3.761_253_4e-1);
+        r = r.mul_add(s, 1.283_791_7e-1);
+        r.mul_add(a, a)
+    }
+}
+
+/// `e^a − 1`: Norbert Juffa's `expm1f`, used by [`erf`]: MLX's Metal `expm1f.h` with the
+/// original's two-step reduction by ln 2, which MLX's drops.
+pub(crate) fn expm1f(a: f32) -> f32 {
+    // exp(a) = 2^i · exp(f), i = rint(a / ln 2)
+    // Juffa's 1.442695f is log2(e) in float32.
+    let mut j = std::f32::consts::LOG2_E.mul_add(a, 12_582_912.0);
+    j -= 12_582_912.0;
+    let i = j as i32;
+    let f = j.mul_add(-6.931_457_5e-1, a);
+    let f = j.mul_add(-1.428_606_8e-6, f);
+    // r = exp(f) − 1 on [−ln 2 / 2, ln 2 / 2]
+    let mut s = f * f;
+    if a == 0.0 {
+        s = a; // −0 passes through
+    }
+    let mut r = 1.973_509_8e-4f32;
+    r = r.mul_add(f, 1.393_090_7e-3);
+    r = r.mul_add(f, 8.333_44e-3);
+    r = r.mul_add(f, 4.166_680_2e-2);
+    r = r.mul_add(f, 1.666_667_2e-1);
+    r = r.mul_add(f, 4.999_999_7e-1);
+    let u = if j == 1.0 { f + 0.5 } else { f };
+    let v = r.mul_add(s, u);
+    let s = 0.5f32;
+    // `ldexp(0.5, i)`, in two steps so that neither factor overflows early.
+    let t = s * 2f32.powi(i / 2) * 2f32.powi(i - i / 2);
+    let y = t - s;
+    let x = (t - y) - s;
+    let mut r = v.mul_add(t, x) + y;
+    r += r;
+    if j == 0.0 {
+        r = v;
+    }
+    if j == 1.0 {
+        r = v + v;
+    }
+    if (a - 1.0).abs() > 88.0 {
+        let p = 2f32.powf(a);
+        r = p.mul_add(p, -1.0);
+    }
+    r
+}
+
 pub(crate) fn sigmoid<T: num_like::Float>(x: T) -> T {
     if x >= T::ZERO {
         T::ONE / (T::ONE + (-x).exp())
@@ -1370,6 +1515,8 @@ macro_rules! half_num {
             // The floor of the rounded quotient (MLX's kernel: `floor(x / y)` in the type).
             fn floordiv_(self, o: Self) -> Self { <$t>::from_f32(self.div_(o).to_f32().floor()) }
             fn pow_(self, o: Self) -> Self { <$t>::from_f32(self.to_f32().powf(o.to_f32())) }
+            fn rem_(self, o: Self) -> Self { <$t>::from_f32(self.to_f32().rem_(o.to_f32())) }
+            fn atan2_(self, o: Self) -> Self { <$t>::from_f32(self.to_f32().atan2(o.to_f32())) }
         }
     )*};
 }

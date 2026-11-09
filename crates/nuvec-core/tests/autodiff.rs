@@ -115,6 +115,27 @@ fn unary_gradients() {
         check(name, f, &[&[2, 3]], lo, hi);
     }
     check("abs-negative", |x| x[0].abs(), &[&[4]], -2.0, -0.5);
+    // MLX's element-wise functions (float64, so the composition's derivative is exact enough).
+    let more: [(&str, F, f64, f64); 15] = [
+        ("expm1", |x| x[0].expm1(), -2.0, 2.0),
+        ("log1p", |x| x[0].log1p(), -0.5, 2.0),
+        ("log2", |x| x[0].log2(), 0.5, 3.0),
+        ("log10", |x| x[0].log10(), 0.5, 3.0),
+        ("tan", |x| x[0].tan(), -1.2, 1.2),
+        ("sinh", |x| x[0].sinh(), -2.0, 2.0),
+        ("cosh", |x| x[0].cosh(), -2.0, 2.0),
+        ("arccos", |x| x[0].arccos(), -0.9, 0.9),
+        ("arccosh", |x| x[0].arccosh(), 1.2, 3.0),
+        ("arcsin", |x| x[0].arcsin(), -0.9, 0.9),
+        ("arcsinh", |x| x[0].arcsinh(), -2.0, 2.0),
+        ("arctan", |x| x[0].arctan(), -2.0, 2.0),
+        ("arctanh", |x| x[0].arctanh(), -0.9, 0.9),
+        ("rsqrt", |x| x[0].rsqrt(), 0.5, 3.0),
+        ("floor", |x| x[0].floor().add(&x[0]), 0.1, 0.9),
+    ];
+    for (name, f, lo, hi) in more {
+        check(name, f, &[&[2, 3]], lo, hi);
+    }
     check("logsumexp", |x| x[0].logsumexp(1), &[&[3, 4]], -3.0, 3.0);
     check(
         "logsumexp-all",
@@ -219,6 +240,15 @@ fn binary_gradients_with_broadcasting() {
         ("power", |x| x[0].power(&x[1])),
     ];
     for (name, f) in cases {
+        check(name, f, &[&[2, 3], &[3]], 0.5, 2.0);
+        check(&format!("{name}-outer"), f, &[&[3, 1], &[1, 4]], 0.5, 2.0);
+    }
+    let more: [(&str, F); 2] = [
+        ("arctan2", |x| x[0].arctan2(&x[1])),
+        // Away from the jumps of ⌊a/b⌋: a in [0.5, 2] and b in [2.5, 4] keep a/b in (0, 1).
+        ("remainder", |x| x[0].remainder(x[1].add(2.0))),
+    ];
+    for (name, f) in more {
         check(name, f, &[&[2, 3], &[3]], 0.5, 2.0);
         check(&format!("{name}-outer"), f, &[&[3, 1], &[1, 4]], 0.5, 2.0);
     }
@@ -337,6 +367,217 @@ fn matmul_gradients() {
         -1.0,
         1.0,
     );
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "hundreds of evaluations: too slow under Miri, and covered natively"
+)]
+fn convolution_gradients() {
+    // One check per lowering: general taps, strided, dilated, grouped, depthwise with a
+    // multiplier, a single tap (1×1), non-overlapping patches, input dilation with flips
+    // and crops, the transposes, and `convolve`.
+    let cases: [(&str, F, &[&[usize]]); 13] = [
+        (
+            "conv2d",
+            |x| ops::conv2d(&x[0], &x[1], 1, 1, 1, 1),
+            &[&[1, 5, 4, 2], &[3, 3, 3, 2]],
+        ),
+        (
+            "conv2d-stride",
+            |x| ops::conv2d(&x[0], &x[1], [2, 1], [1, 0], 1, 1),
+            &[&[2, 5, 5, 2], &[2, 3, 2, 2]],
+        ),
+        (
+            "conv2d-dilated",
+            |x| ops::conv2d(&x[0], &x[1], 1, 0, [2, 1], 1),
+            &[&[1, 6, 4, 2], &[2, 2, 2, 2]],
+        ),
+        (
+            "conv2d-groups",
+            |x| ops::conv2d(&x[0], &x[1], 1, 1, 1, 2),
+            &[&[1, 4, 4, 4], &[4, 3, 3, 2]],
+        ),
+        (
+            "conv2d-depthwise",
+            |x| ops::conv2d(&x[0], &x[1], 1, 1, 1, 3),
+            &[&[1, 4, 4, 3], &[6, 3, 3, 1]],
+        ),
+        (
+            "conv2d-1x1",
+            |x| ops::conv2d(&x[0], &x[1], 1, 0, 1, 1),
+            &[&[2, 3, 3, 4], &[3, 1, 1, 4]],
+        ),
+        (
+            "conv2d-patches",
+            |x| ops::conv2d(&x[0], &x[1], 2, 0, 1, 1),
+            &[&[1, 4, 6, 2], &[3, 2, 2, 2]],
+        ),
+        (
+            "conv3d",
+            |x| ops::conv3d(&x[0], &x[1], [1, 2, 1], 1, 1, 1),
+            &[&[1, 3, 4, 3, 2], &[2, 2, 3, 2, 2]],
+        ),
+        (
+            "conv_general",
+            |x| {
+                let o = ops::ConvOptions::new()
+                    .stride(&[1, 2])
+                    .padding_lo_hi(&[2, -1], &[0, 1])
+                    .input_dilation(&[2, 1])
+                    .kernel_dilation(&[1, 2])
+                    .flip(true);
+                ops::conv_general(&x[0], &x[1], &o)
+            },
+            &[&[1, 3, 5, 2], &[2, 2, 2, 2]],
+        ),
+        (
+            "conv_transpose1d",
+            |x| ops::conv_transpose1d(&x[0], &x[1], 2, 1, 1, 1, 1),
+            &[&[2, 5, 3], &[2, 3, 3]],
+        ),
+        (
+            "conv_transpose2d",
+            |x| ops::conv_transpose2d(&x[0], &x[1], [2, 1], [1, 0], 1, [1, 0], 1),
+            &[&[1, 3, 4, 2], &[3, 3, 2, 2]],
+        ),
+        (
+            "conv_transpose3d",
+            |x| ops::conv_transpose3d(&x[0], &x[1], 2, 0, 1, 0, 1),
+            &[&[1, 2, 2, 2, 2], &[2, 2, 2, 2, 2]],
+        ),
+        (
+            "convolve-same",
+            |x| ops::convolve(&x[0], &x[1], ops::ConvolveMode::Same),
+            &[&[7], &[4]],
+        ),
+    ];
+    for (name, f, shapes) in cases {
+        check(name, f, shapes, -1.0, 1.0);
+    }
+}
+
+/// The Hadamard transform's derivative is its transpose: the transform for 2^k, the
+/// transposed order-m matrix for 12, 20 and 28 (MLX uses the transform itself there).
+#[test]
+fn hadamard_gradients() {
+    let cases: [(&str, F, &[&[usize]]); 4] = [
+        (
+            "hadamard-16",
+            |x| ops::hadamard_transform(&x[0], None),
+            &[&[2, 16]],
+        ),
+        (
+            "hadamard-12",
+            |x| ops::hadamard_transform(&x[0], None),
+            &[&[2, 12]],
+        ),
+        (
+            "hadamard-40",
+            |x| ops::hadamard_transform(&x[0], Some(0.5)),
+            &[&[40]],
+        ),
+        (
+            "hadamard-56",
+            |x| ops::hadamard_transform(&x[0], None),
+            &[&[3, 56]],
+        ),
+    ];
+    for (name, f, shapes) in cases {
+        check(name, f, shapes, -1.0, 1.0);
+    }
+}
+
+/// `vmap` over a convolution's input, weight or both equals the per-example convolutions,
+/// and so do its gradients; empty batches and size-1 axes run.
+#[test]
+fn convolution_vmap_and_edges() {
+    common::on_cpu();
+    let mut rng = Rng::new(0x95);
+    let r = |rng: &mut Rng, s: &[usize]| {
+        Array::from_slice(&values(rng, s.iter().product(), -1.0, 1.0), s)
+    };
+    let xs = r(&mut rng, &[3, 1, 6, 5, 4]);
+    let ws = r(&mut rng, &[3, 2, 3, 3, 4]);
+    let f = |v: &[Array]| Ok(vec![ops::conv2d(&v[0], &v[1], [2, 1], 1, 1, 1)]);
+    for axes in [[Some(0), None], [None, Some(0)], [Some(0), Some(0)]] {
+        let w0 = if axes[1].is_some() {
+            ws.clone()
+        } else {
+            ws.i(0)
+        };
+        let x0 = if axes[0].is_some() {
+            xs.clone()
+        } else {
+            xs.i(0)
+        };
+        let got = vmap_flat(f, &axes, &[0])(&[x0.clone(), w0.clone()])
+            .unwrap()
+            .remove(0);
+        for b in 0..3 {
+            let pick = |a: &Array, on: Option<i32>| if on.is_some() { a.i(b) } else { a.clone() };
+            let want = ops::conv2d(&pick(&x0, axes[0]), &pick(&w0, axes[1]), [2, 1], 1, 1, 1);
+            let (g, w) = (vec64(&got.i(b)), vec64(&want));
+            assert!(
+                g.iter().zip(&w).all(|(a, b)| (a - b).abs() <= 1e-12),
+                "vmap {axes:?} example {b}"
+            );
+        }
+    }
+    // The gradient of a vmapped convolution equals the per-example gradients summed.
+    let loss = |v: &[Array]| {
+        let y = vmap_flat(f, &[Some(0), None], &[0])(&[v[0].clone(), v[1].clone()])?.remove(0);
+        Ok(vec![y.square().sum(..)])
+    };
+    let (_, g) = vjp_flat(loss, &[xs.clone(), ws.i(0)], &[Array::from(1.0)]).unwrap();
+    let mut gw = vec![0.0; ws.i(0).size()];
+    for b in 0..3 {
+        let one = |v: &[Array]| {
+            Ok(vec![
+                ops::conv2d(&v[0], &v[1], [2, 1], 1, 1, 1).square().sum(..),
+            ])
+        };
+        let (_, gb) = vjp_flat(one, &[xs.i(b), ws.i(0)], &[Array::from(1.0)]).unwrap();
+        gw.iter_mut().zip(vec64(&gb[1])).for_each(|(a, b)| *a += b);
+    }
+    assert!(
+        vec64(&g[1])
+            .iter()
+            .zip(&gw)
+            .all(|(a, b)| (a - b).abs() <= 1e-10),
+        "vmapped weight gradient"
+    );
+    // Edges: an empty batch, size-1 axes, a kernel as large as the padded input.
+    let empty = ops::conv2d(
+        &ops::zeros([0, 4, 4, 3], DType::F64),
+        &r(&mut rng, &[2, 3, 3, 3]),
+        1,
+        1,
+        1,
+        1,
+    );
+    assert_eq!(empty.shape(), [0, 4, 4, 2]);
+    empty.eval().unwrap();
+    let one = ops::conv2d(
+        &r(&mut rng, &[2, 1, 1, 3]),
+        &r(&mut rng, &[2, 1, 1, 3]),
+        1,
+        0,
+        1,
+        1,
+    );
+    assert_eq!(one.shape(), [2, 1, 1, 2]);
+    let whole = ops::conv2d(
+        &r(&mut rng, &[1, 3, 3, 2]),
+        &r(&mut rng, &[4, 5, 5, 2]),
+        1,
+        1,
+        1,
+        1,
+    );
+    assert_eq!(whole.shape(), [1, 1, 1, 4]);
+    whole.eval().unwrap();
 }
 
 #[test]
@@ -1196,7 +1437,7 @@ mod trees {
         assert!(err.contains("\"1\""), "{err}");
     }
 
-    /// Tree transforms compose like the flat ones (constitution III).
+    /// Tree transforms compose like the flat ones.
     #[test]
     fn tree_transforms_compose() {
         common::on_cpu();

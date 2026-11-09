@@ -6,10 +6,10 @@
 //!   memory-mapped without a copy; mlx-community checkpoints (unpadded headers) are read
 //!   once at load, in parallel.
 //! - **Tokenizer:** BPE read from `tokenizer.json`: byte-level (GPT-2, Llama 3, Qwen 2/3/3.5,
-//!   gpt-oss's o200k and others with their split patterns) and SentencePiece-style with
-//!   byte fallback (Gemma, Llama 2, Mistral v0.1–v0.3). Other split patterns (Mistral's
-//!   Tekken) are not supported, so [`load`] fails for those models; [`load_model`] loads
-//!   their weights.
+//!   gpt-oss's o200k, Mistral's Tekken and others with their split patterns) and
+//!   SentencePiece-style with byte fallback (Gemma, Llama 2, Mistral v0.1–v0.3).
+//! - **Chat templates** (feature `chat`, default): a checkpoint's own templates rendered
+//!   as transformers renders them ([`chat`]).
 //! - **Generation:** chunked prefill, a pipelined decode loop with the KV cache updated in
 //!   place, stopping at the model's end-of-sequence tokens (`config.json` and
 //!   `generation_config.json`), mlx-lm's samplers (temperature, top-p, min-p, top-k), and
@@ -19,7 +19,7 @@
 //!   serves many requests at once.
 //! - **Fine-tuning:** a [`Model`] is a `nuvec_nn::Module` (Hugging Face's parameter names);
 //!   [`lora`] replaces projections by path with LoRA layers and reads and writes mlx-lm's
-//!   adapter directories.
+//!   adapter directories; [`tuner`] trains on mlx-lm's text, chat and completion data.
 //!
 //! ```no_run
 //! use nuvec_lm::{GenerateOptions, generate, load};
@@ -66,6 +66,8 @@ use nuvec::{Array, Error, Quant, QuantMode, Result};
 use nuvec_nn::Module;
 
 pub mod batch;
+#[cfg(feature = "chat")]
+pub mod chat;
 pub mod config;
 pub mod generate;
 pub mod lora;
@@ -78,9 +80,12 @@ pub mod speculative;
 pub mod stop;
 mod suffix;
 pub mod tokenizer;
+mod tokenizer_config;
 pub mod tuner;
 
 pub use batch::{Batcher, BatcherOptions, Event, RequestId};
+#[cfg(feature = "chat")]
+pub use chat::{ChatTemplate, RenderOptions};
 pub use config::{Activation, Config, Gemma4, LayerQuant, PackedFormat, Quantization};
 pub use generate::{FinishReason, GenerateOptions, Generation, WiredLimit, generate};
 pub use model::{KvCache, Model};
@@ -93,6 +98,7 @@ pub use speculative::{
 };
 pub use stop::{Stop, Stopped, TextStream};
 pub use tokenizer::{StreamDecoder, Tokenizer};
+pub use tokenizer_config::TokenizerConfig;
 
 /// The Rust snippets of the README and of the user guide's pages that use the LLM runtime,
 /// run as doctests.

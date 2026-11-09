@@ -14,8 +14,14 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+faer.workspace = true
 gemm.workspace = true
 half.workspace = true
+
+[features]
+# LAPACK from Apple's Accelerate (system framework, AMX units) for the decompositions on
+# Apple targets; the pure-Rust path (`faer`) otherwise.
+accelerate = []
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]

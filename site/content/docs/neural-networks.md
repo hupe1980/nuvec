@@ -81,14 +81,17 @@ Constructors take no `bool` and return no `Result`; initialisation draws MLX's v
 
 - `Linear::new(i, o)` (`.without_bias()`), `QuantizedLinear::from_linear(&l)` (MLX's affine 64/4; `from_linear_with(&l, Quant::affine(32, 8))` or `QuantMode::Mxfp4`), `Embedding::new(n, d)`, `QuantizedEmbedding::from_embedding(&e)`;
 - `RmsNorm::new(d).eps(e)`, `LayerNorm::new(d).eps(e).affine(false)` / `.without_bias()` and `Rope::new(d).traditional().base(b).scale(s)` on the fused kernels;
-- `LoraLinear::from_base(base, rank)` over a full-precision or quantized base layer (LoRA and QLoRA), with `.scale(s)`, `.dropout(p)` and `.rslora()`;
+- `LoraLinear::from_base(base, rank)` over a full-precision or quantized base layer (LoRA and QLoRA), with `.scale(s)`, `.dropout(p)`, `.rslora()` and `.dora()` (DoRA, mlx-lm's `DoRALinear`). Its backward pass keeps the input in its own dtype and computes the adapters' gradients before moving on, so a LoRA layer keeps only its input;
+- `Conv1d`, `Conv2d` and `Conv3d` (`::new(in, out, kernel)` or `::grouped(…, groups)`, then `.stride(s)`, `.padding(p)`, `.dilation(d)`, `.without_bias()`), and `ConvTranspose1d`/`2d`/`3d` (also `.output_padding(p)`), as MLX's `nn.Conv*` and `nn.ConvTranspose*`, channels last;
+- `MaxPool1d`/`2d`/`3d` and `AvgPool1d`/`2d`/`3d` (`::new(kernel)`, `.stride(s)`, `.padding(p)`), as MLX's: max pooling pads with `-∞`, average pooling with zeros that count;
 - `Dropout::new(p)`, as MLX's `nn.Dropout`;
-- activations: `relu`, `silu`, `gelu_approx`, `gelu_fast_approx`.
+- activations, as MLX's `nn` (its formulas, bit for bit): `relu`, `relu2`, `relu6`, `leaky_relu`, `prelu`, `elu`, `selu`, `celu`, `silu`, `gelu`, `gelu_approx`, `gelu_fast_approx`, `softplus`, `softsign`, `softshrink`, `hard_shrink`, `hard_tanh`, `hardswish`, `mish`, `log_sigmoid`, `log_softmax`, `softmin`, `glu`, `step`, and the fused `swiglu` (its backward pass keeps only its two inputs).
 
 ## Losses and optimizers
 
 - `losses::cross_entropy` with mean, sum or no reduction, on the fused kernel.
-- `optim`: `Sgd` (momentum, `.nesterov()`, weight decay), `Adam` (`.betas`, `.eps`, `.bias_correction()`), `AdamW` (MLX's default decay 0.01), `Lion` and `Muon`. `opt.update(&mut model, &grads)` updates the trainable leaves from a gradient tree of the model's type.
+- `losses::linear_cross_entropy(h, targets, weights, head, reduction)`: the cross entropy of an output head without its `[N, vocab]` logits ([`fast::linear_cross_entropy`](@/docs/kernels.md), row chunks whose hidden-state gradient comes from the same pass).
+- `optim`: `Sgd` (momentum, `.nesterov()`, weight decay), `Adam` (`.betas`, `.eps`, `.bias_correction()`), `AdamW` (MLX's default decay 0.01), `Lion`, `Muon` and `Adafactor` (MLX's: factored second moments, relative step, update clipping). `opt.update(&mut model, &grads)` updates the trainable leaves from a gradient tree of the model's type.
 - The optimizer's state is a tree: `step`, `learning_rate` (0-D arrays, as MLX's `optimizer.state`) and the slots by parameter path (`slots.layers.0.weight.m`). Freezing or unfreezing never moves or resets state. `opt.init(&model)` creates it up front; `set_learning_rate(lr)` writes the rate. `Box<dyn Optimizer>` works.
 - Parameter groups (MLX's `MultiOptimizer`): `MultiOptimizer::new(Sgd::new(1e-2)).group(|p| p.contains("lora_a"), Adam::new(1e-3))`; the first matching group wins.
 - Learning-rate schedules: exponential, step and cosine decay, linear warm-up, and joined schedules, as float32 functions of the step array.

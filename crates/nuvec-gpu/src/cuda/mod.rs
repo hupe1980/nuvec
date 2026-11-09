@@ -1,7 +1,7 @@
 //! The CUDA runtime (Linux, feature `cuda`), on NVIDIA's cuda-rust: the device, a
 //! managed-memory allocator, and launches of the kernels of `nuvec_kernels::cuda` (generated
 //! PTX and Tile kernels). The counterpart of [`crate::Device`]'s Metal runtime, with the
-//! same role: no CUDA C, NVRTC or vendor libraries (constitution I).
+//! same role: no CUDA C, NVRTC or vendor libraries.
 
 mod device;
 mod error;

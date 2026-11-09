@@ -1,0 +1,383 @@
+{
+ "repo": "mlx-community/Mistral-Small-24B-Instruct-2501-4bit",
+ "special_tokens": {
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "unk_token": "<unk>"
+ },
+ "templates": [
+  "default"
+ ],
+ "cases": [
+  {
+   "conversation": "user",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[INST]Hello, who are you?[/INST]"
+  },
+  {
+   "conversation": "user",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[INST]Hello, who are you?[/INST]"
+  },
+  {
+   "conversation": "user",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[INST]Hello, who are you?[/INST]",
+   "ids": [
+    1,
+    3,
+    22177,
+    1044,
+    2274,
+    1584,
+    1636,
+    1063,
+    4
+   ]
+  },
+  {
+   "conversation": "user",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[INST]Hello, who are you?[/INST]"
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[SYSTEM_PROMPT]You are a concise assistant.[/SYSTEM_PROMPT][INST]Name three primes.[/INST]"
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[SYSTEM_PROMPT]You are a concise assistant.[/SYSTEM_PROMPT][INST]Name three primes.[/INST]"
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[SYSTEM_PROMPT]You are a concise assistant.[/SYSTEM_PROMPT][INST]Name three primes.[/INST]",
+   "ids": [
+    1,
+    17,
+    4568,
+    1584,
+    1261,
+    104335,
+    27089,
+    1046,
+    18,
+    3,
+    2266,
+    3300,
+    84844,
+    1046,
+    4
+   ]
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[SYSTEM_PROMPT]You are a concise assistant.[/SYSTEM_PROMPT][INST]Name three primes.[/INST]"
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[INST]What is 2 + 2?[/INST]2 + 2 = 4.</s>[INST]  And times three?\n[/INST]"
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[INST]What is 2 + 2?[/INST]2 + 2 = 4.</s>[INST]  And times three?\n[/INST]"
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[INST]What is 2 + 2?[/INST]2 + 2 = 4.</s>[INST]  And times three?\n[/INST]",
+   "ids": [
+    1,
+    3,
+    7493,
+    1395,
+    1032,
+    1050,
+    1867,
+    1032,
+    1050,
+    1063,
+    4,
+    1050,
+    1867,
+    1032,
+    1050,
+    1376,
+    1032,
+    1052,
+    1046,
+    2,
+    3,
+    1032,
+    3060,
+    5213,
+    3300,
+    9551,
+    4
+   ]
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[INST]What is 2 + 2?[/INST]2 + 2 = 4.</s>[INST]  And times three?\n[/INST]"
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "Only user, system and assistant roles are supported!"
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "Only user, system and assistant roles are supported!"
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "Only user, system and assistant roles are supported!"
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "Only user, system and assistant roles are supported!"
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "Only user, system and assistant roles are supported!"
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "Only user, system and assistant roles are supported!"
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "Only user, system and assistant roles are supported!"
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "Only user, system and assistant roles are supported!"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[INST]What is 2 + 2?[/INST]4</s>[INST]And 3 + 3?[/INST]6</s>"
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[INST]What is 2 + 2?[/INST]4</s>[INST]And 3 + 3?[/INST]6</s>"
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[INST]What is 2 + 2?[/INST]4</s>[INST]And 3 + 3?[/INST]6</s>",
+   "ids": [
+    1,
+    3,
+    7493,
+    1395,
+    1032,
+    1050,
+    1867,
+    1032,
+    1050,
+    1063,
+    4,
+    1052,
+    2,
+    3,
+    4998,
+    1032,
+    1051,
+    1867,
+    1032,
+    1051,
+    1063,
+    4,
+    1054,
+    2
+   ]
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[INST]What is 2 + 2?[/INST]4</s>[INST]And 3 + 3?[/INST]6</s>"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[INST]Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab[/INST]"
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[INST]Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab[/INST]"
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[INST]Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab[/INST]",
+   "ids": [
+    1,
+    3,
+    20560,
+    1671,
+    9755,
+    1044,
+    1032,
+    29659,
+    119685,
+    1140,
+    1141,
+    1534,
+    16593,
+    1062,
+    1748,
+    1576,
+    36864,
+    1039,
+    1429,
+    13267,
+    1034,
+    1617,
+    2595,
+    1009,
+    8710,
+    4
+   ]
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[INST]Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab[/INST]"
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[SYSTEM_PROMPT][/SYSTEM_PROMPT][INST]Hi[/INST]"
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[SYSTEM_PROMPT][/SYSTEM_PROMPT][INST]Hi[/INST]"
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[SYSTEM_PROMPT][/SYSTEM_PROMPT][INST]Hi[/INST]",
+   "ids": [
+    1,
+    17,
+    18,
+    3,
+    37133,
+    4
+   ]
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[SYSTEM_PROMPT][/SYSTEM_PROMPT][INST]Hi[/INST]"
+  },
+  {
+   "conversation": "turns_prefill",
+   "continue_final_message": true,
+   "text": "<s>[INST]What is 2 + 2?[/INST]2 + 2 = 4.</s>[INST]  And times three?\n[/INST]Twelve"
+  },
+  {
+   "conversation": "turns",
+   "continue_final_message": true,
+   "add_generation_prompt": true,
+   "error": "continue_final_message and add_generation_prompt are not compatible. Use continue_final_message when you want the model to continue the final message, and add_generation_prompt when you want to add a "
+  }
+ ]
+}

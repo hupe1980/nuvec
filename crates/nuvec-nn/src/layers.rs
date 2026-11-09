@@ -12,6 +12,12 @@ use nuvec::{Array, DType, OpErrorKind, Param, Quant, QuantMode, Quantized, fast,
 
 use crate::Module;
 
+mod conv;
+pub use conv::{
+    AvgPool1d, AvgPool2d, AvgPool3d, Conv1d, Conv2d, Conv3d, ConvTranspose1d, ConvTranspose2d,
+    ConvTranspose3d, MaxPool1d, MaxPool2d, MaxPool3d,
+};
+
 thread_local! {
     /// The key sequence before and after the bias draw of the last `Linear::new` on this
     /// thread, and the bias it drew: `without_bias` rewinds the sequence when nothing was
@@ -579,6 +585,9 @@ impl LoraBase {
 /// `y = base(x) + scale · (dropout(x) A) B`, with `A` of shape `[input, r]` and `B` of shape
 /// `[r, output]` (zeros at first, so the layer starts as its base). Names follow mlx-lm:
 /// `linear.weight`, `lora_a`, `lora_b`.
+///
+/// With a magnitude `m` ([`LoraLinear::dora`]), it is mlx-lm's `DoRALinear`: the output is
+/// rescaled per output feature by `m / ‖W + scale · Bᵀ Aᵀ‖` (the norm without gradient).
 #[derive(Debug, Clone, Module)]
 pub struct LoraLinear {
     /// The adapted layer (frozen).
@@ -593,6 +602,8 @@ pub struct LoraLinear {
     pub scale: f32,
     /// Dropout on the update's input (mlx-lm's LoRA dropout; 0 by default).
     pub dropout: Dropout,
+    /// DoRA's learned magnitude per output feature, `[output_dims]` (float32).
+    pub m: Option<Param>,
 }
 
 impl LoraLinear {
@@ -616,7 +627,35 @@ impl LoraLinear {
             lora_b: Param::new(lora_b),
             scale: 20.0,
             dropout: Dropout::new(0.0),
+            m: None,
         }
+    }
+
+    /// Weight-decomposed adaptation (DoRA, mlx-lm's `DoRALinear`): adds the magnitude `m`,
+    /// initialised to the row norms of the base weight (dequantized) in float32.
+    #[track_caller]
+    pub fn dora(mut self) -> Self {
+        let w = self.base_weight().astype(DType::F32);
+        self.m = Some(Param::new(row_norms(&w)));
+        self
+    }
+
+    /// The base weight `[output, input]`, dequantized.
+    #[track_caller]
+    fn base_weight(&self) -> Array {
+        match &self.base {
+            LoraBase::Linear(l) => l.weight.value().clone(),
+            LoraBase::Quantized(q) => q.dequantized_weight(None),
+        }
+    }
+
+    /// `scale · Bᵀ Aᵀ`, `[output, input]`.
+    #[track_caller]
+    fn delta(&self) -> Array {
+        self.lora_b
+            .t()
+            .multiply(f64::from(self.scale))
+            .matmul(&self.lora_a.t())
     }
 
     /// Sets the update's scale.
@@ -640,16 +679,35 @@ impl LoraLinear {
         self
     }
 
-    /// `base(x) + scale · (dropout(x) A) B`, the update cast to `x`'s dtype.
+    /// `base(x) + scale · (dropout(x) A) B`, the update cast to `x`'s dtype; with DoRA,
+    /// `(m / stop_gradient(‖W + scale · Bᵀ Aᵀ‖)) · (x Wᵀ + scale · (dropout(x) A) B) + bias`.
     #[track_caller]
     pub fn forward(&self, x: &Array) -> Array {
-        let y = self.base.forward(x);
-        let z = self
-            .dropout
-            .forward(x)
-            .matmul(&self.lora_a)
-            .matmul(&self.lora_b);
-        y.add(z.multiply(f64::from(self.scale)).astype(x.dtype()))
+        let update = lora_update(
+            &self.dropout.forward(x),
+            self.lora_a.value(),
+            self.lora_b.value(),
+            self.scale,
+        );
+        let Some(m) = &self.m else {
+            return self.base.forward(x).add(update);
+        };
+        let w = self.base_weight();
+        let (y, bias) = match &self.base {
+            LoraBase::Linear(l) => (x.matmul(&w.t()), l.bias.as_ref()),
+            LoraBase::Quantized(q) => (x.quantized_matmul(&q.quantized(), true), q.bias.as_ref()),
+        };
+        let adapted = w.add(self.delta());
+        let denom = row_norms(&adapted).stop_gradient();
+        let out = m
+            .value()
+            .divide(&denom)
+            .astype(x.dtype())
+            .multiply(y.add(update));
+        match bias {
+            Some(b) => out.add(b.value()),
+            None => out,
+        }
     }
 
     /// The base layer with the update merged into its weight (mlx-lm's `fuse` with
@@ -664,17 +722,77 @@ impl LoraLinear {
                 (q.dequantized_weight(dtype), q.bias.clone())
             }
         };
-        let delta = self
-            .lora_b
-            .t()
-            .multiply(f64::from(self.scale))
-            .matmul(&self.lora_a.t())
-            .astype(weight.dtype());
+        let delta = self.delta().astype(weight.dtype());
+        let weight = weight.add(&delta);
+        // DoRA: each row rescaled to its learned magnitude (mlx-lm's `DoRALinear.fuse`).
+        let weight = match &self.m {
+            Some(m) => m
+                .value()
+                .divide(row_norms(&weight))
+                .expand_dims(-1)
+                .multiply(&weight)
+                .astype(weight.dtype()),
+            None => weight,
+        };
         Linear {
-            weight: Param::new(weight.add(&delta)),
+            weight: Param::new(weight),
             bias: bias.map(|b| Param::new(b.into_inner())),
         }
     }
+}
+
+/// LoRA's update `(scale · (x A) B)` in `x`'s dtype, `x` promoted to the adapters' dtype as
+/// `x.matmul(a)` does, with its own backward pass:
+/// - `x` is kept in its dtype (promoted again in the backward pass), not its promoted copy,
+///   and `x A` is recomputed from it (referring to the forward pass's results would keep
+///   the update itself alive);
+/// - the input's gradient is evaluated after the adapters' gradients, so each layer's
+///   `[.., output]` cotangent is freed before the backward pass moves to the layer below
+///   (otherwise every layer's would be alive until its adapters' gradients are reached).
+///
+/// The values and gradients equal the composition's.
+#[track_caller]
+fn lora_update(x: &Array, a: &Array, b: &Array, scale: f32) -> Array {
+    if x.ndim() == 0 || a.ndim() != 2 || b.ndim() != 2 {
+        let z = x.matmul(a).matmul(b);
+        return z.multiply(f64::from(scale)).astype(x.dtype());
+    }
+    let scale = f64::from(scale);
+    let f = nuvec::custom_function_flat(move |xs| {
+        let (x, a, b) = (&xs[0], &xs[1], &xs[2]);
+        Ok(vec![
+            x.matmul(a).matmul(b).multiply(scale).astype(x.dtype()),
+        ])
+    })
+    .with_vjp(move |p, _, c| {
+        let (x, a, b, g) = (&p[0], &p[1], &p[2], &c[0]);
+        let (d, out) = (x.shape()[x.ndim() - 1], b.shape()[1]);
+        let wide = a.dtype();
+        let g = g.astype(wide).multiply(scale).reshape([-1, out]);
+        // Promoted after the cotangent exists, so `compile` cannot merge it with the forward
+        // pass's promotion.
+        let xw = ops::depends(x, std::slice::from_ref(&g))
+            .reshape([-1, d])
+            .astype(wide);
+        let db = xw.matmul(a).t().matmul(&g);
+        let ddown = g.matmul(&b.t());
+        let da = xw.t().matmul(&ddown);
+        let mut shape = x.shape().to_vec();
+        shape[x.ndim() - 1] = d;
+        let dx = ddown.matmul(&a.t()).astype(x.dtype()).reshape(shape);
+        let dx = ops::depends(&dx, &[da.clone(), db.clone()]);
+        Ok(vec![dx, da, db])
+    });
+    match f.call(&[x.clone(), a.clone(), b.clone()]) {
+        Ok(mut out) => out.swap_remove(0),
+        Err(e) => Array::failure("lora", OpErrorKind::InvalidArgument(e.to_string())),
+    }
+}
+
+/// The Euclidean norm of each row of `w` (`mx.linalg.norm(w, axis=1)`).
+#[track_caller]
+fn row_norms(w: &Array) -> Array {
+    w.multiply(w).sum(1).sqrt()
 }
 
 impl From<Linear> for LoraBase {

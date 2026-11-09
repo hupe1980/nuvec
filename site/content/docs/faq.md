@@ -40,7 +40,8 @@ Yes:
 
 - autodiff covers every operation; models are structs with `#[derive(Module)]` whose gradients have the model's type;
 - `nuvec-nn` has layers, dropout, LoRA and optimizers (with parameter groups); quantized layers support QLoRA-style fine-tuning;
-- nuvec-lm trains LoRA adapters on loaded models as `mlx_lm.lora` (the `lora` example) and reads and writes mlx-lm's adapter directories;
+- nuvec-lm fine-tunes loaded models as `mlx_lm.lora` (LoRA, DoRA or full, on text, chat or completion data with `--mask-prompt`; the `lora` example) and reads and writes mlx-lm's adapter directories;
+- nuvec-lm renders a checkpoint's chat template as transformers does (`nuvec_lm::chat`);
 - a whole training step compiles with `compile_mut`.
 
 The repository trains MLX's MNIST example and matches MLX's accuracy.

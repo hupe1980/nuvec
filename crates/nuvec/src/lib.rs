@@ -175,15 +175,16 @@ pub use nuvec_core::tree::{
 pub use nuvec_core::{
     Array, ArrayIndex, At, Axes, Axis, Category, Complex64, CustomFunction, CustomFunctionFlat,
     DType, Device, DeviceKind, Element, Ellipsis, Error, GatherQmm, GradOutput, InAxes, InAxis,
-    IntoResult, IntoShape, NewAxis, OpErrorKind, OutAxes, Quant, QuantMode, Quantized, Result,
-    Scalar, ScalarOperand, ScalarOrArray, ScanOptions, Scheduled, Step, Stepped, Stream,
+    IntoResult, IntoShape, NewAxis, OpErrorKind, OutAxes, QqmmWeight, Quant, QuantMode, Quantized,
+    Result, Scalar, ScalarOperand, ScalarOrArray, ScanOptions, Scheduled, Step, Stepped, Stream,
     VarOptions, Vmap, array, async_eval, at_least_float, bf16, checkpoint, checkpoint_flat,
     custom_function, custom_function_flat, default_device, default_stream, eval, f16, grad,
     grad_flat, jvp, jvp_flat, promote_types, schedule, set_default_stream, value_and_grad,
     value_and_grad_flat, vjp, vjp_flat, vmap, vmap_flat, with_stream,
 };
 pub use nuvec_core::{
-    ROW_INDEPENDENT_ROWS, fast, graph, ops, random, row_exact, speculative, tree, with_row_exact,
+    ROW_INDEPENDENT_ROWS, fast, graph, linalg, ops, random, row_exact, speculative, tree,
+    with_row_exact,
 };
 pub use nuvec_io::{load_into, save};
 

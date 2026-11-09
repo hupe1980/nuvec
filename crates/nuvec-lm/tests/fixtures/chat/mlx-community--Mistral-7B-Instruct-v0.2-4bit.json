@@ -1,0 +1,389 @@
+{
+ "repo": "mlx-community/Mistral-7B-Instruct-v0.2-4bit",
+ "special_tokens": {
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "unk_token": "<unk>"
+ },
+ "templates": [
+  "default"
+ ],
+ "cases": [
+  {
+   "conversation": "user",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[INST] Hello, who are you? [/INST]"
+  },
+  {
+   "conversation": "user",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[INST] Hello, who are you? [/INST]"
+  },
+  {
+   "conversation": "user",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[INST] Hello, who are you? [/INST]",
+   "ids": [
+    1,
+    733,
+    16289,
+    28793,
+    22557,
+    28725,
+    693,
+    460,
+    368,
+    28804,
+    733,
+    28748,
+    16289,
+    28793
+   ]
+  },
+  {
+   "conversation": "user",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[INST] Hello, who are you? [/INST]"
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "system",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[INST] What is 2 + 2? [/INST]2 + 2 = 4.</s>[INST]   And times three?\n [/INST]"
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[INST] What is 2 + 2? [/INST]2 + 2 = 4.</s>[INST]   And times three?\n [/INST]"
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[INST] What is 2 + 2? [/INST]2 + 2 = 4.</s>[INST]   And times three?\n [/INST]",
+   "ids": [
+    1,
+    733,
+    16289,
+    28793,
+    1824,
+    349,
+    28705,
+    28750,
+    648,
+    28705,
+    28750,
+    28804,
+    733,
+    28748,
+    16289,
+    28793,
+    28750,
+    648,
+    28705,
+    28750,
+    327,
+    28705,
+    28781,
+    28723,
+    2,
+    733,
+    16289,
+    28793,
+    259,
+    1015,
+    2421,
+    1712,
+    28804,
+    13,
+    733,
+    28748,
+    16289,
+    28793
+   ]
+  },
+  {
+   "conversation": "turns",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[INST] What is 2 + 2? [/INST]2 + 2 = 4.</s>[INST]   And times three?\n [/INST]"
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "tools",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "tools_string_arguments",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "tools_short_ids",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "'dict object' has no attribute 'content'"
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[INST] What is 2 + 2? [/INST]4</s>[INST] And 3 + 3? [/INST]6</s>"
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[INST] What is 2 + 2? [/INST]4</s>[INST] And 3 + 3? [/INST]6</s>"
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[INST] What is 2 + 2? [/INST]4</s>[INST] And 3 + 3? [/INST]6</s>",
+   "ids": [
+    1,
+    733,
+    16289,
+    28793,
+    1824,
+    349,
+    28705,
+    28750,
+    648,
+    28705,
+    28750,
+    28804,
+    733,
+    28748,
+    16289,
+    28793,
+    28781,
+    2,
+    733,
+    16289,
+    28793,
+    1015,
+    28705,
+    28770,
+    648,
+    28705,
+    28770,
+    28804,
+    733,
+    28748,
+    16289,
+    28793,
+    28784,
+    2
+   ]
+  },
+  {
+   "conversation": "reasoning",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[INST] What is 2 + 2? [/INST]4</s>[INST] And 3 + 3? [/INST]6</s>"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "parts",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "can only concatenate str (not \"list\") to str"
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "text": "<s>[INST] Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab [/INST]"
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "text": "<s>[INST] Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab [/INST]"
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "text": "<s>[INST] Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab [/INST]",
+   "ids": [
+    1,
+    733,
+    16289,
+    28793,
+    1778,
+    28837,
+    9526,
+    28725,
+    28705,
+    30050,
+    29822,
+    28705,
+    31057,
+    523,
+    4011,
+    28767,
+    567,
+    464,
+    14108,
+    28742,
+    345,
+    6324,
+    28739,
+    414,
+    852,
+    12,
+    4252,
+    733,
+    28748,
+    16289,
+    28793
+   ]
+  },
+  {
+   "conversation": "unusual",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "text": "<s>[INST] Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab [/INST]"
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "empty_system",
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  },
+  {
+   "conversation": "turns_prefill",
+   "continue_final_message": true,
+   "text": "<s>[INST] What is 2 + 2? [/INST]2 + 2 = 4.</s>[INST]   And times three?\n [/INST]Twelve"
+  },
+  {
+   "conversation": "turns",
+   "continue_final_message": true,
+   "add_generation_prompt": true,
+   "error": "continue_final_message and add_generation_prompt are not compatible. Use continue_final_message when you want the model to continue the final message, and add_generation_prompt when you want to add a "
+  }
+ ]
+}

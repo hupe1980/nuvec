@@ -921,9 +921,403 @@ mod spec_063 {
                 scale: 20.0,
                 dropout: 0.0,
             };
-            let c = AdapterConfig::new(2, p).keys(["self_attn.q_proj"]);
+            let c = AdapterConfig::new(2, p)
+                .keys(["self_attn.q_proj"])
+                .fine_tune_type(nuvec_lm::lora::FineTuneType::Dora);
             let _: (usize, &Option<Vec<String>>, LoraParams) = (c.num_layers, &c.keys, c.params);
+            let _: nuvec_lm::lora::FineTuneType = c.fine_tune_type;
             c
+        }
+
+        /// Fine-tuning: the chunked loss, mlx-lm's tuner and its options.
+        fn training(
+            m: &mut Model,
+            data: &nuvec_lm::tuner::Dataset,
+            c: &AdapterConfig,
+        ) -> Result<()> {
+            use nuvec_lm::lora::{
+                FineTuneType, apply, linear_to_dora_layers, load_weights, save_weights,
+            };
+            use nuvec_lm::tuner::{
+                AnyOptimizer, Event, TrainingArgs, build_optimizer, build_schedule, default_loss,
+                evaluate, read_config, train,
+            };
+            let _: Result<FineTuneType> = FineTuneType::from_name("full");
+            let _: &str = FineTuneType::Lora.name();
+            let _: usize = apply(m, c)?;
+            let _: Result<usize> = linear_to_dora_layers(m, 1, None, LoraParams::default());
+            save_weights("w.safetensors", m)?;
+            load_weights("w.safetensors", m)?;
+            let config: nuvec::io::json::Json = read_config("c.yaml")?;
+            let lr = build_schedule(&config)?;
+            let mut opt: AnyOptimizer = build_optimizer("adafactor", &config, lr)?;
+            let args = TrainingArgs {
+                grad_checkpoint: true,
+                ..TrainingArgs::default()
+            };
+            train(m, &mut opt, data, Some(data), &args, c, |e: &Event| {
+                drop(e.clone())
+            })?;
+            let mut adam = nuvec_nn::optim::Adam::new(1e-5);
+            train(m, &mut adam, data, None, &args, c, |_| {})?;
+            let _: f32 = evaluate(m, data, 4, Some(2), 2048)?;
+            m.set_grad_checkpoint(true);
+            let h: Array = m.forward_hidden_uncached(&Array::from(1u32));
+            let t = Array::from(1u32);
+            let (_loss, _n): (Array, Array) = default_loss(m, &h, &t);
+            let _: Array = m.token_losses(&h, &t);
+            let _: Array = nuvec::fast::linear_cross_entropy(
+                &h,
+                &t,
+                std::slice::from_ref(&h),
+                |x, w| x.matmul(&w[0].t()),
+                Some(128),
+            );
+            let _: Array = nuvec_nn::losses::linear_cross_entropy(
+                &h,
+                &t,
+                std::slice::from_ref(&h),
+                |x, w| x.matmul(&w[0].t()),
+                nuvec_nn::losses::Reduction::Mean,
+            );
+            let _ = nuvec_nn::optim::Adafactor::new(1e-3)
+                .eps(1e-30, 1e-3)
+                .clip_threshold(1.0)
+                .decay_rate(-0.8)
+                .beta_1(0.9)
+                .weight_decay(0.0)
+                .scale_parameter(true)
+                .relative_step(true)
+                .warmup_init(false);
+            let l = nuvec_nn::LoraLinear::from_base(nuvec_nn::Linear::new(4, 4), 2).dora();
+            let _: &Option<nuvec::Param> = &l.m;
+            Ok(())
+        }
+
+        /// `linalg`.
+        fn linear_algebra(a: &Array, b: &Array) {
+            use nuvec::{linalg, ops};
+            let [_q, _r]: [Array; 2] = linalg::qr(a);
+            let [_u, _s, _vt]: [Array; 3] = linalg::svd(a);
+            let _: Array = linalg::svd_values(a);
+            let [_w, _v]: [Array; 2] = linalg::eigh(a, false);
+            let _: Array = linalg::eigvalsh(a, true);
+            let [_w, _v]: [Array; 2] = linalg::eig(a);
+            let _: Array = linalg::eigvals(a);
+            let [_p, _l, _u]: [Array; 3] = linalg::lu(a);
+            let [_lu, _piv]: [Array; 2] = linalg::lu_factor(a);
+            let _ = (
+                linalg::cholesky(a, false),
+                linalg::inv(a),
+                linalg::tri_inv(a, true),
+            );
+            let _ = (
+                linalg::cholesky_inv(a, false),
+                linalg::pinv(a),
+                linalg::det(a),
+            );
+            let [_sign, _logabs]: [Array; 2] = linalg::slogdet(a);
+            let _ = (
+                linalg::solve(a, b),
+                linalg::solve_triangular(a, b, false),
+                linalg::cross(a, b, -1),
+            );
+            let _ = linalg::norm(a, ops::Norm::Nuc, Some(&[0, 1]), false);
+        }
+
+        /// Convolutions and their layers.
+        fn convolutions(x: &Array, w: &Array) {
+            use nuvec::ops::{self, ConvArg, ConvOptions, ConvolveMode};
+            use nuvec_nn::{
+                AvgPool1d, AvgPool2d, AvgPool3d, Conv1d, Conv2d, Conv3d, ConvTranspose1d,
+                ConvTranspose2d, ConvTranspose3d, MaxPool1d, MaxPool2d, MaxPool3d,
+            };
+            let _: ConvArg<2> = 3.into();
+            let _: ConvArg<2> = [3, 2].into();
+            let _ = (
+                ops::conv2d(x, w, 1, [1, 0], 1, 1),
+                ops::conv3d(x, w, 1, 0, 1, 1),
+                ops::conv_transpose1d(x, w, 2, 1, 1, 1, 1),
+                ops::conv_transpose2d(x, w, 2, 1, 1, 0, 1),
+                ops::conv_transpose3d(x, w, 2, 1, 1, 0, 1),
+                ops::convolve(x, w, ConvolveMode::Same),
+            );
+            let o: ConvOptions = ConvOptions::new()
+                .stride(&[1, 2])
+                .padding(&[1])
+                .padding_lo_hi(&[1, 0], &[0, 1])
+                .kernel_dilation(&[1])
+                .input_dilation(&[2])
+                .groups(1)
+                .flip(true);
+            let _ = ops::conv_general(x, w, &o);
+            let c1: Conv1d = Conv1d::grouped(4, 8, 3, 2).stride(2).padding(1).dilation(1);
+            let c2: Conv2d = Conv2d::new(3, 8, [3, 3]).without_bias();
+            let c3: Conv3d = Conv3d::new(3, 8, 2);
+            let t1: ConvTranspose1d = ConvTranspose1d::new(4, 2, 3).output_padding(1);
+            let t2: ConvTranspose2d = ConvTranspose2d::grouped(4, 2, 3, 2).stride(2);
+            let t3: ConvTranspose3d = ConvTranspose3d::new(4, 2, 2);
+            let _ = (
+                c1.forward(x),
+                c2.forward(x),
+                c3.forward(x),
+                t1.forward(x),
+                t2.forward(x),
+                t3.forward(x),
+            );
+            let _ = (
+                MaxPool1d::new(2).forward(x),
+                MaxPool2d::new(3).stride(2).padding(1).forward(x),
+                MaxPool3d::new(2).forward(x),
+                AvgPool1d::new(2).forward(x),
+                AvgPool2d::new([2, 1]).forward(x),
+                AvgPool3d::new(2).forward(x),
+            );
+        }
+
+        /// MLX's special products and transforms.
+        fn special_products(a: &Array, b: &Array, q: &nuvec::Quantized) {
+            use nuvec::{QqmmWeight, Quant, QuantMode, ops};
+            let _: Array = ops::hadamard_transform(a, Some(0.5));
+            let _: Array = ops::segmented_mm(a, b, a);
+            let _: Array = ops::block_masked_mm(a, b, 32, Some(a), None, None);
+            let _: Array = ops::qqmm(a, b);
+            let _: Array = ops::qqmm(a, (b, QuantMode::Mxfp8));
+            let _: Array = ops::qqmm(a, (b, Quant::new(QuantMode::Nvfp4)));
+            let _: Array = ops::qqmm(a, q);
+            let _: QqmmWeight<'_> = q.into();
+            let _: Array = ops::gather_qqmm(a, q, None, Some(b), true);
+            let _: nuvec::Result<(Vec<Vec<usize>>, String)> =
+                ops::einsum_path("ij,jk->ik", &[a.clone(), b.clone()]);
+        }
+
+        /// MLX's element-wise, shape and creation functions.
+        fn op_breadth(a: &Array, b: &Array) {
+            use nuvec::{DType, ops};
+            let unary: [fn(&Array) -> Array; 39] = [
+                ops::erf,
+                ops::expm1,
+                ops::log1p,
+                ops::log2,
+                ops::log10,
+                ops::tan,
+                ops::sinh,
+                ops::cosh,
+                ops::arccos,
+                ops::arccosh,
+                ops::arcsin,
+                ops::arcsinh,
+                ops::arctan,
+                ops::arctanh,
+                ops::rsqrt,
+                ops::floor,
+                ops::ceil,
+                ops::bitwise_invert,
+                ops::square,
+                ops::reciprocal,
+                ops::degrees,
+                ops::radians,
+                ops::positive,
+                ops::trunc,
+                ops::real,
+                ops::imag,
+                ops::conj,
+                ops::logical_not,
+                ops::isnan,
+                ops::isinf,
+                ops::isfinite,
+                ops::isposinf,
+                ops::isneginf,
+                ops::acos,
+                ops::atan,
+                ops::atleast_1d,
+                ops::atleast_2d,
+                ops::atleast_3d,
+                ops::matrix_transpose,
+            ];
+            let _ = unary.map(|f| f(a));
+            let _: [Array; 9] = [
+                ops::arctan2(a, b),
+                ops::remainder(a, 2),
+                ops::bitwise_and(a, b),
+                ops::bitwise_or(a, b),
+                ops::bitwise_xor(a, b),
+                ops::left_shift(a, 1),
+                ops::right_shift(a, 1),
+                ops::logical_and(a, b),
+                ops::logical_xor(a, true),
+            ];
+            let _: [Array; 2] = ops::divmod(a, b);
+            let _: Array = ops::round(a, 2);
+            let _: Array = a.round(0);
+            let _ = (
+                a.erf(),
+                a.square(),
+                a.reciprocal(),
+                a.moveaxis(0, 1),
+                a.swapaxes(0, 1),
+            );
+            let _ = ops::nan_to_num(a, ops::NanToNum::new().nan(0.0).posinf(1.0).neginf(-1.0));
+            let c = ops::CloseOptions::new()
+                .rtol(1e-3)
+                .atol(0.0)
+                .equal_nan(true);
+            let _ = (
+                ops::isclose(a, b, c),
+                ops::allclose(a, b, c),
+                ops::array_equal(a, b, true),
+            );
+            let _ = (ops::clip(a, 0.0, 1.0), ops::count_nonzero(a, .., false));
+            let _: [Array; 2] = ops::minmax(a, -1, true);
+            let _ = (
+                ops::flip(a, None),
+                ops::roll(a, &[1], Some(&[0])),
+                ops::tile(a, &[2]),
+            );
+            let _: Vec<Array> = ops::unstack(a, 0);
+            let _: Vec<Array> = ops::broadcast_arrays(&[a.clone(), b.clone()]);
+            let _ = ops::unflatten(a, 0, &[2, -1]);
+            let _ = ops::pad(a, &[(1, 1)], ops::PadMode::Reflect, 0.0);
+            let _ = (
+                ops::tri(3, None, 0, DType::F32),
+                ops::tril(a, 0),
+                ops::triu(a, -1),
+            );
+            let _ = (
+                ops::eye(3, Some(4), 1, DType::I32),
+                ops::identity(3, DType::F16),
+            );
+            let _ = (
+                ops::diag(a, 0),
+                ops::diagonal(a, 0, 0, 1),
+                ops::trace(a, 0, 0, 1),
+            );
+            let _ = ops::linspace(0.0, 1.0, 5, DType::F32);
+            let _: Vec<Array> = ops::meshgrid(&[a.clone(), b.clone()], false, "xy");
+            let _ = (
+                ops::hanning(5),
+                ops::hamming(5),
+                ops::blackman(5),
+                ops::bartlett(5),
+            );
+            let _ = (ops::tensordot(a, b, &[1], &[0]), ops::tensordot_n(a, b, 1));
+            let _ = (
+                ops::inner(a, b),
+                ops::outer(a, b),
+                ops::kron(a, b),
+                ops::vecdot(a, b, -1),
+            );
+            let _ = ops::einsum("ij,jk->ik", &[a.clone(), b.clone()]);
+            let _ = (
+                ops::diff(a, 1, -1),
+                ops::median(a, None, false),
+                ops::searchsorted(a, b, true),
+            );
+            let u: ops::Unique = ops::unique(a, 4, None);
+            let _ = (u.values, u.index, u.inverse, u.counts);
+            let _ = (
+                ops::as_strided(a, &[2], &[1], 0),
+                ops::empty(&[2], DType::F32),
+                ops::empty_like(a),
+            );
+            let _ = (
+                ops::flatten(a, 0, -1),
+                ops::matrix_norm(a, ops::Norm::Fro, None, false),
+            );
+            let _: bool = ops::issubdtype(DType::F16, ops::DTypeCategory::Floating);
+            let _: bool =
+                ops::isdtype(DType::I8, "signed integer") && ops::can_cast(DType::I8, DType::I32);
+            let _: Option<DType> = ops::result_type(&[DType::I8, DType::F16]);
+            let _ = (
+                nuvec_nn::gelu(a),
+                nuvec_nn::softplus(a),
+                nuvec_nn::mish(a),
+                nuvec_nn::glu(a, -1),
+            );
+            let _ = (
+                nuvec_nn::elu(a, 1.0),
+                nuvec_nn::celu(a, 1.0),
+                nuvec_nn::selu(a),
+                nuvec_nn::log_sigmoid(a),
+            );
+            let _ = (
+                nuvec_nn::relu2(a),
+                nuvec_nn::relu6(a),
+                nuvec_nn::leaky_relu(a, 0.01),
+                nuvec_nn::softsign(a),
+            );
+            let _ = (
+                nuvec_nn::softshrink(a, 0.5),
+                nuvec_nn::hard_shrink(a, 0.5),
+                nuvec_nn::hard_tanh(a, -1.0, 1.0),
+            );
+            let _ = (
+                nuvec_nn::hardswish(a),
+                nuvec_nn::prelu(a, b),
+                nuvec_nn::step(a, 0.0),
+            );
+            let _ = (nuvec_nn::log_softmax(a, -1), nuvec_nn::softmin(a, -1));
+        }
+
+        /// Chat templates and mlx-lm's chat and completion data.
+        fn chat(tokenizer: &nuvec_lm::Tokenizer, model: &nuvec_lm::Config) -> Result<()> {
+            use nuvec::io::json::Json;
+            use nuvec_lm::TokenizerConfig;
+            use nuvec_lm::chat::{self, ChatTemplate, RenderOptions};
+            use nuvec_lm::tuner::{self, DataOptions, Dataset};
+            let config: TokenizerConfig = TokenizerConfig::from_dir("m")?;
+            let _: Option<&str> = config.special_token("eos_token");
+            let _: &Vec<(String, String)> = &config.templates;
+            let t: ChatTemplate = ChatTemplate::from_dir("m")?;
+            let t2 = ChatTemplate::from_config(&config)?;
+            let _ = ChatTemplate::new("{{ messages }}")?;
+            let _: Vec<&str> = t.names().collect();
+            let options = RenderOptions::new()
+                .generation_prompt(true)
+                .continue_final_message(false)
+                .tools(Json::Array(vec![]))
+                .documents(Json::Array(vec![]))
+                .template("default")
+                .now(std::time::SystemTime::now())
+                .arg("enable_thinking", Json::Bool(false));
+            let _: bool = options.has_arg("enable_thinking");
+            let _: Result<&str> = t.select(&options);
+            let messages = [Json::Null];
+            let _: String = t.render(&messages, &options)?;
+            let _: Vec<u32> = t2.encode(tokenizer, &messages, &options)?;
+            let _: bool = chat::has_thinking(tokenizer);
+            let _: RenderOptions = chat::mlx_lm_options(tokenizer, RenderOptions::default());
+            let _: Vec<u32> = chat::prompt_ids(
+                Some(&t),
+                tokenizer,
+                "hi",
+                Some("s"),
+                None,
+                RenderOptions::new(),
+            )?;
+            let eos: Option<u32> = tuner::eos_token_id(tokenizer, &config, model);
+            let o = DataOptions {
+                mask_prompt: true,
+                ..DataOptions::default()
+            };
+            let (_, _, _, _, _): (
+                &String,
+                &String,
+                &String,
+                &String,
+                &Option<std::time::SystemTime>,
+            ) = (
+                &o.text_feature,
+                &o.chat_feature,
+                &o.prompt_feature,
+                &o.completion_feature,
+                &o.now,
+            );
+            let d: Dataset =
+                Dataset::from_rows(&messages, tokenizer, Some(&t), eos.unwrap_or(0), &o)?;
+            let _ = Dataset::load_with("train.jsonl", tokenizer, None, 0, &o)?;
+            let _: Vec<(&[u32], usize)> = d.rows().collect();
+            Ok(())
         }
 
         /// `Projection` is non-exhaustive: matches need a wildcard.

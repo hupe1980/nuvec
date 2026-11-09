@@ -27,8 +27,18 @@ fn single(primitive: Primitive, inputs: Vec<Array>) -> Result<Array> {
 
 pub(crate) fn binary(op: BinaryOp, a: &Array, b: &Array) -> Result<Array> {
     let mut dtype = promote_types(a.dtype(), b.dtype());
-    if matches!(op, BinaryOp::Divide | BinaryOp::LogAddExp) {
+    if matches!(
+        op,
+        BinaryOp::Divide | BinaryOp::LogAddExp | BinaryOp::ArcTan2
+    ) {
         dtype = at_least_float(dtype);
+    }
+    if op.is_bitwise() && matches!(dtype.category(), Category::Float | Category::Complex) {
+        return Err(Error::unsupported_dtype(op.name(), dtype));
+    }
+    if matches!(op, BinaryOp::LeftShift | BinaryOp::RightShift) && dtype == DType::Bool {
+        // MLX shifts booleans as uint8.
+        dtype = DType::U8;
     }
     let ordered = matches!(
         op,
@@ -36,7 +46,9 @@ pub(crate) fn binary(op: BinaryOp, a: &Array, b: &Array) -> Result<Array> {
             | BinaryOp::Minimum
             | BinaryOp::LogAddExp
             | BinaryOp::FloorDivide
+            | BinaryOp::Remainder
             | BinaryOp::Power
+            | BinaryOp::ArcTan2
             | BinaryOp::Less
             | BinaryOp::LessEqual
             | BinaryOp::Greater
@@ -101,9 +113,14 @@ pub(crate) fn unary(op: UnaryOp, a: &Array) -> Result<Array> {
     } else {
         a.dtype()
     };
+    if op.is_rounding() && !matches!(dtype.category(), Category::Float | Category::Complex) {
+        // Integers and booleans are their own floor, ceiling and rounding (MLX).
+        return Ok(a.clone());
+    }
     let unsupported = match op {
         UnaryOp::Negative => dtype == DType::Bool,
         UnaryOp::Abs | UnaryOp::Conjugate => false,
+        UnaryOp::BitwiseInvert => matches!(dtype.category(), Category::Float | Category::Complex),
         _ => dtype == DType::Complex64,
     };
     if unsupported {
@@ -165,6 +182,44 @@ unary_fn! {
     sigmoid => Sigmoid;
     /// Element-wise inverse error function, in at least float32.
     erfinv => ErfInv;
+    /// Element-wise error function, in at least float32.
+    erf => Erf;
+    /// Element-wise `e^a − 1`, in at least float32.
+    expm1 => Expm1;
+    /// Element-wise `ln(1 + a)`, in at least float32.
+    log1p => Log1p;
+    /// Element-wise base-2 logarithm, in at least float32.
+    log2 => Log2;
+    /// Element-wise base-10 logarithm, in at least float32.
+    log10 => Log10;
+    /// Element-wise tangent, in at least float32.
+    tan => Tan;
+    /// Element-wise hyperbolic sine, in at least float32.
+    sinh => Sinh;
+    /// Element-wise hyperbolic cosine, in at least float32.
+    cosh => Cosh;
+    /// Element-wise inverse cosine, in at least float32.
+    arccos => ArcCos;
+    /// Element-wise inverse hyperbolic cosine, in at least float32.
+    arccosh => ArcCosh;
+    /// Element-wise inverse sine, in at least float32.
+    arcsin => ArcSin;
+    /// Element-wise inverse hyperbolic sine, in at least float32.
+    arcsinh => ArcSinh;
+    /// Element-wise inverse tangent, in at least float32.
+    arctan => ArcTan;
+    /// Element-wise inverse hyperbolic tangent, in at least float32.
+    arctanh => ArcTanh;
+    /// Element-wise `1 / √a`, in at least float32.
+    rsqrt => Rsqrt;
+    /// Element-wise floor; integers and booleans unchanged.
+    floor => Floor;
+    /// Element-wise ceiling; integers and booleans unchanged.
+    ceil => Ceil;
+    /// Element-wise rounding to the nearest integer, ties to even; integers unchanged.
+    round => Round;
+    /// Element-wise `~a` of integers or booleans.
+    bitwise_invert => BitwiseInvert;
 }
 
 /// Whether the row kernels (softmax, log-sum-exp) take `a` over its last axis.

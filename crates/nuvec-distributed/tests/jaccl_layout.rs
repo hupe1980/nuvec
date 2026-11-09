@@ -1,6 +1,6 @@
 //! The RDMA bindings' struct sizes and field offsets against the SDK's
 //! `infiniband/verbs.h`: a C probe compiled with the system compiler prints every value the
-//! bindings rely on (constitution I). Skipped without `cc` or the SDK.
+//! bindings rely on. Skipped without `cc` or the SDK.
 
 #![cfg(all(feature = "jaccl", target_os = "macos"))]
 

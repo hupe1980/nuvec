@@ -1288,6 +1288,347 @@ mod gpu {
         );
     }
 
+    /// The segmented GEMM against the composition: unaligned shapes, empty, reversed and
+    /// out-of-range segments (clamped), batched segments, every dtype.
+    #[test]
+    fn segmented_mm_matches_the_composition() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x96);
+        let segments = Array::from_slice(
+            &[0u32, 100, 100, 100, 37, 300, 250, 10, 0, 9999, 299, 300],
+            [2, 3, 2],
+        );
+        for (m, k, n) in [(64, 300, 64), (70, 300, 33), (5, 300, 130)] {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let a = random(&mut rng, &[m, k], dtype);
+                let b = random(&mut rng, &[k, n], dtype);
+                let tol = match dtype {
+                    DType::F32 => 1e-5,
+                    _ => tolerance(dtype),
+                };
+                both(&format!("segmented_mm {m}x{k}x{n} {dtype}"), tol, || {
+                    Ok(vec![ops::segmented_mm(&a, &b, &segments)])
+                });
+            }
+        }
+    }
+
+    /// The Hadamard kernels (one pass, two passes above 8192, the order-m stage, half
+    /// types kept in float32 between passes) against the CPU's composition.
+    #[test]
+    fn hadamard_matches_the_composition() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x95);
+        for n in [
+            2,
+            64,
+            1024,
+            8192,
+            16384,
+            65536,
+            12,
+            20 * 512,
+            28 * 4096,
+            12 * 16384,
+        ] {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let rows = (65536 / n).clamp(1, 4);
+                let x = random(&mut rng, &[rows, n], dtype);
+                let tol = match dtype {
+                    DType::F32 => 1e-5,
+                    _ => tolerance(dtype),
+                };
+                both(&format!("hadamard {n} {dtype}"), tol, || {
+                    Ok(vec![ops::hadamard_transform(&x, None)])
+                });
+            }
+        }
+        // A strided input and a custom scale.
+        let x = random(&mut rng, &[32, 6], DType::F32);
+        both("hadamard strided", 1e-6, || {
+            Ok(vec![ops::hadamard_transform(&x.t(), Some(0.5))])
+        });
+    }
+
+    /// Every convolution route on the GPU (MLX's implicit-GEMM kernels with each channel
+    /// and filter specialisation and tile shape, the general kernel, both depthwise
+    /// kernels, the columns and GEMM) against the CPU's composition, with gradients.
+    #[test]
+    fn convolutions_match_the_composition() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        type Conv = fn(&Array, &Array) -> Array;
+        fn o(
+            s: &[i32],
+            lo: &[i32],
+            hi: &[i32],
+            kd: &[i32],
+            id: &[i32],
+            g: i32,
+            flip: bool,
+        ) -> ops::ConvOptions {
+            ops::ConvOptions::new()
+                .stride(s)
+                .padding_lo_hi(lo, hi)
+                .kernel_dilation(kd)
+                .input_dilation(id)
+                .groups(g)
+                .flip(flip)
+        }
+        let cases: Vec<(&str, Vec<usize>, Vec<usize>, Conv)> = vec![
+            (
+                "2d small filter",
+                vec![2, 9, 9, 16],
+                vec![32, 3, 3, 16],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 1),
+            ),
+            (
+                "2d large filter",
+                vec![1, 20, 20, 16],
+                vec![16, 17, 17, 16],
+                |x, w| ops::conv2d(x, w, 1, 0, 1, 1),
+            ),
+            (
+                "2d 1 channel",
+                vec![2, 10, 10, 1],
+                vec![16, 3, 3, 1],
+                |x, w| ops::conv2d(x, w, 2, 1, 1, 1),
+            ),
+            (
+                "2d 2 channels",
+                vec![2, 10, 10, 2],
+                vec![16, 3, 3, 2],
+                |x, w| ops::conv2d(x, w, 2, 1, 1, 1),
+            ),
+            (
+                "2d 3 channels",
+                vec![1, 32, 32, 3],
+                vec![48, 8, 8, 3],
+                |x, w| ops::conv2d(x, w, 8, 0, 1, 1),
+            ),
+            (
+                "2d 4 channels",
+                vec![2, 10, 10, 4],
+                vec![16, 3, 3, 4],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 1),
+            ),
+            (
+                "2d 8 channels",
+                vec![2, 10, 10, 8],
+                vec![32, 3, 3, 8],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 1),
+            ),
+            (
+                "2d 8 outputs",
+                vec![2, 9, 9, 16],
+                vec![8, 3, 3, 16],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 1),
+            ),
+            (
+                "2d bm64",
+                vec![2, 64, 64, 64],
+                vec![64, 3, 3, 64],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 1),
+            ),
+            ("2d flip", vec![1, 9, 8, 16], vec![16, 3, 2, 16], |x, w| {
+                ops::conv_general(x, w, &o(&[1], &[1, 0], &[1, 0], &[1], &[1], 1, true))
+            }),
+            (
+                "2d groups",
+                vec![2, 9, 9, 32],
+                vec![32, 3, 3, 16],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 2),
+            ),
+            (
+                "2d groups 3 channels",
+                vec![2, 9, 9, 12],
+                vec![16, 3, 3, 3],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 4),
+            ),
+            (
+                "2d general",
+                vec![2, 12, 11, 24],
+                vec![40, 3, 3, 24],
+                |x, w| ops::conv2d(x, w, [2, 1], [1, 2], [1, 2], 1),
+            ),
+            (
+                "2d general dilated",
+                vec![1, 9, 10, 16],
+                vec![32, 3, 3, 16],
+                |x, w| {
+                    ops::conv_general(
+                        x,
+                        w,
+                        &o(&[2, 1], &[2, 1], &[1, 2], &[2, 1], &[2, 3], 1, true),
+                    )
+                },
+            ),
+            (
+                "2d transpose",
+                vec![2, 8, 8, 32],
+                vec![16, 4, 4, 32],
+                |x, w| ops::conv_transpose2d(x, w, 2, 1, 1, 0, 1),
+            ),
+            (
+                "2d transpose odd channels",
+                vec![1, 7, 6, 5],
+                vec![3, 3, 3, 5],
+                |x, w| ops::conv_transpose2d(x, w, 2, 1, 1, 1, 1),
+            ),
+            (
+                "2d winograd",
+                vec![1, 64, 64, 128],
+                vec![128, 3, 3, 128],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 1),
+            ),
+            (
+                "2d winograd odd tiles",
+                vec![2, 45, 50, 96],
+                vec![160, 3, 3, 96],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 1),
+            ),
+            (
+                "2d padded channels",
+                vec![2, 20, 20, 24],
+                vec![32, 3, 3, 24],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 1),
+            ),
+            (
+                "1d padded channels",
+                vec![2, 40, 8],
+                vec![16, 9, 8],
+                |x, w| ops::conv1d(x, w, 1, 4, 1, 1),
+            ),
+            (
+                "2d explicit",
+                vec![1, 5, 5, 24],
+                vec![40, 3, 3, 24],
+                |x, w| ops::conv2d(x, w, 1, 0, 1, 1),
+            ),
+            (
+                "2d explicit groups",
+                vec![1, 6, 6, 8],
+                vec![6, 3, 3, 4],
+                |x, w| ops::conv_transpose2d(x, w, 2, 0, 1, 0, 2),
+            ),
+            (
+                "2d depthwise 3x3",
+                vec![2, 13, 11, 16],
+                vec![16, 3, 3, 1],
+                |x, w| ops::conv2d(x, w, 1, 1, 1, 16),
+            ),
+            (
+                "2d depthwise 7x7 s2",
+                vec![1, 20, 17, 24],
+                vec![24, 7, 7, 1],
+                |x, w| ops::conv2d(x, w, 2, 3, 1, 24),
+            ),
+            (
+                "2d depthwise flip",
+                vec![1, 9, 9, 8],
+                vec![8, 5, 5, 1],
+                |x, w| ops::conv_general(x, w, &o(&[1], &[2], &[2], &[1], &[1], 8, true)),
+            ),
+            (
+                "2d depthwise nuvec",
+                vec![1, 9, 9, 5],
+                vec![10, 3, 3, 1],
+                |x, w| ops::conv2d(x, w, 1, 1, 2, 5),
+            ),
+            ("2d crop", vec![1, 9, 9, 16], vec![16, 3, 3, 16], |x, w| {
+                ops::conv_general(x, w, &o(&[1], &[-1, 1], &[1, -2], &[1], &[1], 1, false))
+            }),
+            ("1d", vec![2, 30, 16], vec![32, 5, 16], |x, w| {
+                ops::conv1d(x, w, 2, 2, 1, 1)
+            }),
+            ("1d 3 channels", vec![2, 30, 3], vec![16, 4, 3], |x, w| {
+                ops::conv1d(x, w, 1, 1, 2, 1)
+            }),
+            ("1d explicit", vec![2, 30, 24], vec![40, 3, 24], |x, w| {
+                ops::conv1d(x, w, 1, 1, 1, 1)
+            }),
+            ("1d transpose", vec![2, 9, 16], vec![16, 4, 16], |x, w| {
+                ops::conv_transpose1d(x, w, 2, 1, 1, 1, 1)
+            }),
+            ("3d", vec![1, 5, 6, 7, 16], vec![32, 3, 3, 3, 16], |x, w| {
+                ops::conv3d(x, w, 1, 1, 1, 1)
+            }),
+            (
+                "3d large filter",
+                vec![1, 3, 20, 20, 16],
+                vec![16, 1, 17, 17, 16],
+                |x, w| ops::conv3d(x, w, 1, 0, 1, 1),
+            ),
+            (
+                "3d explicit",
+                vec![1, 5, 6, 7, 5],
+                vec![8, 2, 3, 2, 5],
+                |x, w| ops::conv3d(x, w, [1, 2, 1], 1, 1, 1),
+            ),
+            (
+                "3d transpose",
+                vec![1, 3, 4, 4, 16],
+                vec![16, 2, 2, 2, 16],
+                |x, w| ops::conv_transpose3d(x, w, 2, 0, 1, 0, 1),
+            ),
+            (
+                "3d depthwise",
+                vec![1, 4, 5, 6, 3],
+                vec![3, 2, 3, 2, 1],
+                |x, w| ops::conv3d(x, w, 1, 1, 1, 3),
+            ),
+        ];
+        let mut rng = Rng::new(0x94);
+        for (name, xs, ws, f) in cases {
+            // Float32 sums of `k` products differ by up to about `4 (k + 1) ε` (MLX's kernels
+            // as nuvec's).
+            let k = ws[1..].iter().product::<usize>() as f64;
+            let f32_tol = (4.0 * (k + 1.0) * f64::from(f32::EPSILON)).max(1e-4);
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let x = random(&mut rng, &xs, dtype);
+                let w = random(&mut rng, &ws, dtype);
+                let name = format!("{name} {dtype}");
+                let tol = match dtype {
+                    DType::F32 => f32_tol,
+                    _ => tolerance(dtype),
+                };
+                if name.contains("winograd") && dtype == DType::F32 {
+                    // Winograd's error scales with the output's magnitude (about 1e-5 of it,
+                    // as MLX's).
+                    let c = values(&on(Device::cpu(), || f(&x, &w)));
+                    let g = values(&on(Device::gpu(0), || f(&x, &w)));
+                    let scale = c.iter().fold(0f64, |m, v| m.max(v.abs()));
+                    let err = c
+                        .iter()
+                        .zip(&g)
+                        .fold(0f64, |m, (a, b)| m.max((a - b).abs()));
+                    assert!(err <= 3e-5 * scale, "{name}: {err} of {scale}");
+                    continue;
+                }
+                both(&name, tol, || Ok(vec![f(&x, &w)]));
+                // A transposed (strided) input.
+                let xt = ops::swapaxes(&ops::swapaxes(&x, 0, 1).contiguous(), 0, 1);
+                both(&format!("{name} strided"), tol, || Ok(vec![f(&xt, &w)]));
+            }
+            let x = random(&mut rng, &xs, DType::F32);
+            let w = random(&mut rng, &ws, DType::F32);
+            let y = f(&x, &w);
+            let dims: Vec<usize> = y.shape().iter().map(|&d| d as usize).collect();
+            let g = random(&mut rng, &dims, DType::F32);
+            let fs = move |a: &[Array]| Ok(vec![f(&a[0], &a[1])]);
+            // (Winograd's forward value is checked above, against its scale.)
+            let skip = usize::from(name.contains("winograd"));
+            both(&format!("{name} grads"), 4.0 * f32_tol, || {
+                Ok(with_grads(fs, &[x.clone(), w.clone()], &g)?.split_off(skip))
+            });
+        }
+    }
+
     #[test]
     fn depthwise_conv1d_matches_the_fallback() {
         if crate::common::require_gpu().is_none() {

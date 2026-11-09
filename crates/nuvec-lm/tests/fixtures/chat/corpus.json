@@ -1,0 +1,169 @@
+{
+ "repos": [
+  {
+   "repo": "mlx-community/Qwen3-0.6B-4bit",
+   "model_type": "qwen3",
+   "commit": "73e3e38d981303bc594367cd910ea6eb48349da8"
+  },
+  {
+   "repo": "mlx-community/Qwen3-8B-4bit",
+   "model_type": "qwen3",
+   "commit": "545dc4251c05440727734bcd94334791f6ab0192"
+  },
+  {
+   "repo": "mlx-community/Qwen3-30B-A3B-4bit",
+   "model_type": "qwen3_moe",
+   "commit": "d388dead1515f5e085ef7a0431dd8fadf0886c57"
+  },
+  {
+   "repo": "mlx-community/Qwen3.8-27B-4bit",
+   "model_type": "qwen3_5",
+   "commit": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+  },
+  {
+   "repo": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+   "model_type": "qwen3",
+   "commit": "50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b"
+  },
+  {
+   "repo": "mlx-community/Qwen3-4B-Thinking-2507-4bit",
+   "model_type": "qwen3",
+   "commit": "627b019c66f22d4de0a641d289b41497651a55c9"
+  },
+  {
+   "repo": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+   "model_type": "qwen3_moe",
+   "commit": "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+  },
+  {
+   "repo": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+   "model_type": "qwen2",
+   "commit": "c26a38f6a37d0a51b4e9a1eb3026530fa35d9fed"
+  },
+  {
+   "repo": "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+   "model_type": "qwen2",
+   "commit": "019cc73c45c770444708a6dd8690c66243cc5c80"
+  },
+  {
+   "repo": "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit",
+   "model_type": "qwen2",
+   "commit": "21848dbf533d2518a1ef895104820d5ee51317ea"
+  },
+  {
+   "repo": "mlx-community/DeepSeek-R1-0528-Qwen3-8B-4bit",
+   "model_type": "qwen3",
+   "commit": "b9b5af4fa18feb8cdbccdadf3aad2c83d0abbe51"
+  },
+  {
+   "repo": "mlx-community/Llama-3.2-1B-Instruct-4bit",
+   "model_type": "llama",
+   "commit": "08231374eeacb049a0eade7922910865b8fce912"
+  },
+  {
+   "repo": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+   "model_type": "llama",
+   "commit": "7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
+  },
+  {
+   "repo": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+   "model_type": "llama",
+   "commit": "241a666dad6cb93c8ff213d39a7f34a36bf26db4"
+  },
+  {
+   "repo": "mlx-community/Llama-3.3-70B-Instruct-4bit",
+   "model_type": "llama",
+   "commit": "de2dfaf56839b7d0e834157d2401dee02726874d"
+  },
+  {
+   "repo": "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+   "model_type": "mistral",
+   "commit": "a4b8f870474b0eb527f466a03fbc187830d271f5"
+  },
+  {
+   "repo": "mlx-community/Mistral-7B-Instruct-v0.2-4bit",
+   "model_type": "mistral",
+   "commit": "64481e3a4a7bb0990c45c991958f8d6c00c1e785"
+  },
+  {
+   "repo": "mlx-community/Ministral-8B-Instruct-2410-4bit",
+   "model_type": "mistral",
+   "commit": "ac59869ee8c0b25c94b7cf2ed72f5814d5ed092b"
+  },
+  {
+   "repo": "mlx-community/Mistral-Small-24B-Instruct-2501-4bit",
+   "model_type": "mistral",
+   "commit": "51ed0c6d2f98a25d8a60f19994f0e86c944995e0"
+  },
+  {
+   "repo": "mlx-community/Mistral-Nemo-Instruct-2407-4bit",
+   "model_type": "mistral",
+   "commit": "647ca0751669b21a364c86ccc5df54c4d7e4e91c"
+  },
+  {
+   "repo": "mlx-community/gemma-4-e4b-it-4bit",
+   "model_type": "gemma4",
+   "commit": "475b9088d29754a3379866cf5aeb6b41acd313c2"
+  },
+  {
+   "repo": "mlx-community/gemma-4-26b-a4b-it-4bit",
+   "model_type": "gemma4",
+   "commit": "0d77464eeb233a2da68ebf9d7dc4edaac7db956d"
+  },
+  {
+   "repo": "mlx-community/gpt-oss-20b-MXFP4-Q8",
+   "model_type": "gpt_oss",
+   "commit": "773a7da77e569019bb0fd17a554b263738d669a3"
+  },
+  {
+   "repo": "mlx-community/gpt-oss-120b-MXFP4-Q8",
+   "model_type": "gpt_oss",
+   "commit": "81e5ac3ad0af6efb1298a8e8c7a10ed2990c137b"
+  },
+  {
+   "repo": "lmstudio-community/gpt-oss-20b-MLX-8bit",
+   "model_type": "gpt_oss",
+   "commit": "d23249e3b54df6248c79b67c155bab2f836742dd"
+  },
+  {
+   "repo": "mlx-community/Qwen3.5-4B-MLX-4bit",
+   "model_type": "qwen3_5",
+   "commit": "32f3e8ecf65426fc3306969496342d504bfa13f3"
+  },
+  {
+   "repo": "mlx-community/Qwen3.5-4B-4bit",
+   "model_type": "qwen3_5",
+   "commit": "0e7ffd5c629ef7719d4cbc04069232580bfa9d9c"
+  },
+  {
+   "repo": "mlx-community/Qwen3.5-9B-MLX-4bit",
+   "model_type": "qwen3_5",
+   "commit": "938d8919941c6e7efd3c7150eff7fe9d12afa631"
+  },
+  {
+   "repo": "mlx-community/Qwen3.5-9B-4bit",
+   "model_type": "qwen3_5",
+   "commit": "8b2b98c00a6b4d291155e4890773ca8f769aee53"
+  },
+  {
+   "repo": "mlx-community/Qwen3.5-0.8B-4bit",
+   "model_type": "qwen3_5",
+   "commit": "da28692b5f139cb0ec58a356b437486b7dac7462"
+  },
+  {
+   "repo": "mlx-community/Qwen3.6-35B-A3B-4bit",
+   "model_type": "qwen3_5_moe",
+   "commit": "38740b847e4cb78f352aba30aa41c76e08e6eb46"
+  },
+  {
+   "repo": "mlx-community/Qwen3.6-27B-4bit",
+   "model_type": "qwen3_5",
+   "commit": "c000ac2c2057d94be3fa931000c31723aac53282"
+  },
+  {
+   "repo": "mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit",
+   "model_type": "qwen3_5_moe",
+   "commit": "08567bc6e2bcb36630b3efb9aca40611c9832795"
+  }
+ ]
+}

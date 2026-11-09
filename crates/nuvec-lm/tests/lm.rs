@@ -2601,16 +2601,16 @@ mod lora {
             assert_eq!(lora::load_adapters(&out, &mut again).unwrap(), config);
             assert_eq!(logits(&again, &prompt), got);
         }
-        // Another fine-tuning type is an error.
-        let bad = std::env::temp_dir().join(format!("nuvec-lm-{}-dora", std::process::id()));
+        // An unknown fine-tuning type is an error.
+        let bad = std::env::temp_dir().join(format!("nuvec-lm-{}-prefix", std::process::id()));
         std::fs::create_dir_all(&bad).unwrap();
-        std::fs::write(bad.join("adapter_config.json"), r#"{"fine_tune_type": "dora", "num_layers": 1, "lora_parameters": {"rank": 2, "scale": 1.0}}"#).unwrap();
+        std::fs::write(bad.join("adapter_config.json"), r#"{"fine_tune_type": "prefix", "num_layers": 1, "lora_parameters": {"rank": 2, "scale": 1.0}}"#).unwrap();
         let (dir, ..) = fixture("qwen3_f32");
         let mut model = load_model(&dir).unwrap();
         let err = lora::load_adapters(&bad, &mut model)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("dora"), "{err}");
+        assert!(err.contains("prefix"), "{err}");
         let config = AdapterConfig::new(2, LoraParams::default()).keys(["self_attn.q_proj"]);
         assert_eq!(
             config.keys.as_deref(),

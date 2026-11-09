@@ -22,6 +22,8 @@ nuvec-io.workspace = true
 nuvec-macros.workspace = true
 
 [features]
+# Accelerate's LAPACK for `linalg` on Apple targets (AMX); the pure-Rust `faer` otherwise.
+accelerate = ["nuvec-core/accelerate"]
 # The experimental JACCL backend of `distributed` (RDMA over Thunderbolt 5).
 jaccl = ["nuvec-distributed/jaccl"]
 

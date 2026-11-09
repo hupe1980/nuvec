@@ -86,7 +86,7 @@ Or run the bundled example, which prints mlx-lm-style statistics:
 
 ```sh
 cargo run --release -p nuvec-lm --example generate -- \
-    --model mlx-community/Qwen3-8B-4bit --prompt "Write a haiku about Rust" --chat
+    --model mlx-community/Qwen3-8B-4bit --prompt "Write a haiku about Rust"
 ```
 
 ## Next steps

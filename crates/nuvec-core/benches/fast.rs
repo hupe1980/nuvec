@@ -1,4 +1,4 @@
-//! Fused operations on the GPU, compared against MLX by `scripts/bench_fast.py`
+//! Fused operations and element-wise functions on the GPU, compared against MLX by `scripts/bench_fast.py`
 //! (`just bench-fast`). Prints `name<TAB>dtype<TAB>us_single<TAB>us_grouped` per case: time
 //! per operation in sustained `async_eval` bursts after a warm-up, with one or eight
 //! operations per `async_eval`. The case list and method match the script's.
@@ -62,9 +62,42 @@ const CASES: &[(&str, &[usize])] = &[
     ("sdpa-e4b-d256-512", &[1, 8, 2, 1, 512, 256]),
     ("sdpa-e4b-d512-1k", &[1, 8, 2, 1, 1024, 512]),
     ("sdpa-e4b-d512-4k", &[1, 8, 2, 1, 4096, 512]),
+    // MLX's element-wise functions over 2^24 contiguous elements (`ew-<name>`).
+    ("ew-erf", &[1 << 24]),
+    ("ew-expm1", &[1 << 24]),
+    ("ew-log1p", &[1 << 24]),
+    ("ew-log2", &[1 << 24]),
+    ("ew-tan", &[1 << 24]),
+    ("ew-sinh", &[1 << 24]),
+    ("ew-arccos", &[1 << 24]),
+    ("ew-arcsinh", &[1 << 24]),
+    ("ew-arctanh", &[1 << 24]),
+    ("ew-rsqrt", &[1 << 24]),
+    ("ew-floor", &[1 << 24]),
+    ("ew-round", &[1 << 24]),
+    ("ew-arctan2", &[1 << 24]),
+    ("ew-remainder", &[1 << 24]),
 ];
 
 fn op(name: &str, x: &Array, w: &Array, targets: &Array) -> Array {
+    if let Some(f) = name.strip_prefix("ew-") {
+        return match f {
+            "erf" => x.erf(),
+            "expm1" => x.expm1(),
+            "log1p" => x.log1p(),
+            "log2" => x.log2(),
+            "tan" => x.tan(),
+            "sinh" => x.sinh(),
+            "arccos" => x.arccos(),
+            "arcsinh" => x.arcsinh(),
+            "arctanh" => x.arctanh(),
+            "rsqrt" => x.rsqrt(),
+            "floor" => x.floor(),
+            "round" => x.round(0),
+            "arctan2" => x.arctan2(w),
+            _ => x.remainder(w),
+        };
+    }
     match name.split('-').next().expect("prefix") {
         // `x` is q, `w` the keys and values (one array), as set up in `main`.
         "sdpa" => {

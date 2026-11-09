@@ -461,6 +461,24 @@ pub fn run(case: &Case) -> Result<Vec<Array>> {
             let cs = &xs[n..n + consts];
             Ok(jvp_flat(|ps: &[Array]| f(ps, cs), &xs[..n], &xs[n + consts..])?.1)
         }
+        "einsum_path" => {
+            let (path, report) = ops::einsum_path(p("subscripts"), &xs)?;
+            let width = path.iter().map(Vec::len).max().unwrap_or(0);
+            let rows: Vec<i32> = path
+                .iter()
+                .flat_map(|s| (0..width).map(move |i| s.get(i).map_or(-1, |&v| v as i32)))
+                .collect();
+            let nums: Vec<i64> = report
+                .lines()
+                .skip(1)
+                .take(4)
+                .map(|l| l.split(':').nth(1).unwrap().trim().parse().unwrap())
+                .collect();
+            Ok(vec![
+                Array::from_slice(&rows, [path.len(), width]),
+                Array::from_slice(&nums, [4]),
+            ])
+        }
         "quantize" => {
             let x = match p("pre") {
                 "t" => xs[0].t(),
@@ -487,6 +505,23 @@ pub fn run(case: &Case) -> Result<Vec<Array>> {
             } else {
                 Ok(xs[0].split_at(&ints(p("at")), axis))
             }
+        }
+        op if op.starts_with("linalg_") => linalg_case(&op[7..], case, &xs),
+        "divmod" => Ok(ops::divmod(&xs[0], &xs[1]).to_vec()),
+        "unstack" => Ok(ops::unstack(&xs[0], p("axis").parse().unwrap())),
+        "broadcast_arrays" => Ok(ops::broadcast_arrays(&xs)),
+        "meshgrid" => Ok(ops::meshgrid(&xs, p("sparse") == "1", p("indexing"))),
+        "unique" => {
+            let u = ops::unique(&xs[0], p("size").parse().unwrap(), p("fill").parse().ok());
+            Ok(vec![u.values, u.index, u.inverse, u.counts])
+        }
+        "minmax" => {
+            let axes = if p("axes") == "all" {
+                vec![0, 1, 2][..xs[0].ndim()].to_vec()
+            } else {
+                ints(p("axes"))
+            };
+            Ok(ops::minmax(&xs[0], &axes[..], p("keepdims") == "1").to_vec())
         }
         op => Ok(vec![apply(case, op, xs)?]),
     }
@@ -548,6 +583,13 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "less_equal" => Some(ops::less_equal),
         "greater" => Some(ops::greater),
         "greater_equal" => Some(ops::greater_equal),
+        "arctan2" => Some(ops::arctan2),
+        "remainder" => Some(ops::remainder),
+        "bitwise_and" => Some(ops::bitwise_and),
+        "bitwise_or" => Some(ops::bitwise_or),
+        "bitwise_xor" => Some(ops::bitwise_xor),
+        "left_shift" => Some(ops::left_shift),
+        "right_shift" => Some(ops::right_shift),
         _ => None,
     };
     if let Some(f) = binary {
@@ -570,6 +612,25 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "sigmoid" => Some(ops::sigmoid),
         "conjugate" => Some(ops::conjugate),
         "erfinv" => Some(ops::erfinv),
+        "erf" => Some(ops::erf),
+        "expm1" => Some(ops::expm1),
+        "log1p" => Some(ops::log1p),
+        "log2" => Some(ops::log2),
+        "log10" => Some(ops::log10),
+        "tan" => Some(ops::tan),
+        "sinh" => Some(ops::sinh),
+        "cosh" => Some(ops::cosh),
+        "arccos" => Some(ops::arccos),
+        "arccosh" => Some(ops::arccosh),
+        "arcsin" => Some(ops::arcsin),
+        "arcsinh" => Some(ops::arcsinh),
+        "arctan" => Some(ops::arctan),
+        "arctanh" => Some(ops::arctanh),
+        "rsqrt" => Some(ops::rsqrt),
+        "floor" => Some(ops::floor),
+        "ceil" => Some(ops::ceil),
+        "round" => Some(|x| ops::round(x, 0)),
+        "bitwise_invert" => Some(ops::bitwise_invert),
         _ => None,
     };
     if let Some(f) = unary {
@@ -597,7 +658,200 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
     if let Some(f) = reduction {
         return Ok(f(&xs[0], reduce_axes(p("axes"), &xs[0])));
     }
+    let composed: Option<fn(&Array) -> Array> = match op {
+        "square" => Some(ops::square),
+        "reciprocal" => Some(ops::reciprocal),
+        "degrees" => Some(ops::degrees),
+        "radians" => Some(ops::radians),
+        "trunc" => Some(ops::trunc),
+        "real" => Some(ops::real),
+        "imag" => Some(ops::imag),
+        "logical_not" => Some(ops::logical_not),
+        "isnan" => Some(ops::isnan),
+        "isinf" => Some(ops::isinf),
+        "isfinite" => Some(ops::isfinite),
+        "isposinf" => Some(ops::isposinf),
+        "isneginf" => Some(ops::isneginf),
+        _ => None,
+    };
+    if let Some(f) = composed {
+        return Ok(f(&xs[0]));
+    }
+    let close = || {
+        ops::CloseOptions::new()
+            .rtol(p("rtol").parse().unwrap())
+            .atol(p("atol").parse().unwrap())
+            .equal_nan(p("equal_nan") == "1")
+    };
+    let named = || dtype_named(p("dtype"));
+    let axes = |k: &str| (p(k) != "all").then(|| ints(p(k)));
     Ok(match op {
+        "flip" => ops::flip(&xs[0], axes("axes").as_deref()),
+        "roll" => ops::roll(&xs[0], &ints(p("shift")), axes("axes").as_deref()),
+        "tile" => ops::tile(&xs[0], &ints(p("reps"))),
+        "moveaxis" => ops::moveaxis(
+            &xs[0],
+            p("source").parse().unwrap(),
+            p("destination").parse().unwrap(),
+        ),
+        "swapaxes" => ops::swapaxes(
+            &xs[0],
+            p("axis1").parse().unwrap(),
+            p("axis2").parse().unwrap(),
+        ),
+        "atleast_1d" => ops::atleast_1d(&xs[0]),
+        "atleast_2d" => ops::atleast_2d(&xs[0]),
+        "atleast_3d" => ops::atleast_3d(&xs[0]),
+        "unflatten" => ops::unflatten(&xs[0], p("axis").parse().unwrap(), &ints(p("shape"))),
+        "pad" => {
+            let widths: Vec<(i32, i32)> = p("widths")
+                .split(';')
+                .map(|w| {
+                    let v = ints(w);
+                    (v[0], v[1])
+                })
+                .collect();
+            let mode = match p("mode") {
+                "edge" => ops::PadMode::Edge,
+                "reflect" => ops::PadMode::Reflect,
+                "symmetric" => ops::PadMode::Symmetric,
+                _ => ops::PadMode::Constant,
+            };
+            ops::pad(
+                &xs[0],
+                &widths,
+                mode,
+                p("value").parse::<f64>().unwrap_or(0.0),
+            )
+        }
+        "tri" => ops::tri(
+            p("n").parse().unwrap(),
+            p("m").parse().ok(),
+            p("k").parse().unwrap(),
+            named(),
+        ),
+        "eye" => ops::eye(
+            p("n").parse().unwrap(),
+            p("m").parse().ok(),
+            p("k").parse().unwrap(),
+            named(),
+        ),
+        "identity" => ops::identity(p("n").parse().unwrap(), named()),
+        "tril" => ops::tril(&xs[0], p("k").parse().unwrap()),
+        "triu" => ops::triu(&xs[0], p("k").parse().unwrap()),
+        "diag" => ops::diag(&xs[0], p("k").parse().unwrap()),
+        "diagonal" | "trace" => {
+            let (o, a1, a2) = (
+                p("offset").parse().unwrap(),
+                p("axis1").parse().unwrap(),
+                p("axis2").parse().unwrap(),
+            );
+            if op == "diagonal" {
+                ops::diagonal(&xs[0], o, a1, a2)
+            } else {
+                ops::trace(&xs[0], o, a1, a2)
+            }
+        }
+        "linspace" => ops::linspace(
+            p("start").parse().unwrap(),
+            p("stop").parse().unwrap(),
+            p("num").parse().unwrap(),
+            named(),
+        ),
+        "hanning" => ops::hanning(p("m").parse().unwrap()),
+        "hamming" => ops::hamming(p("m").parse().unwrap()),
+        "blackman" => ops::blackman(p("m").parse().unwrap()),
+        "bartlett" => ops::bartlett(p("m").parse().unwrap()),
+        "tensordot" => ops::tensordot(&xs[0], &xs[1], &ints(p("axes_a")), &ints(p("axes_b"))),
+        "tensordot_n" => ops::tensordot_n(&xs[0], &xs[1], p("n").parse().unwrap()),
+        "inner" => ops::inner(&xs[0], &xs[1]),
+        "outer" => ops::outer(&xs[0], &xs[1]),
+        "kron" => ops::kron(&xs[0], &xs[1]),
+        "vecdot" => ops::vecdot(&xs[0], &xs[1], p("axis").parse().unwrap()),
+        "matrix_transpose" => ops::matrix_transpose(&xs[0]),
+        "einsum" => ops::einsum(p("subscripts"), &xs),
+        "segmented_mm" => ops::segmented_mm(&xs[0], &xs[1], &xs[2]),
+        "block_masked_mm" => {
+            let masks = p("masks");
+            let at = |c: char| masks.find(c).map(|i| &xs[2 + i]);
+            ops::block_masked_mm(
+                &xs[0],
+                &xs[1],
+                p("block_size").parse().unwrap(),
+                at('o'),
+                at('l'),
+                at('r'),
+            )
+        }
+        "qqmm" | "gather_qqmm" => {
+            let mode = match p("mode") {
+                "mxfp8" => nuvec_core::QuantMode::Mxfp8,
+                "mxfp4" => nuvec_core::QuantMode::Mxfp4,
+                _ => nuvec_core::QuantMode::Nvfp4,
+            };
+            let quant = nuvec_core::Quant::new(mode);
+            let q = ops::quantize(&xs[1], quant);
+            let w: nuvec_core::QqmmWeight<'_> = if p("q") == "1" {
+                (&q).into()
+            } else {
+                (&xs[1], quant).into()
+            };
+            if op == "qqmm" {
+                ops::qqmm(&xs[0], w)
+            } else {
+                ops::gather_qqmm(&xs[0], w, None, Some(&xs[2]), false)
+            }
+        }
+        "hadamard_transform" => ops::hadamard_transform(
+            &xs[0],
+            match p("scale") {
+                "" | "none" => None,
+                v => Some(v.parse().unwrap()),
+            },
+        ),
+        "diff" => ops::diff(&xs[0], p("n").parse().unwrap(), p("axis").parse().unwrap()),
+        "median" => ops::median(&xs[0], axes("axes").as_deref(), p("keepdims") == "1"),
+        "searchsorted" => ops::searchsorted(&xs[0], &xs[1], p("side") == "right"),
+        "flatten" => ops::flatten(
+            &xs[0],
+            p("start").parse().unwrap(),
+            p("end").parse().unwrap(),
+        ),
+        "matrix_norm" => {
+            let ord = match p("ord") {
+                "none" => ops::Norm::Default,
+                "fro" => ops::Norm::Fro,
+                o => ops::Norm::P(o.parse().unwrap()),
+            };
+            ops::matrix_norm(&xs[0], ord, axes("axes").as_deref(), p("keepdims") == "1")
+        }
+        "as_strided" => {
+            let shape: Vec<usize> = ints(p("shape")).iter().map(|&d| d as usize).collect();
+            let strides: Vec<i64> = ints(p("strides")).iter().map(|&d| i64::from(d)).collect();
+            ops::as_strided(&xs[0], &shape, &strides, p("offset").parse().unwrap())
+        }
+        "logical_and" => ops::logical_and(&xs[0], &xs[1]),
+        "logical_or" => ops::logical_or(&xs[0], &xs[1]),
+        "logical_xor" => ops::logical_xor(&xs[0], &xs[1]),
+        "round_decimals" => ops::round(&xs[0], p("decimals").parse().unwrap()),
+        "nan_to_num" => {
+            let mut v = ops::NanToNum::default();
+            v.nan = p("nan").parse().unwrap_or(0.0);
+            v.posinf = p("posinf").parse().ok();
+            v.neginf = p("neginf").parse().ok();
+            ops::nan_to_num(&xs[0], v)
+        }
+        "isclose" => ops::isclose(&xs[0], &xs[1], close()),
+        "allclose" => ops::allclose(&xs[0], &xs[1], close()),
+        "array_equal" => ops::array_equal(&xs[0], &xs[1], p("equal_nan") == "1"),
+        "clip" => ops::clip(&xs[0], &xs[1], &xs[2]),
+        "count_nonzero" => {
+            if p("axes") == "all" {
+                ops::count_nonzero(&xs[0], .., p("keepdims") == "1")
+            } else {
+                ops::count_nonzero(&xs[0], &ints(p("axes"))[..], p("keepdims") == "1")
+            }
+        }
         "where" => ops::where_(&xs[0], &xs[1], &xs[2]),
         "addmm" => xs[2].addmm(
             &xs[0],
@@ -659,6 +913,93 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         "slice" => graph::slice(&xs[0], &slice_args(p("args")))?,
         "broadcast_to" => xs[0].broadcast_to(usizes(p("shape"))),
         "expand_dims" => xs[0].expand_dims(p("axis").parse::<i32>().unwrap()),
+        "conv2d" | "conv3d" => {
+            let v = ints(p("stride"));
+            let pd = ints(p("padding"));
+            let dl = ints(p("dilation"));
+            let g = p("groups").parse::<i32>().unwrap();
+            if op == "conv2d" {
+                ops::conv2d(
+                    &xs[0],
+                    &xs[1],
+                    [v[0], v[1]],
+                    [pd[0], pd[1]],
+                    [dl[0], dl[1]],
+                    g,
+                )
+            } else {
+                ops::conv3d(
+                    &xs[0],
+                    &xs[1],
+                    [v[0], v[1], v[2]],
+                    [pd[0], pd[1], pd[2]],
+                    [dl[0], dl[1], dl[2]],
+                    g,
+                )
+            }
+        }
+        "conv_general" => ops::conv_general(
+            &xs[0],
+            &xs[1],
+            &ops::ConvOptions::new()
+                .stride(&ints(p("stride")))
+                .padding_lo_hi(&ints(p("lo")), &ints(p("hi")))
+                .kernel_dilation(&ints(p("kd")))
+                .input_dilation(&ints(p("id")))
+                .groups(p("groups").parse().unwrap())
+                .flip(p("flip") == "1"),
+        ),
+        "conv_transpose1d" => {
+            let n = |k: &str| p(k).parse::<i32>().unwrap();
+            ops::conv_transpose1d(
+                &xs[0],
+                &xs[1],
+                n("stride"),
+                n("padding"),
+                n("dilation"),
+                n("output_padding"),
+                n("groups"),
+            )
+        }
+        "conv_transpose2d" => {
+            let a = |k: &str| {
+                let v = ints(p(k));
+                [v[0], v[1]]
+            };
+            ops::conv_transpose2d(
+                &xs[0],
+                &xs[1],
+                a("stride"),
+                a("padding"),
+                a("dilation"),
+                a("output_padding"),
+                p("groups").parse().unwrap(),
+            )
+        }
+        "conv_transpose3d" => {
+            let a = |k: &str| {
+                let v = ints(p(k));
+                [v[0], v[1], v[2]]
+            };
+            ops::conv_transpose3d(
+                &xs[0],
+                &xs[1],
+                a("stride"),
+                a("padding"),
+                a("dilation"),
+                a("output_padding"),
+                p("groups").parse().unwrap(),
+            )
+        }
+        "convolve" => ops::convolve(
+            &xs[0],
+            &xs[1],
+            match p("mode") {
+                "same" => ops::ConvolveMode::Same,
+                "valid" => ops::ConvolveMode::Valid,
+                _ => ops::ConvolveMode::Full,
+            },
+        ),
         "conv1d" => {
             let n = |k: &str| p(k).parse::<i32>().unwrap();
             xs[0].conv1d(
@@ -797,6 +1138,66 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
             8.0 * eps * e.abs().max(1.0)
         }
         "erfinv" => 8.0 * eps * e.abs().max(f64::MIN_POSITIVE),
+        // MLX's CPU erf is Abramowitz and Stegun's 7.1.26 (1.5e-7, plus its float32
+        // evaluation); nuvec's is faithfully rounded.
+        "erf" => 2.5e-7 + 4.0 * eps * e.abs(),
+        // Windows: float32 cosines of MLX's (its zeros are 1e-15-sized).
+        "hanning" | "hamming" | "blackman" | "bartlett" => 4.0 * eps,
+        // Butterflies: each level's rounding is relative to that level's magnitude, at most
+        // `n · max|x|` (before the scale); MLX rounds half types after every radix pass.
+        "hadamard_transform" => {
+            let x = &case.inputs[0];
+            let n = *x.shape.last().unwrap_or(&1) as f64;
+            let max = values(x).iter().fold(0f64, |m, &(re, _)| m.max(re.abs()));
+            let scale = case
+                .params
+                .get("scale")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(1.0 / n.sqrt());
+            (n.log2() + 30.0) * eps * scale * n * max.max(1.0)
+        }
+        // Chains of three or more: each product's rounding is relative to the chain over
+        // absolute values (cancellation hides it from the result).
+        "einsum" if case.inputs.len() > 2 => {
+            let abs: Vec<Array> = case.inputs.iter().map(|t| to_array(t).abs()).collect();
+            let bound = ops::einsum(&case.params["subscripts"], &abs)
+                .max(..)
+                .astype(nuvec_core::DType::F64)
+                .item::<f64>()
+                .unwrap_or(1.0);
+            let k: usize = case
+                .inputs
+                .iter()
+                .map(|t| t.shape.iter().product::<usize>())
+                .max()
+                .unwrap_or(1);
+            (k as f64 + 4.0) * eps * bound.max(1.0)
+        }
+        // Contractions in another order than MLX's.
+        "einsum" | "tensordot" | "tensordot_n" | "inner" | "vecdot" | "trace" | "segmented_mm"
+        | "block_masked_mm" => {
+            let k = case
+                .inputs
+                .iter()
+                .map(|t| t.shape.iter().product::<usize>())
+                .max()
+                .unwrap_or(1);
+            (k as f64 + 4.0) * eps * e.abs().max(1.0)
+        }
+        "linspace" => 2.0 * eps * e.abs().max(1.0),
+        // Decompositions in another order than LAPACK's: relative to the input's size
+        // and magnitude (well-conditioned inputs).
+        op if op.starts_with("linalg_") => {
+            let n = case.inputs[0].shape.iter().rev().take(2).product::<usize>() as f64;
+            let scale = values(&case.inputs[0])
+                .iter()
+                .fold(1.0f64, |m, &(re, _)| m.max(re.abs()));
+            4.0 * (n + 4.0) * eps * scale.max(e.abs())
+        }
+        "matrix_norm" => {
+            let k = case.inputs[0].shape.iter().product::<usize>() as f64;
+            (k + 4.0) * eps * e.abs().max(1.0)
+        }
         "logsumexp" | "softmax" => 8.0 * eps * e.abs().max(1.0),
         // Statistics in float32, then rounded; kernels and fallbacks round at different
         // points.
@@ -833,10 +1234,11 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
         }
         // Sums of `K · C_in / groups` products, in another order than MLX's kernels: as a
         // product, bounded by the operands' magnitudes (the sum may cancel).
-        "conv1d" => {
+        "conv1d" | "conv2d" | "conv3d" | "conv_general" | "conv_transpose1d"
+        | "conv_transpose2d" | "conv_transpose3d" | "convolve" => {
             let bound = |t: &Tensor| values(t).iter().fold(1.0f64, |m, &(re, _)| m.max(re.abs()));
             let w = &case.inputs[1].shape;
-            let k = (w[1] * w[2]) as f64;
+            let k = w[1..].iter().product::<usize>() as f64;
             4.0 * (k + 1.0) * eps * bound(&case.inputs[0]) * bound(&case.inputs[1])
         }
         // Each step rounds in MLX (float32), once in nuvec (f64): the error grows with
@@ -851,7 +1253,9 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
             let n = case.inputs[0].shape.iter().max().copied().unwrap_or(1) as f64;
             4.0 * (n + 1.0) * eps * e.abs().max(1.0)
         }
-        "exp" | "log" | "sqrt" | "sin" | "cos" | "tanh" | "sigmoid" | "power" => {
+        "exp" | "log" | "sqrt" | "sin" | "cos" | "tanh" | "sigmoid" | "power" | "expm1"
+        | "log1p" | "log2" | "log10" | "tan" | "sinh" | "cosh" | "arccos" | "arccosh"
+        | "arcsin" | "arcsinh" | "arctan" | "arctanh" | "rsqrt" | "arctan2" => {
             4.0 * eps * e.abs().max(f64::MIN_POSITIVE)
         }
         // A sum of the larger operand and log1p(exp(·)): absolute error near zero.
@@ -960,4 +1364,84 @@ pub fn compare(case: &Case, got: &Tensor, expected: &Tensor) -> std::result::Res
         }
     }
     Ok(())
+}
+
+/// A dtype by MLX's name (`float32`, `int8`, …).
+fn dtype_named(name: &str) -> DType {
+    match name {
+        "bool" => DType::Bool,
+        "uint8" => DType::U8,
+        "uint16" => DType::U16,
+        "uint32" => DType::U32,
+        "uint64" => DType::U64,
+        "int8" => DType::I8,
+        "int16" => DType::I16,
+        "int32" => DType::I32,
+        "int64" => DType::I64,
+        "float16" => DType::F16,
+        "bfloat16" => DType::BF16,
+        "float64" => DType::F64,
+        "complex64" => DType::Complex64,
+        _ => DType::F32,
+    }
+}
+
+/// Per column, the sign of its largest-magnitude entry (decompositions' free signs), as in
+/// `scripts/mlx_fixtures.py`.
+fn signs(cols: &Array) -> Array {
+    let idx = cols.abs().argmax_keepdims(-2);
+    ops::take_along_axis(cols, &idx, -2).sign()
+}
+
+/// nuvec's linalg outputs, normalised as the recorder normalises MLX's.
+fn linalg_case(f: &str, case: &Case, xs: &[Array]) -> Result<Vec<Array>> {
+    let p = |k: &str| case.params.get(k).map(String::as_str).unwrap_or("");
+    let up = p("upper") == "1";
+    let t = |x: &Array| ops::swapaxes(x, -1, -2);
+    Ok(match f {
+        "qr" => {
+            let [q, r] = linalg::qr(&xs[0]);
+            let s = signs(&q);
+            vec![q.multiply(&s), r.multiply(t(&s))]
+        }
+        "svd" => {
+            let [u, s, vt] = linalg::svd(&xs[0]);
+            let k = s.shape()[s.ndim() - 1];
+            let u = u.i((Ellipsis, ..k));
+            let vt = vt.i((Ellipsis, ..k, ..));
+            let g = signs(&u);
+            vec![u.multiply(&g), s, vt.multiply(t(&g))]
+        }
+        "svd_values" => vec![linalg::svd_values(&xs[0])],
+        "eigh" => {
+            let [w, v] = linalg::eigh(&xs[0], up);
+            let g = signs(&v);
+            vec![w, v.multiply(&g)]
+        }
+        "eigvalsh" => vec![linalg::eigvalsh(&xs[0], up)],
+        "eigvals" => {
+            let w = linalg::eigvals(&xs[0]);
+            vec![ops::real(&w).sort(-1), ops::imag(&w).sort(-1)]
+        }
+        "lu" => linalg::lu(&xs[0]).to_vec(),
+        "lu_factor" => linalg::lu_factor(&xs[0]).to_vec(),
+        "slogdet" => linalg::slogdet(&xs[0]).to_vec(),
+        "det" => vec![linalg::det(&xs[0])],
+        "inv" => vec![linalg::inv(&xs[0])],
+        "pinv" => vec![linalg::pinv(&xs[0])],
+        "cholesky" => vec![linalg::cholesky(&xs[0], up)],
+        "tri_inv" => vec![linalg::tri_inv(&xs[0], up)],
+        "cholesky_inv" => vec![linalg::cholesky_inv(&xs[0], up)],
+        "solve" => vec![linalg::solve(&xs[0], &xs[1])],
+        "solve_triangular" => vec![linalg::solve_triangular(&xs[0], &xs[1], up)],
+        "cross" => vec![linalg::cross(&xs[0], &xs[1], p("axis").parse().unwrap())],
+        "norm" => {
+            let ord = match p("ord") {
+                "nuc" => ops::Norm::Nuc,
+                o => ops::Norm::P(o.parse().unwrap()),
+            };
+            vec![linalg::norm(&xs[0], ord, None, false)]
+        }
+        other => panic!("linalg case {other}"),
+    })
 }

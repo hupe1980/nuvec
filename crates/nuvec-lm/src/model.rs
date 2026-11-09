@@ -86,6 +86,9 @@ impl Projection {
     }
 }
 
+/// An output head as a function of a chunk of hidden states and its weights.
+type HeadFn = dyn Fn(&Array, &[Array]) -> Array + Send + Sync;
+
 /// A token embedding, full precision or quantized.
 #[derive(Debug, Clone, Module)]
 pub(crate) enum TokenEmbedding {
@@ -1573,6 +1576,44 @@ impl Block {
         (h, self.reduce(self.mlp.forward(&n)))
     }
 
+    /// [`Block::forward`] through a gradient checkpoint: the block's activations are
+    /// recomputed in the backward pass. `cache` is an uncached one (training), so the
+    /// block keeps nothing in it.
+    #[track_caller]
+    fn forward_checkpointed(
+        &self,
+        x: &Array,
+        pending: Option<&Array>,
+        mask: AttentionMask<'_>,
+        cache: &KvCache,
+    ) -> (Array, Array) {
+        let causal = match mask {
+            AttentionMask::Causal => true,
+            AttentionMask::None => false,
+            _ => return self.forward(x, pending, mask, &mut cache.clone()),
+        };
+        let fresh = cache.clone();
+        let block = nuvec::checkpoint(
+            move |(block, x, pending): &(Block, Array, Option<Array>)| -> (Array, Array) {
+                let mask = match causal {
+                    true => AttentionMask::Causal,
+                    false => AttentionMask::None,
+                };
+                block.forward(x, pending.as_ref(), mask, &mut fresh.clone())
+            },
+        );
+        match block(&(self.clone(), x.clone(), pending.cloned())) {
+            Ok(out) => out,
+            Err(e) => {
+                let failed = Array::failure(
+                    "grad_checkpoint",
+                    OpErrorKind::InvalidArgument(e.to_string()),
+                );
+                (failed.clone(), failed)
+            }
+        }
+    }
+
     /// A sharded block's partial output summed over its group.
     #[track_caller]
     fn reduce(&self, y: Array) -> Array {
@@ -1639,6 +1680,10 @@ pub struct Model {
     /// Whether the output head keeps this rank's vocabulary rows (its logits are gathered).
     #[tree(skip)]
     vocab_sharded: bool,
+    /// Whether blocks without a cache recompute their activations in the backward pass
+    /// ([`Model::set_grad_checkpoint`]).
+    #[tree(skip)]
+    grad_checkpoint: bool,
 }
 
 impl Model {
@@ -1709,6 +1754,7 @@ impl Model {
             stage: None,
             sharding: None,
             vocab_sharded: false,
+            grad_checkpoint: false,
         })
     }
 
@@ -1803,8 +1849,7 @@ impl Model {
     }
 
     /// [`Model::forward`], also giving the final hidden states `[B, L, hidden_size]` (after
-    /// the final norm: what the output head reads, and what the MTP head takes). Not for
-    /// Gemma 4 (a failed array).
+    /// the final norm: what the output head reads, and what the MTP head takes).
     #[track_caller]
     pub fn forward_hidden(&self, tokens: &Array, cache: &mut [KvCache]) -> (Array, Array) {
         if cache.len() != self.model.layers.len() {
@@ -1812,11 +1857,8 @@ impl Model {
             return (e.clone(), e);
         }
         if self.config.gemma4.is_some() {
-            let e = Array::failure(
-                "forward_hidden",
-                OpErrorKind::InvalidArgument("not available for Gemma 4".into()),
-            );
-            return (e.clone(), e);
+            let h = gemma::hidden(self, tokens, cache);
+            return (gemma::logits(self, &h), h);
         }
         // Causal (aligned to the last positions) for several tokens; one token sees all.
         let mask = match tokens.shape().get(1) {
@@ -1829,11 +1871,22 @@ impl Model {
         let mut h = self.model.embed_tokens.forward(tokens);
         let mut pending = None;
         for (layer, c) in self.model.layers.iter().zip(cache) {
-            let (next, mlp) = layer.forward(&h, pending.as_ref(), mask, c);
+            let (next, mlp) = match self.grad_checkpoint && c.uncached {
+                true => layer.forward_checkpointed(&h, pending.as_ref(), mask, c),
+                false => layer.forward(&h, pending.as_ref(), mask, c),
+            };
             (h, pending) = (next, Some(mlp));
         }
         let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
         (self.head(&h), h)
+    }
+
+    /// Sets whether each block recomputes its activations in the backward pass instead of
+    /// keeping them (mlx-lm's `grad_checkpoint`), for forward passes without a cache
+    /// ([`Model::forward_uncached`], [`Model::forward_hidden_uncached`]): less memory for
+    /// one more forward pass per block.
+    pub fn set_grad_checkpoint(&mut self, on: bool) {
+        self.grad_checkpoint = on;
     }
 
     /// One stage's part of [`Model::forward_hidden`]: the first stage embeds, the others
@@ -1952,10 +2005,108 @@ impl Model {
     }
 
     /// The logits of final hidden states `[..., hidden_size]` ([`Model::forward_hidden`],
-    /// [`Model::mtp_forward`]): the output head alone.
+    /// [`Model::mtp_forward`]): the output head (and Gemma 4's soft cap).
     #[track_caller]
     pub fn logits(&self, hidden: &Array) -> Array {
-        self.head(hidden)
+        match self.config.gemma4 {
+            Some(_) => gemma::logits(self, hidden),
+            None => self.head(hidden),
+        }
+    }
+
+    /// The final hidden states `[B, L, hidden_size]` of tokens `[B, L]` with no cache (as
+    /// [`Model::forward_uncached`]): for losses over [`Model::token_losses`].
+    #[track_caller]
+    pub fn forward_hidden_uncached(&self, tokens: &Array) -> Array {
+        let mut cache = self.new_cache();
+        for c in &mut cache {
+            c.uncached = true;
+        }
+        self.forward_hidden(tokens, &mut cache).1
+    }
+
+    /// The cross entropy of [`Model::logits`] of final hidden states `[..., hidden_size]`
+    /// against next tokens `targets` (`hidden`'s shape without the last axis), per token, in
+    /// the logits' dtype: `nn.losses.cross_entropy(model.logits(hidden), targets)`. Computed
+    /// in row chunks ([`nuvec::fast::linear_cross_entropy`]), so the `[..., vocab]` logits
+    /// never exist, for dense, quantized and tied heads; a LoRA or vocabulary-sharded head
+    /// computes the full logits.
+    #[track_caller]
+    pub fn token_losses(&self, hidden: &Array, targets: &Array) -> Array {
+        let cap = self
+            .config
+            .gemma4
+            .as_ref()
+            .and_then(|g| g.final_logit_softcap);
+        let capped = move |z: Array| match cap {
+            Some(c) => nuvec_nn::logit_softcap(&z, c),
+            None => z,
+        };
+        let chunked = |weights: Vec<Array>, head: Box<HeadFn>| {
+            nuvec::fast::linear_cross_entropy(
+                hidden,
+                targets,
+                &weights,
+                move |x, w| capped(head(x, w)),
+                None,
+            )
+        };
+        let quantized = |q: nuvec::Quantized, bias: Option<Array>| {
+            let (quant, with_biases) = (q.quant, q.biases.is_some());
+            let mut weights = vec![q.weight, q.scales];
+            weights.extend(q.biases);
+            let with_bias = bias.is_some();
+            weights.extend(bias);
+            chunked(
+                weights,
+                Box::new(move |x, w| {
+                    let biases = with_biases.then(|| w[2].clone());
+                    let q = nuvec::Quantized::new(w[0].clone(), w[1].clone(), biases, quant);
+                    let z = x.quantized_matmul(&q, true);
+                    match with_bias {
+                        true => z + &w[w.len() - 1],
+                        false => z,
+                    }
+                }),
+            )
+        };
+        let dense = |weight: Array, bias: Option<Array>| {
+            let with_bias = bias.is_some();
+            let mut weights = vec![weight];
+            weights.extend(bias);
+            chunked(
+                weights,
+                Box::new(move |x, w| {
+                    let z = x.matmul(&w[0].t());
+                    match with_bias {
+                        true => z + &w[1],
+                        false => z,
+                    }
+                }),
+            )
+        };
+        if self.sharding.is_some() && self.vocab_sharded {
+            return self.unchunked_losses(hidden, targets);
+        }
+        match (&self.lm_head, &self.model.embed_tokens) {
+            (Some(Projection::Dense(l)), _) => dense(
+                l.weight.value().clone(),
+                l.bias.as_ref().map(|b| b.value().clone()),
+            ),
+            (Some(Projection::Quantized(q)), _) => {
+                quantized(q.quantized(), q.bias.as_ref().map(|b| b.value().clone()))
+            }
+            (Some(Projection::Lora(_)), _) => self.unchunked_losses(hidden, targets),
+            (None, TokenEmbedding::Dense(e)) => dense(e.weight.value().clone(), None),
+            (None, TokenEmbedding::Quantized(q)) => quantized(q.quantized(), None),
+        }
+    }
+
+    /// [`Model::token_losses`] over the full logits.
+    #[track_caller]
+    fn unchunked_losses(&self, hidden: &Array, targets: &Array) -> Array {
+        let logits = self.logits(hidden);
+        nuvec::fast::cross_entropy(&logits, targets).astype(logits.dtype())
     }
 
     /// The output head on the final hidden states.
@@ -2194,6 +2345,60 @@ pub(crate) mod tests {
             .join("tests/fixtures")
             .join(name);
         Some(crate::load_model(dir).unwrap())
+    }
+
+    /// `token_losses` (row chunks) equals the losses of the full logits, with their
+    /// hidden-state gradients, for dense, quantized, tied and soft-capped heads.
+    #[test]
+    fn token_losses_equal_the_full_logits_losses() {
+        // Dense untied, quantized untied, quantized tied, dense tied with a soft cap.
+        for name in ["qwen3_f32", "qwen3_moe_q4", "qwen2_q4", "gemma4_e_f32"] {
+            let Some(model) = fixture_model(name) else {
+                return;
+            };
+            let v = model.config.vocab_size as i32;
+            let ids: Vec<i32> = (0..74).map(|i| i * 7 % v).collect();
+            let tokens = Array::from_slice(&ids, [2, 37]);
+            let hidden = model.forward_hidden_uncached(&tokens.i((.., 0..36)));
+            let targets = tokens.i((.., 1..37)).astype(DType::I32);
+            let cot = ops::arange(0, 72, 1)
+                .astype(DType::F32)
+                .divide(72.0)
+                .reshape([2, 36]);
+            let run = |chunked: bool| {
+                nuvec::vjp(
+                    |h: &Array| match chunked {
+                        true => model.token_losses(h, &targets),
+                        false => model.unchunked_losses(h, &targets),
+                    },
+                    &hidden,
+                    &cot.astype(hidden.dtype()),
+                )
+                .unwrap()
+            };
+            let ((l1, g1), (l2, g2)) = (run(true), run(false));
+            for (what, a, b) in [("losses", &l1, &l2), ("hidden gradient", &g1, &g2)] {
+                let tol = if a.dtype() == DType::F32 { 1e-4 } else { 3e-2 };
+                let d = a
+                    .subtract(b)
+                    .abs()
+                    .max(..)
+                    .astype(DType::F32)
+                    .item::<f32>()
+                    .unwrap();
+                let m = b
+                    .abs()
+                    .max(..)
+                    .astype(DType::F32)
+                    .item::<f32>()
+                    .unwrap()
+                    .max(1e-3);
+                assert!(
+                    d <= tol * m,
+                    "{name} {what}: max difference {d} (scale {m})"
+                );
+            }
+        }
     }
 
     /// `forward_paged` rejects a layer slice of another length, and a failed step leaves

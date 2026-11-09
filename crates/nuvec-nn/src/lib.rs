@@ -75,7 +75,7 @@ use std::any::Any;
 use std::path::Path;
 
 use nuvec::tree::{LeafKind, LoadMode, Visit, VisitMut, Visitor, VisitorMut};
-use nuvec::{Array, Category, Error, Result};
+use nuvec::{Array, Category, Error, Result, ops};
 
 mod display;
 pub mod layers;
@@ -87,8 +87,9 @@ mod weights;
 
 pub use display::{ModuleDisplay, Summary, SummaryRow};
 pub use layers::{
-    Dropout, Embedding, LayerNorm, Linear, LoraBase, LoraLinear, QuantizedEmbedding,
-    QuantizedLinear, RmsNorm, Rope,
+    AvgPool1d, AvgPool2d, AvgPool3d, Conv1d, Conv2d, Conv3d, ConvTranspose1d, ConvTranspose2d,
+    ConvTranspose3d, Dropout, Embedding, LayerNorm, Linear, LoraBase, LoraLinear, MaxPool1d,
+    MaxPool2d, MaxPool3d, QuantizedEmbedding, QuantizedLinear, RmsNorm, Rope,
 };
 /// Derives a model's [`Tree`] impl, with a check against bare `Array` fields (see the
 /// crate documentation). Every tree is a [`Module`] (a blanket impl).
@@ -361,6 +362,140 @@ pub fn gelu_fast_approx(x: &Array) -> Array {
     x.multiply(x.multiply(1.702).sigmoid())
 }
 
+/// The exact GELU, `x (1 + erf(x / √2)) / 2`, as MLX's `nn.gelu`.
+#[track_caller]
+pub fn gelu(x: &Array) -> Array {
+    x.multiply(x.divide(std::f64::consts::SQRT_2).erf().add(1.0))
+        .divide(2.0)
+}
+
+/// `max(x, 0)²`, as MLX's `nn.relu2`.
+#[track_caller]
+pub fn relu2(x: &Array) -> Array {
+    x.maximum(0.0).square()
+}
+
+/// `min(max(x, 0), 6)`, as MLX's `nn.relu6`.
+#[track_caller]
+pub fn relu6(x: &Array) -> Array {
+    x.maximum(0.0).minimum(6.0)
+}
+
+/// `max(slope · x, x)`, as MLX's `nn.leaky_relu` (MLX's default slope is 0.01).
+#[track_caller]
+pub fn leaky_relu(x: &Array, negative_slope: f32) -> Array {
+    ops::maximum(x.multiply(negative_slope), x)
+}
+
+/// `x − logsumexp(x)` over `axis`, as MLX's `nn.log_softmax`.
+#[track_caller]
+pub fn log_softmax(x: &Array, axis: i32) -> Array {
+    x.subtract(x.logsumexp_keepdims(axis))
+}
+
+/// `softmax(−x)` over `axis`, as MLX's `nn.softmin`.
+#[track_caller]
+pub fn softmin(x: &Array, axis: i32) -> Array {
+    x.negative().softmax(axis)
+}
+
+/// `x` where positive, else `α (eˣ − 1)`, as MLX's `nn.elu` (MLX's default α is 1).
+#[track_caller]
+pub fn elu(x: &Array, alpha: f32) -> Array {
+    ops::where_(x.greater(0.0), x, x.exp().subtract(1.0).multiply(alpha))
+}
+
+/// `elu(x, 1.67326) · 1.0507`, as MLX's `nn.selu`.
+#[track_caller]
+pub fn selu(x: &Array) -> Array {
+    elu(x, 1.67326).multiply(1.0507)
+}
+
+/// `max(x, 0) + α (e^(min(x, 0) / α) − 1)`, as MLX's `nn.celu`.
+#[track_caller]
+pub fn celu(x: &Array, alpha: f32) -> Array {
+    x.maximum(0.0).add(
+        x.minimum(0.0)
+            .divide(alpha)
+            .exp()
+            .subtract(1.0)
+            .multiply(alpha),
+    )
+}
+
+/// `log(1 + eˣ)` as `logaddexp(x, 0)`, as MLX's `nn.softplus`.
+#[track_caller]
+pub fn softplus(x: &Array) -> Array {
+    x.logaddexp(0.0)
+}
+
+/// `−softplus(−x)`, as MLX's `nn.log_sigmoid`.
+#[track_caller]
+pub fn log_sigmoid(x: &Array) -> Array {
+    softplus(&x.negative()).negative()
+}
+
+/// `x / (1 + |x|)`, as MLX's `nn.softsign`.
+#[track_caller]
+pub fn softsign(x: &Array) -> Array {
+    ops::divide(x, x.abs().add(1.0))
+}
+
+/// `x − sign(x) λ` where `|x| > λ`, else 0, as MLX's `nn.softshrink` (default λ 0.5).
+#[track_caller]
+pub fn softshrink(x: &Array, lambd: f32) -> Array {
+    ops::where_(
+        x.abs().greater(lambd),
+        x.subtract(x.sign().multiply(lambd)),
+        0.0,
+    )
+}
+
+/// `x` where `|x| > λ`, else 0, as MLX's `nn.hard_shrink` (default λ 0.5).
+#[track_caller]
+pub fn hard_shrink(x: &Array, lambd: f32) -> Array {
+    ops::where_(x.abs().greater(lambd), x, 0.0)
+}
+
+/// `min(max(x, min_val), max_val)`, as MLX's `nn.hard_tanh` (defaults −1 and 1).
+#[track_caller]
+pub fn hard_tanh(x: &Array, min_val: f32, max_val: f32) -> Array {
+    x.maximum(min_val).minimum(max_val)
+}
+
+/// `x · min(max(x + 3, 0), 6) / 6`, as MLX's `nn.hardswish`.
+#[track_caller]
+pub fn hardswish(x: &Array) -> Array {
+    x.multiply(x.add(3.0).maximum(0.0).minimum(6.0)).divide(6.0)
+}
+
+/// `x · tanh(softplus(x))`, as MLX's `nn.mish`.
+#[track_caller]
+pub fn mish(x: &Array) -> Array {
+    x.multiply(softplus(x).tanh())
+}
+
+/// `max(0, x) + α · min(0, x)` with a learned `alpha`, as MLX's `nn.prelu`.
+#[track_caller]
+pub fn prelu(x: &Array, alpha: &Array) -> Array {
+    ops::minimum(0.0, x)
+        .multiply(alpha)
+        .add(ops::maximum(0.0, x))
+}
+
+/// `a · sigmoid(b)` of the two halves of `axis`, as MLX's `nn.glu`.
+#[track_caller]
+pub fn glu(x: &Array, axis: i32) -> Array {
+    let [a, b] = x.split_n::<2>(axis);
+    a.multiply(b.sigmoid())
+}
+
+/// 1 where `x ≥ threshold`, else 0 (int32), as MLX's `nn.step`.
+#[track_caller]
+pub fn step(x: &Array, threshold: f32) -> Array {
+    ops::where_(x.greater_equal(threshold), 1, 0)
+}
+
 /// A compiled function of a tuple of arrays (traced once per input signature, element-wise
 /// chains fused into one kernel), as mlx-lm compiles its activations.
 type Compiled<T> = Box<dyn Fn(&T) -> Result<Array> + Send + Sync>;
@@ -371,7 +506,9 @@ fn weak(value: f32, like: &Array) -> Array {
     Array::from(value).astype(like.dtype())
 }
 
-/// `silu(gate) · x` in one kernel, as mlx-lm's compiled `swiglu`.
+/// `silu(gate) · x` in one kernel, as mlx-lm's compiled `swiglu`. Its gradient is the
+/// composition's, computed from `gate` and `x` alone: the backward pass keeps neither
+/// `sigmoid(gate)` nor `silu(gate)` (two fewer activations per MLP).
 #[track_caller]
 pub fn swiglu(gate: &Array, x: &Array) -> Array {
     static F: std::sync::LazyLock<Compiled<(Array, Array)>> = std::sync::LazyLock::new(|| {
@@ -379,7 +516,37 @@ pub fn swiglu(gate: &Array, x: &Array) -> Array {
             silu(g).multiply(x)
         }))
     });
-    F(&(gate.clone(), x.clone())).unwrap_or_else(|_| silu(gate).multiply(x))
+    static GRAD: std::sync::LazyLock<nuvec::CustomFunctionFlat> = std::sync::LazyLock::new(|| {
+        nuvec::custom_function_flat(|xs| {
+            let (g, x) = (&xs[0], &xs[1]);
+            Ok(vec![
+                F(&(g.clone(), x.clone())).unwrap_or_else(|_| silu(g).multiply(x)),
+            ])
+        })
+        .with_vjp(|p, _, c| {
+            // The composition's backward (`silu(g) · x`, `silu(g) = g · sigmoid(g)`), op
+            // by op, with the sigmoid recomputed.
+            let (g, x, dy) = (&p[0], &p[1], &c[0]);
+            // Recomputed from `g` after the cotangent exists, so `compile` cannot merge it
+            // with the forward pass's sigmoid (which would keep that activation alive).
+            let s = nuvec::ops::depends(g, std::slice::from_ref(dy)).sigmoid();
+            let dx = dy.multiply(g.multiply(&s));
+            let ds = dy.multiply(x);
+            let dg = ds.multiply(&s).add(
+                ds.multiply(g)
+                    .multiply(s.multiply(nuvec::ops::subtract(1.0, &s))),
+            );
+            Ok(vec![dg, dx])
+        })
+    });
+    // Outside a transform (decoding), the kernel alone.
+    if !nuvec::graph::is_tracer(gate) && !nuvec::graph::is_tracer(x) {
+        return F(&(gate.clone(), x.clone())).unwrap_or_else(|_| silu(gate).multiply(x));
+    }
+    match GRAD.call(&[gate.clone(), x.clone()]) {
+        Ok(mut out) => out.remove(0),
+        Err(e) => Array::failure("swiglu", nuvec::OpErrorKind::InvalidArgument(e.to_string())),
+    }
 }
 
 /// gpt-oss's clamped SwiGLU in one kernel, as mlx-lm's compiled `swiglu_oai`:

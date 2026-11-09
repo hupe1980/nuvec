@@ -1,0 +1,425 @@
+{
+ "user": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello, who are you?"
+   }
+  ]
+ },
+ "system": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a concise assistant."
+   },
+   {
+    "role": "user",
+    "content": "Name three primes."
+   }
+  ]
+ },
+ "turns": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2 + 2?"
+   },
+   {
+    "role": "assistant",
+    "content": "2 + 2 = 4."
+   },
+   {
+    "role": "user",
+    "content": "  And times three?\n"
+   }
+  ]
+ },
+ "tools": {
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather in a location.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "A city, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7,
+        "default": 1
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the web <fast> & 'safe'.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "limits": {
+        "type": "object",
+        "properties": {
+         "top_k": {
+          "type": "number",
+          "default": 1.0
+         }
+        }
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "id": "call_0",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Paris",
+        "unit": "celsius"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_0",
+    "name": "get_weather",
+    "content": "{\"temperature\": 21.5}"
+   },
+   {
+    "role": "assistant",
+    "content": "It is 21.5 °C in Paris."
+   }
+  ]
+ },
+ "tools_string_arguments": {
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather in a location.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "A city, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7,
+        "default": 1
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the web <fast> & 'safe'.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "limits": {
+        "type": "object",
+        "properties": {
+         "top_k": {
+          "type": "number",
+          "default": 1.0
+         }
+        }
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "id": "call_1",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"location\": \"Paris\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "name": "get_weather",
+    "content": "sunny"
+   }
+  ]
+ },
+ "tools_short_ids": {
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather in a location.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "A city, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7,
+        "default": 1
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the web <fast> & 'safe'.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "limits": {
+        "type": "object",
+        "properties": {
+         "top_k": {
+          "type": "number",
+          "default": 1.0
+         }
+        }
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "id": "abc123DEF",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Paris",
+        "unit": "celsius"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "abc123DEF",
+    "content": "21.5"
+   },
+   {
+    "role": "assistant",
+    "content": "It is 21.5 °C."
+   },
+   {
+    "role": "user",
+    "content": "Thanks!"
+   }
+  ]
+ },
+ "reasoning": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2 + 2?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Two plus two.",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "And 3 + 3?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Three plus three.",
+    "content": "6"
+   }
+  ]
+ },
+ "parts": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Describe a cat."
+     }
+    ]
+   }
+  ]
+ },
+ "unusual": {
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "tune",
+     "description": "Grüße, 世界 🌍",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "rate": {
+        "type": "number",
+        "default": 1e-05,
+        "minimum": -0.0,
+        "maximum": 1e+16
+       },
+       "scale": {
+        "type": "number",
+        "default": 0.0001,
+        "multipleOf": 123456789012345.6
+       },
+       "seed": {
+        "type": "integer",
+        "default": 9007199254740993
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Grüße, 世界 🌍 <tag> & 'single' \"double\" \\ back\ttab"
+   }
+  ]
+ },
+ "empty_system": {
+  "messages": [
+   {
+    "role": "system",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ]
+ },
+ "turns_prefill": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2 + 2?"
+   },
+   {
+    "role": "assistant",
+    "content": "2 + 2 = 4."
+   },
+   {
+    "role": "user",
+    "content": "  And times three?\n"
+   },
+   {
+    "role": "assistant",
+    "content": "Twelve"
+   }
+  ]
+ }
+}

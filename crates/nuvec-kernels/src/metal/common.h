@@ -79,6 +79,28 @@ inline long loc(uint i, constant int* shape, constant long* strides, int ndim) {
             x = x * x;                                                       \
         }                                                                    \
         return T(r);                                                         \
+    }                                                                        \
+    /* The divisor's sign (MLX's Remainder); 0 for a zero divisor. */         \
+    inline T op_remainder(T a, T b) {                                        \
+        if (b == T(0)) return T(0);                                          \
+        if (T(-1) < T(0) && b == T(-1)) return T(0);                         \
+        T r = a % b;                                                         \
+        if (r != T(0) && ((r < T(0)) != (b < T(0)))) r = op_add(r, b);       \
+        return r;                                                            \
+    }                                                                        \
+    inline T op_bitwise_and(T a, T b) { return a & b; }                      \
+    inline T op_bitwise_or(T a, T b) { return a | b; }                       \
+    inline T op_bitwise_xor(T a, T b) { return a ^ b; }                      \
+    inline T op_bitwise_invert(T a) { return ~a; }                           \
+    /* C++'s shifts: types narrower than int are promoted first; the shift */ \
+    /* is taken modulo the (promoted) width. */                               \
+    inline T op_left_shift(T a, T b) {                                       \
+        if (sizeof(T) < 4) return T(int(a) << (int(b) & 31));                \
+        return T(a << (b & T(sizeof(T) * 8 - 1)));                           \
+    }                                                                        \
+    inline T op_right_shift(T a, T b) {                                      \
+        if (sizeof(T) < 4) return T(int(a) >> (int(b) & 31));                \
+        return T(a >> (b & T(sizeof(T) * 8 - 1)));                           \
     }
 
 NUVEC_INT_OPS(uchar, uint)
@@ -92,16 +114,92 @@ NUVEC_INT_OPS(long, ulong)
 
 // ── Arithmetic: half precision computes in float and rounds once ────────────
 
-// MLX's log1p (`utils.h`).
+// MLX's log1p (`utils.h`; its `Limits<float>::max` is infinity).
 inline float log1p_(float x) {
     float xp1 = 1.0f + x;
-    if (xp1 == numeric_limits<float>::max()) {
-        return numeric_limits<float>::max();
+    if (xp1 == INFINITY) {
+        return INFINITY;
     }
     if (xp1 == 1.0f) {
         return x;
     }
     return x * (precise::log(xp1) / (xp1 - 1.0f));
+}
+
+// expm1f and erf: Norbert Juffa's single-precision approximations (BSD-2-Clause; see
+// THIRD_PARTY_NOTICES), maximum errors 0.997 and 0.995 units in the last place, as MLX's
+// `expm1f.h` and `erf.h` but with the original's two-step reduction by ln 2 (MLX's drops
+// the low part, an error of up to tens of units in the last place).
+inline float expm1f_(float a) {
+    float j = fma(1.442695f, a, 12582912.f);
+    j = j - 12582912.0f;
+    int i = int(j);
+    float f = fma(j, -6.93145752e-1f, a);
+    f = fma(j, -1.42860677e-6f, f);
+    float s = f * f;
+    if (a == 0.0f) {
+        s = a;
+    }
+    float r = 1.97350979e-4f;
+    r = fma(r, f, 1.39309070e-3f);
+    r = fma(r, f, 8.33343994e-3f);
+    r = fma(r, f, 4.16668020e-2f);
+    r = fma(r, f, 1.66666716e-1f);
+    r = fma(r, f, 4.99999970e-1f);
+    float u = (j == 1) ? (f + 0.5f) : f;
+    float v = fma(r, s, u);
+    s = 0.5f;
+    float t = ldexp(s, i);
+    float y = t - s;
+    float x = (t - y) - s;
+    r = fma(v, t, x) + y;
+    r = r + r;
+    if (j == 0) {
+        r = v;
+    }
+    if (j == 1) {
+        r = v + v;
+    }
+    if (fabs(a - 1.0f) > 88.0f) {
+        r = pow(2.0f, a);
+        r = fma(r, r, -1.0f);
+    }
+    return r;
+}
+
+inline float erf_(float a) {
+    float r, s, t, u;
+    t = fabs(a);
+    s = a * a;
+    if (t > 0.927734375f) {
+        r = fma(-1.72853470e-5f, t, 3.83197126e-4f);
+        u = fma(-3.88396438e-3f, t, 2.42546219e-2f);
+        r = fma(r, s, u);
+        r = fma(r, t, -1.06777877e-1f);
+        r = fma(r, t, -6.34846687e-1f);
+        r = fma(r, t, -1.28717512e-1f);
+        r = fma(r, t, -t);
+        r = -expm1f_(r);
+        r = copysign(r, a);
+    } else {
+        r = -5.96761703e-4f;
+        r = fma(r, s, 4.99119423e-3f);
+        r = fma(r, s, -2.67681349e-2f);
+        r = fma(r, s, 1.12819925e-1f);
+        r = fma(r, s, -3.76125336e-1f);
+        r = fma(r, s, 1.28379166e-1f);
+        r = fma(r, a, a);
+    }
+    return r;
+}
+
+// MLX's Remainder: `fmod`, then the divisor's sign.
+inline float remainder_(float a, float b) {
+    float r = fmod(a, b);
+    if (r != 0 && ((r < 0) != (b < 0))) {
+        r += b;
+    }
+    return r;
 }
 
 // MLX's LogAddExp: the larger operand plus log1p(exp(smaller - larger)).
@@ -176,11 +274,43 @@ inline float erfinv_(float a) {
     inline T op_sigmoid(T a) { return T(sigmoid_(float(a))); }                                \
     inline T op_erfinv(T a) { return T(erfinv_(float(a))); }                                  \
     inline T op_logaddexp(T a, T b) { return T(logaddexp_(float(a), float(b))); }            \
-    inline T op_floordiv(T a, T b) { return T(precise::floor(float(op_div(a, b)))); }
+    inline T op_floordiv(T a, T b) { return T(precise::floor(float(op_div(a, b)))); }    \
+    inline T op_erf(T a) { return T(erf_(float(a))); }                                        \
+    inline T op_expm1(T a) { return T(expm1f_(float(a))); }                                   \
+    inline T op_log1p(T a) { return T(log1p_(float(a))); }                                    \
+    inline T op_log2(T a) { return T(precise::log2(float(a))); }                              \
+    inline T op_log10(T a) { return T(precise::log10(float(a))); }                            \
+    inline T op_tan(T a) { return T(precise::tan(float(a))); }                                \
+    inline T op_sinh(T a) { return T(precise::sinh(float(a))); }                              \
+    inline T op_cosh(T a) { return T(precise::cosh(float(a))); }                              \
+    inline T op_arccos(T a) { return T(precise::acos(float(a))); }                            \
+    inline T op_arccosh(T a) { return T(precise::acosh(float(a))); }                          \
+    inline T op_arcsin(T a) { return T(precise::asin(float(a))); }                            \
+    inline T op_arcsinh(T a) { return T(precise::asinh(float(a))); }                          \
+    inline T op_arctan(T a) { return T(precise::atan(float(a))); }                            \
+    inline T op_arctanh(T a) { return T(precise::atanh(float(a))); }                          \
+    inline T op_rsqrt(T a) { return T(precise::rsqrt(float(a))); }                            \
+    inline T op_floor(T a) { return T(metal::floor(float(a))); }                              \
+    inline T op_ceil(T a) { return T(metal::ceil(float(a))); }                                \
+    inline T op_round(T a) { return T(metal::rint(float(a))); }                               \
+    inline T op_arctan2(T a, T b) { return T(precise::atan2(float(a), float(b))); }
 
 NUVEC_FLOAT_OPS(half)
 NUVEC_FLOAT_OPS(bfloat)
 NUVEC_FLOAT_OPS(float)
+
+inline float op_remainder(float a, float b) { return remainder_(a, b); }
+inline bfloat op_remainder(bfloat a, bfloat b) { return bfloat(remainder_(float(a), float(b))); }
+
+// MLX's Remainder in half precision: `fmod` is exact, so computing it in the type gives the
+// bits of the float computation, at the speed of half arithmetic (MLX's).
+inline half op_remainder(half a, half b) {
+    half r = fmod(a, b);
+    if (r != half(0) && ((r < half(0)) != (b < half(0)))) {
+        r += b;
+    }
+    return r;
+}
 
 // MLX's Power: `metal::pow` in the type (half natively; bfloat through float, as MLX's
 // `bfloat16_t`).
@@ -196,6 +326,11 @@ inline nbool op_mul(nbool a, nbool b) { return nbool{uchar(a.v & b.v)}; }
 inline nbool op_max(nbool a, nbool b) { return nbool{uchar(a.v | b.v)}; }
 inline nbool op_min(nbool a, nbool b) { return nbool{uchar(a.v & b.v)}; }
 inline nbool op_abs(nbool a) { return a; }
+// Bitwise operations of booleans (MLX: `bitwise_invert` negates; shifts run as uint8).
+inline nbool op_bitwise_and(nbool a, nbool b) { return nbool{uchar(a.v & b.v)}; }
+inline nbool op_bitwise_or(nbool a, nbool b) { return nbool{uchar(a.v | b.v)}; }
+inline nbool op_bitwise_xor(nbool a, nbool b) { return nbool{uchar(a.v ^ b.v)}; }
+inline nbool op_bitwise_invert(nbool a) { return nbool{uchar(a.v ^ 1)}; }
 inline bool op_eq(nbool a, nbool b) { return a.v == b.v; }
 inline bool op_lt(nbool a, nbool b) { return a.v < b.v; }
 inline bool is_nan_(nbool) { return false; }

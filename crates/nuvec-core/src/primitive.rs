@@ -40,12 +40,64 @@ pub enum UnaryOp {
     Conjugate,
     /// The inverse error function.
     ErfInv,
+    /// The error function (MLX's single-precision approximation).
+    Erf,
+    /// `e^x − 1`, accurate near 0.
+    Expm1,
+    /// `ln(1 + x)`, accurate near 0.
+    Log1p,
+    /// Base-2 logarithm.
+    Log2,
+    /// Base-10 logarithm.
+    Log10,
+    /// Tangent.
+    Tan,
+    /// Hyperbolic sine.
+    Sinh,
+    /// Hyperbolic cosine.
+    Cosh,
+    /// Inverse cosine.
+    ArcCos,
+    /// Inverse hyperbolic cosine.
+    ArcCosh,
+    /// Inverse sine.
+    ArcSin,
+    /// Inverse hyperbolic sine.
+    ArcSinh,
+    /// Inverse tangent.
+    ArcTan,
+    /// Inverse hyperbolic tangent.
+    ArcTanh,
+    /// `1 / √x`.
+    Rsqrt,
+    /// Rounding down (floats only; integers are their own floor).
+    Floor,
+    /// Rounding up (floats only).
+    Ceil,
+    /// Rounding to the nearest integer, ties to even (floats only).
+    Round,
+    /// `~x` (integers and booleans).
+    BitwiseInvert,
 }
 
 impl UnaryOp {
     /// Whether the function computes in floating point (integer inputs are promoted).
     pub(crate) fn is_transcendental(self) -> bool {
-        !matches!(self, Self::Negative | Self::Abs | Self::Conjugate)
+        !matches!(
+            self,
+            Self::Negative
+                | Self::Abs
+                | Self::Conjugate
+                | Self::Floor
+                | Self::Ceil
+                | Self::Round
+                | Self::BitwiseInvert
+        )
+    }
+
+    /// Whether the function is a rounding of floats (the identity for other real types).
+    pub(crate) fn is_rounding(self) -> bool {
+        matches!(self, Self::Floor | Self::Ceil | Self::Round)
     }
 
     pub(crate) fn name(self) -> &'static str {
@@ -61,6 +113,25 @@ impl UnaryOp {
             Self::Sigmoid => "sigmoid",
             Self::Conjugate => "conjugate",
             Self::ErfInv => "erfinv",
+            Self::Erf => "erf",
+            Self::Expm1 => "expm1",
+            Self::Log1p => "log1p",
+            Self::Log2 => "log2",
+            Self::Log10 => "log10",
+            Self::Tan => "tan",
+            Self::Sinh => "sinh",
+            Self::Cosh => "cosh",
+            Self::ArcCos => "arccos",
+            Self::ArcCosh => "arccosh",
+            Self::ArcSin => "arcsin",
+            Self::ArcSinh => "arcsinh",
+            Self::ArcTan => "arctan",
+            Self::ArcTanh => "arctanh",
+            Self::Rsqrt => "rsqrt",
+            Self::Floor => "floor",
+            Self::Ceil => "ceil",
+            Self::Round => "round",
+            Self::BitwiseInvert => "bitwise_invert",
         }
     }
 }
@@ -102,6 +173,21 @@ pub enum BinaryOp {
     Greater,
     /// `a >= b`.
     GreaterEqual,
+    /// `atan2(a, b)`: the angle of the point `(b, a)` (floats).
+    ArcTan2,
+    /// The remainder of floor division: the result has the divisor's sign (MLX's
+    /// `remainder`); 0 for an integer zero divisor, which MLX leaves undefined.
+    Remainder,
+    /// `a & b` (integers and booleans).
+    BitwiseAnd,
+    /// `a | b` (integers and booleans).
+    BitwiseOr,
+    /// `a ^ b` (integers and booleans).
+    BitwiseXor,
+    /// `a << b` (integers; booleans are shifted as uint8), the shift taken as C++ does.
+    LeftShift,
+    /// `a >> b` (arithmetic for signed integers), the shift taken as C++ does.
+    RightShift,
 }
 
 impl BinaryOp {
@@ -135,7 +221,26 @@ impl BinaryOp {
             Self::LessEqual => "less_equal",
             Self::Greater => "greater",
             Self::GreaterEqual => "greater_equal",
+            Self::ArcTan2 => "arctan2",
+            Self::Remainder => "remainder",
+            Self::BitwiseAnd => "bitwise_and",
+            Self::BitwiseOr => "bitwise_or",
+            Self::BitwiseXor => "bitwise_xor",
+            Self::LeftShift => "left_shift",
+            Self::RightShift => "right_shift",
         }
+    }
+
+    /// Whether the operation is defined on integers and booleans only.
+    pub(crate) fn is_bitwise(self) -> bool {
+        matches!(
+            self,
+            Self::BitwiseAnd
+                | Self::BitwiseOr
+                | Self::BitwiseXor
+                | Self::LeftShift
+                | Self::RightShift
+        )
     }
 }
 
@@ -381,9 +486,13 @@ pub enum Primitive {
         quant: crate::Quant,
         /// Whether the dequantized matrix is used transposed (MLX's default).
         transpose: bool,
+        /// Whether every row count takes the matrix-vector kernels (`qqmm`'s products).
+        rows: bool,
     },
     /// A fused operation with a dedicated GPU kernel ([`crate::fast`]).
     Fast(crate::fast::imp::FastOp),
+    /// A decomposition, inverse or solve (`linalg`), on the CPU.
+    Linalg(crate::linalg::imp::LinalgOp),
     /// Element-wise operations fused into one generated kernel ([`crate::graph::Fused`]), as
     /// `compile` builds them. The inputs share the output's shape.
     Compiled(crate::fused::Fused),
@@ -477,6 +586,7 @@ impl Primitive {
             Self::AddMM { .. } => "addmm",
             Self::RandomBits { .. } => "random_bits",
             Self::Fast(op) => op.name(),
+            Self::Linalg(op) => op.name(),
             Self::Compiled(_) => "compiled",
             Self::Quantize { .. } => "quantize",
             Self::Dequantize { .. } => "dequantize",
@@ -536,6 +646,7 @@ impl Primitive {
             | Self::Dequantize { .. }
             | Self::QuantizedMatmul { .. }
             | Self::Fast(_)
+            | Self::Linalg(_)
             | Self::Compiled(_)
             | Self::Custom(_)
             | Self::Copy
@@ -601,6 +712,12 @@ impl Primitive {
                 let supported = match op {
                     UnaryOp::Negative => a.dtype() != DType::Bool,
                     UnaryOp::Abs | UnaryOp::Conjugate => true,
+                    UnaryOp::BitwiseInvert => {
+                        matches!(
+                            a.dtype().category(),
+                            Category::Bool | Category::Signed | Category::Unsigned
+                        )
+                    }
                     _ => a.dtype().category() == Category::Float,
                 };
                 if !supported {
@@ -617,8 +734,15 @@ impl Primitive {
                 self.same_shape_and_dtype(a, b)?;
                 let category = a.dtype().category();
                 let unsupported = match op {
-                    BinaryOp::LogAddExp => category != Category::Float,
-                    BinaryOp::FloorDivide | BinaryOp::Power => {
+                    BinaryOp::LogAddExp | BinaryOp::ArcTan2 => category != Category::Float,
+                    BinaryOp::LeftShift | BinaryOp::RightShift => {
+                        !matches!(category, Category::Signed | Category::Unsigned)
+                    }
+                    op if op.is_bitwise() => !matches!(
+                        category,
+                        Category::Bool | Category::Signed | Category::Unsigned
+                    ),
+                    BinaryOp::FloorDivide | BinaryOp::Power | BinaryOp::Remainder => {
                         matches!(category, Category::Bool | Category::Complex)
                     }
                     BinaryOp::Divide => !matches!(category, Category::Float | Category::Complex),
@@ -1053,6 +1177,13 @@ impl Primitive {
                     .collect();
                 computed(dtype, &out)
             }
+            Self::Linalg(op) => {
+                return Ok(op
+                    .outputs(inputs)?
+                    .into_iter()
+                    .map(|(d, shape)| computed(d, &shape))
+                    .collect());
+            }
             Self::Fast(op) => {
                 let strides = op.output_strides(inputs);
                 // A declared layout is the first output's (the attention's log-sum-exp
@@ -1129,7 +1260,9 @@ impl Primitive {
                 }
                 computed(*dtype, &shape)
             }
-            Self::QuantizedMatmul { quant, transpose } => {
+            Self::QuantizedMatmul {
+                quant, transpose, ..
+            } => {
                 let affine = quant.mode == crate::QuantMode::Affine;
                 let x = self.quantized_arity(inputs, 3 + usize::from(affine))?;
                 let (w, scales) = (&inputs[1], &inputs[2]);

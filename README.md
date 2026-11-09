@@ -28,7 +28,9 @@ nuvec brings [MLX](https://github.com/ml-explore/mlx)'s programming model to Rus
 - 🧠 **Models as plain structs.** `#[derive(Module)]` gives MLX's parameter names; optimizers, freezing, LoRA, `save_weights` and a compiled training step (`compile_mut`) work on the model's own type.
 - 🔥 **MLX's Metal kernels.** GEMM and GEMV, quantized products (affine 1, 2, 3, 4, 5, 6 and 8 bits; MXFP4, MXFP8, NVFP4), fused attention, RMSNorm, RoPE, sort, scan, mixture-of-experts gather kernels, and your own kernels from source (`fast::MetalKernel`). Metal 4 TensorOps kernels for M5 Neural Accelerators are opt-in (`NUVEC_NAX=on`).
 - 🌐 **Several Macs.** MLX's collectives (`all_sum`, `all_gather`, `sum_scatter`, `send`/`recv`, …) as lazy, differentiable array operations over MLX's TCP ring (authenticated and encrypted with a shared key) or, experimentally, JACCL over Thunderbolt 5 RDMA, with pipeline-parallel models (a model larger than one Mac, one stage per Mac) and tensor-parallel models (every layer split across Macs).
-- 🧪 **Tested against MLX.** Over a thousand cases replay results recorded from MLX, with random layouts, gradients and every dtype.
+- 🧮 **MLX's operations.** Every array function of `mlx.core` and `mx.linalg`, with MLX's dtypes and gradients (also for the decompositions, which MLX cannot differentiate): element-wise math with MLX's kernels (`erf`, `expm1`, `rsqrt`, rounding, bitwise and logical operations, …), `pad`, `einsum`, `unique`, `median` and the rest (`scripts/op_coverage.py`).
+- 🖼️ **Convolutions.** 1-D, 2-D and 3-D, transposed and general, on MLX's Metal kernels (implicit GEMM, Winograd with float32 tiles, depthwise) at 0.97–1.07× MLX's GPU time, differentiable; `nuvec-nn` has the `Conv*`, `ConvTranspose*`, `MaxPool*` and `AvgPool*` layers.
+- 🧪 **Tested against MLX.** About 3,000 cases replay results recorded from MLX, with random layouts, gradients and every dtype.
 - 🤖 **LLM runtime.** Llama, Mistral, Qwen 2/3/3.5, gpt-oss and Gemma 4 (dense, hybrid Gated DeltaNet, mixture-of-experts) from mlx-community or Hugging Face checkpoints. Speculative decoding (MTP heads, prompt lookup, SuffixDecoding) and batched serving.
 - 💾 **Memory-mapped weights.** Aligned checkpoints (such as those nuvec writes) go to the GPU without a copy. Unaligned ones (mlx-community's) are read once, in parallel, with no more memory than MLX.
 - ⚙️ **Built for servers.** Attention plans and score-memory caps, a memory limit that refuses instead of swapping, checkpoint footprints before loading, batch-invariant serving and documented determinism. Used by the [mrun](https://github.com/hupe1980/mrun) inference server.
@@ -166,7 +168,7 @@ From the command line (after `hf download mlx-community/Qwen3-8B-4bit`):
 
 ```sh
 cargo run --release -p nuvec-lm --example generate -- \
-    --model mlx-community/Qwen3-8B-4bit --prompt "Write a haiku about Rust" --chat
+    --model mlx-community/Qwen3-8B-4bit --prompt "Write a haiku about Rust"
 ```
 
 ## 📦 Crates
@@ -179,11 +181,11 @@ cargo run --release -p nuvec-lm --example generate -- \
 | [`nuvec-macros`](crates/nuvec-macros) | `#[derive(Tree)]`, `#[derive(Module)]`, `#[derive(Static)]` (re-exported by `nuvec` and `nuvec-nn`) |
 | [`nuvec-gpu`](crates/nuvec-gpu) | Metal runtime: pipelines, buffers, hazard-tracked command encoding, allocator, wired memory, profiler |
 | [`nuvec-kernels`](crates/nuvec-kernels) | Metal kernel sources and the precompiled `nuvec.metallib` |
-| [`nuvec-cpu`](crates/nuvec-cpu) | Pure-Rust CPU kernels |
+| [`nuvec-cpu`](crates/nuvec-cpu) | Pure-Rust CPU kernels and `linalg` decompositions (`faer`; Accelerate's LAPACK with the feature `accelerate`) |
 | [`nuvec-io`](crates/nuvec-io) | safetensors, npy and IDX; memory-mapped loading |
 | [`nuvec-distributed`](crates/nuvec-distributed) | MLX's TCP ring and JACCL (Thunderbolt 5 RDMA, experimental) for `nuvec::distributed` |
-| [`nuvec-nn`](crates/nuvec-nn) | Modules (`#[derive(Module)]`), layers (Linear, quantized, LoRA, norms, RoPE, dropout, tensor-parallel sharded linear), losses, optimizers (SGD, Adam, AdamW, Lion, Muon, parameter groups) |
-| [`nuvec-lm`](crates/nuvec-lm) | LLM runtime: models, tokenizer, KV cache, sampling, speculative decoding, LoRA training and adapters |
+| [`nuvec-nn`](crates/nuvec-nn) | Modules (`#[derive(Module)]`), layers (Linear, quantized, LoRA and DoRA, convolutions and pooling, norms, RoPE, dropout, tensor-parallel sharded linear), MLX's activations, losses (also chunked over an output head), optimizers (SGD, Adam, AdamW, Lion, Muon, Adafactor, parameter groups) |
+| [`nuvec-lm`](crates/nuvec-lm) | LLM runtime: models, tokenizer, chat templates, KV cache, sampling, speculative decoding, fine-tuning (LoRA, DoRA, full; text, chat and completion data) and adapters |
 
 ## 🖥️ Platforms
 
@@ -215,7 +217,7 @@ Building and testing need no Python: the MLX fixtures are checked in. With [uv](
 | Command | Compares |
 |---|---|
 | `just bench-parity` | nuvec-lm vs mlx-lm and the previous release, one model per architecture (about 45 minutes); `--tier full` for all models and long contexts (the table above) |
-| `just bench-gemm` / `bench-quant` / `bench-fast` | matrix products, quantized products, fused kernels |
+| `just bench-gemm` / `bench-quant` / `bench-fast` / `bench-conv` / `bench-special` | matrix products, quantized products, fused kernels, convolutions, Hadamard, einsum and the special products |
 | `just bench-compile`, `just bench-load`, `just mnist` | compiled functions, checkpoint loading, MNIST training |
 | `just fixtures`, `lm-fixtures`, `nn-fixtures`, `io-fixtures` | re-record the reference results |
 

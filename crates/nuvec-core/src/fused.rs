@@ -78,10 +78,16 @@ impl Fused {
                 UnaryOp::Negative => d != DType::Bool,
                 UnaryOp::Abs => true,
                 UnaryOp::Conjugate => false,
+                UnaryOp::BitwiseInvert => !is_float(d),
                 _ => is_float(d),
             },
             (Primitive::Binary(op), &[a, b]) => {
-                a == b && (!matches!(op, BinaryOp::Divide | BinaryOp::LogAddExp) || is_float(a))
+                a == b
+                    && (!matches!(
+                        op,
+                        BinaryOp::Divide | BinaryOp::LogAddExp | BinaryOp::ArcTan2
+                    ) || is_float(a))
+                    && (!op.is_bitwise() || !is_float(a))
             }
             (Primitive::Select, &[c, a, b]) => c == DType::Bool && a == b,
             (Primitive::AsType(to), &[_]) => computes(*to),
@@ -411,8 +417,8 @@ fn unary_fn(op: UnaryOp) -> &'static str {
         UnaryOp::Cos => "cos",
         UnaryOp::Tanh => "tanh",
         UnaryOp::Sigmoid => "sigmoid",
-        UnaryOp::ErfInv => "erfinv",
         UnaryOp::Conjugate => unreachable!("not fused"),
+        op => op.name(),
     }
 }
 
@@ -434,6 +440,7 @@ fn binary_expr(op: BinaryOp, a: &str, b: &str) -> String {
         BinaryOp::LessEqual => format!("nbool{{uchar(op_lt({a}, {b}) || op_eq({a}, {b}))}}"),
         BinaryOp::Greater => format!("nbool{{uchar(op_lt({b}, {a}))}}"),
         BinaryOp::GreaterEqual => format!("nbool{{uchar(op_lt({b}, {a}) || op_eq({a}, {b}))}}"),
+        op => format!("op_{}({a}, {b})", op.name()),
     }
 }
 

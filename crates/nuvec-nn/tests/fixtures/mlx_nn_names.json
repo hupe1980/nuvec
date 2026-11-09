@@ -35,6 +35,18 @@
   "weight",
   "scales"
  ],
+ "Conv2d": [
+  "weight",
+  "bias"
+ ],
+ "Conv2d_no_bias": [
+  "weight"
+ ],
+ "ConvTranspose1d": [
+  "weight",
+  "bias"
+ ],
+ "MaxPool2d": [],
  "RMSNorm": [
   "weight"
  ],

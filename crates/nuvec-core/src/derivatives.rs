@@ -9,9 +9,9 @@ use crate::array::Array;
 use crate::cast::Canon;
 use crate::indexing::{put_along_axis, take_along_axis};
 use crate::ops::imp::{
-    self as ops, broadcast_to, conjugate, cos, divide, equal, exp, greater, greater_equal, less,
-    less_equal, log, matmul, multiply, negative, not_equal, reshape, sin, stop_gradient, subtract,
-    sum, transpose, where_,
+    self as ops, add, broadcast_to, conjugate, cos, divide, equal, exp, greater, greater_equal,
+    less, less_equal, log, matmul, multiply, negative, not_equal, reshape, sin, stop_gradient,
+    subtract, sum, transpose, where_,
 };
 use crate::primitive::{BinaryOp, Primitive, ReduceOp, ScanOp, ScatterReduce, UnaryOp};
 use crate::quantized::{dequantize, quantized_matmul};
@@ -404,6 +404,34 @@ impl Primitive {
                     multiply(v, std::f64::consts::PI.sqrt() / 2.0)?,
                     ops::exp(&multiply(out, out)?)?,
                 )?,
+                // d/dx erf(x) = 2/√π · e^(−x²)
+                UnaryOp::Erf => multiply(
+                    multiply(v, std::f64::consts::FRAC_2_SQRT_PI)?,
+                    ops::exp(&negative(&multiply(x, x)?)?)?,
+                )?,
+                UnaryOp::Expm1 => multiply(v, ops::exp(x)?)?,
+                UnaryOp::Log1p => divide(v, add(x, 1)?)?,
+                UnaryOp::Log2 => divide(v, multiply(x, std::f64::consts::LN_2)?)?,
+                UnaryOp::Log10 => divide(v, multiply(x, std::f64::consts::LN_10)?)?,
+                UnaryOp::Tan => {
+                    let c = cos(x)?;
+                    divide(v, multiply(&c, &c)?)?
+                }
+                UnaryOp::Sinh => multiply(v, ops::cosh(x)?)?,
+                UnaryOp::Cosh => multiply(v, ops::sinh(x)?)?,
+                UnaryOp::ArcCos => {
+                    negative(&multiply(v, ops::rsqrt(&subtract(1, multiply(x, x)?)?)?)?)?
+                }
+                UnaryOp::ArcSin => multiply(v, ops::rsqrt(&subtract(1, multiply(x, x)?)?)?)?,
+                UnaryOp::ArcCosh => multiply(v, ops::rsqrt(&subtract(multiply(x, x)?, 1)?)?)?,
+                UnaryOp::ArcSinh => multiply(v, ops::rsqrt(&add(multiply(x, x)?, 1)?)?)?,
+                UnaryOp::ArcTan => divide(v, add(multiply(x, x)?, 1)?)?,
+                UnaryOp::ArcTanh => divide(v, subtract(1, multiply(x, x)?)?)?,
+                // d/dx x^(−1/2) = −x^(−1/2) / (2x)
+                UnaryOp::Rsqrt => negative(&divide(multiply(v, out)?, multiply(x, 2)?)?)?,
+                // Rounding has a zero derivative (MLX).
+                UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Round => zeros_like(x)?,
+                UnaryOp::BitwiseInvert => return Ok(None),
             },
             Self::Binary(op) => {
                 let (a, b) = (&inputs[0], &inputs[1]);
@@ -441,6 +469,17 @@ impl Primitive {
                         let positive = greater(a, 0)?;
                         let log_a = ops::log(&where_(&positive, a, 1)?)?;
                         multiply(v, multiply(log_a, out)?)?
+                    }
+                    // ∂atan2(a, b) = (b, −a) / (a² + b²)
+                    (BinaryOp::ArcTan2, _) => {
+                        let r = add(multiply(a, a)?, multiply(b, b)?)?;
+                        let num = if i == 0 { b.clone() } else { negative(a)? };
+                        divide(multiply(v, num)?, r)?
+                    }
+                    // a − b·⌊a/b⌋: 1 for `a`, −⌊a/b⌋ for `b` (MLX's Remainder).
+                    (BinaryOp::Remainder, 0) => v.clone(),
+                    (BinaryOp::Remainder, _) => {
+                        negative(&multiply(v, ops::floor(&divide(a, b)?)?)?)?
                     }
                     // Comparisons have no derivative.
                     _ => return Ok(None),
@@ -709,6 +748,7 @@ impl Primitive {
                 Ok(vec![da, db, dc])
             }
             Self::Fast(op) => op.vjp(inputs, outputs, cotangents, wanted),
+            Self::Linalg(op) => op.vjp(inputs, outputs, cotangents, wanted),
             Self::MetalKernel(_) => Err(crate::Error::InvalidArgument("metal_kernel: no derivative or batching rule (wrap the kernel in `custom_function`)".into())),
             Self::Compiled(fused) => fused.vjp(inputs, cotangents, wanted),
             Self::Quantize { .. } => Ok(vec![None]),
@@ -725,7 +765,7 @@ impl Primitive {
                 let [ds, db] = scale_bias_grads(g, inputs, *quant, [wanted[1], wanted[2]])?;
                 Ok(vec![None, ds, db])
             }
-            Self::QuantizedMatmul { quant, transpose } => {
+            Self::QuantizedMatmul { quant, transpose, .. } => {
                 if wanted[1] {
                     return Err(no_weight_gradient("quantized_matmul"));
                 }
@@ -762,7 +802,7 @@ impl Primitive {
                 let n = call.primals;
                 let primals = &inputs[..n];
                 let grads = match &call.rules.vjp {
-                    Some(rule) => rule(primals, outputs, cotangents)?,
+                    Some(rule) => rule(primals, outputs, cotangents, &wanted[..n])?,
                     None => {
                         // Recompute from inputs that depend on the cotangents (as MLX's
                         // `checkpoint`): the recomputation then cannot be merged with the
@@ -771,7 +811,37 @@ impl Primitive {
                             .iter()
                             .map(|p| crate::primitive::depends(p, cotangents))
                             .collect::<Result<Vec<_>>>()?;
-                        crate::vjp_flat(|xs| (call.rules.body)(xs), &remat, cotangents)?.1
+                        // Only the wanted primals are differentiated: the others (frozen
+                        // or packed weights) are constants of the recomputation.
+                        let wanted = &wanted[..n];
+                        let vars: Vec<Array> = remat
+                            .iter()
+                            .zip(wanted)
+                            .filter(|(_, w)| **w)
+                            .map(|(p, _)| p.clone())
+                            .collect();
+                        let body = |xs: &[Array]| {
+                            let mut it = xs.iter();
+                            let all: Vec<Array> = remat
+                                .iter()
+                                .zip(wanted)
+                                .map(|(p, &w)| match w {
+                                    true => it.next().expect("one per wanted primal").clone(),
+                                    false => p.clone(),
+                                })
+                                .collect();
+                            (call.rules.body)(&all)
+                        };
+                        let grads = crate::vjp_flat(body, &vars, cotangents)?.1;
+                        let mut grads = grads.into_iter();
+                        primals
+                            .iter()
+                            .zip(wanted)
+                            .map(|(p, &w)| match w {
+                                true => grads.next().expect("one per wanted primal"),
+                                false => p.zeros_like(),
+                            })
+                            .collect()
                     }
                 };
                 if grads.len() != n {
@@ -947,6 +1017,7 @@ impl Primitive {
                 one(Ok(total))
             }
             Self::Fast(op) => op.jvp(inputs, tangents),
+            Self::Linalg(op) => op.jvp(inputs, tangents),
             Self::MetalKernel(_) => Err(crate::Error::InvalidArgument("metal_kernel: no derivative or batching rule (wrap the kernel in `custom_function`)".into())),
             Self::Compiled(fused) => fused.jvp(inputs, tangents),
             Self::Quantize { .. } => outputs.iter().map(zeros_like).collect(),
@@ -964,7 +1035,7 @@ impl Primitive {
                 Some(_) => Err(no_scale_gradient("dequantize", *quant)),
                 None => outputs.iter().map(zeros_like).collect(),
             },
-            Self::QuantizedMatmul { quant, transpose } => {
+            Self::QuantizedMatmul { quant, transpose, .. } => {
                 let (x, w) = (&inputs[0], &inputs[1]);
                 let biases = inputs.get(3);
                 let mut total = match &tangents[0] {

@@ -222,6 +222,7 @@ impl Primitive {
                 Ok((vec![crate::ops::imp::addmm(&c, &a, &b, alpha, beta)?], 0))
             }
             Self::Fast(op) => op.vmap(inputs, axes),
+            Self::Linalg(op) => op.vmap(inputs, axes),
             Self::MetalKernel(_) => Err(crate::Error::InvalidArgument("metal_kernel: no derivative or batching rule (wrap the kernel in `custom_function`)".into())),
             Self::Compiled(fused) => fused.vmap(inputs, axes),
             Self::Quantize { quant } => {
@@ -243,7 +244,7 @@ impl Primitive {
             // MLX has no rule. With unbatched weights, the batch joins `x`'s leading
             // dimensions; otherwise every operand gets the batch axis first, and 2-D weights
             // get size-1 axes for `x`'s other batch dimensions.
-            Self::QuantizedMatmul { quant, transpose } => {
+            Self::QuantizedMatmul { quant, transpose, .. } => {
                 let x = front(x, axes[0])?;
                 let mut weights: Vec<Array> = inputs[1..].to_vec();
                 if axes[1..].iter().any(Option::is_some) {

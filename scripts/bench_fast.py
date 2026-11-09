@@ -2,7 +2,8 @@
 # requires-python = ">=3.11"
 # dependencies = ["mlx==0.32.4"]
 # ///
-"""GPU fused operations (normalisation, RoPE, softmax, log-sum-exp, cross entropy): nuvec
+"""GPU fused operations (normalisation, RoPE, softmax, log-sum-exp, cross entropy) and
+element-wise functions: nuvec
 vs MLX on the same machine.
 
 Runs `cargo bench -p nuvec-core --bench fast` and the same cases in MLX with the same
@@ -72,6 +73,21 @@ CASES = [
     ("sdpa-e4b-d256-512", (1, 8, 2, 1, 512, 256)),
     ("sdpa-e4b-d512-1k", (1, 8, 2, 1, 1024, 512)),
     ("sdpa-e4b-d512-4k", (1, 8, 2, 1, 4096, 512)),
+    # MLX's element-wise functions over 2^24 contiguous elements (`ew-<name>`).
+    ("ew-erf", (1 << 24,)),
+    ("ew-expm1", (1 << 24,)),
+    ("ew-log1p", (1 << 24,)),
+    ("ew-log2", (1 << 24,)),
+    ("ew-tan", (1 << 24,)),
+    ("ew-sinh", (1 << 24,)),
+    ("ew-arccos", (1 << 24,)),
+    ("ew-arcsinh", (1 << 24,)),
+    ("ew-arctanh", (1 << 24,)),
+    ("ew-rsqrt", (1 << 24,)),
+    ("ew-floor", (1 << 24,)),
+    ("ew-round", (1 << 24,)),
+    ("ew-arctan2", (1 << 24,)),
+    ("ew-remainder", (1 << 24,)),
 ]
 # The boolean window masks, built once per shape (mlx-lm's `create_causal_mask`).
 WINDOWS: dict[tuple[int, int, int], mx.array] = {}
@@ -90,6 +106,9 @@ CASES = [c for c in CASES if any(f in c[0] for f in FILTER.split("|"))]
 
 def op(name: str, x: mx.array, w: mx.array, targets: mx.array) -> mx.array:
     kind = name.split("-")[0]
+    if kind == "ew":
+        fn = getattr(mx, name.split("-", 1)[1])
+        return fn(x, w) if name.endswith(("arctan2", "remainder")) else fn(x)
     if kind == "sdpa":
         mask = "causal" if x.shape[2] > 1 else None
         if "-w" in name and not name.startswith("sdpa-ws"):

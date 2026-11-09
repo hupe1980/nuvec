@@ -32,11 +32,14 @@ group = "Libraries"
 ## Generating
 
 ```rust,no_run
+use nuvec_lm::chat::{self, ChatTemplate, RenderOptions};
 use nuvec_lm::{GenerateOptions, Sampler, StreamDecoder, generate, load};
 
 # fn main() -> nuvec::Result<()> {
 let (model, tokenizer) = load("mlx-community/Qwen3-8B-4bit")?;
-let prompt = tokenizer.encode("<|im_start|>user\nWhat is unified memory?<|im_end|>\n<|im_start|>assistant\n");
+let template = ChatTemplate::from_dir(nuvec_lm::resolve("mlx-community/Qwen3-8B-4bit")?)?;
+// mlx_lm.generate's prompt: the template over a user message, with a generation prompt.
+let prompt = chat::prompt_ids(Some(&template), &tokenizer, "What is unified memory?", None, None, RenderOptions::new())?;
 let options = GenerateOptions {
     max_tokens: 256,
     sampler: Sampler { temperature: 0.7, top_p: 0.9, ..Default::default() },
@@ -52,8 +55,36 @@ for id in generate(&model, &prompt, options)? {
 
 - **End of sequence:** generation stops at the model's end-of-sequence ids (those of `config.json` and `generation_config.json`, as mlx-lm) without yielding them, or at `max_tokens`. `Generation::finish_reason()` says which ended it. With `ignore_eos`, they are ordinary tokens, as in vLLM, and generation runs to `max_tokens` or a stop.
 - **Samplers:** greedy (temperature 0, the default), temperature, top-p, min-p and top-k, with mlx-lm's filters chained in mlx-lm's order. Settings are checked when generation starts (`Sampler::validate`). With `GenerateOptions::seed`, sampled tokens are reproducible, also when batched with other requests.
-- **Tokenizer:** BPE read from `tokenizer.json`, special tokens included: byte-level (GPT-2, Llama 3, Qwen 2/3/3.5 and o200k's gpt-oss split patterns) and SentencePiece-style with byte fallback (Gemma, Llama 2, Mistral v0.1–v0.3); `encode` adds the tokens the tokenizer's post-processor adds (Llama's `<|begin_of_text|>`), as mlx-lm does. Other split patterns (Mistral's Tekken) are not supported. `StreamDecoder` turns token ids into text without splitting multi-byte characters.
+- **Tokenizer:** BPE read from `tokenizer.json`, special tokens included: byte-level (GPT-2, Llama 3, Qwen 2/3/3.5 and o200k's gpt-oss split patterns), Tekken's (Mistral NeMo, Ministral, Mistral Small 3), and SentencePiece-style with byte fallback (Gemma, Llama 2, Mistral v0.1–v0.3); `encode` adds the tokens the tokenizer's post-processor adds (Llama's `<|begin_of_text|>`), as mlx-lm does; `encode_text` does not. `StreamDecoder` turns token ids into text without splitting multi-byte characters.
 - **Cache:** `Generation::cache()` exposes the KV cache (and Gated DeltaNet state) for inspection.
+
+## Chat templates
+
+`nuvec_lm::chat` renders a checkpoint's own chat template exactly as transformers' `apply_chat_template` does (feature `chat`, on by default; pure-Rust `minijinja` in transformers' environment):
+
+```rust,no_run
+use nuvec::io::json;
+use nuvec_lm::chat::{ChatTemplate, RenderOptions};
+
+# fn main() -> nuvec::Result<()> {
+let dir = nuvec_lm::resolve("mlx-community/Qwen3-8B-4bit")?;
+let template = ChatTemplate::from_dir(&dir)?;
+let tokenizer = nuvec_lm::Tokenizer::from_file(dir.join("tokenizer.json"))?;
+let messages = json::parse(br#"[{"role": "system", "content": "Be brief."},
+                                {"role": "user", "content": "Hi!"}]"#)?;
+let options = RenderOptions::new()
+    .generation_prompt(true)
+    .arg("enable_thinking", json::Json::Bool(false));
+let text = template.render(messages.as_array().unwrap(), &options)?;
+let ids = template.encode(&tokenizer, messages.as_array().unwrap(), &options)?;
+# Ok(())
+# }
+```
+
+- **Sources:** `tokenizer_config.json`'s `chat_template` (one, or a named list), `chat_template.jinja` and `additional_chat_templates/*.jinja`, in transformers' precedence; with tools, `tool_use` is chosen when it exists. `TokenizerConfig` holds the special tokens the templates read (`bos_token`, `eos_token`, …).
+- **Options:** tools, documents, a generation prompt or a continued final message, template arguments (`enable_thinking`, …), and the time `strftime_now` reads (UTC when unset; transformers uses the local time).
+- **Exactness:** text and ids equal transformers 5.22.1's for 33 mlx-community checkpoints (Qwen 2.5 to 3.6, Llama 3.x, Mistral, Ministral, Gemma 4, gpt-oss) over 42 cases each, including tools, tool calls, reasoning and Python's number and `json.dumps` spelling (`scripts/chat_fixtures.py`).
+- **Errors:** a template's `raise_exception` (for example "roles must alternate") is an error carrying its message.
 
 ## Stops
 
@@ -224,23 +255,40 @@ Two ranks over Ethernet are slower than one Mac (an all-reduce per layer per tok
 
 `examples/pipeline_generate.rs` (`--tensor` for tensor parallelism) is a ready-made program for `mlx.launch`.
 
-## Fine-tuning with LoRA
+## Fine-tuning
 
-`nuvec_lm::tuner` is mlx-lm's LoRA training loop: `text` JSONL datasets, length-sorted padded batches, the masked next-token loss, a compiled step over the model and the optimizer, validation, and adapters saved in mlx-lm's layout (`mlx_lm.generate --adapter-path` loads them).
+`nuvec_lm::tuner` is mlx-lm's training loop: its JSONL datasets, sorted padded batches, the masked next-token loss, a compiled step over the model and any optimizer (gradient accumulation included), validation, and the trained weights saved in mlx-lm's layout (`mlx_lm.generate --adapter-path` loads them).
 
 ```sh
 cargo run --release -p nuvec-lm --example lora -- \
-    --model models/Qwen3-0.6B-4bit --data data --iters 1000 --batch-size 4
+    --model models/Qwen3-0.6B-4bit --data data --train --iters 1000 --batch-size 4
 ```
 
-`--model` is a local model directory; `--data` holds `train.jsonl` and, optionally, `valid.jsonl`; the other options and defaults are `mlx_lm.lora`'s. To train from your own code, call `tuner::train` with a model whose projections `lora::linear_to_lora_layers` replaced; it reports the loss, speed and peak memory as `Event`s.
+The `lora` example takes `mlx_lm.lora`'s options and defaults, and its YAML files (`--config`, with `lora_parameters`, `optimizer_config` and `lr_schedule`):
+
+- `--fine-tune-type`: `lora`, `dora` or `full` (every parameter of the last `--num-layers` blocks, on a full-precision model);
+- `--optimizer`: `adam`, `adamw`, `muon`, `sgd` or `adafactor`;
+- `--grad-checkpoint`: each block recomputes its activations in the backward pass;
+- `--resume-adapter-file`, `--test` and `--test-batches`, `--grad-accumulation-steps`.
+
+`--model` is a local model directory; `--data` holds `train.jsonl` and, optionally, `valid.jsonl` and `test.jsonl`, in one of mlx-lm's formats (the first row decides):
+
+- `{"text": ...}`: the text, ended with the tokenizer's EOS;
+- `{"messages": [...], "tools": [...]}`: the conversation rendered by the checkpoint's chat template;
+- `{"prompt": ..., "completion": ...}`: a user message and the assistant's answer.
+
+With `--mask-prompt`, the loss counts only the last message of a chat row, or the completion. The keys can be renamed (`text_feature`, `chat_feature`, `prompt_feature`, `completion_feature` in the `--config` file). Rows, offsets and the batches' order (numpy's permutation from `--seed`) equal mlx-lm's (`Dataset::from_rows`, `Dataset::rows`). On chat rows with `--mask-prompt` (Qwen3-0.6B-4bit), the losses agree with `mlx_lm.lora`'s within 2.2e-3.
+
+The loss is computed over row chunks of the output head (`Model::token_losses`), so the `[tokens, vocab]` logits never exist, and each LoRA layer keeps only its input for the backward pass. Against `mlx_lm.lora` on an M4 Pro (batch 4): Qwen3-0.6B-4bit trains at 1.13× its speed at 0.42× its peak memory, Llama-3.2-3B-Instruct-4bit at 1.02× and 0.60×, and with rows of about 2,000 tokens and `--grad-checkpoint` in both, Qwen3-0.6B at 1.03× and 0.28× (`scripts/bench_lora.py`).
+
+From your own code: `lora::apply(&mut model, &AdapterConfig::new(16, params).fine_tune_type(..))`, then `tuner::train(&mut model, &mut optimizer, ..)`; `tuner::build_optimizer` and `tuner::build_schedule` take mlx-lm's names, and the loop reports the loss, speed and peak memory as `Event`s.
 
 ## Command line
 
 ```sh
 cargo run --release -p nuvec-lm --example generate -- \
-    --model mlx-community/Qwen3-8B-4bit --prompt "Explain borrow checking" --chat \
+    --model mlx-community/Qwen3-8B-4bit --prompt "Explain borrow checking" \
     --max-tokens 256 --temp 0.7 --top-p 0.9
 ```
 
-`--chat` wraps the prompt in the ChatML template used by Qwen models; `--min-p` and `--top-k` set the other samplers.
+As `mlx_lm.generate`, the prompt goes through the checkpoint's chat template: `--system-prompt`, `--prefill-response` (the start of the answer), `--chat-template-config '{"enable_thinking": false}'` (template arguments) and `--ignore-chat-template` (the raw prompt). `--min-p` and `--top-k` set the other samplers.

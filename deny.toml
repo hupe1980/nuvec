@@ -97,6 +97,16 @@ allow-build-scripts = [
     { crate = "serde_json" },
     { crate = "target-tuple" },
     { crate = "zmij" },
+    # Via `faer` (nuvec-cpu's dense decompositions, `linalg`): the `nano-gemm-*` scripts write
+    # their micro-kernels as Rust source (`nano-gemm-codegen`); `private-gemm-x86` writes Rust
+    # source with x86 assembly in `global_asm!` (compiled for x86 targets only, by rustc);
+    # `syn` 1 is a compiler version probe. No C, no native libraries.
+    { crate = "nano-gemm-f32" },
+    { crate = "nano-gemm-f64" },
+    { crate = "nano-gemm-c32" },
+    { crate = "nano-gemm-c64" },
+    { crate = "private-gemm-x86" },
+    { crate = "syn" },
     # Metal access: Apple-target cfg probe only, no native code.
     { crate = "objc2" },
     # The CUDA backend (feature `cuda` of nuvec-gpu and nuvec-kernels, Linux), via NVIDIA's

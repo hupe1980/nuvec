@@ -856,6 +856,7 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
             )?)
         }
         Primitive::Fast(op) => op.eval_cpu(operands),
+        Primitive::Linalg(op) => op.eval_cpu(operands),
         Primitive::MetalKernel(_) => Err(Error::InvalidArgument(
             "metal_kernel: custom kernels run on the GPU only".into(),
         )),
@@ -883,7 +884,9 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
                 _ => kernels::fp_dequantize(operands[0], operands[1], group_size, bits, *dtype)?,
             })
         }
-        Primitive::QuantizedMatmul { quant, transpose } => {
+        Primitive::QuantizedMatmul {
+            quant, transpose, ..
+        } => {
             let (group_size, bits) = quant.checked("quantized_matmul")?;
             new(kernels::quantized_matmul(
                 operands, *quant, group_size, bits, *transpose,

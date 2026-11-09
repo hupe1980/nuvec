@@ -89,6 +89,8 @@ mod eval;
 pub mod fast;
 mod file;
 mod fp8;
+mod hadamard;
+mod products;
 // Parts of it are only used by the Metal backend.
 #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
 mod fused;
@@ -100,6 +102,7 @@ mod indexing;
 #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
 mod kernel;
 mod kernels;
+pub mod linalg;
 pub mod ops;
 mod primitive;
 mod quantized;
@@ -129,6 +132,7 @@ pub use error::{Error, OpErrorKind, Result};
 pub use eval::{Scheduled, async_eval, eval, schedule};
 pub use file::{MappedFile, MappedRanges};
 pub use index::{ArrayIndex, At, Ellipsis, NewAxis, Step, Stepped};
+pub use products::QqmmWeight;
 pub use quantized::{GatherQmm, Quant, QuantMode, Quantized};
 pub use scalar::{Scalar, ScalarOperand, ScalarOrArray};
 pub use transforms::{

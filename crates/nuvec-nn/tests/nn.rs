@@ -8,8 +8,8 @@ use nuvec::{
     Array, DType, Error, OpErrorKind, Param, Tree, array, ops, random, value_and_grad,
     value_and_grad_flat,
 };
-use nuvec_nn::losses::{Reduction, cross_entropy};
-use nuvec_nn::optim::{Adam, AdamW, Optimizer, Sgd};
+use nuvec_nn::losses::{Reduction, cross_entropy, linear_cross_entropy};
+use nuvec_nn::optim::{Adafactor, Adam, AdamW, Optimizer, Sgd};
 use nuvec_nn::{
     Dropout, LayerNorm, Linear, LoraLinear, Module, QuantizedLinear, RmsNorm, Rope, Summary, relu,
 };
@@ -72,6 +72,66 @@ fn without_bias_undoes_the_bias_draw() {
     assert!(a.bias.is_none());
     assert_eq!(values(&a.weight), values(&w));
     assert_eq!(values(&next.weight), values(&expected.weight));
+}
+
+/// `swiglu`'s gradient (from `gate` and `x` alone) equals the composition's, in float32
+/// and bfloat16.
+#[test]
+fn swiglu_gradient_equals_the_composition() {
+    for dtype in [DType::F32, DType::BF16] {
+        let g = random::normal([3, 7], DType::F32, 0.0, 2.0, None).astype(dtype);
+        let x = random::normal([3, 7], DType::F32, 0.0, 1.0, None).astype(dtype);
+        let w = random::normal([3, 7], DType::F32, 0.0, 1.0, None).astype(dtype);
+        let run = |fused: bool| {
+            let w = w.clone();
+            value_and_grad_flat(
+                move |p: &[Array]| {
+                    let y = match fused {
+                        true => nuvec_nn::swiglu(&p[0], &p[1]),
+                        false => nuvec_nn::silu(&p[0]).multiply(&p[1]),
+                    };
+                    Ok(y.multiply(&w).astype(DType::F32).sum(..))
+                },
+                &[0, 1],
+            )(&[g.clone(), x.clone()])
+            .unwrap()
+        };
+        let ((v1, g1), (v2, g2)) = (run(true), run(false));
+        let tol = if dtype == DType::F32 { 1e-5 } else { 2e-2 };
+        assert!((values(&v1)[0] - values(&v2)[0]).abs() <= tol * values(&v2)[0].abs().max(1.0));
+        for (a, b) in g1.iter().zip(&g2) {
+            assert_eq!(a.dtype(), b.dtype());
+            for (p, q) in values(&a.astype(DType::F32))
+                .iter()
+                .zip(values(&b.astype(DType::F32)))
+            {
+                assert!(
+                    (p - q).abs() <= tol * q.abs().max(1.0),
+                    "{dtype:?}: {p} vs {q}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn linear_cross_entropy_reduces_as_cross_entropy() {
+    // h = I, so the logits are the head's rows: the losses of `cross_entropy_equals_mlx`.
+    let h = array![[1.0, 0.0], [0.0, 1.0]];
+    let w = array![[2.0, -1.0], [-1.0, 2.0]];
+    let targets = array![0, 1];
+    let head = |x: &Array, w: &[Array]| x.matmul(&w[0]);
+    for (reduction, want) in [
+        (
+            Reduction::None,
+            vec![0.04858732968568802, 0.04858732968568802],
+        ),
+        (Reduction::Mean, vec![0.04858732968568802]),
+        (Reduction::Sum, vec![0.09717465937137604]),
+    ] {
+        let got = linear_cross_entropy(&h, &targets, std::slice::from_ref(&w), head, reduction);
+        close(&values(&got), &want, "linear cross entropy");
+    }
 }
 
 #[test]
@@ -168,6 +228,109 @@ fn optimizers_equal_mlx() {
         for (step, (g, e)) in got.iter().zip(&expected).enumerate() {
             close(g, e, &format!("{name} step {}", step + 1));
         }
+    }
+}
+
+/// Three Adafactor steps on a `[3, 4]` matrix (factored) and a vector, against MLX 0.32.4's
+/// `optimizers.Adafactor` (values recorded on its CPU stream).
+#[test]
+fn adafactor_equals_mlx() {
+    let w0 = [
+        0.5f32, -1.0, 2.0, 0.25, 1.5, 0.0, -0.5, 1.0, -2.0, 0.75, 0.1, -0.3,
+    ];
+    let b0 = [0.2f32, -0.4, 0.6, 1.0];
+    let run = |mut opt: Adafactor| {
+        let (mut w, mut b) = (Array::from_slice(&w0, [3, 4]), Array::from_slice(&b0, [4]));
+        for k in 0..3 {
+            let gw = (Array::from_slice(&w0, [3, 4]) * (k + 1) as f32).sin() * 0.3;
+            let gb = (Array::from_slice(&b0, [4]) * (k + 1) as f32).cos() * 0.2;
+            let out = opt.apply(&[("w", &w), ("b", &b)], &[&gw, &gb]).unwrap();
+            (w, b) = (out[0].clone(), out[1].clone());
+        }
+        (values(&w), values(&b))
+    };
+    let cases: [(&str, Adafactor, [f64; 12], [f64; 4]); 4] = [
+        (
+            "default",
+            Adafactor::new(0.0),
+            [
+                0.470102549,
+                -0.971857905,
+                2.000123501,
+                0.226669669,
+                1.498973012,
+                0.0,
+                -0.461694807,
+                0.96644944,
+                -2.001987696,
+                0.70854038,
+                0.089502826,
+                -0.269662619,
+            ],
+            [0.181990519, -0.415100276, 0.592950344, 1.007625699],
+        ),
+        (
+            "first moment and weight decay",
+            Adafactor::new(0.0).beta_1(0.9).weight_decay(0.1),
+            [
+                0.493408889,
+                -0.990557671,
+                1.992033958,
+                0.245386213,
+                1.492910981,
+                0.0,
+                -0.491929621,
+                0.989379108,
+                -1.99264884,
+                0.739930868,
+                0.09799087,
+                -0.294013441,
+            ],
+            [0.196209282, -0.402319908, 0.596768439, 0.998322189],
+        ),
+        (
+            "learning rate",
+            Adafactor::new(0.05).relative_step(false),
+            [
+                0.355116576,
+                -0.8619802,
+                1.997628212,
+                0.136932284,
+                1.492667675,
+                0.0,
+                -0.314293563,
+                0.835592568,
+                -2.007112026,
+                0.54818517,
+                0.049159631,
+                -0.152906924,
+            ],
+            [0.110869892, -0.474757046, 0.565021694, 1.037151337],
+        ),
+        (
+            "warm-up",
+            Adafactor::new(0.0).warmup_init(true).scale_parameter(false),
+            [
+                0.499993622,
+                -0.999995768,
+                2.000001907,
+                0.249994934,
+                1.500002146,
+                0.0,
+                -0.499991924,
+                0.999994934,
+                -2.000002146,
+                0.749992013,
+                0.099997692,
+                -0.299993485,
+            ],
+            [0.199994296, -0.400004417, 0.599999249, 1.000004768],
+        ),
+    ];
+    for (name, opt, w, b) in cases {
+        let (gw, gb) = run(opt);
+        close(&gw, &w, &format!("{name} matrix"));
+        close(&gb, &b, &format!("{name} vector"));
     }
 }
 
@@ -1081,6 +1244,135 @@ fn gradients_through_modules_check_out() {
             1e-2,
             2e-2,
         );
+    }
+}
+
+/// A LoRA layer on half-precision inputs (float32 adapters) gives the plain composition's
+/// output and gradients (its backward pass promotes the saved input again); and DoRA's
+/// output and gradients equal mlx-lm's formula, with `m` the base rows' norms at first.
+#[test]
+fn lora_and_dora_on_half_precision_inputs_equal_their_formulas() {
+    let base = Linear::new(64, 8);
+    let w = base.weight.value().clone();
+    let mut lora = LoraLinear::from_base(base.clone(), 4);
+    lora.lora_b = Param::new(random::normal([4, 8], DType::F32, 0.0, 0.1, None));
+    let x = random::normal([3, 5, 64], DType::F32, 0.0, 1.0, None).astype(DType::BF16);
+    let (a, b) = (lora.lora_a.value().clone(), lora.lora_b.value().clone());
+    let bias = base.bias.as_ref().unwrap().value().clone();
+    let plain = |x: &Array, a: &Array, b: &Array| {
+        let z = x
+            .astype(DType::F32)
+            .matmul(a)
+            .matmul(b)
+            .multiply(20.0)
+            .astype(x.dtype());
+        base.forward(x).add(z)
+    };
+    let loss = |y: Array| y.astype(DType::F32).tanh().sum(..);
+    let (got, grads) = value_and_grad_flat(
+        |p: &[Array]| {
+            let mut l = lora.clone();
+            l.lora_a = Param::new(p[1].clone());
+            l.lora_b = Param::new(p[2].clone());
+            Ok(loss(l.forward(&p[0])))
+        },
+        &[0, 1, 2],
+    )(&[x.clone(), a.clone(), b.clone()])
+    .unwrap();
+    let (want, wgrads) = value_and_grad_flat(
+        |p: &[Array]| Ok(loss(plain(&p[0], &p[1], &p[2]))),
+        &[0, 1, 2],
+    )(&[x.clone(), a.clone(), b.clone()])
+    .unwrap();
+    close(&values(&got), &[f64::from(values(&want)[0])], "lora value");
+    for (i, (g, w)) in grads.iter().zip(&wgrads).enumerate() {
+        assert_eq!(g.dtype(), w.dtype(), "gradient {i}");
+        let (g, w) = (values(&g.astype(DType::F32)), values(&w.astype(DType::F32)));
+        let scale = w.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-3);
+        for (j, (a, b)) in g.iter().zip(&w).enumerate() {
+            assert!(
+                (a - b).abs() <= 2e-2 * scale,
+                "gradient {i} element {j}: {a} vs {b}"
+            );
+        }
+    }
+    // DoRA: m = ‖W‖ per row; y = m / ‖W + s·BᵀAᵀ‖ · (x Wᵀ + s·(xA)B).
+    let dora = LoraLinear::from_base(base.clone(), 4).dora();
+    let norms: Vec<f32> = (0..8)
+        .map(|r| values(&w.i(r)).iter().map(|v| v * v).sum::<f32>().sqrt())
+        .collect();
+    let m = values(dora.m.as_ref().unwrap().value());
+    close(
+        &m,
+        &norms.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+        "dora magnitude",
+    );
+    let mut dora = dora;
+    dora.lora_a = Param::new(a.clone());
+    dora.lora_b = Param::new(b.clone());
+    let xf = x.astype(DType::F32);
+    let adapted = w.add(b.t().matmul(&a.t()).multiply(20.0));
+    let denom = adapted.multiply(&adapted).sum(1).sqrt();
+    let want = dora
+        .m
+        .as_ref()
+        .unwrap()
+        .value()
+        .divide(&denom)
+        .multiply(
+            xf.matmul(&w.t())
+                .add(xf.matmul(&a).matmul(&b).multiply(20.0)),
+        )
+        .add(&bias);
+    let got = dora.forward(&xf);
+    let (g, wv) = (values(&got), values(&want));
+    for (j, (p, q)) in g.iter().zip(&wv).enumerate() {
+        assert!(
+            (p - q).abs() <= 1e-4 * q.abs().max(1.0),
+            "dora output {j}: {p} vs {q}"
+        );
+    }
+    // The norm has no gradient (as mlx-lm), so finite differences hold for `m` alone; the
+    // adapters' gradients equal the formula's with the same stop-gradient.
+    let mut only_m = dora.clone();
+    only_m.freeze(|p| p.contains("lora_")).unwrap();
+    check_gradients(
+        "dora magnitude",
+        &only_m,
+        |m: &LoraLinear| m.forward(&xf.i(0)).tanh().sum(..),
+        1e-2,
+        2e-2,
+    );
+    let m0 = dora.m.as_ref().unwrap().value().clone();
+    let formula = |p: &[Array]| {
+        let (a, b) = (&p[0], &p[1]);
+        let adapted = w.add(b.t().matmul(&a.t()).multiply(20.0));
+        let denom = adapted.multiply(&adapted).sum(1).sqrt().stop_gradient();
+        let y = m0
+            .divide(&denom)
+            .multiply(xf.matmul(&w.t()).add(xf.matmul(a).matmul(b).multiply(20.0)))
+            .add(&bias);
+        Ok(y.tanh().sum(..))
+    };
+    let (_, want) = value_and_grad_flat(formula, &[0, 1])(&[a.clone(), b.clone()]).unwrap();
+    let (_, got) = value_and_grad_flat(
+        |p: &[Array]| {
+            let mut l = dora.clone();
+            l.lora_a = Param::new(p[0].clone());
+            l.lora_b = Param::new(p[1].clone());
+            Ok(l.forward(&xf).tanh().sum(..))
+        },
+        &[0, 1],
+    )(&[a.clone(), b.clone()])
+    .unwrap();
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        let (g, w) = (values(g), values(w));
+        for (j, (p, q)) in g.iter().zip(&w).enumerate() {
+            assert!(
+                (p - q).abs() <= 1e-4 * q.abs().max(1.0),
+                "dora gradient {i} element {j}: {p} vs {q}"
+            );
+        }
     }
 }
 

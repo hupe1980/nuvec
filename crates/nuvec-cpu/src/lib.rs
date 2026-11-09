@@ -9,6 +9,9 @@
 //!
 //! **Status:** pre-alpha. Element-wise, reduction and matrix-multiplication kernels.
 
+#[cfg(all(feature = "accelerate", target_vendor = "apple"))]
+mod lapack;
+pub mod linalg;
 mod matmul;
 
 pub use matmul::{Gemm, MatView, MatmulError, matmul};

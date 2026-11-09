@@ -1,18 +1,23 @@
-//! Generates text with a Llama-family model, as `mlx_lm.generate`, and prints mlx-lm's
-//! statistics.
+//! Generates text, as `mlx_lm.generate`, and prints mlx-lm's statistics.
 //!
 //! ```text
 //! cargo run --release -p nuvec-lm --example generate -- --model mlx-community/Qwen3-8B-4bit \
 //!     --prompt "Write a story" [--max-tokens 256] [--temp 0] [--top-p 0] [--min-p 0] \
-//!     [--top-k 0] [--chat]
+//!     [--top-k 0] [--system-prompt TEXT] [--prefill-response TEXT] \
+//!     [--chat-template-config '{"enable_thinking": false}'] [--ignore-chat-template]
 //! ```
 //!
-//! `--model` is a directory or a Hugging Face repository in the local cache. `--chat` wraps
-//! the prompt in the ChatML template (Qwen) as a user message.
+//! `--model` is a directory or a Hugging Face repository in the local cache. As in mlx-lm,
+//! the prompt is the checkpoint's chat template over a user message (after the system
+//! prompt, before a prefilled assistant answer), unless the checkpoint has none or
+//! `--ignore-chat-template` is given; `\n` and `\t` in it are unescaped, and `-` reads it
+//! from standard input.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Instant;
 
+use nuvec::io::json::{self, Json};
+use nuvec_lm::chat::{self, ChatTemplate, RenderOptions};
 use nuvec_lm::{GenerateOptions, Sampler, StreamDecoder, WiredLimit, generate, load};
 
 fn main() -> nuvec::Result<()> {
@@ -24,10 +29,27 @@ fn main() -> nuvec::Result<()> {
             .cloned()
     };
     let model_id = value("--model").unwrap_or_else(|| "mlx-community/Qwen3-8B-4bit".into());
-    let mut prompt = value("--prompt").unwrap_or_else(|| "Hello".into());
-    if args.iter().any(|a| a == "--chat") {
-        prompt = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
+    let mut prompt = value("--prompt")
+        .unwrap_or_else(|| "Hello".into())
+        .replace("\\n", "\n")
+        .replace("\\t", "\t");
+    if prompt == "-" {
+        prompt.clear();
+        std::io::stdin()
+            .read_to_string(&mut prompt)
+            .map_err(|e| nuvec::Error::Io(e.to_string()))?;
     }
+    let template_args: Vec<(String, Json)> = match value("--chat-template-config") {
+        Some(c) => match json::parse(c.as_bytes())? {
+            Json::Object(fields) => fields,
+            _ => {
+                return Err(nuvec::Error::InvalidArgument(
+                    "--chat-template-config: a JSON object".into(),
+                ));
+            }
+        },
+        None => Vec::new(),
+    };
     let number =
         |flag: &str, default: f32| value(flag).map_or(default, |v| v.parse().expect("a number"));
     let options = GenerateOptions {
@@ -43,7 +65,21 @@ fn main() -> nuvec::Result<()> {
     };
 
     let (model, tokenizer) = load(&model_id)?;
-    let ids = tokenizer.encode(&prompt);
+    let template = if args.iter().any(|a| a == "--ignore-chat-template") {
+        None
+    } else {
+        ChatTemplate::from_dir(nuvec_lm::resolve(&model_id)?).ok()
+    };
+    let ids = chat::prompt_ids(
+        template.as_ref(),
+        &tokenizer,
+        &prompt,
+        value("--system-prompt").as_deref(),
+        value("--prefill-response").as_deref(),
+        template_args
+            .into_iter()
+            .fold(RenderOptions::new(), |o, (k, v)| o.arg(k, v)),
+    )?;
 
     println!("==========");
     // Wired before the clock starts, as mlx-lm's `stream_generate` does.
