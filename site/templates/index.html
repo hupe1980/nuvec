@@ -35,7 +35,7 @@
         {
           "@type": "Question",
           "name": "How fast is nuvec compared to MLX?",
-          "acceptedAnswer": { "@type": "Answer", "text": "On par. On an Apple M4 Pro (nuvec 0.5.0, mlx-lm 0.32.2, 2026-10-31, 12 models), nuvec-lm decodes at 0.98–1.10× mlx-lm's speed (geometric mean 1.01×), with time to first token 1.02× at 2,048 and 32,768 tokens. Concurrent serving is 1.00× at 4 and 8 requests, and warm loads are 1.8× faster." }
+          "acceptedAnswer": { "@type": "Answer", "text": "On par. On an Apple M4 Pro, nuvec-lm decodes at 1.01× mlx-lm's speed (geometric mean), reaches the first token as fast, and loads 1.5–1.8× faster." }
         },
         {
           "@type": "Question",
@@ -187,13 +187,13 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
     <div>
       <h2 class="section-title">As fast as MLX. Measured, not claimed.</h2>
       <p>Every number comes from <code>just bench-parity</code>: nuvec-lm and mlx-lm on the same Mac and checkpoints in one session, medians of alternating runs, with the previous release alongside to catch regressions.</p>
-      <p class="muted small">Apple M4 Pro · nuvec 0.5.0 · mlx-lm 0.32.2 · 2026-10-31 · greedy · decode after a 961-token prompt.</p>
+      <p class="muted small">Apple M4 Pro · nuvec 0.8.0 · mlx-lm 0.32.2 · 2026-11-09 · greedy · decode after a 961-token prompt.</p>
       <a class="link-arrow" href="{{ get_url(path='@/docs/benchmarks.md') }}">Full tables and method</a>
     </div>
     <div class="bars" role="table" aria-label="Decode speed relative to mlx-lm">
-      <div class="bar-row" role="row"><span role="cell">Qwen3-8B</span><span class="bar" role="cell" style="--v:1.01"><b>1.01×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3-8B</span><span class="bar" role="cell" style="--v:1.02"><b>1.02×</b></span></div>
       <div class="bar-row" role="row"><span role="cell">Qwen3.5-9B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">Qwen3-30B-A3B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3-30B-A3B</span><span class="bar" role="cell" style="--v:1.02"><b>1.02×</b></span></div>
       <div class="bar-row" role="row"><span role="cell">gpt-oss-20b</span><span class="bar" role="cell" style="--v:0.99"><b>0.99×</b></span></div>
       <div class="bar-axis" aria-hidden="true"><span>mlx-lm = 1.00×</span></div>
     </div>
@@ -232,7 +232,7 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
   <div class="wrap faq-short">
     <h2 class="section-title">Questions</h2>
     <details><summary>Is nuvec a binding to MLX?</summary><p>No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ library. It reaches Metal through Apple's system frameworks and compiles its own Metal kernels, several of them ported from MLX.</p></details>
-    <details><summary>How fast is it compared to MLX?</summary><p>On par. On an Apple M4 Pro (nuvec 0.5.0, mlx-lm 0.32.2, 2026-10-31, 12 models), nuvec-lm decodes at 0.98–1.10× mlx-lm's speed (geometric mean 1.01×), with time to first token 1.02× at 2,048 and 32,768 tokens. Concurrent serving is 1.00× at 4 and 8 requests, and warm loads are 1.8× faster. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
+    <details><summary>How fast is it compared to MLX?</summary><p>On par. On an Apple M4 Pro, nuvec-lm decodes at 1.01× mlx-lm's speed (geometric mean), reaches the first token as fast, and loads 1.5–1.8× faster. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
     <details><summary>Which hardware does it support?</summary><p>Macs with Apple Silicon (M1 or later) on macOS 15 or newer. The core and CPU crates also build and run on Linux.</p></details>
     <a class="link-arrow" href="{{ get_url(path='@/docs/faq.md') }}">All questions</a>
   </div>
