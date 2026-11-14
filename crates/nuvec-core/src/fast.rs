@@ -880,7 +880,7 @@ pub fn ssm_scan(
         Location::caller(),
         &operands(&[x, a_log, b, c, d, dt], &[state]),
         || {
-            let (y, s) = ssm::ssm_scan(x, a_log, b, c, d, dt, state, 256)?;
+            let (y, s) = ssm::ssm_scan(x, a_log, b, c, d, dt, state)?;
             Ok([y, s])
         },
     );
