@@ -22,8 +22,8 @@ use nuvec::{Array, Error, Result};
 use nuvec_nn::{Linear, Param, QuantizedLinear};
 
 use super::{
-    Attention, Block, BlockMlp, GatedDeltaNet, GptOssMlp, Mixer, Mlp, Model, MoeMlp, Projection,
-    SwitchGlu, SwitchProjection,
+    Attention, Block, BlockMlp, GatedDeltaNet, GptOssMlp, Mixer, Mlp, Model, MoeMlp, OutProj,
+    Projection, SwitchGlu, SwitchProjection,
 };
 
 fn invalid(m: String) -> Error {
@@ -305,9 +305,14 @@ impl Attention {
                 .rows(&at("q_proj"), &[out_rows(&self.q_proj)], n, r)?,
             k_proj: self.k_proj.as_ref().map(|p| kv(p, "k_proj")).transpose()?,
             v_proj: self.v_proj.as_ref().map(|p| kv(p, "v_proj")).transpose()?,
-            o_proj: self.o_proj.cols(&at("o_proj"), n, r)?,
+            o_proj: match &self.o_proj {
+                OutProj::O(p) => OutProj::O(p.cols(&at("o_proj"), n, r)?),
+                OutProj::Out(p) => OutProj::Out(p.cols(&at("out_proj"), n, r)?),
+            },
             q_norm: self.q_norm.clone(),
             k_norm: self.k_norm.clone(),
+            q_layernorm: self.q_layernorm.clone(),
+            k_layernorm: self.k_layernorm.clone(),
             heads: self.heads / n,
             kv_heads,
             scale: self.scale,
@@ -362,6 +367,11 @@ impl Block {
         let mixer = match &self.mixer {
             Mixer::Attention(a) => Mixer::Attention(a.shard(&format!("{path}.self_attn"), n, r)?),
             Mixer::Linear(l) => Mixer::Linear(l.shard(&format!("{path}.linear_attn"), n, r)?),
+            Mixer::Mamba(_) | Mixer::ShortConv(_) => {
+                return Err(nuvec::Error::InvalidArgument(format!(
+                    "{path}: Mamba-2 and short-convolution layers are not split across ranks"
+                )));
+            }
         };
         let p = format!("{path}.mlp");
         let mlp = match &self.mlp {
@@ -383,12 +393,18 @@ impl Block {
                 experts: m.experts.shard(&format!("{p}.experts"), n, r)?,
                 experts_per_token: m.experts_per_token,
             })),
+            // Unreachable: their mixers are refused above.
+            BlockMlp::Granite(_) | BlockMlp::Lfm2(_) => {
+                return Err(nuvec::Error::InvalidArgument(format!(
+                    "{path}: Granite 4 and LFM2 MLPs are not split across ranks"
+                )));
+            }
         };
         Ok(Self {
             mixer,
             mlp,
-            input_layernorm: self.input_layernorm.clone(),
-            post_attention_layernorm: self.post_attention_layernorm.clone(),
+            norms: self.norms.clone(),
+            residual_multiplier: self.residual_multiplier,
             gemma: None,
             group: Some(group.clone()),
         })

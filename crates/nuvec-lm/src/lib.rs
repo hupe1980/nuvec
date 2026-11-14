@@ -1,8 +1,9 @@
 //! LLM runtime with mlx-lm's behaviour and speed:
 //!
 //! - **Models:** Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE, Qwen 3.5 (hybrid Gated
-//!   DeltaNet and attention, dense or mixture-of-experts), gpt-oss and Gemma 4 (text), from
-//!   Hugging Face or MLX checkpoints, including MLX's quantized ones. Aligned files are
+//!   DeltaNet and attention, dense or mixture-of-experts), gpt-oss, Gemma 4 (text), Granite 4
+//!   (Mamba-2 and attention) and LFM2 (short convolutions and attention), from Hugging Face
+//!   or MLX checkpoints, including MLX's quantized ones. Aligned files are
 //!   memory-mapped without a copy; mlx-community checkpoints (unpadded headers) are read
 //!   once at load, in parallel.
 //! - **Tokenizer:** BPE read from `tokenizer.json`: byte-level (GPT-2, Llama 3, Qwen 2/3/3.5,
@@ -14,7 +15,7 @@
 //!   place, stopping at the model's end-of-sequence tokens (`config.json` and
 //!   `generation_config.json`), mlx-lm's samplers (temperature, top-p, min-p, top-k), and
 //!   [speculative decoding](speculative) with pluggable drafters; memory is wired while
-//!   generating ([`WiredLimit`]).
+//!   generating ([`WiredLimit`]); quantized KV caches as mlx-lm's `kv_bits` ([`KvQuant`]).
 //! - **Serving:** batched decoding over a [paged KV cache](paged) and a [`Batcher`] that
 //!   serves many requests at once; prompt caches saved and loaded in mlx-lm's file format
 //!   ([`save_prompt_cache`], [`load_prompt_cache`]).
@@ -222,6 +223,7 @@ fn dropped(name: &str, config: &Config) -> bool {
 fn sanitize(weights: BTreeMap<String, Array>, config: &Config) -> Result<BTreeMap<String, Array>> {
     let weights = match config.model_type.as_str() {
         "gpt_oss" => sanitize_gpt_oss(weights)?,
+        "granitemoehybrid" | "lfm2" => sanitize_granite_lfm2(weights, config)?,
         _ => weights,
     };
     let mut weights: BTreeMap<String, Array> = weights
@@ -300,9 +302,12 @@ fn sanitize(weights: BTreeMap<String, Array>, config: &Config) -> Result<BTreeMa
             );
         }
     }
-    let unsanitized = weights
-        .iter()
-        .any(|(k, v)| k.contains("conv1d.weight") && v.shape().last() != Some(&1));
+    // Qwen 3.5's Hugging Face checkpoints (only): `[C, 1, K]` convolutions mark norm weights
+    // stored zero-centred.
+    let unsanitized = config.linear_attention.is_some()
+        && weights
+            .iter()
+            .any(|(k, v)| k.contains("conv1d.weight") && v.shape().last() != Some(&1));
     if unsanitized {
         const NORMS: [&str; 8] = [
             ".input_layernorm.weight",
@@ -323,6 +328,48 @@ fn sanitize(weights: BTreeMap<String, Array>, config: &Config) -> Result<BTreeMa
         }
     }
     Ok(weights)
+}
+
+/// mlx-lm's `granitemoehybrid.sanitize` and `lfm2.sanitize`: convolutions stored `[C, 1, K]`
+/// as `[C, K, 1]`; Granite 4's experts (`input_linear` `[E, 2·I, D]`: gate then up;
+/// `output_linear`) as `switch_mlp`, and a dense model's `shared_mlp` as its `mlp`; a
+/// redundant `lm_head.weight` beside tied embeddings dropped.
+fn sanitize_granite_lfm2(
+    weights: BTreeMap<String, Array>,
+    config: &Config,
+) -> Result<BTreeMap<String, Array>> {
+    let mut out = BTreeMap::new();
+    for (k, v) in weights {
+        let conv = k.ends_with("conv1d.weight") || k.ends_with(".conv.conv.weight");
+        if conv && v.ndim() == 3 && v.shape()[2] != 1 {
+            out.insert(k, v.transpose([0, 2, 1]).check()?);
+        } else if k == "lm_head.weight" && config.tie_word_embeddings {
+            continue;
+        } else if let Some(base) = k.strip_suffix(".block_sparse_moe.input_linear.weight") {
+            let [gate, up] = v.split_n::<2>(-2);
+            let p = format!("{base}.block_sparse_moe.switch_mlp");
+            out.insert(format!("{p}.gate_proj.weight"), gate.check()?);
+            out.insert(format!("{p}.up_proj.weight"), up.check()?);
+        } else if let Some(base) = k.strip_suffix(".block_sparse_moe.output_linear.weight") {
+            out.insert(
+                format!("{base}.block_sparse_moe.switch_mlp.down_proj.weight"),
+                v,
+            );
+        } else if config.moe.is_none()
+            && let Some(base) = k.strip_suffix(".shared_mlp.input_linear.weight")
+        {
+            let [gate, up] = v.split_n::<2>(0);
+            out.insert(format!("{base}.mlp.gate_proj.weight"), gate.check()?);
+            out.insert(format!("{base}.mlp.up_proj.weight"), up.check()?);
+        } else if config.moe.is_none()
+            && let Some(base) = k.strip_suffix(".shared_mlp.output_linear.weight")
+        {
+            out.insert(format!("{base}.mlp.down_proj.weight"), v);
+        } else {
+            out.insert(k, v);
+        }
+    }
+    Ok(out)
 }
 
 /// gpt-oss's Hugging Face experts as mlx-lm's `SwitchGLU` (`experts.{gate,up,down}_proj`):

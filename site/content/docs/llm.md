@@ -19,6 +19,8 @@ group = "Libraries"
 | Qwen 3.5 / 3.6 | `qwen3_5`, `qwen3_5_text`, `qwen3_5_moe`, `qwen3_5_moe_text` | hybrid Gated DeltaNet and gated attention, partial RoPE, dense or mixture-of-experts |
 | gpt-oss | `gpt_oss` | sliding and full layers, attention sinks, YaRN, biased router and experts with the clamped SwiGLU; MXFP4 and affine checkpoints, Hugging Face's MXFP4 originals converted at load |
 | Gemma 4 | `gemma4`, `gemma4_text`, `gemma4_unified`, `gemma4_unified_text` | sliding and full layers with their own head sizes and RoPE, per-layer inputs, KV-shared layers, K = V, the experts branch, the logit soft cap; vision and audio weights are skipped |
+| Granite 4 | `granitemoehybrid` | Mamba-2 and attention layers (RoPE or none), experts with a shared MLP or dense MLPs, embedding, residual, attention and logit multipliers; no speculative decoding, paged `Batcher` or tensor parallelism |
+| LFM2 | `lfm2` | gated short convolutions and attention with q/k norms; no speculative decoding, paged `Batcher` or tensor parallelism |
 
 `load` takes a directory or a Hugging Face repository id found in the local cache; nothing is downloaded.
 

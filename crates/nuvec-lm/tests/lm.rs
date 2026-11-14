@@ -442,6 +442,99 @@ fn logits(name: &str) -> (Vec<f32>, Vec<f32>) {
     (got.astype(DType::F32).to_vec::<f32>().unwrap(), expected)
 }
 
+/// Granite 4 (`granitemoehybrid`): Mamba-2 and attention layers, experts with a shared MLP,
+/// and its embedding, residual, attention and logit multipliers.
+#[test]
+fn granite4_matches_mlx_lm() {
+    check("granite4_moe_f32", 1e-4);
+}
+
+/// Granite 4 dense, without rotary embeddings (`position_embedding_type: nope`).
+#[test]
+fn granite4_dense_matches_mlx_lm() {
+    check("granite4_dense_f32", 1e-4);
+}
+
+/// Granite 4 in Hugging Face's layout (`[C, 1, K]` convolutions, `input_linear` and
+/// `output_linear` experts).
+#[test]
+fn hugging_face_granite4_checkpoints_are_sanitized() {
+    check("granite4_moe_hf", 1e-4);
+}
+
+/// LFM2: gated short convolutions and attention with q/k layer norms (its config gives
+/// only `full_attn_idxs`).
+#[test]
+fn lfm2_matches_mlx_lm() {
+    check("lfm2_f32", 1e-4);
+}
+
+/// LFM2 in Hugging Face's layout (`[C, 1, K]` convolutions).
+#[test]
+fn hugging_face_lfm2_checkpoints_are_sanitized() {
+    check("lfm2_hf", 1e-4);
+}
+
+/// Granite 4 and LFM2 keep states that cannot be rolled back or paged: speculative
+/// decoding and the paged `Batcher` refuse them, naming the family; a quantized KV cache
+/// quantizes their attention layers and leaves the states as they are.
+#[test]
+fn granite4_and_lfm2_refuse_rollback_and_paging() {
+    use nuvec_lm::{
+        Batcher, BatcherOptions, DraftPolicy, KvQuant, PromptLookup, speculative_generate,
+    };
+    if !gpu() {
+        return;
+    }
+    for (name, family) in [
+        ("granite4_moe_f32", "granitemoehybrid"),
+        ("lfm2_f32", "lfm2"),
+    ] {
+        let (dir, prompt, ..) = fixture(name);
+        let model = load_model(&dir).unwrap();
+        let options = GenerateOptions {
+            max_tokens: 4,
+            ..Default::default()
+        };
+        let speculative = speculative_generate(
+            &model,
+            &prompt,
+            options.clone(),
+            Box::new(PromptLookup::default()),
+            DraftPolicy::Fixed(4),
+        );
+        let Err(err) = speculative else {
+            panic!("{name}: speculative decoding not refused")
+        };
+        assert!(err.to_string().contains(family), "{name}: {err}");
+        let Err(err) = Batcher::new(&model, BatcherOptions::default()) else {
+            panic!("{name}: the paged Batcher not refused")
+        };
+        assert!(err.to_string().contains(family), "{name}: {err}");
+        let quantized = GenerateOptions {
+            kv_quant: Some(KvQuant {
+                group_size: 32,
+                start: 0,
+                ..Default::default()
+            }),
+            ..options.clone()
+        };
+        let plain: Vec<u32> = generate(&model, &prompt, options)
+            .unwrap()
+            .collect::<nuvec::Result<_>>()
+            .unwrap();
+        let ids: Vec<u32> = generate(&model, &prompt, quantized)
+            .unwrap()
+            .collect::<nuvec::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            ids.len(),
+            plain.len(),
+            "{name}: a quantized cache generates"
+        );
+    }
+}
+
 #[test]
 fn hybrid_qwen3_5_matches_mlx_lm() {
     check("qwen3_5_f32", 1e-4);
@@ -463,6 +556,8 @@ fn half_precision_qwen3_5_stays_close_to_mlx_lm() {
         "qwen3_5_moe_q4",
         "qwen3_moe_q4",
         "qwen3_5_moe_nvfp4",
+        "granite4_moe_q4",
+        "lfm2_q4",
     ] {
         let (got, want) = logits(name);
         // Routing near a tie may pick another expert after a one-ulp difference (which
@@ -2801,7 +2896,13 @@ fn prompt_caches_load_mlx_lm_files_and_round_trip() {
     };
     let dir = std::env::temp_dir().join(format!("nuvec-prompt-cache-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    for name in ["qwen3_f32", "qwen3_5_f32", "gpt_oss_f32"] {
+    for name in [
+        "qwen3_f32",
+        "qwen3_5_f32",
+        "gpt_oss_f32",
+        "granite4_moe_f32",
+        "lfm2_f32",
+    ] {
         let (path, prompt, ..) = fixture(name);
         let model = load_model(&path).unwrap();
         let next = nuvec::io::load_safetensors(path.join("prompt_cache_next.safetensors"))

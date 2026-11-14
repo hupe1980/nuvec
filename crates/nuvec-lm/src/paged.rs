@@ -89,6 +89,11 @@ impl PagedCache {
                 "blocks of a power-of-two size, at least one block and one sequence",
             ));
         }
+        if let Some(family) = model.unpageable() {
+            return Err(invalid(format!(
+                "{family}'s Mamba-2 or short-convolution layers have no paged states"
+            )));
+        }
         let int = |v: usize| i32::try_from(v).map_err(|_| invalid(format!("{v} is too large")));
         let mut groups: Vec<Group> = Vec::new();
         let mut layer_group = Vec::new();
