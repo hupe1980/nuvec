@@ -524,9 +524,9 @@ fn fused_power_is_close_to_the_precise_one() {
     }
 }
 
-/// mrun's B6: a compiled function keeps where each product was built. The same product
-/// built inside and outside `with_row_exact` is not merged: called outside the mode, the
-/// inside one keeps each row's one-row bits, the other routes as MLX's.
+/// A compiled function keeps where each product was built. The same product built inside
+/// and outside `with_row_exact` is not merged: called outside the mode, the inside one keeps
+/// each row's one-row bits, the other routes as MLX's.
 #[test]
 fn row_exact_products_are_not_merged() {
     use nuvec_core::{Quant, random, with_row_exact};
@@ -555,5 +555,10 @@ fn row_exact_products_are_not_merged() {
         }
         merged_would_differ += usize::from(bits(&out[0]) != bits(&out[1]));
     }
-    assert!(merged_would_differ > 0, "the two routings were merged");
+    // From generation 15 MLX's routing takes `qmv_wide`, whose bits differ for some seeds:
+    // equal outputs there mean the two products were merged.
+    let generation = nuvec_gpu::Device::shared().and_then(|d| d.info().generation);
+    if generation.is_some_and(|g| g >= 15) {
+        assert!(merged_would_differ > 0, "the two routings were merged");
+    }
 }

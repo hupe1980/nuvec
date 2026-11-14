@@ -736,11 +736,16 @@ mod built_inside {
         }
     }
 
-    /// Outside the mode, products route as MLX's: some rows of a 3-row 4-bit product
-    /// differ from their one-row products (`qmv_wide`).
+    /// Outside the mode, products route as MLX's: on GPUs from generation 15, where MLX
+    /// takes `qmv_wide` from 2 rows, some rows of a 3-row 4-bit product differ from their
+    /// one-row products.
     #[test]
     fn outside_the_mode_routing_is_mlx() {
         if !gpu() {
+            return;
+        }
+        let generation = nuvec_gpu::Device::shared().and_then(|d| d.info().generation);
+        if generation.is_none_or(|g| g < 15) {
             return;
         }
         let (k, n, rows) = (1024, 256, 3);

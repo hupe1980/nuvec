@@ -8,7 +8,8 @@ use nuvec_gpu::{Arg, Buffer, Device, GpuError};
 /// would only be reported, so tests record errors here and check them at the end).
 static GPU_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Held by the tests that keep the GPU or its compiler busy for long, so they do not overlap:
+/// Held by the tests that keep the GPU or its compiler busy for long, or queue chains of
+/// command buffers, so they do not overlap:
 /// on virtualised GPUs (CI) a command buffer waiting on its fence behind the others' work can
 /// exceed the GPU watchdog.
 static LONG_RUNNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -312,6 +313,7 @@ fn empty_buffers_and_zero_threads() {
 
 #[test]
 fn timeline_orders_command_buffers_committed_without_waiting() {
+    let _long = long_running();
     let Some(device) = device() else { return };
     let n = 1 << 16;
     let ones = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
@@ -353,6 +355,7 @@ fn abandoned_command_buffers_keep_the_timeline_moving() {
 
 #[test]
 fn completion_handlers_report_and_back_pressure_bounds_in_flight_work() {
+    let _long = long_running();
     let Some(device) = device() else { return };
     let n = 1 << 20;
     let a = device.buffer_from(&f32s(&vec![1.0; n])).unwrap();
@@ -380,6 +383,7 @@ fn completion_handlers_report_and_back_pressure_bounds_in_flight_work() {
 
 #[test]
 fn ordered_command_buffers_read_in_flight_results_across_threads() {
+    let _long = long_running();
     let Some(device) = device() else { return };
     let n = 1 << 18;
     let ones = std::sync::Arc::new(device.buffer_from(&f32s(&vec![1.0; n])).unwrap());
@@ -451,6 +455,7 @@ fn function_constants_specialise_and_cache_pipelines() {
 
 #[test]
 fn ordered_command_buffers_wait_only_for_their_writers_and_overlap_otherwise() {
+    let _long = long_running();
     let Some(device) = device() else { return };
     // Two interleaved chains (`x += 1`, `y += 2`), one command buffer per step, all committed
     // without waiting; a final command buffer reads both chains (a wait on two writers).
@@ -485,6 +490,7 @@ fn ordered_command_buffers_wait_only_for_their_writers_and_overlap_otherwise() {
 
 #[test]
 fn ordered_writes_wait_for_in_flight_readers() {
+    let _long = long_running();
     let Some(device) = device() else { return };
     // A slow chain reads `a`; a later command buffer overwrites `a`. The chain must see the
     // old values (write after read across command buffers).
@@ -515,6 +521,7 @@ fn ordered_writes_wait_for_in_flight_readers() {
 
 #[test]
 fn reused_memory_is_written_after_in_flight_readers() {
+    let _long = long_running();
     let Some(device) = device() else { return };
     // A slow chain reads `a`; `a` is dropped while the chain is in flight, and its memory
     // reused for a buffer later work overwrites. The chain must still see `a`'s values.
@@ -681,6 +688,7 @@ fn reading_reused_memory_waits_for_the_previous_owner() {
 
 #[test]
 fn unordered_work_on_busy_memory_and_reads_of_unsubmitted_writes_are_refused() {
+    let _long = long_running();
     let Some(device) = device() else { return };
     let pipeline = device.pipeline("nuvec_add_f32").unwrap();
     // A writer encoded but not committed: its fence orders nothing yet.
