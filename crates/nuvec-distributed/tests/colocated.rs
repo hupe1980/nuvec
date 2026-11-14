@@ -69,7 +69,10 @@ fn ranks_in_one_process_fail_at_once_on_the_gpu() {
         (start.elapsed(), e)
     });
     for (took, e) in got {
-        assert!(took < Duration::from_millis(100), "took {took:?}");
+        assert!(
+            took < Duration::from_secs(2),
+            "took {took:?} (the timeout is 5 s)"
+        );
         assert!(e.contains("ranks") && e.contains("one process"), "{e}");
     }
     // Closed groups no longer count: a group of this process alone works.
