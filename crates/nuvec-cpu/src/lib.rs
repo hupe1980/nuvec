@@ -9,11 +9,14 @@
 //!
 //! **Status:** pre-alpha. Element-wise, reduction and matrix-multiplication kernels.
 
+#[cfg_attr(miri, allow(dead_code))]
+mod few_rows;
 #[cfg(all(feature = "accelerate", target_vendor = "apple"))]
 mod lapack;
 pub mod linalg;
 mod matmul;
 
+pub use few_rows::{EXACT_ROWS, FEW_ROWS};
 pub use matmul::{Gemm, MatView, MatmulError, matmul};
 
 /// The version of this crate.

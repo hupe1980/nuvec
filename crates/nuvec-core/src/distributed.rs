@@ -6,8 +6,11 @@
 //! `vmap` and `compile` as MLX defines, and run on the CPU over the arrays' shared memory.
 //! On a GPU stream they run on the group's worker thread once the GPU work producing their
 //! inputs completes, and the GPU work reading their outputs is committed once they are done,
-//! so neither the evaluating thread nor the GPU waits for the network. Without a configured group, the default group
-//! has size 1 and every collective is the identity, so single-process code runs unchanged.
+//! so neither the evaluating thread nor the GPU waits for the network. Each rank is its own
+//! process, as in MLX: ranks of one group as threads of one process work on the CPU stream,
+//! and on the GPU (one command stream per GPU) their collectives fail at once, naming the
+//! ranks. Without a configured group, the default group has size 1 and every collective is
+//! the identity, so single-process code runs unchanged.
 //!
 //! The transport is a [`Communicator`]; `nuvec-distributed` provides MLX's TCP ring and
 //! JACCL backends and installs one as the default group.
@@ -64,6 +67,11 @@ pub trait Communicator: Send + Sync {
     /// blocking; an error names a lost peer. Backends that cannot tell report `Ok`.
     fn health(&self) -> Result<()> {
         Ok(())
+    }
+    /// The same value for every rank of one group (a hash of its nodes), so ranks of one
+    /// group in the same process can be told apart from separate groups; `None` if unknown.
+    fn membership(&self) -> Option<u64> {
+        None
     }
     /// A subgroup of the ranks with the same `color`, ordered by `key` (MLX's `split`).
     fn split(&self, color: i32, key: i32) -> Result<Arc<dyn Communicator>> {
@@ -133,6 +141,31 @@ impl Drop for Registered {
 /// Groups by id (`id - 1`; `None` once closed); id 0 is the size-1 group.
 static GROUPS: Mutex<Vec<Option<Arc<Registered>>>> = Mutex::new(Vec::new());
 static DEFAULT: RwLock<Option<Group>> = RwLock::new(None);
+
+/// On the GPU, a collective of a group with another of its ranks in this process fails at
+/// once: nuvec has one command stream per GPU, and the work after one rank's collective
+/// waits for it, so another rank's input would never reach its peer (a deadlock until the
+/// timeout). MLX also runs one process per rank.
+pub(crate) fn check_gpu_ranks(id: usize) -> Result<()> {
+    let entry = registered(id)?;
+    let Some(membership) = entry.comm.membership() else {
+        return Ok(());
+    };
+    let rank = entry.comm.rank();
+    let groups = GROUPS.lock().unwrap_or_else(PoisonError::into_inner);
+    let other = groups
+        .iter()
+        .flatten()
+        .find(|g| g.comm.membership() == Some(membership) && g.comm.rank() != rank);
+    match other {
+        None => Ok(()),
+        Some(g) => Err(Error::InvalidArgument(format!(
+            "distributed: ranks {rank} and {} of this group run in one process; on the GPU \
+             each rank needs its own process (as MLX), or evaluate on the CPU stream",
+            g.comm.rank()
+        ))),
+    }
+}
 
 fn registered(id: usize) -> Result<Arc<Registered>> {
     let groups = GROUPS.lock().unwrap_or_else(PoisonError::into_inner);

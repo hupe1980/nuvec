@@ -99,7 +99,7 @@ pub trait Gemm: Copy + Default + sealed::Sealed + 'static {
 }
 
 macro_rules! impl_gemm {
-    ($t:ty, $g:ty, $mul_add:expr, $one:expr) => {
+    ($t:ty, $g:ty, $mul_add:expr, $one:expr $(, $few:ident)?) => {
         impl sealed::Sealed for $t {}
         impl Gemm for $t {
             fn mul_add(acc: Self, a: Self, b: Self) -> Self {
@@ -116,6 +116,11 @@ macro_rules! impl_gemm {
                 a: MatView<'_, Self>,
                 b: MatView<'_, Self>,
             ) {
+                // Up to `EXACT_ROWS` rows: each row's bits independent of the others.
+                $(if m <= crate::$few::EXACT_ROWS {
+                    crate::$few::rows(m, n, k, a, b, dst);
+                    return;
+                })?
                 let lhs = a.data.as_ptr().wrapping_offset(a.offset).cast::<$g>();
                 let rhs = b.data.as_ptr().wrapping_offset(b.offset).cast::<$g>();
                 // SAFETY: the caller guarantees that every element reachable through `a`
@@ -150,7 +155,7 @@ macro_rules! impl_gemm {
     };
 }
 
-impl_gemm!(f32, f32, |acc, a, b| acc + a * b, 1.0);
+impl_gemm!(f32, f32, |acc, a, b| acc + a * b, 1.0, few_rows);
 impl_gemm!(f64, f64, |acc, a, b| acc + a * b, 1.0);
 
 impl sealed::Sealed for f16 {}

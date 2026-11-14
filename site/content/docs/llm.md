@@ -119,6 +119,10 @@ if let Some(FinishReason::Stop(stopped)) = generation.finish_reason() {
 - **`min_tokens`:** the first `min_tokens` tokens are never end-of-sequence or stop tokens (their probability is zero), and no stop string ends generation before then.
 - **The same everywhere:** `generate`, `Batcher` and `speculative_generate` end alike, with the same finish reasons. A stop inside an accepted draft ends speculative decoding at that token.
 
+## Prompt caches
+
+`save_prompt_cache(path, &model, &cache, &metadata)` writes a cache after a prompt (a system prompt, a document) and `load_prompt_cache(path, &model)` reads it back, so a later run continues without recomputing the prompt. The files are mlx-lm's (`save_prompt_cache`, `load_prompt_cache`, `mlx_lm.cache_prompt`): each loads in the other.
+
 ## How generation is fast
 
 - **Chunked prefill** (2,048 tokens at a time, as mlx-lm) with the cache written once per position.

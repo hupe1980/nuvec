@@ -2,14 +2,15 @@
 # requires-python = ">=3.11"
 # dependencies = ["mlx==0.32.4"]
 # ///
-"""Few-row products (B = 1..16 rows: dense, affine quantized, gathered) on the GPU: nuvec
-against MLX, and against nuvec 0.3.0's routing when `BASE` names a checkout of v0.3.0
+"""Few-row products (B = 1..16 rows: dense, affine quantized, gathered) on the GPU: nuvec's
+default routing and its row-exact mode (`with_row_exact`, lanes that must equal their solo
+runs) against MLX, and against nuvec 0.3.0's routing when `BASE` names a checkout of v0.3.0
 whose `crates/nuvec-core/benches/rows.rs` holds the same cases (in the 0.3 API).
 
-Runs `cargo bench -p nuvec-core --bench rows` (and in `BASE`) twice, alternating, and the
-same cases in MLX, then prints microseconds per product, the ratios, and the largest
-row count up to which every case keeps at least 0.98× of 0.3.0 (the candidate for
-`ROW_INDEPENDENT_ROWS`).
+Runs `cargo bench -p nuvec-core --bench rows` in both modes (and in `BASE`) twice, and the
+same cases in MLX, then prints microseconds per product, the row-exact time against one
+row and against MLX, and the largest row count up to which every case keeps at least 0.98×
+of 0.3.0 (the candidate for `ROW_INDEPENDENT_ROWS`).
 
 Usage: `just bench-rows [filter]`, `BASE=../nuvec-0.3.0 just bench-rows`.
 """
@@ -29,12 +30,13 @@ FILTER = sys.argv[1] if len(sys.argv) > 1 else ""
 DTYPES = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 
 
-def nuvec(root: Path) -> dict[tuple[str, str, int], float]:
+def nuvec(root: Path, exact: bool = False) -> dict[tuple[str, str, int], float]:
     out: dict[tuple[str, str, int], float] = {}
     for _ in range(2):
         proc = subprocess.run(["cargo", "bench", "-q", "-p", "nuvec-core", "--bench", "rows"],
                               cwd=root, capture_output=True, text=True, check=True,
-                              env={**os.environ, "BENCH_FILTER": FILTER})
+                              env={**os.environ, "BENCH_FILTER": FILTER,
+                                   "BENCH_EXACT": "1" if exact else "0"})
         for line in proc.stdout.splitlines():
             name, dt, b, us = line.split("\t")
             key = (name, dt, int(b))
@@ -50,6 +52,18 @@ def mlx_op(name: str, dt, b: int):
         x, w = u(b, k), u(n, k)
         mx.eval(x, w)
         return lambda: x @ w.T
+    if name.startswith("affine4stream"):
+        n, k = dims
+        ws = [mx.quantize(u(n, k) + i * 1e-3, group_size=64, bits=4) for i in range(16)]
+        x = u(b, k)
+        mx.eval(ws, x)
+        turn = [0]
+
+        def op():
+            wq, s, bi = ws[turn[0]]
+            turn[0] = (turn[0] + 1) % len(ws)
+            return mx.quantized_matmul(x, wq, s, bi, transpose=True, group_size=64, bits=4)
+        return op
     if name.startswith("affine"):
         bits = 8 if name.startswith("affine8") else 4
         n, k = dims
@@ -102,17 +116,21 @@ def mlx(keys) -> dict[tuple[str, str, int], float]:
 
 def main() -> None:
     now = nuvec(ROOT)
+    exact = nuvec(ROOT, exact=True)
     base = nuvec(Path(os.environ["BASE"])) if os.environ.get("BASE") else {}
     ref = mlx(sorted(now))
-    print(f"{'case':38} {'dtype':9} {'B':>3} {'nuvec':>9} {'0.3.0':>9} {'mlx':>9} {'0.3.0/now':>9}")
+    nan = float("nan")
+    print(f"{'case':38} {'dtype':9} {'B':>3} {'nuvec':>9} {'exact':>9} {'mlx':>9} "
+          f"{'exact/B1':>9} {'exact/mlx':>9} {'0.3.0/now':>9}")
     ok_up_to = 16
     for key in sorted(now):
         name, dt, b = key
-        r = base[key] / now[key] if key in base else float("nan")
+        r = base[key] / now[key] if key in base else nan
         if key in base and b >= 2 and r < 0.98:
             ok_up_to = min(ok_up_to, b - 1)
-        print(f"{name:38} {dt:9} {b:>3} {now[key]:9.1f} {base.get(key, float('nan')):9.1f} "
-              f"{ref.get(key, float('nan')):9.1f} {r:9.2f}")
+        e, one = exact.get(key, nan), exact.get((name, dt, 1), nan)
+        print(f"{name:38} {dt:9} {b:>3} {now[key]:9.1f} {e:9.1f} {ref.get(key, nan):9.1f} "
+              f"{e / one:9.2f} {e / ref.get(key, nan):9.2f} {r:9.2f}")
     if base:
         print(f"every case ≥ 0.98× of 0.3.0 up to B = {ok_up_to}")
 

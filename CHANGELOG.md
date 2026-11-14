@@ -6,6 +6,30 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `fast::ssm_update` and `fast::ssm_scan`: Mamba-2's one-token update and prompt pass (Granite
+  4's SSM layers), mlx-lm's kernel and `ssm_attn`, with its bits on the GPU.
+- `nuvec_lm::save_prompt_cache` and `load_prompt_cache`: prompt caches in mlx-lm's file
+  format (plain, hybrid and sliding-window models), interchangeable with mlx-lm's.
+
+### Changed
+
+- Row-exact affine quantized products of 2 and 3 rows read each weight once per pair of rows
+  (from 4 rows before): two lanes under `with_row_exact` cost 1.0× one lane with weights read
+  from memory (0.89× MLX's time). `just bench-rows` measures the row-exact mode and weights
+  read from memory.
+
+### Fixed
+
+- CPU products of up to 16 rows give each row the bits of the row alone: dense, quantized
+  and gathered products, and the attention fallback's serial rule, so a verification under
+  `with_row_exact` decodes on the CPU exactly as serial decoding (it differed by up to
+  2.6e-5 in float32). One kernel reduces each element in an order fixed by K alone (NEON on
+  aarch64) and reads the weights once per 8 rows.
+- Two ranks of one group in one process fail their GPU collectives at once, naming the
+  ranks, instead of waiting for each other until the timeout; on the CPU stream they work.
+
 ## [0.8.0] - 2026-11-09
 
 ### Added

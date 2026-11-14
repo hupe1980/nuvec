@@ -52,6 +52,9 @@ CASES = [
     ("sdpa-verify8-4k", (1, 32, 8, 8, 4096, 128)),
     ("sdpa-verify4-q36", (1, 16, 2, 4, 8194, 256)),
     ("sdpa-verify8-q36", (1, 16, 2, 8, 32768, 256)),
+    ("sdpa-q38-decode-21k", (1, 24, 4, 1, 21019, 256)),
+    ("sdpa-q38-verify4-21k", (1, 24, 4, 4, 21022, 256)),
+    ("sdpa-q38-verify8-21k", (1, 24, 4, 8, 21026, 256)),
     # Sliding windows (`-w<keys>`): gpt-oss (D 64, W 128) and Gemma 4 sliding layers
     # (D 256, W 1024), MLX with the equivalent boolean mask (as mlx-lm builds it).
     ("sdpa-wdecode-w128", (1, 64, 8, 1, 4096, 64)),

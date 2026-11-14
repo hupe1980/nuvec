@@ -42,6 +42,7 @@ minijinja-contrib = { version = "3.0.1", default-features = false, features = ["
 unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
 # Dense decompositions (QR, SVD, eigensolvers, LU, Cholesky) for `linalg`, pure Rust.
 faer = { version = "0.24.4", default-features = false, features = ["std", "linalg", "rayon"] }
+rayon = "1.12"
 gemm = { version = "0.19", default-features = false, features = ["std", "f16", "rayon"] }
 objc2 = "0.6"
 block2 = "0.6"

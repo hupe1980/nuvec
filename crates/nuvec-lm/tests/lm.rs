@@ -2618,3 +2618,208 @@ mod lora {
         );
     }
 }
+
+/// mrun's B5: on the CPU, a verify of 2–4 draft tokens under `with_row_exact` gives each
+/// position the logits of serial decoding, and the step after it too, so speculative
+/// decoding on the CPU equals plain decoding (dense, mixture-of-experts and hybrid models).
+#[test]
+fn cpu_verify_rows_equal_serial_decoding() {
+    let bits = |a: &Array| a.view(DType::U32).to_vec::<u32>().unwrap();
+    nuvec::with_stream(Device::cpu(), || {
+        nuvec::with_row_exact(|| {
+            for name in [
+                "qwen3_f32",
+                "qwen3_moe_f32",
+                "qwen3_5_f32",
+                "qwen3_5_moe_f32",
+            ] {
+                let (dir, prompt, ..) = fixture(name);
+                let model = load_model(&dir).unwrap();
+                let drafts: Vec<u32> = prompt.iter().rev().take(5).copied().collect();
+                let head = Array::from_slice(&prompt, [1, prompt.len()]);
+                for rows in [2, 4] {
+                    // Serial: one token per step.
+                    let mut kv = model.new_cache();
+                    model.forward(&head, &mut kv).eval().unwrap();
+                    let serial: Vec<Vec<u32>> = drafts[..=rows]
+                        .iter()
+                        .map(|&t| bits(&model.forward(&Array::from_slice(&[t], [1, 1]), &mut kv)))
+                        .collect();
+                    // Verify `rows` tokens in one pass, then one step.
+                    let mut kv = model.new_cache();
+                    model.forward(&head, &mut kv).eval().unwrap();
+                    let block = Array::from_slice(&drafts[..rows], [1, rows]);
+                    let verified = model.forward(&block, &mut kv);
+                    for r in 0..rows {
+                        let row = verified.i((.., r as i32..r as i32 + 1));
+                        assert!(bits(&row) == serial[r], "{name}: verify row {r} of {rows}");
+                    }
+                    let next = Array::from_slice(&drafts[rows..=rows], [1, 1]);
+                    assert!(
+                        bits(&model.forward(&next, &mut kv)) == serial[rows],
+                        "{name}: the step after a {rows}-row verify"
+                    );
+                }
+            }
+        });
+    });
+}
+
+/// `fast::ssm_update` and `fast::ssm_scan` against mlx-lm's Mamba-2 kernel and `ssm_attn`:
+/// bit for bit on the GPU, within float32 rounding on the CPU.
+#[test]
+fn ssm_update_equals_mlx_lm() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ssm.safetensors");
+    let f = nuvec::io::load_safetensors(path).unwrap().tensors;
+    let bits = |a: &Array| {
+        a.astype(DType::F32)
+            .view(DType::U32)
+            .to_vec::<u32>()
+            .unwrap()
+    };
+    let close = |a: &Array, b: &Array, tol: f32| {
+        let (a, b) = (
+            a.astype(DType::F32).to_vec::<f32>().unwrap(),
+            b.astype(DType::F32).to_vec::<f32>().unwrap(),
+        );
+        a.iter()
+            .zip(&b)
+            .all(|(x, y)| (x - y).abs() <= tol * y.abs().max(1.0))
+    };
+    for case in ["f32", "bf16", "f16"] {
+        let t = |k: &str| f[&format!("{case}.{k}")].clone();
+        let run = || {
+            nuvec::fast::ssm_update(
+                &t("x"),
+                &t("a_log"),
+                &t("b"),
+                &t("c"),
+                &t("d"),
+                &t("dt_after"),
+                &t("state"),
+            )
+        };
+        if gpu() {
+            let (y, s) = run();
+            assert!(bits(&y) == bits(&t("y")), "{case}: GPU output");
+            assert!(bits(&s) == bits(&t("next")), "{case}: GPU state");
+        }
+        let (y, s) = nuvec::with_stream(Device::cpu(), run);
+        let tol = if case == "f32" { 1e-5 } else { 1e-2 };
+        assert!(close(&y, &t("y"), tol), "{case}: CPU output");
+        assert!(close(&s, &t("next"), tol), "{case}: CPU state");
+    }
+    // Strided inputs (offset slices of wider arrays) give the same bits.
+    {
+        let t = |k: &str| f[&format!("f32.{k}")].clone();
+        let wide = |a: &Array| nuvec::ops::concatenate(&[a.clone(), a.clone()], -1);
+        let half = |a: &Array, n: i32| wide(a).i((.., .., .., n..2 * n));
+        let (x, b, c) = (t("x"), t("b"), t("c"));
+        let (dh, ds) = (x.shape()[3], b.shape()[3]);
+        let devices = [Some(Device::cpu()), gpu().then(|| Device::gpu(0))];
+        for device in devices.into_iter().flatten() {
+            nuvec::with_stream(device, || {
+                let (y, s) = nuvec::fast::ssm_update(
+                    &x,
+                    &t("a_log"),
+                    &b,
+                    &c,
+                    &t("d"),
+                    &t("dt_after"),
+                    &t("state"),
+                );
+                let (y2, s2) = nuvec::fast::ssm_update(
+                    &half(&x, dh),
+                    &t("a_log"),
+                    &half(&b, ds),
+                    &half(&c, ds),
+                    &t("d"),
+                    &t("dt_after"),
+                    &t("state").swapaxes(2, 3).swapaxes(2, 3),
+                );
+                assert!(
+                    bits(&y) == bits(&y2) && bits(&s) == bits(&s2),
+                    "strided on {device:?}"
+                );
+            });
+        }
+    }
+    // Prompts (mlx-lm's `ssm_attn`, 300 tokens in two chunks, and 37 in bfloat16).
+    for case in ["prompt", "prompt_bf16"] {
+        let t = |k: &str| f[&format!("{case}.{k}")].clone();
+        let state = t("state");
+        let run = || {
+            nuvec::fast::ssm_scan(
+                &t("x"),
+                &t("a_log"),
+                &t("b"),
+                &t("c"),
+                &t("d"),
+                &t("dt_after"),
+                Some(&state),
+            )
+        };
+        if gpu() {
+            let (y, s) = run();
+            assert!(bits(&y) == bits(&t("y")), "{case}: GPU output");
+            assert!(bits(&s) == bits(&t("next")), "{case}: GPU state");
+        }
+        let (y, s) = nuvec::with_stream(Device::cpu(), run);
+        assert!(close(&y, &t("y"), 1e-3), "{case}: CPU output");
+        assert!(close(&s, &t("next"), 1e-3), "{case}: CPU state");
+    }
+}
+
+/// mlx-lm's `save_prompt_cache` files load and continue to mlx-lm's next logits, and a
+/// cache nuvec saves loads back (plain, hybrid and sliding-window YaRN models).
+#[test]
+fn prompt_caches_load_mlx_lm_files_and_round_trip() {
+    use nuvec_lm::{load_prompt_cache, save_prompt_cache};
+    let bits = |a: &Array| a.view(DType::U32).to_vec::<u32>().unwrap();
+    let worst = |a: &Array, b: &Array| {
+        let (a, b) = (
+            a.astype(DType::F32).to_vec::<f32>().unwrap(),
+            b.to_vec::<f32>().unwrap(),
+        );
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let dir = std::env::temp_dir().join(format!("nuvec-prompt-cache-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["qwen3_f32", "qwen3_5_f32", "gpt_oss_f32"] {
+        let (path, prompt, ..) = fixture(name);
+        let model = load_model(&path).unwrap();
+        let next = nuvec::io::load_safetensors(path.join("prompt_cache_next.safetensors"))
+            .unwrap()
+            .tensors;
+        let token = &next["token"];
+        // mlx-lm's file.
+        let (mut caches, meta) =
+            load_prompt_cache(path.join("prompt_cache.safetensors"), &model).unwrap();
+        assert_eq!(meta.get("model").map(String::as_str), Some(name));
+        let d = worst(&model.forward(token, &mut caches), &next["logits"]);
+        assert!(d < 2e-4, "{name}: mlx-lm's cache continues {d} away");
+        // nuvec's own file.
+        let mut kv = model.new_cache();
+        let head = Array::from_slice(&prompt, [1, prompt.len()]);
+        model.forward(&head, &mut kv).eval().unwrap();
+        let file = dir.join(format!("{name}.safetensors"));
+        let meta = std::collections::BTreeMap::from([("model".to_string(), name.to_string())]);
+        save_prompt_cache(&file, &model, &kv, &meta).unwrap();
+        let (mut loaded, _) = load_prompt_cache(&file, &model).unwrap();
+        let (want, got) = (
+            model.forward(token, &mut kv),
+            model.forward(token, &mut loaded),
+        );
+        if name == "gpt_oss_f32" {
+            // Keys scaled by YaRN's mscale and back: one rounding each way.
+            let d = worst(&got, &want);
+            assert!(d < 1e-5, "{name}: round trip {d} away");
+        } else {
+            assert!(bits(&got) == bits(&want), "{name}: round trip");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

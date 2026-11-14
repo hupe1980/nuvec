@@ -17,6 +17,7 @@ categories.workspace = true
 faer.workspace = true
 gemm.workspace = true
 half.workspace = true
+rayon.workspace = true
 
 [features]
 # LAPACK from Apple's Accelerate (system framework, AMX units) for the decompositions on

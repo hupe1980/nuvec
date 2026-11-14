@@ -12,7 +12,7 @@ group = "Libraries"
 
 Every process calls `init`, which reads MLX's launch environment and connects the first backend it describes: the TCP ring, then JACCL. `init_backend(strict, Backend::Ring)` (or `Backend::Jaccl`) names the backend, as MLX's `init(backend=...)`; a second call returns the same group, and `is_available(backend)` reports whether a backend can run on this machine.
 
-The ring reads `MLX_HOSTFILE`, a JSON list with one entry per rank of `"host:port"` addresses, and `MLX_RANK`. The processes can share one Mac (over loopback) or run one per Mac (over Ethernet or Thunderbolt IP).
+The ring reads `MLX_HOSTFILE`, a JSON list with one entry per rank of `"host:port"` addresses, and `MLX_RANK`. The processes can share one Mac (over loopback) or run one per Mac (over Ethernet or Thunderbolt IP). Each rank is its own process, as in MLX: ranks of one group as threads of one process work on the CPU stream, but on the GPU (one command stream per GPU) their collectives fail at once with an error naming the ranks.
 
 ```json
 [["10.0.0.1:5000"], ["10.0.0.2:5000"]]
