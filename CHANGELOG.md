@@ -6,6 +6,8 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-14
+
 ### Changed
 
 - `graph::Primitive::QuantizedMatmul` has a `row_exact` field: whether the product was built
@@ -18,7 +20,7 @@ All notable changes to nuvec are documented here. The format follows
 
 - A quantized product built inside `with_row_exact` is row-exact wherever it is evaluated.
   Before, only gathered products kept the mode; a lane step built inside and evaluated
-  outside could give a lane other bits than its solo decode (mrun's MoE shared expert).
+  outside could give a lane other bits than its solo decode.
 
 ## [0.9.0] - 2026-11-14
 
@@ -661,7 +663,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/hupe1980/nuvec/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/hupe1980/nuvec/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/hupe1980/nuvec/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hupe1980/nuvec/compare/v0.6.1...v0.7.0
