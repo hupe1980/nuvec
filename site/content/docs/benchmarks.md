@@ -84,6 +84,8 @@ Products route as MLX's, so a request's batched tokens may differ in their low b
 
 `just bench-gemm`, `bench-quant`, `bench-fast` and `bench-compile` run the same kernels in nuvec and MLX: sustained asynchronous bursts after a warm-up, best of three, programs alternating. They report nuvec/MLX time (lower is better).
 
+`just bench-verify` times speculative verification's attention, 1 to 8 causal rows over 4K to 32K keys, in nuvec and MLX, and each against one row. The per-row arithmetic that keeps each row's bits equal to serial decoding sets the cost, not reading the cache: rows that share one read of it take as long. On an M4 Pro, 8 rows take 3.6–6.8× one row's time and 0.47–1.02× MLX 0.32.4's.
+
 ## Run them yourself
 
 The benchmarks need [uv](https://docs.astral.sh/uv/), which installs the pinned MLX, and the models in your Hugging Face cache:

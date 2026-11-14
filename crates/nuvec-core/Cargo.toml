@@ -68,6 +68,10 @@ name = "attention_route"
 harness = false
 
 [[bench]]
+name = "verify"
+harness = false
+
+[[bench]]
 name = "rows"
 harness = false
 
