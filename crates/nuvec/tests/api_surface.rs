@@ -653,7 +653,7 @@ mod spec_063 {
     fn nax_status_is_pinned() {
         use nuvec::metal::{NaxReason, NaxStatus};
         let _: fn() -> NaxStatus = nuvec::metal::nax;
-        let s = NaxStatus::Off(NaxReason::Unmeasured);
+        let s = NaxStatus::Off(NaxReason::Generation);
         assert!(!s.is_active());
         assert!(NaxStatus::Active { forced: true }.is_active());
         let _ = [

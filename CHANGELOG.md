@@ -6,6 +6,20 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `graph::Primitive::QuantizedMatmul` has a `row_exact` field: whether the product was built
+  inside `with_row_exact` (breaking for code that constructs or matches the variant without
+  `..`).
+- `NUVEC_NAX=auto` runs the Neural Accelerator kernels on M5-class GPUs (MLX's rule); other
+  GPUs keep them off. `NaxReason::Unmeasured` is removed.
+
+### Fixed
+
+- A quantized product built inside `with_row_exact` is row-exact wherever it is evaluated.
+  Before, only gathered products kept the mode; a lane step built inside and evaluated
+  outside could give a lane other bits than its solo decode (mrun's MoE shared expert).
+
 ## [0.9.0] - 2026-11-14
 
 ### Added

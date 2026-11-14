@@ -64,9 +64,6 @@ pub enum NaxReason {
     Generation,
     /// This build has no NAX kernel library (an SDK older than 26.2 or no Metal).
     NoLibrary,
-    /// An eligible GPU, but nuvec's NAX kernels have no recorded M5 measurement, so `auto`
-    /// keeps them off. `NUVEC_NAX=on` forces them.
-    Unmeasured,
     /// A NAX pipeline failed to build; the existing kernels are used from then on.
     PipelineError,
     /// There is no Metal device.
@@ -133,7 +130,7 @@ pub(crate) fn nax_eligible(generation: Option<u32>, class: Option<char>, os: (u3
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// The NAX decision: the override, the OS (TensorOps need macOS 26.2 even when forced),
-/// the library, then MLX's rule, with `auto` off on eligible GPUs (no recorded M5 measurement).
+/// the library, then MLX's rule.
 pub(crate) fn nax_status(
     generation: Option<u32>,
     class: Option<char>,
@@ -147,7 +144,7 @@ pub(crate) fn nax_status(
         _ if os < (26, 2) => NaxStatus::Off(NaxReason::Os),
         _ if !library => NaxStatus::Off(NaxReason::NoLibrary),
         NaxOverride::On => NaxStatus::Active { forced: !eligible },
-        NaxOverride::Auto if eligible => NaxStatus::Off(NaxReason::Unmeasured),
+        NaxOverride::Auto if eligible => NaxStatus::Active { forced: false },
         NaxOverride::Auto => NaxStatus::Off(NaxReason::Generation),
     }
 }
@@ -170,7 +167,7 @@ mod nax_tests {
                     let auto = nax_status(generation, Some(class), os, Auto, true);
                     let want = match (os >= (26, 2), eligible) {
                         (false, _) => off(NaxReason::Os),
-                        (true, true) => off(NaxReason::Unmeasured),
+                        (true, true) => NaxStatus::Active { forced: false },
                         (true, false) => off(NaxReason::Generation),
                     };
                     assert_eq!(auto, want, "{generation:?} {class} {os:?}");

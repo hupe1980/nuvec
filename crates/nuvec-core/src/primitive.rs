@@ -488,6 +488,9 @@ pub enum Primitive {
         transpose: bool,
         /// Whether every row count takes the matrix-vector kernels (`qqmm`'s products).
         rows: bool,
+        /// Whether the product was built inside [`crate::with_row_exact`]: it is row-exact
+        /// wherever it is evaluated.
+        row_exact: bool,
     },
     /// A fused operation with a dedicated GPU kernel ([`crate::fast`]).
     Fast(crate::fast::imp::FastOp),

@@ -1720,13 +1720,14 @@ mod metal {
                     quant,
                     transpose,
                     rows,
+                    row_exact,
                 } => {
                     let (group_size, bits) = quant.checked("quantized_matmul")?;
                     if quant.mode == crate::QuantMode::Affine {
                         self.quantized_matmul(
                             operands,
                             out,
-                            (group_size, bits, *transpose),
+                            (group_size, bits, *transpose, *row_exact),
                             &mut buffer,
                         )?
                     } else {
@@ -1734,7 +1735,7 @@ mod metal {
                             operands,
                             out,
                             *quant,
-                            (*transpose, *rows),
+                            (*transpose, *rows, *row_exact),
                             &mut buffer,
                         )?
                     }
@@ -6000,7 +6001,7 @@ mod metal {
             operands: &[Operand<'_>],
             out: &Output,
             quant: crate::Quant,
-            (transpose, vector_rows): (bool, bool),
+            (transpose, vector_rows, built_exact): (bool, bool, bool),
             buffer: &mut Buffer,
         ) -> Result<()> {
             let (group_size, bits) = quant.checked("quantized_matmul")?;
@@ -6040,9 +6041,9 @@ mod metal {
             let b = u8::from(batched);
             let output = buffer.metal_mut().expect("device storage");
             let quad = k == 128 || k == 64;
-            // Row-exact (`with_row_exact`): matrix-vector products up to `rows` rows; else
-            // MLX's routing, with `qmv_wide` from 2 rows.
-            let exact = crate::row_exact();
+            // Row-exact (built or evaluated inside `with_row_exact`): matrix-vector products
+            // up to `rows` rows; else MLX's routing, with `qmv_wide` from 2 rows.
+            let exact = built_exact || crate::row_exact();
             if transpose {
                 let limit = if vector_rows {
                     usize::MAX
@@ -6527,7 +6528,7 @@ mod metal {
             &mut self,
             operands: &[Operand<'_>],
             out: &Output,
-            (group_size, bits, transpose): (usize, usize, bool),
+            (group_size, bits, transpose, built_exact): (usize, usize, bool, bool),
             buffer: &mut Buffer,
         ) -> Result<()> {
             let x = self.packed(operands[0], false)?;
@@ -6545,10 +6546,10 @@ mod metal {
                 .map(|d| d.info())
                 .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;
             let (generation, class) = (info.generation.unwrap_or(0), info.class.unwrap_or('g'));
-            // Row-exact (`with_row_exact`): matrix-vector products up to
-            // `ROW_INDEPENDENT_ROWS` rows; else MLX's limits (4 untransposed), and
+            // Row-exact (built or evaluated inside `with_row_exact`): matrix-vector products
+            // up to `ROW_INDEPENDENT_ROWS` rows; else MLX's limits (4 untransposed), and
             // `qmv_wide` from 2 rows on GPUs from generation 15.
-            let exact = crate::row_exact();
+            let exact = built_exact || crate::row_exact();
             let rows = crate::ROW_INDEPENDENT_ROWS + 1;
             let limit = match (transpose, exact) {
                 (true, true) => qmv_batch_limit(k, n, generation, class).max(rows),

@@ -108,13 +108,14 @@
 //! - **Row independence:** a product with at most [`ROW_INDEPENDENT_ROWS`] rows gives each
 //!   row the bits of the same row's one-row product: dense matrix products (float32,
 //!   float16, bfloat16; a multi-row matrix-vector kernel that reads the weights once)
-//!   always, and quantized and gathered (mixture-of-experts) products under
-//!   [`with_row_exact`] (every bit width and group size, sorted or unsorted indices, up to
-//!   `ROW_INDEPENDENT_ROWS` tokens of up to 8 experts each). Outside it, quantized and
+//!   always, and quantized and gathered (mixture-of-experts) products built or evaluated
+//!   under [`with_row_exact`] (every mode, bit width and group size, sorted or unsorted
+//!   indices, up to `ROW_INDEPENDENT_ROWS` tokens of up to 8 experts each); a step built
+//!   inside may be evaluated outside. Otherwise quantized and
 //!   gathered products route as MLX's do: from 2 rows, multi-vector kernels that read the
 //!   weights once give a row other low bits than its one-row product. The row-wise
-//!   operations of a decode step are row-independent always: `rms_norm`, `add_rms_norm`, `rope` and
-//!   `norm_rope` with per-row offsets, element-wise operations, vector attention over equal
+//!   operations of a decode step are row-independent always: `rms_norm`, `add_rms_norm`,
+//!   `rope` and `norm_rope` with per-row offsets, element-wise operations, vector attention over equal
 //!   key lengths, `gated_delta` and `gated_delta_slots`. On the CPU every product of up to
 //!   16 rows reduces each element in one order that depends only on K, so these rules hold
 //!   there too, in or outside [`with_row_exact`].
