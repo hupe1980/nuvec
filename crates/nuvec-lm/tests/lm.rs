@@ -2699,10 +2699,17 @@ fn ssm_update_equals_mlx_lm() {
                 &t("state"),
             )
         };
-        if gpu() {
+        // Bit for bit on the GPU the fixture was recorded on; other generations round
+        // `fast::exp` and the SIMD sum differently.
+        if recorded_gpu() {
             let (y, s) = run();
             assert!(bits(&y) == bits(&t("y")), "{case}: GPU output");
             assert!(bits(&s) == bits(&t("next")), "{case}: GPU state");
+        } else if gpu() {
+            let (y, s) = run();
+            let tol = if case == "f32" { 1e-5 } else { 1e-2 };
+            assert!(close(&y, &t("y"), tol), "{case}: GPU output");
+            assert!(close(&s, &t("next"), tol), "{case}: GPU state");
         }
         let (y, s) = nuvec::with_stream(Device::cpu(), run);
         let tol = if case == "f32" { 1e-5 } else { 1e-2 };
@@ -2759,10 +2766,16 @@ fn ssm_update_equals_mlx_lm() {
                 Some(&state),
             )
         };
-        if gpu() {
+        // Bit for bit on the GPU the fixture was recorded on; other generations round
+        // `fast::exp` and the SIMD sum differently.
+        if recorded_gpu() {
             let (y, s) = run();
             assert!(bits(&y) == bits(&t("y")), "{case}: GPU output");
             assert!(bits(&s) == bits(&t("next")), "{case}: GPU state");
+        } else if gpu() {
+            let (y, s) = run();
+            assert!(close(&y, &t("y"), 1e-3), "{case}: GPU output");
+            assert!(close(&s, &t("next"), 1e-3), "{case}: GPU state");
         }
         let (y, s) = nuvec::with_stream(Device::cpu(), run);
         assert!(close(&y, &t("y"), 1e-3), "{case}: CPU output");
