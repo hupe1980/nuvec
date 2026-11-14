@@ -146,6 +146,7 @@ static DEFAULT: RwLock<Option<Group>> = RwLock::new(None);
 /// once: nuvec has one command stream per GPU, and the work after one rank's collective
 /// waits for it, so another rank's input would never reach its peer (a deadlock until the
 /// timeout). MLX also runs one process per rank.
+#[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
 pub(crate) fn check_gpu_ranks(id: usize) -> Result<()> {
     let entry = registered(id)?;
     let Some(membership) = entry.comm.membership() else {
