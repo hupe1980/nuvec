@@ -4,7 +4,8 @@
 //! cargo run --release -p nuvec-lm --example generate -- --model mlx-community/Qwen3-8B-4bit \
 //!     --prompt "Write a story" [--max-tokens 256] [--temp 0] [--top-p 0] [--min-p 0] \
 //!     [--top-k 0] [--system-prompt TEXT] [--prefill-response TEXT] \
-//!     [--chat-template-config '{"enable_thinking": false}'] [--ignore-chat-template]
+//!     [--chat-template-config '{"enable_thinking": false}'] [--ignore-chat-template] \
+//!     [--kv-bits 8] [--kv-group-size 64] [--quantized-kv-start 5000]
 //! ```
 //!
 //! `--model` is a directory or a Hugging Face repository in the local cache. As in mlx-lm,
@@ -18,7 +19,7 @@ use std::time::Instant;
 
 use nuvec::io::json::{self, Json};
 use nuvec_lm::chat::{self, ChatTemplate, RenderOptions};
-use nuvec_lm::{GenerateOptions, Sampler, StreamDecoder, WiredLimit, generate, load};
+use nuvec_lm::{GenerateOptions, KvQuant, Sampler, StreamDecoder, WiredLimit, generate, load};
 
 fn main() -> nuvec::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -61,6 +62,11 @@ fn main() -> nuvec::Result<()> {
             top_k: value("--top-k").map_or(0, |v| v.parse().expect("a number")),
             ..Default::default()
         },
+        kv_quant: value("--kv-bits").map(|bits| KvQuant {
+            bits: bits.parse().expect("a number"),
+            group_size: value("--kv-group-size").map_or(64, |v| v.parse().expect("a number")),
+            start: value("--quantized-kv-start").map_or(5000, |v| v.parse().expect("a number")),
+        }),
         ..Default::default()
     };
 

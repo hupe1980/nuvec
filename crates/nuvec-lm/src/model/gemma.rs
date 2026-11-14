@@ -354,7 +354,7 @@ pub(super) fn hidden(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array 
         _ => AttentionMask::None,
     };
     // Each layer's keys and values and its first query's position, for KV-shared layers.
-    let mut kvs: Vec<Option<((Array, Array), i32)>> = vec![None; m.model.layers.len()];
+    let mut kvs: Vec<Option<(super::Kv, i32)>> = vec![None; m.model.layers.len()];
     // The previous layer's output under this layer's input norm.
     let mut normed = None;
     for (i, (layer, c)) in m.model.layers.iter().zip(cache).enumerate() {

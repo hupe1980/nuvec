@@ -6,6 +6,20 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Quantized KV caches, as mlx-lm's `kv_bits`, `kv_group_size` and `quantized_kv_start`:
+  `GenerateOptions::kv_quant` (`KvQuant`), `KvCache::quantize`, `quantize_at`,
+  `is_quantized` and `nbytes`. The attention equals mlx-lm's bit for bit; sliding-window
+  layers and sinks are supported too. Prompt-cache files read and write `QuantizedKVCache`
+  layers. The `generate` example takes `--kv-bits`, `--kv-group-size` and
+  `--quantized-kv-start`.
+
+### Fixed
+
+- Affine quantized products with K of 64 or 128 run MLX's `qmv_quad` kernel, as MLX routes
+  them, and equal MLX's results bit for bit (float32 differed by up to 1.2e-6).
+
 ## [0.10.0] - 2026-11-14
 
 ### Changed

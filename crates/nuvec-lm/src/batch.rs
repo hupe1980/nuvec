@@ -283,6 +283,11 @@ impl<'a> Batcher<'a> {
             return invalid("empty prompt".into());
         }
         options.validate()?;
+        if options.kv_quant.is_some() {
+            return invalid(
+                "the paged cache is not quantized (`kv_quant` is for `generate`)".into(),
+            );
+        }
         if !self.fits(prompt.len()) {
             return invalid(format!(
                 "a prompt of {} tokens never fits in {} blocks of {} positions",

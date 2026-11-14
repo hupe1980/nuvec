@@ -89,7 +89,7 @@ pub use batch::{Batcher, BatcherOptions, Event, RequestId};
 pub use chat::{ChatTemplate, RenderOptions};
 pub use config::{Activation, Config, Gemma4, LayerQuant, PackedFormat, Quantization};
 pub use generate::{FinishReason, GenerateOptions, Generation, WiredLimit, generate};
-pub use model::{KvCache, Model, load_prompt_cache, save_prompt_cache};
+pub use model::{KvCache, KvQuant, Model, load_prompt_cache, save_prompt_cache};
 pub use paged::{PagedCache, SeqId, decode_batch};
 pub use pipeline::{Split, Stage, load_model_pipelined, load_model_sharded};
 pub use sample::Sampler;

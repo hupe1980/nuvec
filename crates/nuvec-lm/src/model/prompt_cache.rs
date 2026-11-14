@@ -7,7 +7,7 @@ use std::path::Path;
 
 use nuvec::{Array, DType, Result};
 
-use super::{KvCache, Model};
+use super::{KvCache, KvQuant, Model};
 
 fn invalid(msg: String) -> nuvec::Error {
     nuvec::Error::InvalidArgument(format!("prompt cache: {msg}"))
@@ -15,10 +15,12 @@ fn invalid(msg: String) -> nuvec::Error {
 
 /// Saves `model`'s `caches` (one per layer) and `metadata` to `path`, as mlx-lm's
 /// `save_prompt_cache` (keys as mlx-lm caches them: with YaRN's mscale where `model` folds
-/// it into the attention scale): attention layers as `KVCache` (keys, values, offset), sliding-window
-/// layers as `RotatingKVCache` (their last `window` positions in order), Gated DeltaNet
-/// layers as `ArraysCache` (the convolution's inputs and the recurrent state). mlx-lm loads
-/// the file with `load_prompt_cache`, and [`load_prompt_cache`] loads mlx-lm's.
+/// it into the attention scale): attention layers as `KVCache` (keys, values, offset) or,
+/// quantized, `QuantizedKVCache`; sliding-window layers as `RotatingKVCache` (their last
+/// `window` positions in order); Gated DeltaNet layers as `ArraysCache` (the convolution's
+/// inputs and the recurrent state). mlx-lm loads the file with `load_prompt_cache`, and
+/// [`load_prompt_cache`] loads mlx-lm's. Quantized sliding-window caches, and quantized caches
+/// of layers whose keys carry a folded mscale, have no mlx-lm form and are refused.
 pub fn save_prompt_cache(
     path: impl AsRef<Path>,
     model: &Model,
@@ -47,6 +49,27 @@ pub fn save_prompt_cache(
                 scalars.push((format!("{i}.{j}"), "none"));
             }
             "ArraysCache"
+        } else if let Some((k, v, q)) = c.quantized_keys_values() {
+            if c.window.is_some() || c.start != 0 {
+                return Err(invalid(format!(
+                    "layer {i}: a quantized sliding-window cache (mlx-lm has none)"
+                )));
+            }
+            if model.cached_key_factor(i, k[1].dtype()) != 1.0 {
+                return Err(invalid(format!(
+                    "layer {i}: quantized keys with a folded mscale cannot be rescaled"
+                )));
+            }
+            for (side, t) in [k, v].into_iter().enumerate() {
+                for (j, a) in t.into_iter().enumerate() {
+                    put(format!("{i}.{side}.{j}"), a);
+                }
+            }
+            for (j, value) in [(2, c.offset), (3, q.group_size), (4, q.bits)] {
+                put(format!("{i}.{j}"), Array::from(value));
+                scalars.push((format!("{i}.{j}"), "scalar"));
+            }
+            "QuantizedKVCache"
         } else if let Some(w) = c.window {
             let (k, v) = c
                 .keys_values()
@@ -97,8 +120,9 @@ pub fn save_prompt_cache(
 
 /// Loads a prompt cache for `model` saved by [`save_prompt_cache`] or mlx-lm's
 /// `save_prompt_cache`: one cache per layer and the caller's metadata. Keys of layers whose
-/// YaRN mscale `model` folds into the attention scale are divided by it (one rounding). mlx-lm's `KVCache`, `RotatingKVCache`
-/// (without kept leading positions, as its language models use it) and `ArraysCache` load.
+/// YaRN mscale `model` folds into the attention scale are divided by it (one rounding).
+/// mlx-lm's `KVCache`, `QuantizedKVCache`, `RotatingKVCache` (without kept leading
+/// positions, as its language models use it) and `ArraysCache` load.
 pub fn load_prompt_cache(
     path: impl AsRef<Path>,
     model: &Model,
@@ -168,6 +192,34 @@ pub fn load_prompt_cache(
                     window: Some(max_size),
                     start: offset - n,
                     offset,
+                    ..KvCache::default()
+                }
+            }
+            "QuantizedKVCache" => {
+                let triple = |side: usize| -> Result<[Array; 3]> {
+                    Ok([
+                        tensor(format!("{i}.{side}.0"))?,
+                        tensor(format!("{i}.{side}.1"))?,
+                        tensor(format!("{i}.{side}.2"))?,
+                    ])
+                };
+                let quant = KvQuant {
+                    bits: scalar(format!("{i}.4"))?,
+                    group_size: scalar(format!("{i}.3"))?,
+                    start: 0,
+                };
+                quant.validate()?;
+                let (qk, qv) = (triple(0)?, triple(1)?);
+                if model.cached_key_factor(i, qk[1].dtype()) != 1.0 {
+                    return Err(invalid(format!(
+                        "layer {i}: quantized keys with a folded mscale cannot be rescaled"
+                    )));
+                }
+                KvCache {
+                    qkeys: Some(qk),
+                    qvalues: Some(qv),
+                    quant: Some(quant),
+                    offset: scalar(format!("{i}.2"))?,
                     ..KvCache::default()
                 }
             }

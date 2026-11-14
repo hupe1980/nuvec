@@ -425,7 +425,7 @@ pub fn speculative_generate<'a, D: Drafter>(
     options.validate()?;
     let auto = drafter.auto(model);
     let wired = WiredLimit::new();
-    let mut cache = model.new_cache();
+    let mut cache = model.new_cache_for(&options)?;
     // The prompt but its last token, in chunks; a drafter that wants them sees each chunk's
     // hidden states (paired with the tokens that follow, all known here).
     let head = &prompt[..prompt.len() - 1];

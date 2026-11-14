@@ -249,6 +249,11 @@ impl PagedCache {
         // Checked before anything is allocated.
         let mut rows = None;
         for ((c, g), &states) in cache.iter().zip(&self.layer_group).zip(&self.states) {
+            if c.is_quantized() {
+                return Err(invalid(
+                    "a quantized cache (the paged cache is not quantized)",
+                ));
+            }
             let batch = match (c.linear_state(), c.keys_values()) {
                 (Some((conv, _)), _) => conv.shape().first().copied(),
                 (None, Some((k, _))) => k.shape().first().copied(),
