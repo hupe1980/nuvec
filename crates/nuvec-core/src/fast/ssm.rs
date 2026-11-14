@@ -152,14 +152,14 @@ pub(crate) fn ssm_update(
             .reshape([n, h, 1, ds])
     };
     let next = da
-        .multiply(&state.astype(f))
-        .add(&x32.multiply(&dt32).multiply(&heads(b)));
+        .multiply(state.astype(f))
+        .add(x32.multiply(&dt32).multiply(heads(b)));
     let y = next
-        .multiply(&heads(c))
+        .multiply(heads(c))
         .sum(-1)
         .add(
-            &x32.reshape([n, h, dh])
-                .multiply(&d.astype(f).reshape([1, h, 1])),
+            x32.reshape([n, h, dh])
+                .multiply(d.astype(f).reshape([1, h, 1])),
         )
         .reshape([n, 1, h, dh])
         .astype(t);
@@ -174,6 +174,9 @@ fn segsum(x: &Array) -> Array {
     ops::tril(&x, -1).cumsum(-2)
 }
 
+/// mlx-lm's chunk length.
+const STEP: usize = 256;
+
 pub(crate) fn ssm_scan(
     x: &Array,
     a_log: &Array,
@@ -182,7 +185,6 @@ pub(crate) fn ssm_scan(
     d: &Array,
     dt: &Array,
     state: Option<&Array>,
-    step: usize,
 ) -> Result<(Array, Array)> {
     let invalid = |what: String| Error::InvalidArgument(format!("ssm_scan: {what}"));
     let [bn, l, h, dh] = <[usize; 4]>::try_from(x.dims()).map_err(|_| {
@@ -206,7 +208,7 @@ pub(crate) fn ssm_scan(
             dt.dims()
         )));
     }
-    if g == 0 || h % g != 0 || step == 0 {
+    if g == 0 || h % g != 0 {
         return Err(invalid(format!(
             "heads ({h}) must be a multiple of groups ({g})"
         )));
@@ -215,12 +217,12 @@ pub(crate) fn ssm_scan(
     let repeats = hi / gi;
     // As mlx-lm's `ssm_attn` (after `compute_dt`), in its order.
     let a = a_log.exp().negative().astype(dt.dtype());
-    let dta = dt.multiply(&a.reshape([1, 1, -1]));
+    let dta = dt.multiply(a.reshape([1, 1, -1]));
     let dtx = dt.reshape([bi, l as i32, hi, 1]).multiply(x);
     let mut state = state.cloned();
     let mut ys = Vec::new();
-    for i in (0..l).step_by(step) {
-        let s = step.min(l - i) as i32;
+    for i in (0..l).step_by(STEP) {
+        let s = STEP.min(l - i) as i32;
         let (i, end) = (i as i32, i as i32 + s);
         let dtx = dtx.i((.., i..end));
         let dta = dta.i((.., i..end));
@@ -239,18 +241,18 @@ pub(crate) fn ssm_scan(
             .matmul(&bh);
         if let Some(state) = &state {
             let cum = dta.cumsum(-2).exp();
-            next = next.add(&cum.i((.., -1, .., NewAxis, NewAxis)).multiply(state));
+            next = next.add(cum.i((.., -1, .., NewAxis, NewAxis)).multiply(state));
             let cr = cc.reshape([bi, s, gi, 1, dsi, 1]);
             let prev = state
                 .reshape([bi, 1, gi, repeats, dhi, dsi])
                 .matmul(&cr)
                 .squeeze(-1);
             let prev = ops::flatten(&prev, 2, 3);
-            y = y.add(&cum.expand_dims(-1).multiply(&prev));
+            y = y.add(cum.expand_dims(-1).multiply(&prev));
         }
         ys.push(y.astype(x.dtype()));
         state = Some(next);
     }
-    let y = ops::concatenate(&ys, 1).add(&x.multiply(&d.reshape([1, 1, hi, 1])));
+    let y = ops::concatenate(&ys, 1).add(x.multiply(d.reshape([1, 1, hi, 1])));
     Ok((y, state.expect("at least one token")))
 }

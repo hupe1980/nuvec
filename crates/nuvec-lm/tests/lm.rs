@@ -2650,9 +2650,9 @@ fn cpu_verify_rows_equal_serial_decoding() {
                     model.forward(&head, &mut kv).eval().unwrap();
                     let block = Array::from_slice(&drafts[..rows], [1, rows]);
                     let verified = model.forward(&block, &mut kv);
-                    for r in 0..rows {
+                    for (r, want) in serial[..rows].iter().enumerate() {
                         let row = verified.i((.., r as i32..r as i32 + 1));
-                        assert!(bits(&row) == serial[r], "{name}: verify row {r} of {rows}");
+                        assert!(bits(&row) == *want, "{name}: verify row {r} of {rows}");
                     }
                     let next = Array::from_slice(&drafts[rows..=rows], [1, 1]);
                     assert!(
