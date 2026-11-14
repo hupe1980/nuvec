@@ -12,6 +12,7 @@ use nuvec_io::{
     safetensors_footprint_filtered, save_safetensors, save_safetensors_async,
 };
 
+/// Held by every test that loads: the footprint checks read the device's memory counters.
 static MEMORY: Mutex<()> = Mutex::new(());
 
 fn temp(name: &str) -> PathBuf {
@@ -127,6 +128,7 @@ fn footprints_match_what_a_load_maps_and_copies() {
 
 #[test]
 fn broken_files_are_errors_naming_the_file() {
+    let _one = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let truncated = temp("truncated.safetensors");
     let w = ops::arange(0, 100, 1).astype(DType::F32);
     save_safetensors(&truncated, &[("w", &w)], &[]).unwrap();
@@ -218,6 +220,7 @@ fn bytes_of(a: &Array) -> Vec<u8> {
 /// aligned in memory, also when a filter leaves gaps.
 #[test]
 fn misaligned_files_load_bit_identical() {
+    let _one = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     // Deterministic pseudo-random bytes.
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut random = |n: usize| -> Vec<u8> {
