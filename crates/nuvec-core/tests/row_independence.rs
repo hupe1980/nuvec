@@ -636,3 +636,128 @@ mod rowwise {
         });
     }
 }
+
+/// mrun's B6: the mode applies where a product is built or where it is evaluated, so a
+/// lane step built inside `with_row_exact` and evaluated outside keeps each row's bits.
+mod built_inside {
+    use super::*;
+
+    /// Random operands: the patterns above are too smooth to separate the kernels.
+    fn normal(shape: &[i32], seed: u64) -> Array {
+        random::normal(shape, DType::BF16, 0.0, 1.0, &random::key(seed))
+    }
+
+    fn quants() -> Vec<Quant> {
+        let mut q: Vec<Quant> = [(32, 2), (32, 4), (64, 4), (64, 8)]
+            .into_iter()
+            .map(|(gs, bits)| Quant::affine(gs, bits))
+            .collect();
+        q.extend([QuantMode::Mxfp4, QuantMode::Mxfp8, QuantMode::Nvfp4].map(Quant::new));
+        q
+    }
+
+    /// Each row of `x · wᵀ` against its one-row product, both evaluated inside the mode.
+    fn exact_rows(name: &str, y: &Array, x: &Array, wq: &Quantized) {
+        let n = x.shape()[0];
+        for r in 0..n {
+            let one = with_row_exact(|| {
+                let one = x.i(r..r + 1).quantized_matmul(wq, true);
+                one.eval().unwrap();
+                one
+            });
+            assert!(
+                bits(&y.i(r..r + 1)) == bits(&one),
+                "{name}: row {r} of {n} differs from the row alone"
+            );
+        }
+    }
+
+    /// Built inside and evaluated outside, and built outside and evaluated inside: every
+    /// quantized mode, 2–8 rows, 20 seeds.
+    #[test]
+    fn rows_are_exact_wherever_the_product_is_evaluated() {
+        if !gpu() {
+            return;
+        }
+        for quant in quants() {
+            for (k, n) in [(512, 512), (1024, 256), (4096, 64)] {
+                for rows in [2, 3, 4, 8] {
+                    for seed in 0..20 {
+                        let w = normal(&[n, k], seed);
+                        let wq = w.quantize(quant);
+                        let x = normal(&[rows, k], seed + 1000);
+                        let name = format!("{quant:?} K={k} N={n} B={rows} seed {seed}");
+                        let built = with_row_exact(|| x.quantized_matmul(&wq, true));
+                        built.eval().unwrap();
+                        exact_rows(&format!("{name} built inside"), &built, &x, &wq);
+                        let outside = x.quantized_matmul(&wq, true);
+                        with_row_exact(|| outside.eval().unwrap());
+                        exact_rows(&format!("{name} evaluated inside"), &outside, &x, &wq);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Transforms run inside the mode build their products there: `vmap` over rows and
+    /// the input gradient keep each row's bits when evaluated outside.
+    #[test]
+    fn transforms_built_inside_are_exact() {
+        if !gpu() {
+            return;
+        }
+        let (k, n, rows) = (1024, 256, 4);
+        for seed in 0..20 {
+            let wq = normal(&[n, k], seed).quantize(Quant::affine(32, 4));
+            let x = normal(&[rows, k], seed + 1000);
+            let mapped = with_row_exact(|| {
+                vmap(|x: &Array| Ok::<_, Error>(x.expand_dims(0).quantized_matmul(&wq, true)))
+                    .call(&x)
+                    .unwrap()
+            });
+            mapped.eval().unwrap();
+            exact_rows(&format!("vmap seed {seed}"), &mapped.squeeze(1), &x, &wq);
+            // The input gradient is a product with the untransposed weights.
+            let g = normal(&[rows, n], seed + 2000);
+            let (_, dx) =
+                with_row_exact(|| vjp(|x: &Array| x.quantized_matmul(&wq, true), &x, &g).unwrap());
+            dx.eval().unwrap();
+            for r in 0..rows {
+                let one = with_row_exact(|| {
+                    let one = g.i(r..r + 1).quantized_matmul(&wq, false);
+                    one.eval().unwrap();
+                    one
+                });
+                assert!(
+                    bits(&dx.i(r..r + 1)) == bits(&one),
+                    "vjp seed {seed}: row {r} differs from the row alone"
+                );
+            }
+        }
+    }
+
+    /// Outside the mode, products route as MLX's: some rows of a 3-row 4-bit product
+    /// differ from their one-row products (`qmv_wide`).
+    #[test]
+    fn outside_the_mode_routing_is_mlx() {
+        if !gpu() {
+            return;
+        }
+        let (k, n, rows) = (1024, 256, 3);
+        let differ = (0..20)
+            .filter(|&seed| {
+                let wq = normal(&[n, k], seed).quantize(Quant::affine(32, 4));
+                let x = normal(&[rows, k], seed + 1000);
+                let y = x.quantized_matmul(&wq, true);
+                (0..rows).any(|r| {
+                    let one = x.i(r..r + 1).quantized_matmul(&wq, true);
+                    bits(&y.i(r..r + 1)) != bits(&one)
+                })
+            })
+            .count();
+        assert!(
+            differ > 0,
+            "no row differs: MLX's multi-row kernel did not run"
+        );
+    }
+}

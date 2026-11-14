@@ -497,6 +497,7 @@ pub(crate) fn quantized_product(
         quant,
         transpose,
         rows,
+        row_exact: crate::row_exact(),
     };
     let out = Array::from_op(primitive, inputs)?.swap_remove(0);
     if vector {

@@ -523,3 +523,37 @@ fn fused_power_is_close_to_the_precise_one() {
         assert!((a - b).abs() <= 4.0 * f32::EPSILON * b.abs(), "{a} vs {b}");
     }
 }
+
+/// mrun's B6: a compiled function keeps where each product was built. The same product
+/// built inside and outside `with_row_exact` is not merged: called outside the mode, the
+/// inside one keeps each row's one-row bits, the other routes as MLX's.
+#[test]
+fn row_exact_products_are_not_merged() {
+    use nuvec_core::{Quant, random, with_row_exact};
+    if !gpu() {
+        return;
+    }
+    let bits = |a: &Array| a.astype(DType::F32).to_vec::<f32>().unwrap();
+    let (k, n, rows) = (1024, 256, 3);
+    let mut merged_would_differ = 0;
+    for seed in 0..20 {
+        let normal = |s: &[i32], seed| random::normal(s, DType::BF16, 0.0, 1.0, &random::key(seed));
+        let wq = normal(&[n, k], seed).quantize(Quant::affine(32, 4));
+        let x = normal(&[rows, k], seed + 1000);
+        let w = wq.clone();
+        let f = compile_flat(move |xs: &[Array]| {
+            let exact = with_row_exact(|| xs[0].quantized_matmul(&w, true));
+            Ok(vec![exact, xs[0].quantized_matmul(&w, true)])
+        });
+        let out = f(std::slice::from_ref(&x)).unwrap();
+        for r in 0..rows {
+            let one = x.i(r..r + 1).quantized_matmul(&wq, true);
+            assert!(
+                bits(&out[0].i(r..r + 1)) == bits(&one),
+                "seed {seed}: row {r} of the product built inside differs from the row alone"
+            );
+        }
+        merged_would_differ += usize::from(bits(&out[0]) != bits(&out[1]));
+    }
+    assert!(merged_would_differ > 0, "the two routings were merged");
+}

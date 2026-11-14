@@ -158,18 +158,20 @@ pub mod prelude {
 
 /// Products with at most this many rows give each row the bits of the same row's
 /// one-row product: dense matrix products in float32, float16 and bfloat16 always, and
-/// quantized and gathered (mixture-of-experts) products evaluated under
+/// quantized and gathered (mixture-of-experts) products built or evaluated under
 /// [`with_row_exact`] (on the CPU always). See the `nuvec` crate's "Determinism" section.
 pub const ROW_INDEPENDENT_ROWS: usize = 8;
 
 thread_local! {
-    /// Whether products evaluated on this thread keep rows independent ([`with_row_exact`]).
+    /// Whether products built or evaluated on this thread keep rows independent
+    /// ([`with_row_exact`]).
     static ROW_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `f` with row-exact products on this thread: quantized and gathered products of up
-/// to [`ROW_INDEPENDENT_ROWS`] rows (tokens, for gathers) evaluated or built inside give
-/// each row the bits of its one-row product, through one matrix-vector product per row
+/// to [`ROW_INDEPENDENT_ROWS`] rows (tokens, for gathers) built or evaluated inside give
+/// each row the bits of its one-row product (a product built inside keeps that wherever
+/// it is evaluated), through one matrix-vector product per row
 /// or nuvec's few-row kernels with the same arithmetic (each weight read once for two
 /// rows). Outside it they route as MLX does, whose multi-vector kernels are faster from 3
 /// rows on but give a row other bits than its one-row product. Speculative verification

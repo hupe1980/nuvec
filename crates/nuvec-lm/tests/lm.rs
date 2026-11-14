@@ -2836,3 +2836,66 @@ fn prompt_caches_load_mlx_lm_files_and_round_trip() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Lanes of independent sequences, a decode step built inside `with_row_exact` and evaluated
+/// outside it (as a server samples), give each lane its solo decode's logits bit for bit for
+/// 10 steps: dense, and mixtures of experts with and without a shared expert. (These tiny
+/// shapes do not separate the kernels; `row_independence.rs` `built_inside` does.)
+#[test]
+fn lanes_built_in_row_exact_equal_solo_decoding() {
+    use nuvec_lm::{PagedCache, decode_batch};
+    if !gpu() {
+        return;
+    }
+    let bits = |a: &Array| {
+        a.astype(DType::F32)
+            .view(DType::U32)
+            .to_vec::<u32>()
+            .unwrap()
+    };
+    for name in [
+        "qwen3_5_q4",
+        "qwen3_5_moe_q4",
+        "qwen3_moe_q4",
+        "gemma4_moe_q4",
+    ] {
+        let (dir, prompt, ..) = fixture(name);
+        let model = load_model(&dir).unwrap();
+        for lanes in [2, 3, 4] {
+            let mut cache = PagedCache::new(&model, 64, 8, lanes).unwrap();
+            let (mut solo, mut ids, mut tokens) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..lanes {
+                let p: Vec<u32> = prompt
+                    .iter()
+                    .cycle()
+                    .skip(i)
+                    .take(prompt.len() + i)
+                    .copied()
+                    .collect();
+                let mut kv = model.new_cache();
+                let head = Array::from_slice(&p[..p.len() - 1], [1, p.len() - 1]);
+                let _ = model.forward(&head, &mut kv).check().unwrap();
+                ids.push(cache.insert(&kv).unwrap());
+                solo.push(kv);
+                tokens.push(*p.last().unwrap());
+            }
+            for step in 0..10 {
+                let logits =
+                    nuvec::with_row_exact(|| decode_batch(&model, &tokens, &ids, &mut cache))
+                        .unwrap();
+                let logits = bits(&logits);
+                let vocab = logits.len() / lanes;
+                for (r, kv) in solo.iter_mut().enumerate() {
+                    let x = Array::from_slice(&[tokens[r]], [1, 1]);
+                    let one = nuvec::with_row_exact(|| model.forward(&x, kv).i((.., -1)));
+                    assert!(
+                        logits[r * vocab..(r + 1) * vocab] == bits(&one)[..],
+                        "{name}, {lanes} lanes, step {step}: lane {r} differs from its solo decode"
+                    );
+                    // A varied next token per lane.
+                    tokens[r] = (one.argmax(-1).item::<u32>().unwrap() + step) % 100;
+                }
+            }
+        }
+    }
+}

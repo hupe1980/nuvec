@@ -1183,6 +1183,7 @@ impl FastOp {
                             quant: *quant,
                             transpose: *transpose,
                             rows: false,
+                            row_exact: crate::row_exact(),
                         };
                         let columns = product.quantized_columns(w, &inputs[2..], *quant)?;
                         // Affine kernels take transposed weights (`x · wᵀ`) and the scales'

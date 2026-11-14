@@ -132,6 +132,7 @@ fn quantization_parameters_are_validated() {
             quant: Quant::affine(64, 7),
             transpose: true,
             rows: false,
+            row_exact: false,
         },
         vec![
             f32s(&[1, 64]),
@@ -431,6 +432,7 @@ fn case(rng: &mut SplitMix64) -> (Primitive, Vec<Array>) {
                             quant,
                             transpose,
                             rows: false,
+                            row_exact: false,
                         },
                         3 + biases,
                     )

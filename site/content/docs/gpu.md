@@ -62,9 +62,9 @@ nuvec::memory::set_wired_limit(info.recommended_working_set as usize)?;
 M5-class GPUs have a Neural Accelerator in every GPU core, reached through Metal 4's TensorOps (`matmul2d` from Metal Performance Primitives). nuvec ships kernels for them in a second kernel library for macOS 26.2 and later; the baseline still runs on macOS 15. They cover dense GEMM (64 × 64 tiles, thin tiles of 16 or 32 rows or columns, and split K), affine 2/4/8-bit quantized products, and the sorted mixture-of-experts gather.
 
 - `NUVEC_NAX=auto` (default), `on` or `off`; `nuvec::metal::nax()` reports whether they run and why not.
-- Under `auto` they are off: they have not been measured on an M5, and an eligible M5 reports `Off(Unmeasured)`.
+- Under `auto` they run on M5-class GPUs (MLX's rule: generation 17 or later, 18 for the `p` class) and nowhere else.
 - `NUVEC_NAX=on` forces them on any GPU with TensorOps (every Apple GPU on macOS 26.2). On earlier GPUs they run on the ordinary GPU cores at about the speed of the SIMD kernels.
-- `just nax-report` checks their correctness, benchmarks them against nuvec's SIMD kernels and MLX's NAX path, and writes a report.
+- `just nax-report` checks their correctness, benchmarks them against nuvec's SIMD kernels and MLX's NAX path, and writes a report. They have not yet been measured on an M5: if you have one, please [post the report](https://github.com/hupe1980/nuvec/issues/new?template=nax-report.md).
 
 ## Profiling
 
