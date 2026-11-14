@@ -14,7 +14,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 cargo build --release -q -p nuvec-lm --example decode_loop
-bin="$root/target/release/examples/decode_loop"
+bin="${CARGO_TARGET_DIR:-$root/target}/release/examples/decode_loop"
 
 log="$(mktemp -t nuvec-leak-check)"
 trap 'rm -f "$log"' EXIT
