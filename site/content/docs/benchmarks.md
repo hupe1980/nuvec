@@ -25,7 +25,7 @@ nuvec's performance target is MLX on the same machine. Every number here comes f
 
 Apple M4 Pro, 48 GB, macOS 26.6.2; nuvec 0.8.0, mlx 0.32.4, mlx-lm 0.32.2; 2026-11-09.
 
-The geometric means are **decode 1.01×, time to first token 1.00× at 2,048 tokens, peak memory 1.01×, warm load 1.50×, and concurrent serving 1.02× at 4 requests.** No cell is below the 0.98× gate. Qwen3.5-9B's MTP head decodes at 1.37× mlx-lm's plain decode, prompt lookup at 1.04× (geometric mean). Against 0.7.0 in the same session, the geometric mean over 32 cells is 1.00×, with no regression.
+The geometric means are **decode 1.01×, time to first token 1.00× at 2,048 tokens, peak memory 1.01×, warm load 1.50×, and concurrent serving 1.02× at 4 requests.** No cell is below the 0.98× gate. Qwen3.5-9B's MTP head decodes at 1.37× mlx-lm's plain decode, prompt lookup at 1.04× (geometric mean).
 
 | model | kind | decode (25 / 961 / 3,841 tokens) | TTFT 2K | peak memory | warm load | 4 requests |
 |---|---|---:|---:|---:|---:|---:|

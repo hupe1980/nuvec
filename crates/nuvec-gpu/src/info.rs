@@ -9,7 +9,8 @@ pub struct DeviceInfo {
     /// Metal's architecture string, e.g. `applegpu_g16s`.
     pub architecture: String,
     /// GPU generation parsed from the architecture string (16 for `applegpu_g16s`), if any.
-    /// Neural-accelerator kernels need generation 17 or later.
+    /// Under `NUVEC_NAX=auto` the Neural Accelerator kernels run from generation 17 (18 for
+    /// class `p`).
     pub generation: Option<u32>,
     /// Class letter after the generation (`s` for `applegpu_g16s`), if any. Kept verbatim:
     /// the letter-to-tier mapping is not documented by Apple.
