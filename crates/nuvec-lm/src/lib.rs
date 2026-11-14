@@ -16,7 +16,8 @@
 //!   [speculative decoding](speculative) with pluggable drafters; memory is wired while
 //!   generating ([`WiredLimit`]).
 //! - **Serving:** batched decoding over a [paged KV cache](paged) and a [`Batcher`] that
-//!   serves many requests at once.
+//!   serves many requests at once; prompt caches saved and loaded in mlx-lm's file format
+//!   ([`save_prompt_cache`], [`load_prompt_cache`]).
 //! - **Fine-tuning:** a [`Model`] is a `nuvec_nn::Module` (Hugging Face's parameter names);
 //!   [`lora`] replaces projections by path with LoRA layers and reads and writes mlx-lm's
 //!   adapter directories; [`tuner`] trains on mlx-lm's text, chat and completion data.

@@ -171,9 +171,8 @@ thread_local! {
 /// Runs `f` with row-exact products on this thread: quantized and gathered products of up
 /// to [`ROW_INDEPENDENT_ROWS`] rows (tokens, for gathers) built or evaluated inside give
 /// each row the bits of its one-row product (a product built inside keeps that wherever
-/// it is evaluated), through one matrix-vector product per row
-/// or nuvec's few-row kernels with the same arithmetic (each weight read once for two
-/// rows). Outside it they route as MLX does, whose multi-vector kernels are faster from 3
+/// it is evaluated), through one matrix-vector product per row or nuvec's few-row kernels
+/// with the same arithmetic (each weight read once for two rows). Outside it they route as MLX does, whose multi-vector kernels are faster from 3
 /// rows on but give a row other bits than its one-row product. Speculative verification
 /// runs in this mode, and so can batched serving that must equal each request run alone.
 pub fn with_row_exact<R>(f: impl FnOnce() -> R) -> R {
