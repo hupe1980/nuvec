@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use nuvec::{Array, DeviceKind, Result, async_eval, default_device, eval};
 
-use crate::model::{KvCache, Model};
+use crate::model::{KvCache, KvQuant, Model};
 use crate::sample::Sampler;
 use crate::stop::{Stop, StopState, Stopped};
 
@@ -34,6 +34,9 @@ pub struct GenerateOptions {
     /// probability is zero), and no stop string ends generation before the
     /// `min_tokens`-th token (vLLM's `min_tokens`).
     pub min_tokens: usize,
+    /// Quantized attention caches (mlx-lm's `kv_bits`, `kv_group_size`,
+    /// `quantized_kv_start`); none by default.
+    pub kv_quant: Option<KvQuant>,
 }
 
 /// The sampling keys of one generation: split from its seed, one per token, or none (the
@@ -67,6 +70,7 @@ impl Default for GenerateOptions {
             stop: Stop::default(),
             ignore_eos: false,
             min_tokens: 0,
+            kv_quant: None,
         }
     }
 }
@@ -76,6 +80,9 @@ impl GenerateOptions {
     /// most `max_tokens`.
     pub fn validate(&self) -> Result<()> {
         self.sampler.validate()?;
+        if let Some(q) = self.kv_quant {
+            q.validate()?;
+        }
         if self.min_tokens > self.max_tokens {
             return Err(nuvec::Error::InvalidArgument(format!(
                 "generate: min_tokens ({}) exceeds max_tokens ({})",
@@ -276,7 +283,7 @@ pub fn generate<'a>(
     }
     options.validate()?;
     let wired = WiredLimit::new();
-    let mut cache = model.new_cache();
+    let mut cache = model.new_cache_for(&options)?;
     let (rest, last) = prompt.split_at(prompt.len() - 1);
     prefill(model, &mut cache, rest, options.prefill_step)?;
     let mut g = Generation {

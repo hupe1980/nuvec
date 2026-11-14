@@ -1886,6 +1886,28 @@ for n in [64, 4096, 16384, 28 * 128, 12 * 1024, 20 * 16384]:
     for dt in ["float32", "float16", "bfloat16"]:
         case_gpu(f"hadamard-gpu-{n}-{dt}", "hadamard_transform", [make(dt, (2, n))])
 
+# Affine products on MLX's `qmv_quad` (K of 64 or 128, power-of-two bits; 1 bit only at
+# K = 128): one row, more rows, batched, and keys broadcast over grouped queries as in
+# quantized attention (`quantized_scaled_dot_product_attention`).
+AFFINE_QUAD = [
+    ("quad128", (1, 128), (40, 128)),
+    ("quad64", (1, 64), (24, 64)),
+    ("quad-rows", (12, 128), (64, 128)),
+    ("quad-batched", (2, 3, 64), (2, 40, 64)),
+    ("quad-broadcast", (1, 2, 2, 3, 64), (1, 2, 1, 40, 64)),
+]
+for gs, bits in [(32, 8), (64, 4), (32, 2), (128, 1)]:
+    for dt in ["float32", "float16", "bfloat16"]:
+        for name, xs, ws in AFFINE_QUAD:
+            if ws[-1] % gs or (bits == 1 and ws[-1] != 128):
+                continue
+            with mx.stream(mx.gpu):
+                wq, scales, biases = mx.quantize(make(dt, ws) / 4, group_size=gs, bits=bits)
+                mx.eval(wq, scales, biases)
+            case_gpu(f"affine-qmm-b{bits}-{dt}-{name}", "quantized_matmul",
+                     [make(dt, xs) / 4, wq, scales, biases], group_size=gs, bits=bits,
+                     transpose=1)
+
 # ── Writer ──────────────────────────────────────────────────────────────────
 
 def string(s: str) -> bytes:

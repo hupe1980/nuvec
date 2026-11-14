@@ -6625,6 +6625,18 @@ mod metal {
                 );
             }
             args.extend([Arg::bytes(&kb), Arg::bytes(&nb)]);
+            if transpose && (k == 128 || (k == 64 && bits >= 2)) && bits.is_power_of_two() {
+                // MLX's `qmv_quad` for a small inner dimension (`dispatch_qmv`): one row per
+                // threadgroup row, so rows stay independent.
+                if batched {
+                    args.extend(batch_info.iter().map(|v| Arg::bytes(v)));
+                }
+                let name = format!(
+                    "nuvec_affine_qmv_quad_{base}_d{k}_batch{}",
+                    u8::from(batched)
+                );
+                return self.dispatch_groups(&name, &args, [m, n.div_ceil(64), batch], [32, 1, 1]);
+            }
             if transpose && !exact && m >= 2 && generation >= 15 {
                 // MLX's `qmv_wide`: up to five vectors per threadgroup, each weight group
                 // decoded once for them.

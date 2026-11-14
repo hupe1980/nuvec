@@ -21,6 +21,9 @@ evaluation mode (`expected.safetensors`).
 Usage: `just lm-fixtures` (or `uv run scripts/lm_fixtures.py`; `--only chained_sampler,eos`
 records just those).
 
+`--only kv_quant` records mlx-lm's quantized KV caches (generation and a prompt cache) on the
+head-32 models.
+
 `--cached [repo…]` records, for each model of `CACHED` in the local Hugging Face cache (or
 the repos named; one at a time, skipping any whose weights exceed half the memory), mlx-lm's 32
 greedy tokens after a fixed prompt with the log-probability of each and the top 5 ids and
@@ -169,7 +172,7 @@ def main() -> None:
              "adapters": adapters, "fp": fp_models, "packed": packed_models,
              "ops": ops_fixtures, "gpt_oss": gpt_oss_models, "gemma4": gemma4_models,
              "o200k": o200k_splits, "spm": spm_tokenizers, "mtp": mtp_heads,
-             "ssm": ssm, "prompt_cache": prompt_caches}[name]()
+             "ssm": ssm, "prompt_cache": prompt_caches, "kv_quant": kv_quant}[name]()
         return
     mx.random.seed(20261018)
     for name, (family, args, dtype, quant) in CASES.items():
@@ -474,6 +477,77 @@ def prompt_caches() -> None:
         mx.save_safetensors(str(OUT / name / "prompt_cache_next.safetensors"),
                             {"token": nxt, "logits": logits})
         print(f"{name}: prompt cache of {len(cache)} layers")
+
+
+KV_QUANT = [(8, 32, 0), (4, 32, 0), (8, 32, len(PROMPT) + 3)]
+
+
+def kv_quant() -> None:
+    """mlx-lm's quantized KV caches (`generate_step(..., kv_bits, kv_group_size,
+    quantized_kv_start)`) on the head-32 models: 12 greedy tokens and each step's
+    log-probabilities per setting in `<model>/kv_quant.safetensors`
+    (`b{bits}_g{group}_s{start}_tokens`, `_logprobs`; `dense_logprobs` without quantization); and `qwen3_5_f32`'s prompt cache with
+    its attention layers quantized (8 bits, group 32) in `prompt_cache_q8.safetensors`, with
+    the next token's logits in `prompt_cache_q8_next.safetensors`."""
+    from mlx_lm.generate import maybe_quantize_kv_cache
+    from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache
+    from mlx_lm.utils import load_model
+
+    prompt = mx.array(PROMPT, dtype=mx.uint32)
+    for name in ("qwen3_5_f32", "qwen3_5_q4", "qwen3_5_moe_q4"):
+        model, _ = load_model(OUT / name)
+        out = {}
+        # The same generation with a full-precision cache, for the half-precision models'
+        # baseline distance from nuvec.
+        dense = [lp.astype(mx.float32) for (_, lp), _ in
+                 zip(generate_step(prompt, model, max_tokens=12), range(12))]
+        out["dense_logprobs"] = mx.stack(dense)
+        for bits, group, start in KV_QUANT:
+            tokens, logprobs = [], []
+            for (t, lp), _ in zip(generate_step(prompt, model, max_tokens=12, kv_bits=bits,
+                                                kv_group_size=group,
+                                                quantized_kv_start=start), range(12)):
+                tokens.append(int(t))
+                logprobs.append(lp.astype(mx.float32))
+            key = f"b{bits}_g{group}_s{start}"
+            out[f"{key}_tokens"] = mx.array(tokens, dtype=mx.uint32)
+            out[f"{key}_logprobs"] = mx.stack(logprobs)
+            print(f"{name} {key}: {tokens}")
+        mx.save_safetensors(str(OUT / name / "kv_quant.safetensors"), out)
+    # The attention itself: mlx-lm's `quantized_scaled_dot_product_attention` over keys and
+    # values quantized by `mx.quantize` (GQA 4/2, head 64, 40 keys; one query and a causal
+    # prefill of 6; float32 and bfloat16; 8 and 4 bits).
+    from mlx_lm.models.base import quantized_scaled_dot_product_attention as qsdpa
+    att = {}
+    for dt_name, dt in (("f32", mx.float32), ("bf16", mx.bfloat16)):
+        for bits in (8, 4):
+            mx.random.seed(7)
+            k = mx.random.normal((1, 2, 40, 64)).astype(dt)
+            v = mx.random.normal((1, 2, 40, 64)).astype(dt)
+            kq = mx.quantize(k, group_size=32, bits=bits)
+            vq = mx.quantize(v, group_size=32, bits=bits)
+            for L in (1, 6):
+                q = mx.random.normal((1, 4, L, 64)).astype(dt)
+                # A copy: mlx-lm scales its queries in place (`queries *= scale`).
+                out = qsdpa(mx.array(q), kq, vq, scale=0.125,
+                            mask="causal" if L > 1 else None, group_size=32, bits=bits)
+                tag = f"{dt_name}_b{bits}_l{L}"
+                att[f"{tag}_q"] = q
+                for side, t in (("k", kq), ("v", vq)):
+                    for j, a in enumerate(t):
+                        att[f"{tag}_{side}{j}"] = a
+                att[f"{tag}_out"] = out
+    mx.save_safetensors(str(OUT / "kv_quant_attention.safetensors"), att)
+    model, _ = load_model(OUT / "qwen3_5_f32")
+    cache = make_prompt_cache(model)
+    model(prompt[None], cache=cache)
+    maybe_quantize_kv_cache(cache, 0, 32, 8)
+    save_prompt_cache(str(OUT / "qwen3_5_f32" / "prompt_cache_q8.safetensors"), cache,
+                      {"model": "qwen3_5_f32"})
+    nxt = mx.array([[PROMPT[-1]]], dtype=mx.uint32)
+    logits = model(nxt, cache=cache).astype(mx.float32)
+    mx.save_safetensors(str(OUT / "qwen3_5_f32" / "prompt_cache_q8_next.safetensors"),
+                        {"token": nxt, "logits": logits})
 
 
 # gpt-oss (mlx-lm's `gpt_oss`): sliding (W 4, shorter than the prompt) and full layers,

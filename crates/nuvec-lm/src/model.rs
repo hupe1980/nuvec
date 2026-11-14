@@ -341,6 +341,63 @@ pub struct KvCache {
     steps: Option<(Array, Array)>,
     /// Attention keys and values are returned, not kept ([`Model::forward_uncached`]).
     uncached: bool,
+    /// Quantized keys and values (codes, scales, biases each), once [`KvCache::quantize`]d.
+    qkeys: Option<[Array; 3]>,
+    qvalues: Option<[Array; 3]>,
+    /// The quantization of keys and values written from now on.
+    quant: Option<KvQuant>,
+    /// The quantization applied once the cache holds `start` positions
+    /// ([`KvCache::quantize_at`]).
+    auto: Option<KvQuant>,
+}
+
+/// mlx-lm's KV cache quantization (`kv_bits`, `kv_group_size`, `quantized_kv_start`): once an
+/// attention layer's cache holds `start` positions, its keys and values are quantized
+/// (affine, `bits` per value, a scale and a bias per `group_size` values), and so is every
+/// later write. Sliding-window layers and sinks are supported (mlx-lm refuses them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvQuant {
+    /// Bits per value (2, 3, 4, 5, 6 or 8).
+    pub bits: i32,
+    /// Values per scale and bias (32, 64 or 128); head dimensions must be multiples of it.
+    pub group_size: i32,
+    /// Cached positions from which a layer's cache is quantized (mlx-lm's 5000).
+    pub start: usize,
+}
+
+impl Default for KvQuant {
+    fn default() -> Self {
+        Self {
+            bits: 8,
+            group_size: 64,
+            start: 5000,
+        }
+    }
+}
+
+impl KvQuant {
+    fn quant(self) -> nuvec::Quant {
+        nuvec::Quant::affine(self.group_size, self.bits)
+    }
+
+    pub(crate) fn validate(self) -> Result<()> {
+        if !matches!(self.bits, 2..=6 | 8) || !matches!(self.group_size, 32 | 64 | 128) {
+            return Err(nuvec::Error::InvalidArgument(format!(
+                "KV quantization takes 2–6 or 8 bits and groups of 32, 64 or 128, not {} bits \
+                 in groups of {}",
+                self.bits, self.group_size
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// An attention layer's cached keys and values as attention reads them.
+#[derive(Debug, Clone)]
+pub(crate) enum Kv {
+    Dense(Array, Array),
+    /// Codes, scales and biases of the keys, then of the values.
+    Quantized([Array; 3], [Array; 3], KvQuant),
 }
 
 /// Positions added to a cache's capacity at a time.
@@ -372,26 +429,32 @@ impl KvCache {
     /// the keys normalised by `norm` (if any) and rotated as they are written, and returns
     /// all cached positions.
     #[track_caller]
-    fn update(
-        &mut self,
-        rope: &Rope,
-        norm: Option<&RmsNorm>,
-        keys: &Array,
-        values: &Array,
-    ) -> (Array, Array) {
+    fn update(&mut self, rope: &Rope, norm: Option<&RmsNorm>, keys: &Array, values: &Array) -> Kv {
         let (prev, start) = (self.offset, self.start);
         let l = values.shape().get(2).copied().unwrap_or_default();
         let end = prev + l;
         if self.uncached {
             self.offset = end;
-            return (rope.norm_rope(keys, norm, prev, None), values.clone());
+            return Kv::Dense(rope.norm_rope(keys, norm, prev, None), values.clone());
+        }
+        // mlx-lm quantizes after the forward in which the cache reaches `start` positions:
+        // here, before the next write.
+        if let Some(q) = self.auto
+            && self.quant.is_none()
+            && prev > 0
+            && usize::try_from(prev).is_ok_and(|p| p >= q.start)
+        {
+            self.convert(q);
+        }
+        if let Some(quant) = self.quant {
+            return self.update_quantized(quant, &rope.norm_rope(keys, norm, prev, None), values);
         }
         let fits = self
             .keys
             .as_ref()
             .is_some_and(|k| end - start <= k.shape()[2]);
         // A window keeps the last `W − 1` positions (what the next queries read) and the slack.
-        let keep = self.window.map(|w| w - 1 + WINDOW_SLACK);
+        let keep = self.keep();
         let excess = keep.is_some_and(|keep| prev - start > keep + 2 * CACHE_STEP);
         let (k, v) = if fits && !excess {
             // Each write takes the cache's only handle, so it is done in place.
@@ -406,14 +469,7 @@ impl KvCache {
             };
             (k, all.at((.., .., at)).set(values))
         } else {
-            // Grown by whole steps (mlx-lm's rule), written in one concatenation: the kept
-            // positions, the new ones, then zeros up to the step (no copy of the grown cache
-            // to update it). A window drops what no later query reads and keeps a step of
-            // room, so it compacts once per step.
-            let from = keep.map_or(start, |keep| (prev - keep).max(start));
-            let n = prev - from + l;
-            let room = if keep.is_some() { CACHE_STEP } else { 0 };
-            let pad = (n + CACHE_STEP - 1) / CACHE_STEP * CACHE_STEP - n + room;
+            let (from, pad) = self.growth(l);
             let keys = rope.norm_rope(keys, norm, prev, None);
             let kept = (from - start, prev - start);
             let k = grow(self.keys.take(), kept, &keys, pad);
@@ -423,12 +479,141 @@ impl KvCache {
         self.offset = end;
         self.keys = Some(k.clone());
         self.values = Some(v.clone());
-        // Attention reads the last `W − 1 + L` positions (all of them without a window).
+        let view = self.view(prev, end);
+        Kv::Dense(view(&k), view(&v))
+    }
+
+    /// [`update`](Self::update) of a quantized cache: the rotated keys and the values
+    /// quantized, then written as the dense ones.
+    #[track_caller]
+    fn update_quantized(&mut self, quant: KvQuant, keys: &Array, values: &Array) -> Kv {
+        let (prev, start) = (self.offset, self.start);
+        let l = values.shape().get(2).copied().unwrap_or_default();
+        let end = prev + l;
+        let triple = |a: &Array| {
+            let q = a.quantize(quant.quant());
+            [q.weight, q.scales, q.biases.expect("affine")]
+        };
+        let new = [triple(keys), triple(values)];
+        let fits = self
+            .qkeys
+            .as_ref()
+            .is_some_and(|k| end - start <= k[0].shape()[2]);
+        let excess = self
+            .keep()
+            .is_some_and(|keep| prev - start > keep + 2 * CACHE_STEP);
+        let old = [self.qkeys.take(), self.qvalues.take()];
+        let [k, v] = if fits && !excess {
+            // Each write takes the cache's only handle, so it is done in place.
+            let at = prev - start..end - start;
+            let [ok, ov] = old.map(|o| o.expect("allocated together"));
+            let [[k0, k1, k2], [v0, v1, v2]] = [ok, ov];
+            let set =
+                |a: Array, side: usize, i: usize| a.at((.., .., at.clone())).set(&new[side][i]);
+            [
+                [set(k0, 0, 0), set(k1, 0, 1), set(k2, 0, 2)],
+                [set(v0, 1, 0), set(v1, 1, 1), set(v2, 1, 2)],
+            ]
+        } else {
+            let (from, pad) = self.growth(l);
+            let kept = (from - start, prev - start);
+            self.start = from;
+            std::array::from_fn(|side| {
+                std::array::from_fn(|i| {
+                    let old = old[side].as_ref().map(|o| o[i].clone());
+                    grow(old, kept, &new[side][i], pad)
+                })
+            })
+        };
+        self.offset = end;
+        self.qkeys = Some(k.clone());
+        self.qvalues = Some(v.clone());
+        let view = self.view(prev, end);
+        Kv::Quantized(k.each_ref().map(&view), v.each_ref().map(&view), quant)
+    }
+
+    /// The positions a sliding-window cache keeps: the last `W − 1` (what the next queries
+    /// read) and the slack.
+    fn keep(&self) -> Option<i32> {
+        self.window.map(|w| w - 1 + WINDOW_SLACK)
+    }
+
+    /// Where a growth of `l` positions starts and the zeros after them. Grown by whole steps
+    /// (mlx-lm's rule), written in one concatenation: the kept positions, the new ones, then
+    /// zeros up to the step (no copy of the grown cache to update it). A window drops what no
+    /// later query reads and keeps a step of room, so it compacts once per step.
+    fn growth(&self, l: i32) -> (i32, i32) {
+        let (prev, start) = (self.offset, self.start);
+        let keep = self.keep();
+        let from = keep.map_or(start, |keep| (prev - keep).max(start));
+        let n = prev - from + l;
+        let room = if keep.is_some() { CACHE_STEP } else { 0 };
+        (
+            from,
+            (n + CACHE_STEP - 1) / CACHE_STEP * CACHE_STEP - n + room,
+        )
+    }
+
+    /// The view attention reads after a write of positions `prev..end`: the last `W − 1 + L`
+    /// positions (all of them without a window).
+    fn view(&self, prev: i32, end: i32) -> impl Fn(&Array) -> Array + use<> {
         let first = self
             .window
             .map_or(self.start, |w| (prev - (w - 1)).max(self.start));
-        let view = |a: &Array| between(a, first - self.start, end - self.start);
-        (view(&k), view(&v))
+        let (from, to) = (first - self.start, end - self.start);
+        move |a: &Array| between(a, from, to)
+    }
+
+    /// Quantizes this attention layer's keys and values now (mlx-lm's
+    /// `KVCache.to_quantized`) and every later write. Gated DeltaNet layers are left as
+    /// they are.
+    pub fn quantize(&mut self, quant: KvQuant) -> Result<()> {
+        quant.validate()?;
+        if let (Some(k), Some(v)) = (&self.keys, &self.values) {
+            let dims = (k.shape()[3], v.shape()[3]);
+            if dims.0 % quant.group_size != 0 || dims.1 % quant.group_size != 0 {
+                return Err(nuvec::Error::InvalidArgument(format!(
+                    "head dimensions {} and {} are not multiples of the KV quantization's \
+                     group size {}",
+                    dims.0, dims.1, quant.group_size
+                )));
+            }
+        }
+        self.convert(quant);
+        Ok(())
+    }
+
+    /// Quantizes this attention layer's cache once it holds `quant.start` positions, as
+    /// mlx-lm's generation does with `kv_bits` (after the forward that reaches them).
+    pub fn quantize_at(&mut self, quant: KvQuant) -> Result<()> {
+        quant.validate()?;
+        self.auto = Some(quant);
+        Ok(())
+    }
+
+    fn convert(&mut self, quant: KvQuant) {
+        if self.quant.is_some() || self.conv.is_some() || self.recurrent.is_some() {
+            return;
+        }
+        if let (Some(k), Some(v)) = (self.keys.take(), self.values.take()) {
+            let triple = |a: &Array| {
+                let q = a.quantize(quant.quant());
+                [q.weight, q.scales, q.biases.expect("affine")]
+            };
+            self.qkeys = Some(triple(&k));
+            self.qvalues = Some(triple(&v));
+        }
+        self.quant = Some(quant);
+    }
+
+    /// Whether the keys and values are quantized ([`quantize`](Self::quantize)).
+    pub fn is_quantized(&self) -> bool {
+        self.quant.is_some()
+    }
+
+    /// The bytes of the cached arrays.
+    pub fn nbytes(&self) -> usize {
+        self.state().iter().map(Array::nbytes).sum()
     }
 
     /// Makes Gated DeltaNet layers keep the state after every position of the following
@@ -508,6 +693,18 @@ impl KvCache {
         }
     }
 
+    /// The quantized keys and values (codes, scales, biases each) of positions
+    /// [`start`](Self::start)`..offset`, and their quantization, if quantized.
+    pub(crate) fn quantized_keys_values(&self) -> Option<([Array; 3], [Array; 3], KvQuant)> {
+        let n = self.offset - self.start;
+        let view = |t: &[Array; 3]| t.each_ref().map(|a| positions(a, n));
+        Some((
+            view(self.qkeys.as_ref()?),
+            view(self.qvalues.as_ref()?),
+            self.quant?,
+        ))
+    }
+
     /// A Gated DeltaNet layer's convolution and recurrent states (`[B, kernel − 1,
     /// channels]` and `[B, Hv, Dv, Dk]`), if any.
     pub(crate) fn linear_state(&self) -> Option<(Array, Array)> {
@@ -530,6 +727,16 @@ impl KvCache {
             keep_steps: false,
             steps: None,
             uncached: self.uncached,
+            qkeys: self
+                .qkeys
+                .as_ref()
+                .map(|t| t.each_ref().map(|a| a.i(i..i + 1))),
+            qvalues: self
+                .qvalues
+                .as_ref()
+                .map(|t| t.each_ref().map(|a| a.i(i..i + 1))),
+            quant: self.quant,
+            auto: self.auto,
         }
     }
 
@@ -538,6 +745,8 @@ impl KvCache {
         [&self.keys, &self.values, &self.conv, &self.recurrent]
             .into_iter()
             .flatten()
+            .chain(self.qkeys.iter().flatten())
+            .chain(self.qvalues.iter().flatten())
             .cloned()
             .collect()
     }
@@ -553,6 +762,8 @@ impl KvCache {
         ]
         .into_iter()
         .flatten()
+        .chain(self.qkeys.iter_mut().flatten())
+        .chain(self.qvalues.iter_mut().flatten())
         {
             *a = nuvec::ops::depends(a, std::slice::from_ref(dep));
         }
@@ -748,15 +959,15 @@ impl Attention {
         x: &Array,
         mask: AttentionMask<'_>,
         cache: &mut KvCache,
-        shared: Option<(&(Array, Array), i32)>,
-    ) -> (Array, (Array, Array)) {
+        shared: Option<(&Kv, i32)>,
+    ) -> (Array, Kv) {
         let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
         let (q, gate) = self.query(x, [b, l]);
         let at = shared.map_or(cache.offset, |(_, at)| at);
         // The query and key (written into the cache) normalised and rotated in one kernel.
         let q = self.input_scale(q.transpose(HEADS_FIRST));
         let q = self.rope.norm_rope(&q, self.q_norm.as_ref(), at, None);
-        let (k, v) = match shared {
+        let kv = match shared {
             Some((kv, _)) => {
                 cache.offset += l;
                 kv.clone()
@@ -781,9 +992,80 @@ impl Attention {
             }
         };
         let scale = self.scale(q.dtype());
-        let o = fast::scaled_dot_product_attention(&q, &k, &v, scale, &self.options(mask));
-        (self.output(&o, gate, [b, l]), (k, v))
+        let o = match &kv {
+            Kv::Dense(k, v) => {
+                fast::scaled_dot_product_attention(&q, k, v, scale, &self.options(mask))
+            }
+            Kv::Quantized(k, v, quant) => {
+                let sinks = self.sinks.as_ref().map(Param::value);
+                let layer = (self.kv_heads, self.window, sinks);
+                quantized_attention(&q, (k, v, *quant), scale, mask, layer)
+            }
+        };
+        (self.output(&o, gate, [b, l]), kv)
     }
+}
+
+/// Attention over quantized keys and values (`[B, kv_heads, S, ·]` triples): mlx-lm's
+/// `quantized_scaled_dot_product_attention` (scaled queries, `quantized_matmul` with
+/// the keys, the mask, a precise softmax, `quantized_matmul` with the values), with the
+/// layer's window and sinks, which mlx-lm refuses.
+#[track_caller]
+fn quantized_attention(
+    q: &Array,
+    (k, v, quant): (&[Array; 3], &[Array; 3], KvQuant),
+    scale: f32,
+    mask: AttentionMask<'_>,
+    (kv_heads, window, sinks): (i32, Option<i32>, Option<&Array>),
+) -> Array {
+    let [b, hq, l, d] = q.shape_n::<4>().unwrap_or_default();
+    let (hkv, s) = (kv_heads, k[0].shape()[2]);
+    let rep = hq / hkv;
+    let q = (q * scale).reshape([b, hkv, rep, l, d]);
+    let weights = |t: &[Array; 3]| {
+        let [w, sc, bi] = t.each_ref().map(|a| a.expand_dims(-3));
+        nuvec::Quantized::affine(w, sc, bi, quant.group_size, quant.bits)
+    };
+    let mut scores = q.quantized_matmul(&weights(k), true);
+    let lowest = |dtype: DType| match dtype {
+        DType::F16 => -65504.0,
+        DType::BF16 => -3.389_531_389_251_535e38,
+        _ => f64::from(f32::MIN),
+    };
+    // Query `i` is position `S − L + i` of the keys: causal and window masks.
+    let causal = (l > 1 && (window.is_some() || matches!(mask, AttentionMask::Causal)))
+        || window.is_some_and(|w| s > w);
+    if causal {
+        let qi = ops::arange(s - l, s, 1).reshape([l, 1]);
+        let ki = ops::arange(0, s, 1).reshape([1, s]);
+        let mut keep = qi.greater_equal(&ki);
+        if let Some(w) = window {
+            keep = ops::logical_and(&keep, (&qi - &ki).less(w));
+        }
+        scores = ops::where_(&keep, &scores, lowest(scores.dtype()));
+    } else if let AttentionMask::Array(m) = mask {
+        let m = match m.ndim() {
+            4 if m.shape()[1] == 1 => m.expand_dims(2),
+            4 => m.reshape([m.shape()[0], hkv, rep, m.shape()[2], m.shape()[3]]),
+            _ => m.clone(),
+        };
+        scores = match m.dtype() {
+            DType::Bool => ops::where_(&m, &scores, lowest(scores.dtype())),
+            _ => &scores + &m,
+        };
+    }
+    let probs = match sinks {
+        Some(sinks) => {
+            let column = sinks.astype(scores.dtype()).reshape([1, hkv, rep, 1, 1]);
+            let column = ops::broadcast_to(&column, [b, hkv, rep, l, 1]);
+            let p = ops::softmax(&ops::concatenate(&[scores, column], -1), -1);
+            p.i((.., .., .., .., ..s))
+        }
+        None => ops::softmax(&scores, -1),
+    };
+    probs
+        .quantized_matmul(&weights(v), false)
+        .reshape([b, hq, l, -1])
 }
 
 /// One attention layer's paged keys and values, `[blocks, kv_heads, block_size,
@@ -1822,6 +2104,17 @@ impl Model {
             .collect()
     }
 
+    /// [`new_cache`](Self::new_cache) with `options`' KV quantization.
+    pub(crate) fn new_cache_for(&self, options: &crate::GenerateOptions) -> Result<Vec<KvCache>> {
+        let mut cache = self.new_cache();
+        if let Some(q) = options.kv_quant {
+            for c in &mut cache {
+                c.quantize_at(q)?;
+            }
+        }
+        Ok(cache)
+    }
+
     /// The factor between mlx-lm's cached keys and this model's for layer `layer` at
     /// `dtype`: YaRN's mscale where it is folded into the attention scale (float32), else 1.
     pub(crate) fn cached_key_factor(&self, layer: usize, dtype: DType) -> f32 {
@@ -2313,6 +2606,143 @@ pub(crate) mod tests {
     /// A model of the `qwen3_f32` fixture, or `None` without a Metal device.
     /// A position's bytes are the full-attention pools' bytes per position once a
     /// sequence brought them (windows, K = V and Gated DeltaNet layers included).
+    /// Attention over a quantized cache equals the fused kernel over the dequantized cache
+    /// (within float tolerance): grouped queries, causal prefill and one-query decode,
+    /// sliding windows and sinks (which mlx-lm's quantized path refuses).
+    #[test]
+    fn quantized_attention_equals_the_dequantized_reference() {
+        use nuvec::random::{key, normal};
+        if !nuvec::metal::is_available() {
+            return;
+        }
+        let _gpu = nuvec::Stream::default_for(nuvec::Device::gpu(0));
+        nuvec::set_default_stream(_gpu);
+        let (b, hq, hkv, d, s) = (1, 4, 2, 64, 40);
+        let quant = KvQuant {
+            bits: 8,
+            group_size: 32,
+            start: 0,
+        };
+        let k = normal([b, hkv, s, d], DType::F32, 0.0, 1.0, &key(1));
+        let v = normal([b, hkv, s, d], DType::F32, 0.0, 1.0, &key(2));
+        let sinks = normal([hq], DType::F32, 0.0, 1.0, &key(3));
+        let triple = |a: &Array| {
+            let q = a.quantize(quant.quant());
+            [
+                q.weight.clone(),
+                q.scales.clone(),
+                q.biases.clone().unwrap(),
+            ]
+        };
+        let (kq, vq) = (triple(&k), triple(&v));
+        let deq = |t: &[Array; 3]| {
+            let q = nuvec::Quantized::affine(t[0].clone(), t[1].clone(), t[2].clone(), 32, 8);
+            q.dequantize(DType::F32)
+        };
+        let (kd, vd) = (deq(&kq), deq(&vq));
+        for l in [1, 6] {
+            let q = normal([b, hq, l, d], DType::F32, 0.0, 1.0, &key(4));
+            for window in [None, Some(9)] {
+                for with_sinks in [false, true] {
+                    let mask = if l > 1 {
+                        AttentionMask::Causal
+                    } else {
+                        AttentionMask::None
+                    };
+                    let sinks = with_sinks.then_some(&sinks);
+                    let got = quantized_attention(
+                        &q,
+                        (&kq, &vq, quant),
+                        0.125,
+                        mask,
+                        (hkv, window, sinks),
+                    );
+                    let mut options: fast::AttentionOptions<'_> = mask.into();
+                    if let Some(w) = window {
+                        options = fast::AttentionOptions::causal().window(w);
+                    }
+                    let want = fast::scaled_dot_product_attention(
+                        &q,
+                        &kd,
+                        &vd,
+                        0.125,
+                        &options.sinks(sinks),
+                    );
+                    let (g, w) = (got.to_vec::<f32>().unwrap(), want.to_vec::<f32>().unwrap());
+                    let diff = g
+                        .iter()
+                        .zip(&w)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0, f32::max);
+                    assert!(
+                        diff < 1e-4,
+                        "L={l} window {window:?} sinks {with_sinks}: {diff}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The attention equals mlx-lm's `quantized_scaled_dot_product_attention` bit for bit on
+    /// the GPU the fixture was recorded on (within float tolerance elsewhere): grouped
+    /// queries, one query and a causal prefill, float32 and bfloat16, 8 and 4 bits.
+    #[test]
+    fn quantized_attention_equals_mlx_lm() {
+        if !nuvec::metal::is_available() {
+            return;
+        }
+        nuvec::set_default_stream(nuvec::Stream::default_for(nuvec::Device::gpu(0)));
+        let recorded =
+            nuvec::metal::device_info().is_some_and(|d| d.architecture == "applegpu_g16s");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/kv_quant_attention.safetensors");
+        let t = nuvec::io::load_safetensors(path).unwrap().tensors;
+        for dt in ["f32", "bf16"] {
+            for bits in [8, 4] {
+                for l in [1, 6] {
+                    let tag = format!("{dt}_b{bits}_l{l}");
+                    let get = |k: &str| t[&format!("{tag}_{k}")].clone();
+                    let k = [get("k0"), get("k1"), get("k2")];
+                    let v = [get("v0"), get("v1"), get("v2")];
+                    let quant = KvQuant {
+                        bits,
+                        group_size: 32,
+                        start: 0,
+                    };
+                    let mask = if l > 1 {
+                        AttentionMask::Causal
+                    } else {
+                        AttentionMask::None
+                    };
+                    let got = quantized_attention(
+                        &get("q"),
+                        (&k, &v, quant),
+                        0.125,
+                        mask,
+                        (2, None, None),
+                    );
+                    let (g, w) = (
+                        got.astype(DType::F32).to_vec::<f32>().unwrap(),
+                        get("out").astype(DType::F32).to_vec::<f32>().unwrap(),
+                    );
+                    let d = g
+                        .iter()
+                        .zip(&w)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0, f32::max);
+                    if recorded {
+                        assert!(
+                            g.iter().zip(&w).all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{tag}: differs from mlx-lm by {d}"
+                        );
+                    } else {
+                        assert!(d < 1e-2, "{tag}: {d} from mlx-lm");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn kv_bytes_per_position_match_the_pools() {
         for name in [

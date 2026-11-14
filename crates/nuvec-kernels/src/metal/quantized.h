@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 //
 // MLX's affine quantization kernels: quantize, dequantize, the quantized matrix-vector
-// products (`qmv_fast`, `qmv`, `qvm`), the tiled quantized matrix products (`qmm_t`,
-// `qmm_t_splitk`, `qmm_n`) and their gather (mixture-of-experts) variants, ported from MLX
-// v0.32.4 (mlx/backend/metal/kernels/quantized.h, quantized_utils.h and the row-tile
-// scheduler of utils.h) and the multi-vector `qmv_wide`, without the qmv_quad and
-// floating-point (mx/nv) kernels.
+// products (`qmv_quad`, `qmv_fast`, `qmv`, `qvm`, the multi-vector `qmv_wide`), the tiled
+// quantized matrix products (`qmm_t`, `qmm_t_splitk`, `qmm_n`) and their gather
+// (mixture-of-experts) variants, ported from MLX v0.32.4
+// (mlx/backend/metal/kernels/quantized.h, quantized_utils.h and the row-tile scheduler of
+// utils.h), without the floating-point (mx/nv) kernels.
 // Placed in `mlx::quant`; needs steel_gemm.h first (BlockMMA, BlockLoader, elem_to_loc).
 //
 // `affine_quantize` deviates so that it agrees with MLX's CPU quantizer (and nuvec's): the
@@ -815,6 +815,63 @@ struct QuantizedBlockLoader {
     }
   }
 };
+
+template <typename T, int group_size, int bits, int D>
+METAL_FUNC void qmv_quad_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint quad_gid [[quadgroup_index_in_threadgroup]],
+    uint quad_lid [[thread_index_in_quadgroup]]) {
+  constexpr int quads_per_simd = SIMD_SIZE / QUAD_SIZE;
+  constexpr int pack_factor = 32 / bits;
+  constexpr int values_per_thread = D / QUAD_SIZE;
+  constexpr int packs_per_thread = values_per_thread / pack_factor;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  constexpr int results_per_quadgroup = 8;
+
+  typedef float U;
+
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_quadgroup] = {0};
+
+  // Adjust positions
+  const int in_vec_size_w = in_vec_size / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * quads_per_simd * results_per_quadgroup + quad_gid;
+
+  w += out_row * in_vec_size_w + quad_lid * packs_per_thread;
+  scales += out_row * in_vec_size_g + quad_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + quad_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + quad_lid * values_per_thread;
+  y += tid.x * out_vec_size + out_row;
+
+  U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+
+  for (int row = 0; row < results_per_quadgroup; row++) {
+    auto wl = (const device uint8_t*)(w + row * in_vec_size_w * quads_per_simd);
+    const device T* sl = scales + row * in_vec_size_g * quads_per_simd;
+    const device T* bl = biases + row * in_vec_size_g * quads_per_simd;
+
+    U s = sl[0];
+    U b = bl[0];
+    if (row * quads_per_simd + out_row < out_vec_size) {
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_quadgroup; row++) {
+    result[row] = quad_sum(result[row]);
+    if (quad_lid == 0 && row * quads_per_simd + out_row < out_vec_size) {
+      y[row * quads_per_simd] = static_cast<T>(result[row]);
+    }
+  }
+}
 
 template <typename T, int group_size, int bits, bool partial_rows = false>
 METAL_FUNC void qmv_fast_impl(
@@ -1794,6 +1851,58 @@ template <typename T, int group_size, int bits, bool partial_rows, int R>
   }
 }
 
+
+template <typename T, int group_size, int bits, int D, bool batched>
+[[kernel]] void affine_qmv_quad(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& x_batch_ndims [[buffer(7)]],
+    const constant int* x_shape [[buffer(8)]],
+    const constant int64_t* x_strides [[buffer(9)]],
+    const constant int& w_batch_ndims [[buffer(10)]],
+    const constant int* w_shape [[buffer(11)]],
+    const constant int64_t* w_strides [[buffer(12)]],
+    const constant int64_t* s_strides [[buffer(13)]],
+    const constant int64_t* b_strides [[buffer(14)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint quad_gid [[quadgroup_index_in_threadgroup]],
+    uint quad_lid [[thread_index_in_quadgroup]]) {
+  if (batched) {
+    int M = x_shape[x_batch_ndims];
+    adjust_matrix_offsets<T>(
+        x,
+        w,
+        scales,
+        biases,
+        y,
+        out_vec_size * M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        s_strides,
+        b_strides,
+        tid);
+  }
+  qmv_quad_impl<T, group_size, bits, D>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      tid,
+      quad_gid,
+      quad_lid);
+}
 
 template <
     typename T,

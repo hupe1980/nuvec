@@ -123,6 +123,10 @@ if let Some(FinishReason::Stop(stopped)) = generation.finish_reason() {
 
 `save_prompt_cache(path, &model, &cache, &metadata)` writes a cache after a prompt (a system prompt, a document) and `load_prompt_cache(path, &model)` reads it back, so a later run continues without recomputing the prompt. The files are mlx-lm's (`save_prompt_cache`, `load_prompt_cache`, `mlx_lm.cache_prompt`): each loads in the other.
 
+## Quantized KV caches
+
+`GenerateOptions::kv_quant` quantizes attention caches as mlx-lm's `kv_bits`, `kv_group_size` and `quantized_kv_start` do: `KvQuant { bits: 8, group_size: 64, start: 5000 }` (the default) quantizes each layer's cache once it holds 5,000 positions, then every later write. The attention equals mlx-lm's bit for bit, and decode runs at mlx-lm's speed with the same settings. An 8-bit cache in groups of 64 takes 0.53× the memory of a bfloat16 one, 4 bits 0.28×. Sliding-window layers and attention sinks (gpt-oss, Gemma 4) are quantized too; mlx-lm refuses them. Head dimensions must be multiples of the group size. The paged `Batcher` does not take quantized caches. Prompt caches with quantized layers save and load in mlx-lm's format (`QuantizedKVCache`).
+
 ## How generation is fast
 
 - **Chunked prefill** (2,048 tokens at a time, as mlx-lm) with the cache written once per position.

@@ -69,6 +69,22 @@ NUVEC_Q_TYPE(float16, half)
 NUVEC_Q_TYPE(bfloat16, bfloat16_t)
 NUVEC_Q_TYPE(float32, float)
 
+// MLX's `qmv_quad` (K of 64 or 128): the bit widths MLX routes to it (powers of two; 1 bit
+// only at K = 128).
+#define NUVEC_QMV_QUAD_D(iname, T, gs, b, d)                                              \
+    NUVEC_Q(qmv_quad, iname, T, gs, b, "_d" #d "_batch0", d, false)                       \
+    NUVEC_Q(qmv_quad, iname, T, gs, b, "_d" #d "_batch1", d, true)
+#define NUVEC_QMV_QUAD(iname, T, gs)                                                      \
+    NUVEC_QMV_QUAD_D(iname, T, gs, 1, 128)                                                \
+    NUVEC_QMV_QUAD_D(iname, T, gs, 2, 64) NUVEC_QMV_QUAD_D(iname, T, gs, 2, 128)          \
+    NUVEC_QMV_QUAD_D(iname, T, gs, 4, 64) NUVEC_QMV_QUAD_D(iname, T, gs, 4, 128)          \
+    NUVEC_QMV_QUAD_D(iname, T, gs, 8, 64) NUVEC_QMV_QUAD_D(iname, T, gs, 8, 128)
+#define NUVEC_QMV_QUAD_GS(iname, T)                                                       \
+    NUVEC_QMV_QUAD(iname, T, 32) NUVEC_QMV_QUAD(iname, T, 64) NUVEC_QMV_QUAD(iname, T, 128)
+NUVEC_QMV_QUAD_GS(float32, float)
+NUVEC_QMV_QUAD_GS(float16, half)
+NUVEC_QMV_QUAD_GS(bfloat16, bfloat16_t)
+
 // nuvec's few-row products (quantized.h, `affine_qmv_rows`), every bit width, two rows
 // per threadgroup (more are slower).
 #define NUVEC_QMV_ROWS_B(iname, T, gs, b)                                                \

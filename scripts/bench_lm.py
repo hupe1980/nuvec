@@ -9,6 +9,8 @@ no chat template) and prints prompt (prefill) and generation throughput, as both
 them. The model must be in the local Hugging Face cache (nothing is downloaded).
 
 Usage: `just bench-lm [model] [max_tokens]` (default mlx-community/Qwen3-8B-4bit, 256).
+`KV_BITS=8 just bench-lm …` quantizes the KV cache on both sides from the first token
+(`--kv-bits`, `KV_GROUP_SIZE` default 64, `--quantized-kv-start 0`).
 """
 
 from __future__ import annotations
@@ -25,7 +27,11 @@ MODEL = sys.argv[1] if len(sys.argv) > 1 else "mlx-community/Qwen3-8B-4bit"
 MAX_TOKENS = sys.argv[2] if len(sys.argv) > 2 else "256"
 PARAGRAPH = ("The lighthouse keeper climbed the spiral stairs every evening, counting the "
              "steps and listening to the sea against the rocks below. ")
-REPEATS = [1, 40, 160]  # about 20, 800 and 3200 prompt tokens
+# About 20, 800 and 3200 prompt tokens (`REPEATS=200,1600` for about 4K and 32K).
+REPEATS = [int(r) for r in os.environ.get("REPEATS", "1,40,160").split(",")]
+KV = (["--kv-bits", os.environ["KV_BITS"], "--kv-group-size",
+       os.environ.get("KV_GROUP_SIZE", "64"), "--quantized-kv-start", "0"]
+      if os.environ.get("KV_BITS") else [])
 
 
 def numbers(text: str) -> tuple[int, float, float]:
@@ -37,7 +43,7 @@ def numbers(text: str) -> tuple[int, float, float]:
 def mlx(prompt: str) -> tuple[int, float, float]:
     out = subprocess.run(
         [sys.executable, "-m", "mlx_lm", "generate", "--model", MODEL, "--prompt", prompt,
-         "--max-tokens", MAX_TOKENS, "--ignore-chat-template"],
+         "--max-tokens", MAX_TOKENS, "--ignore-chat-template", *KV],
         capture_output=True, text=True, check=True, env={**os.environ, "HF_HUB_OFFLINE": "1"})
     return numbers(out.stdout)
 
@@ -45,7 +51,7 @@ def mlx(prompt: str) -> tuple[int, float, float]:
 def nuvec(prompt: str) -> tuple[int, float, float]:
     out = subprocess.run(
         ["cargo", "run", "-q", "--release", "-p", "nuvec-lm", "--example", "generate", "--",
-         "--model", MODEL, "--prompt", prompt, "--max-tokens", MAX_TOKENS],
+         "--model", MODEL, "--prompt", prompt, "--max-tokens", MAX_TOKENS, *KV],
         cwd=ROOT, capture_output=True, text=True, check=True)
     return numbers(out.stdout)
 

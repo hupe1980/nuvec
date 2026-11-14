@@ -2899,3 +2899,264 @@ fn lanes_built_in_row_exact_equal_solo_decoding() {
         }
     }
 }
+
+/// mlx-lm's quantized KV caches (`kv_bits`, `kv_group_size`, `quantized_kv_start`), quantized
+/// from the first step or mid-way, on dense, mixture-of-experts and hybrid models: greedy
+/// generation gives mlx-lm's tokens (as far as it does with a full-precision cache), and each step's log-probabilities are within 1e-3 of
+/// mlx-lm's in float32, and in half precision no farther from them on average than with a
+/// full-precision cache (nuvec's half-precision forward pass is held close, not equal). The
+/// attention itself is bit-exact (`quantized_attention_equals_mlx_lm`).
+#[test]
+fn kv_quant_equals_mlx_lm() {
+    use nuvec_lm::KvQuant;
+    if !gpu() {
+        return;
+    }
+    for name in ["qwen3_5_f32", "qwen3_5_q4", "qwen3_5_moe_q4"] {
+        let (dir, prompt, _, _, greedy) = fixture(name);
+        let model = load_model(&dir).unwrap();
+        // Where nuvec's own greedy decoding (full-precision cache) leaves mlx-lm's: a mixture
+        // of experts in half precision can route another expert after an ulp near a tie.
+        let plain = GenerateOptions {
+            max_tokens: greedy.len(),
+            ..Default::default()
+        };
+        let same: Vec<u32> = generate(&model, &prompt, plain)
+            .unwrap()
+            .collect::<nuvec::Result<_>>()
+            .unwrap();
+        let agree = same.iter().zip(&greedy).take_while(|(a, b)| a == b).count();
+        let want = nuvec::io::load_safetensors(dir.join("kv_quant.safetensors"))
+            .unwrap()
+            .tensors;
+        // mlx-lm's `generate_step`: the prompt but its last token, then one token per step.
+        let run = |quant: Option<KvQuant>, tokens: &[u32]| {
+            let mut cache = model.new_cache();
+            if let Some(q) = quant {
+                for c in &mut cache {
+                    c.quantize_at(q).unwrap();
+                }
+            }
+            let head = Array::from_slice(&prompt[..prompt.len() - 1], [1, prompt.len() - 1]);
+            let _ = model.forward(&head, &mut cache).check().unwrap();
+            let mut token = *prompt.last().unwrap();
+            let mut steps = Vec::new();
+            for &t in tokens {
+                let logits = model.forward(&Array::from_slice(&[token], [1, 1]), &mut cache);
+                let logits = logits.i((0, -1));
+                let lp = (&logits - logits.logsumexp_keepdims(-1)).astype(DType::F32);
+                steps.push(lp.to_vec::<f32>().unwrap());
+                token = t;
+            }
+            (steps, cache.iter().any(|c| c.is_quantized()))
+        };
+        let distance = |got: &[f32], want: &Array| -> (f32, f32) {
+            let want = want.to_vec::<f32>().unwrap();
+            let d: Vec<f32> = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).collect();
+            let max = d.iter().fold(0.0f32, |m, &x| m.max(x));
+            (max, d.iter().sum::<f32>() / d.len() as f32)
+        };
+        for (bits, group_size, start) in [(8, 32, 0), (4, 32, 0), (8, 32, prompt.len() + 3)] {
+            let key = format!("b{bits}_g{group_size}_s{start}");
+            let tokens = want[&format!("{key}_tokens")].to_vec::<u32>().unwrap();
+            let logprobs = &want[&format!("{key}_logprobs")];
+            let quant = KvQuant {
+                bits,
+                group_size,
+                start,
+            };
+            let (quantized, converted) = run(Some(quant), &tokens);
+            assert!(converted, "{name} {key}: not quantized");
+            let (dense, _) = run(None, &tokens);
+            for step in 0..tokens.len() {
+                let (max, mean) = distance(&quantized[step], &logprobs.i(step as i32));
+                if name.ends_with("_f32") {
+                    assert!(max <= 1e-3, "{name} {key}: step {step} {max} from mlx-lm");
+                } else {
+                    let (_, base) = distance(&dense[step], &want["dense_logprobs"].i(step as i32));
+                    assert!(
+                        mean <= 2.0 * base + 1e-3,
+                        "{name} {key}: step {step} {mean} from mlx-lm on average (dense {base})"
+                    );
+                }
+            }
+            let options = GenerateOptions {
+                max_tokens: tokens.len(),
+                kv_quant: Some(quant),
+                ..Default::default()
+            };
+            let ids: Vec<u32> = generate(&model, &prompt, options)
+                .unwrap()
+                .collect::<nuvec::Result<_>>()
+                .unwrap();
+            let n = agree.min(ids.len());
+            assert_eq!(ids[..n], tokens[..n], "{name} {key}: greedy tokens");
+        }
+    }
+}
+
+/// An 8-bit cache in groups of 32 takes 1 byte per value plus a float32 scale and bias per
+/// 32 values: the attention layers' bytes are 0.3125× the float32 cache's.
+#[test]
+fn kv_quant_cache_bytes() {
+    use nuvec_lm::KvQuant;
+    if !gpu() {
+        return;
+    }
+    let (dir, prompt, ..) = fixture("qwen3_5_f32");
+    let model = load_model(&dir).unwrap();
+    let ids = Array::from_slice(&prompt, [1, prompt.len()]);
+    let mut dense = model.new_cache();
+    model.forward(&ids, &mut dense).eval().unwrap();
+    let mut quantized = dense.clone();
+    let quant = KvQuant {
+        group_size: 32,
+        ..Default::default()
+    };
+    for c in &mut quantized {
+        c.quantize(quant).unwrap();
+    }
+    let (mut q, mut d) = (0, 0);
+    for (qc, dc) in quantized.iter().zip(&dense) {
+        if qc.is_quantized() {
+            q += qc.nbytes();
+            d += dc.nbytes();
+        }
+    }
+    assert!(
+        q > 0 && q * 10_000 == d * 3125,
+        "quantized {q} bytes against {d}"
+    );
+}
+
+/// Invalid KV quantizations are refused: bits and groups MLX does not quantize with, head
+/// dimensions that are not multiples of the group, and the paged `Batcher`.
+#[test]
+fn kv_quant_refusals() {
+    use nuvec_lm::{Batcher, BatcherOptions, KvQuant};
+    if !gpu() {
+        return;
+    }
+    let (dir, prompt, ..) = fixture("qwen3_f32");
+    let model = load_model(&dir).unwrap();
+    let options = |bits, group_size| GenerateOptions {
+        max_tokens: 2,
+        kv_quant: Some(KvQuant {
+            bits,
+            group_size,
+            start: 0,
+        }),
+        ..Default::default()
+    };
+    assert!(generate(&model, &prompt, options(7, 32)).is_err(), "7 bits");
+    assert!(
+        generate(&model, &prompt, options(8, 16)).is_err(),
+        "groups of 16"
+    );
+    // Head dimension 16: not a multiple of 32.
+    let ids: nuvec::Result<Vec<u32>> =
+        generate(&model, &prompt, options(8, 32)).and_then(|g| g.collect());
+    assert!(ids.is_err(), "head dimension 16");
+    let mut batcher = Batcher::new(&model, BatcherOptions::default()).unwrap();
+    assert!(
+        batcher.submit(prompt.clone(), options(8, 32)).is_err(),
+        "batcher"
+    );
+}
+
+/// Speculative decoding with a quantized cache gives plain greedy generation's tokens with
+/// the same cache: rejected drafts trim the quantized positions.
+#[test]
+fn kv_quant_speculative_equals_greedy() {
+    use nuvec_lm::{DraftPolicy, KvQuant, PromptLookup, speculative_generate};
+    if !gpu() {
+        return;
+    }
+    for name in ["qwen3_5_f32", "qwen3_5_moe_q4"] {
+        let (dir, prompt, ..) = fixture(name);
+        let model = load_model(&dir).unwrap();
+        // A repetitive prompt, so prompt lookup drafts.
+        let prompt: Vec<u32> = prompt
+            .iter()
+            .cycle()
+            .take(prompt.len() * 3)
+            .copied()
+            .collect();
+        let options = GenerateOptions {
+            max_tokens: 24,
+            kv_quant: Some(KvQuant {
+                group_size: 32,
+                start: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plain: Vec<u32> = generate(&model, &prompt, options.clone())
+            .unwrap()
+            .collect::<nuvec::Result<_>>()
+            .unwrap();
+        let mut g = speculative_generate(
+            &model,
+            &prompt,
+            options,
+            Box::new(PromptLookup::default()),
+            DraftPolicy::Fixed(4),
+        )
+        .unwrap();
+        let spec: Vec<u32> = g.by_ref().collect::<nuvec::Result<_>>().unwrap();
+        assert_eq!(spec, plain, "{name}");
+        assert!(g.stats().drafted > 0, "{name}: no drafts");
+    }
+}
+
+/// mlx-lm's prompt cache with quantized attention layers (`QuantizedKVCache`, a hybrid model)
+/// loads and continues to mlx-lm's next logits; nuvec's saved quantized cache loads back.
+#[test]
+fn kv_quant_prompt_cache_round_trips() {
+    use nuvec_lm::{KvQuant, load_prompt_cache, save_prompt_cache};
+    if !gpu() {
+        return;
+    }
+    let (path, prompt, ..) = fixture("qwen3_5_f32");
+    let model = load_model(&path).unwrap();
+    let next = nuvec::io::load_safetensors(path.join("prompt_cache_q8_next.safetensors"))
+        .unwrap()
+        .tensors;
+    let token = &next["token"];
+    let (mut caches, _) =
+        load_prompt_cache(path.join("prompt_cache_q8.safetensors"), &model).unwrap();
+    assert!(caches.iter().any(|c| c.is_quantized()));
+    let got = model.forward(token, &mut caches).astype(DType::F32);
+    let (g, w) = (
+        got.to_vec::<f32>().unwrap(),
+        next["logits"].to_vec::<f32>().unwrap(),
+    );
+    let d = g
+        .iter()
+        .zip(&w)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(d < 2e-4, "mlx-lm's quantized cache continues {d} away");
+    let mut kv = model.new_cache();
+    let head = Array::from_slice(&prompt, [1, prompt.len()]);
+    model.forward(&head, &mut kv).eval().unwrap();
+    for c in &mut kv {
+        c.quantize(KvQuant {
+            group_size: 32,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let file =
+        std::env::temp_dir().join(format!("nuvec-kv-quant-{}.safetensors", std::process::id()));
+    save_prompt_cache(&file, &model, &kv, &Default::default()).unwrap();
+    let (mut loaded, _) = load_prompt_cache(&file, &model).unwrap();
+    std::fs::remove_file(&file).ok();
+    let bits = |a: &Array| {
+        a.astype(DType::F32)
+            .view(DType::U32)
+            .to_vec::<u32>()
+            .unwrap()
+    };
+    assert!(bits(&model.forward(token, &mut loaded)) == bits(&model.forward(token, &mut kv)));
+}
