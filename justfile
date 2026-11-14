@@ -189,6 +189,10 @@ bench-attention-route *filter:
 bench-rows *filter:
     uv run scripts/bench_rows.py {{filter}}
 
+# Verify attention (1–8 causal rows over 4K–32K keys): nuvec vs MLX, and each against one row.
+bench-verify *filter:
+    uv run scripts/bench_verify.py {{filter}}
+
 # ── Downstream and long-running checks ────────────────────────────────────────
 
 # A server-like workload on a caller-owned thread for HOURS hours: fails if the process
