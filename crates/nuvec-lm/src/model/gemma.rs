@@ -142,9 +142,11 @@ pub(super) fn model(b: &Builder<'_>, c: &Config, g: &Gemma4) -> Result<Model> {
                 v_proj: (!shared && !k_eq_v)
                     .then(|| b.projection(&a("v_proj"), d, kv, false))
                     .transpose()?,
-                o_proj: b.projection(&a("o_proj"), q, d, false)?,
+                o_proj: OutProj::O(b.projection(&a("o_proj"), q, d, false)?),
                 q_norm: Some(norm(hd)),
                 k_norm: (!shared).then(|| norm(hd)),
+                q_layernorm: None,
+                k_layernorm: None,
                 heads: int(&a(""), c.num_attention_heads)?,
                 kv_heads: int(&a(""), kv_heads)?,
                 scale: 1.0,
@@ -200,8 +202,8 @@ pub(super) fn model(b: &Builder<'_>, c: &Config, g: &Gemma4) -> Result<Model> {
             Ok(Block {
                 mixer: Mixer::Attention(attention),
                 mlp: BlockMlp::Dense(Box::new(mlp)),
-                input_layernorm: norm(d),
-                post_attention_layernorm: norm(d),
+                norms: Norms::standard(norm(d), norm(d)),
+                residual_multiplier: None,
                 group: None,
                 gemma: Some(Box::new(parts)),
             })
@@ -233,7 +235,7 @@ pub(super) fn model(b: &Builder<'_>, c: &Config, g: &Gemma4) -> Result<Model> {
         model: Body {
             embed_tokens: b.embedding("model.embed_tokens", c.vocab_size, d)?,
             layers: blocks,
-            norm: norm(d),
+            norm: FinalNorm::Norm(norm(d)),
             per_layer,
         },
         lm_head: (!c.tie_word_embeddings)
@@ -274,7 +276,7 @@ fn after_attention(
     i: usize,
     next: &RmsNorm,
 ) -> (Array, Array) {
-    let post = &layer.post_attention_layernorm;
+    let post = layer.norms.post();
     let (h1, n) = residual(h, o, post, None, Some(&p.pre_feedforward_layernorm));
     let mut f = layer.mlp.forward(&n.expect("a next norm"));
     if let (Some(router), Some(experts), Some(post1), Some(post2), Some(pre2)) = (
@@ -366,13 +368,13 @@ pub(super) fn hidden(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array 
             .map(|(kv, at)| (kv, *at));
         let n = normed
             .take()
-            .unwrap_or_else(|| layer.input_layernorm.forward(&h));
+            .unwrap_or_else(|| layer.norms.input().forward(&h));
         let (o, kv) = attention.forward_kv(&n, mask, c, shared);
         kvs[i] = Some((kv, shared.map_or(at, |(_, at)| at)));
         let (next, n) = after_attention(layer, p, (&h, &o), per_layer.as_ref(), i, next_norm(m, i));
         (h, normed) = (next, Some(n));
     }
-    normed.unwrap_or_else(|| m.model.norm.forward(&h))
+    normed.unwrap_or_else(|| m.model.norm.get().forward(&h))
 }
 
 /// [`Model::forward_paged`] of a Gemma 4 model: KV-shared layers attend to their source
@@ -392,13 +394,13 @@ pub(super) fn forward_paged(
         let shared = p.kv_source.and_then(|s| pools[s].as_ref());
         let n = normed
             .take()
-            .unwrap_or_else(|| layer.input_layernorm.forward(&h));
+            .unwrap_or_else(|| layer.norms.input().forward(&h));
         let (o, kv) = attention.forward_paged_kv(&n, pages, step, shared);
         pools[i] = Some(kv);
         let (next, n) = after_attention(layer, p, (&h, &o), per_layer.as_ref(), i, next_norm(m, i));
         (h, normed) = (next, Some(n));
     }
-    logits(m, &normed.unwrap_or_else(|| m.model.norm.forward(&h)))
+    logits(m, &normed.unwrap_or_else(|| m.model.norm.get().forward(&h)))
 }
 
 /// The norm after layer `i`: the next layer's input norm, or the final norm.
@@ -406,5 +408,5 @@ fn next_norm(m: &Model, i: usize) -> &RmsNorm {
     m.model
         .layers
         .get(i + 1)
-        .map_or(&m.model.norm, |l| &l.input_layernorm)
+        .map_or(m.model.norm.get(), |l| l.norms.input())
 }

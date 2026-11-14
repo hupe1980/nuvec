@@ -251,6 +251,9 @@ impl Builder<'_> {
 #[derive(Debug, Clone, Module)]
 struct Rope {
     rope: nuvec_nn::Rope,
+    /// No rotation (Granite 4's `nope`): queries and keys are only normalised.
+    #[tree(skip)]
+    identity: bool,
 }
 
 impl Rope {
@@ -264,11 +267,12 @@ impl Rope {
 
     /// Over `dims` features with a base and scaling.
     fn with(dims: usize, (base, scaling): (f32, &RopeScaling), traditional: bool) -> Result<Self> {
-        let mut rope = nuvec_nn::Rope::scaled(int("rope dims", dims)?, base, scaling);
+        let identity = dims == 0;
+        let mut rope = nuvec_nn::Rope::scaled(int("rope dims", dims.max(2))?, base, scaling);
         if traditional {
             rope = rope.traditional();
         }
-        Ok(Self { rope })
+        Ok(Self { rope, identity })
     }
 
     fn rotation(&self) -> fast::Rotation<'_> {
@@ -286,6 +290,18 @@ impl Rope {
         at: i32,
         cache: Option<&Array>,
     ) -> Array {
+        if self.identity {
+            let x = norm.map_or_else(
+                || x.clone(),
+                |n| fast::rms_norm(x, Some(n.weight.value()), n.eps),
+            );
+            let l = x.shape().get(2).copied().unwrap_or_default();
+            // Written in place at evaluation (the cache's only other handle is the caller's).
+            return match cache {
+                Some(c) => c.clone().at((.., .., at..at + l)).set(&x),
+                None => x,
+            };
+        }
         let norm = norm.map(|n| (n.weight.value(), n.eps));
         fast::norm_rope(x, norm, self.rotation(), at, cache)
     }
@@ -301,6 +317,13 @@ impl Rope {
         positions: &Array,
         pool: Option<(&Array, &Array)>,
     ) -> Array {
+        if self.identity {
+            // Paged caches refuse the families without rotation (`PagedCache::new`).
+            return Array::failure(
+                "norm_rope_at",
+                OpErrorKind::InvalidArgument("no paged attention without rotation".into()),
+            );
+        }
         let norm = norm.map(|n| (n.weight.value(), n.eps));
         fast::norm_rope_at(x, norm, self.rotation(), positions, pool)
     }
@@ -818,9 +841,14 @@ struct Attention {
     k_proj: Option<Projection>,
     /// `None` also with K = V (Gemma 4's full layers: the keys' projection is the values').
     v_proj: Option<Projection>,
-    o_proj: Projection,
+    /// `o_proj`, or LFM2's `out_proj` (transparent).
+    #[tree(rename = "")]
+    o_proj: OutProj,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
+    /// LFM2's names for the query and key norms.
+    q_layernorm: Option<RmsNorm>,
+    k_layernorm: Option<RmsNorm>,
     #[tree(skip)]
     heads: i32,
     #[tree(skip)]
@@ -845,7 +873,32 @@ struct Attention {
     v_norm: Option<f32>,
 }
 
+/// The attention's output projection, under the family's name.
+#[derive(Debug, Clone, Module)]
+pub(crate) enum OutProj {
+    #[tree(rename = "o_proj")]
+    O(Projection),
+    #[tree(rename = "out_proj")]
+    Out(Projection),
+}
+
+impl OutProj {
+    pub(crate) fn get(&self) -> &Projection {
+        match self {
+            Self::O(p) | Self::Out(p) => p,
+        }
+    }
+}
+
 impl Attention {
+    /// The query and key norms, under either name.
+    fn qk_norms(&self) -> (Option<&RmsNorm>, Option<&RmsNorm>) {
+        (
+            self.q_norm.as_ref().or(self.q_layernorm.as_ref()),
+            self.k_norm.as_ref().or(self.k_layernorm.as_ref()),
+        )
+    }
+
     fn new(b: &Builder<'_>, path: &str, c: &Config, window: Option<usize>) -> Result<Self> {
         let (d, hd) = (c.hidden_size, c.head_dim);
         let (q, kv) = (c.num_attention_heads * hd, c.num_key_value_heads * hd);
@@ -868,12 +921,20 @@ impl Attention {
             q_proj: b.projection(&p("q_proj"), d, q * (1 + usize::from(gate)), c.qkv_bias)?,
             k_proj: Some(b.projection(&p("k_proj"), d, kv, c.qkv_bias)?),
             v_proj: Some(b.projection(&p("v_proj"), d, kv, c.qkv_bias)?),
-            o_proj: b.projection(&p("o_proj"), q, d, c.o_bias)?,
-            q_norm: norm(),
-            k_norm: norm(),
+            o_proj: match c.lfm2 {
+                Some(_) => OutProj::Out(b.projection(&p("out_proj"), q, d, c.o_bias)?),
+                None => OutProj::O(b.projection(&p("o_proj"), q, d, c.o_bias)?),
+            },
+            q_norm: norm().filter(|_| c.lfm2.is_none()),
+            k_norm: norm().filter(|_| c.lfm2.is_none()),
+            q_layernorm: norm().filter(|_| c.lfm2.is_some()),
+            k_layernorm: norm().filter(|_| c.lfm2.is_some()),
             heads: int(path, c.num_attention_heads)?,
             kv_heads: int(path, c.num_key_value_heads)?,
-            scale: (hd as f32).powf(-0.5),
+            // Granite 4's attention scale is its `attention_multiplier`.
+            scale: c
+                .granite
+                .map_or((hd as f32).powf(-0.5), |g| g.attention_multiplier),
             mscale,
             rope,
             gate,
@@ -940,8 +1001,8 @@ impl Attention {
     fn output(&self, o: &Array, gate: Option<Array>, [b, l]: [i32; 2]) -> Array {
         let o = o.transpose(HEADS_FIRST).reshape([b, l, -1]);
         match gate {
-            Some(g) => self.o_proj.forward(&o.multiply(g.sigmoid())),
-            None => self.o_proj.forward(&o),
+            Some(g) => self.o_proj.get().forward(&o.multiply(g.sigmoid())),
+            None => self.o_proj.get().forward(&o),
         }
     }
 
@@ -966,7 +1027,7 @@ impl Attention {
         let at = shared.map_or(cache.offset, |(_, at)| at);
         // The query and key (written into the cache) normalised and rotated in one kernel.
         let q = self.input_scale(q.transpose(HEADS_FIRST));
-        let q = self.rope.norm_rope(&q, self.q_norm.as_ref(), at, None);
+        let q = self.rope.norm_rope(&q, self.qk_norms().0, at, None);
         let kv = match shared {
             Some((kv, _)) => {
                 cache.offset += l;
@@ -988,7 +1049,7 @@ impl Attention {
                     None => v,
                 };
                 let k = self.input_scale(k);
-                cache.update(&self.rope, self.k_norm.as_ref(), &k, &v)
+                cache.update(&self.rope, self.qk_norms().1, &k, &v)
             }
         };
         let scale = self.scale(q.dtype());
@@ -1179,7 +1240,7 @@ impl Attention {
         let q = self.input_scale(q).transpose(HEADS_FIRST);
         let q = self
             .rope
-            .norm_rope_at(&q, self.q_norm.as_ref(), &step.positions, None);
+            .norm_rope_at(&q, self.qk_norms().0, &step.positions, None);
         let (keys, values, group) = match shared {
             Some(kv) => kv.clone(),
             None => {
@@ -1196,7 +1257,7 @@ impl Attention {
                 };
                 let k = self.input_scale(k).transpose(HEADS_FIRST);
                 let (keys, values) = layer.write_kv(
-                    (&self.rope, self.k_norm.as_ref()),
+                    (&self.rope, self.qk_norms().1),
                     (&k, &v.reshape([b, self.kv_heads, -1])),
                     &step.positions,
                     &g.slots,
@@ -1502,6 +1563,196 @@ impl GatedDeltaNet {
     }
 }
 
+/// The causal depthwise convolution of a recurrent mixer over `input` (`[B, L, C]`), with
+/// the previous step's last `kernel − 1` inputs from `cache` (zeros at first); keeps the
+/// last `kernel − 1` inputs for the next step and returns the convolution's input
+/// (`[B, kernel − 1 + L, C]`).
+#[track_caller]
+fn conv_input(cache: &mut KvCache, input: &Array, kernel: i32) -> Array {
+    let [b, l, channels] = input.shape_n::<3>().unwrap_or_default();
+    let state = match cache.conv.take() {
+        Some(c) => c,
+        None => ops::zeros([b, kernel - 1, channels], input.dtype()),
+    };
+    let input = ops::concatenate(&[state, input.clone()], 1);
+    let kept = input.i((.., l..l + kernel - 1));
+    // After a prompt, a copy: the view would keep the whole input alive.
+    cache.conv = Some(if l > 1 { kept.multiply(1.0) } else { kept });
+    input
+}
+
+/// A depthwise convolution (`weight` `[C, K, 1]`) with an optional bias, as MLX's `Conv1d`.
+#[track_caller]
+fn depthwise(input: &Array, weight: &Array, bias: Option<&Param>) -> Array {
+    let channels = weight.shape().first().copied().unwrap_or_default();
+    let y = input.conv1d(weight, 1, 0, 1, channels);
+    match bias {
+        Some(b) => y.add(b.value()),
+        None => y,
+    }
+}
+
+/// Granite 4's Mamba-2 mixer (mlx-lm's `GraniteMoeHybridMamba2Mixer`): one projection into
+/// the gate, the convolution's input and `dt`; a causal depthwise convolution and SiLU;
+/// Mamba-2's SSM ([`fast::ssm_scan`] for a prompt or without a state, [`fast::ssm_update`]
+/// for one token); the gated RMS norm (`rms_norm(silu(gate) · y)`); the output projection.
+#[derive(Debug, Clone, Module)]
+struct Mamba2 {
+    in_proj: Projection,
+    conv1d: Conv1d,
+    dt_bias: Param,
+    #[tree(rename = "A_log")]
+    a_log: Param,
+    #[tree(rename = "D")]
+    d: Param,
+    norm: RmsNorm,
+    out_proj: Projection,
+    #[tree(skip)]
+    sizes: MambaSizes,
+}
+
+/// A depthwise convolution's parameters (`weight` `[C, K, 1]`, optional `bias`).
+#[derive(Debug, Clone, Module)]
+struct Conv1d {
+    weight: Param,
+    bias: Option<Param>,
+}
+
+/// Mamba-2's sizes as dimensions, and `dt`'s clip range.
+#[derive(Debug, Clone, Copy, nuvec::Static)]
+struct MambaSizes {
+    heads: i32,
+    head_dim: i32,
+    state: i32,
+    groups: i32,
+    kernel: i32,
+    /// `time_step_limit`'s bounds as bits (hashed exactly).
+    limit: (u32, u32),
+}
+
+impl Mamba2 {
+    fn new(b: &Builder<'_>, path: &str, c: &Config) -> Result<Self> {
+        let m = c
+            .granite
+            .ok_or_else(|| nuvec::Error::InvalidArgument(format!("{path}: no Mamba settings")))?
+            .mamba;
+        let inner = m.heads * m.head_dim;
+        let conv_dim = inner + 2 * m.groups * m.state;
+        let p = |name: &str| format!("{path}.{name}");
+        Ok(Self {
+            in_proj: b.projection(
+                &p("in_proj"),
+                c.hidden_size,
+                inner + conv_dim + m.heads,
+                m.proj_bias,
+            )?,
+            conv1d: Conv1d {
+                weight: param(&[conv_dim, m.conv_kernel, 1], DType::F32),
+                bias: m.conv_bias.then(|| param(&[conv_dim], DType::F32)),
+            },
+            dt_bias: param(&[m.heads], DType::F32),
+            a_log: param(&[m.heads], DType::F32),
+            d: param(&[m.heads], DType::F32),
+            norm: Builder::norm(inner, c.rms_norm_eps),
+            out_proj: b.projection(&p("out_proj"), inner, c.hidden_size, m.proj_bias)?,
+            sizes: MambaSizes {
+                heads: int(path, m.heads)?,
+                head_dim: int(path, m.head_dim)?,
+                state: int(path, m.state)?,
+                groups: int(path, m.groups)?,
+                kernel: int(path, m.conv_kernel)?,
+                limit: (m.time_step_limit.0.to_bits(), m.time_step_limit.1.to_bits()),
+            },
+        })
+    }
+
+    #[track_caller]
+    fn forward(&self, x: &Array, cache: &mut KvCache) -> Array {
+        let MambaSizes {
+            heads,
+            head_dim,
+            state,
+            groups,
+            kernel,
+            limit,
+        } = self.sizes;
+        let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
+        let inner = heads * head_dim;
+        let projected = self.in_proj.forward(x);
+        let conv_dim = inner + 2 * groups * state;
+        let parts = projected.split_at(&[inner, inner + conv_dim], -1);
+        let [gate, conv, dt]: [Array; 3] = parts.try_into().expect("three parts");
+        let input = conv_input(cache, &conv, kernel);
+        let conv = silu(&depthwise(
+            &input,
+            self.conv1d.weight.value(),
+            self.conv1d.bias.as_ref(),
+        ));
+        let parts = conv.split_at(&[inner, inner + groups * state], -1);
+        let [h, bm, cm]: [Array; 3] = parts.try_into().expect("three parts");
+        let h = h.reshape([b, l, heads, head_dim]);
+        let bm = bm.reshape([b, l, groups, state]);
+        let cm = cm.reshape([b, l, groups, state]);
+        // mlx-lm's `compute_dt`: `clip(softplus(dt + dt_bias))` in float32.
+        let (lo, hi) = (f32::from_bits(limit.0), f32::from_bits(limit.1));
+        let dt = softplus(&dt.astype(DType::F32).add(self.dt_bias.value()))
+            .maximum(f64::from(lo))
+            .minimum(f64::from(hi));
+        let d = self.d.value().astype(h.dtype());
+        let (y, next) = match cache.recurrent.take() {
+            Some(s) if l == 1 => fast::ssm_update(&h, self.a_log.value(), &bm, &cm, &d, &dt, &s),
+            s => fast::ssm_scan(&h, self.a_log.value(), &bm, &cm, &d, &dt, s.as_ref()),
+        };
+        cache.recurrent = Some(next);
+        cache.offset += l;
+        let y = swiglu(&gate, &y.reshape([b, l, inner]));
+        let y = fast::rms_norm(&y, Some(self.norm.weight.value()), self.norm.eps);
+        self.out_proj.forward(&y)
+    }
+}
+
+/// LFM2's gated short convolution (mlx-lm's `ShortConv`): one projection into `B`, `C` and
+/// `x`; a causal depthwise convolution of `B · x`; `C ·` the convolution; the output
+/// projection.
+#[derive(Debug, Clone, Module)]
+struct ShortConv {
+    conv: Conv1d,
+    in_proj: Projection,
+    out_proj: Projection,
+    #[tree(skip)]
+    kernel: i32,
+}
+
+impl ShortConv {
+    fn new(b: &Builder<'_>, path: &str, c: &Config) -> Result<Self> {
+        let l = c
+            .lfm2
+            .ok_or_else(|| nuvec::Error::InvalidArgument(format!("{path}: no LFM2 settings")))?;
+        let d = c.hidden_size;
+        let p = |name: &str| format!("{path}.{name}");
+        Ok(Self {
+            conv: Conv1d {
+                weight: param(&[d, l.conv_kernel, 1], DType::F32),
+                bias: l.conv_bias.then(|| param(&[d], DType::F32)),
+            },
+            in_proj: b.projection(&p("in_proj"), d, 3 * d, l.conv_bias)?,
+            out_proj: b.projection(&p("out_proj"), d, d, l.conv_bias)?,
+            kernel: int(path, l.conv_kernel)?,
+        })
+    }
+
+    #[track_caller]
+    fn forward(&self, x: &Array, cache: &mut KvCache) -> Array {
+        let l = x.shape().get(1).copied().unwrap_or_default();
+        let parts = self.in_proj.forward(x).split(3, -1);
+        let [bm, cm, h]: [Array; 3] = parts.try_into().expect("three parts");
+        let input = conv_input(cache, &bm.multiply(&h), self.kernel);
+        let conv = depthwise(&input, self.conv.weight.value(), self.conv.bias.as_ref());
+        cache.offset += l;
+        self.out_proj.forward(&cm.multiply(&conv))
+    }
+}
+
 /// A layer's token mixer, named as mlx-lm's (`self_attn`, `linear_attn`).
 #[derive(Debug, Clone, Module)]
 enum Mixer {
@@ -1509,6 +1760,10 @@ enum Mixer {
     Attention(Attention),
     #[tree(rename = "linear_attn")]
     Linear(GatedDeltaNet),
+    #[tree(rename = "mamba")]
+    Mamba(Mamba2),
+    #[tree(rename = "conv")]
+    ShortConv(ShortConv),
 }
 
 #[derive(Debug, Clone, Module)]
@@ -1787,12 +2042,116 @@ impl GptOssMlp {
     }
 }
 
+/// Granite 4's MLP (mlx-lm's `GraniteMoeHybridMoE` and `GraniteMoeHybridSharedMLP`): the
+/// experts' output plus the shared MLP's.
+#[derive(Debug, Clone, Module)]
+struct GraniteMlp {
+    block_sparse_moe: GraniteMoe,
+    shared_mlp: SharedMlp,
+}
+
+/// Granite 4's experts: a router (`router.layer`), the softmax of the best `k` logits
+/// (precise), SwiGLU experts, and their outputs weighted and summed (as gpt-oss's).
+#[derive(Debug, Clone, Module)]
+struct GraniteMoe {
+    router: Router,
+    switch_mlp: SwitchGlu,
+    #[tree(skip)]
+    experts_per_token: i32,
+}
+
+#[derive(Debug, Clone, Module)]
+struct Router {
+    layer: Projection,
+}
+
+/// Granite 4's shared MLP: `input_linear` gives the gate and the up projection.
+#[derive(Debug, Clone, Module)]
+struct SharedMlp {
+    input_linear: Projection,
+    output_linear: Projection,
+}
+
+impl GraniteMlp {
+    fn new(b: &Builder<'_>, path: &str, d: usize, moe: &MixtureOfExperts) -> Result<Self> {
+        let p = |name: &str| format!("{path}.{name}");
+        let shared = moe
+            .shared_intermediate_size
+            .unwrap_or(moe.intermediate_size);
+        Ok(Self {
+            block_sparse_moe: GraniteMoe {
+                router: Router {
+                    layer: b.projection(
+                        &p("block_sparse_moe.router.layer"),
+                        d,
+                        moe.experts,
+                        false,
+                    )?,
+                },
+                switch_mlp: SwitchGlu::new(b, &p("block_sparse_moe.switch_mlp"), d, moe)?,
+                experts_per_token: int(path, moe.experts_per_token)?,
+            },
+            shared_mlp: SharedMlp {
+                input_linear: b.projection(&p("shared_mlp.input_linear"), d, 2 * shared, false)?,
+                output_linear: b.projection(&p("shared_mlp.output_linear"), shared, d, false)?,
+            },
+        })
+    }
+
+    #[track_caller]
+    fn forward(&self, x: &Array) -> Array {
+        let moe = &self.block_sparse_moe;
+        let logits = moe.router.layer.forward(x);
+        let (top, best) = fast::moe_route(&logits, moe.experts_per_token, false);
+        let weights = best.softmax(-1);
+        let experts = fast::weighted_sum(&moe.switch_mlp.forward(x, &top), &weights);
+        let parts = self.shared_mlp.input_linear.forward(x).split(2, -1);
+        let shared = self
+            .shared_mlp
+            .output_linear
+            .forward(&swiglu(&parts[0], &parts[1]));
+        experts.add(shared)
+    }
+}
+
+/// LFM2's MLP (`w2(swiglu(w1 · x, w3 · x))`).
+#[derive(Debug, Clone, Module)]
+struct FeedForward {
+    w1: Projection,
+    w3: Projection,
+    w2: Projection,
+}
+
+impl FeedForward {
+    fn new(b: &Builder<'_>, path: &str, d: usize, hidden: usize) -> Result<Self> {
+        let p = |name: &str| format!("{path}.{name}");
+        Ok(Self {
+            w1: b.projection(&p("w1"), d, hidden, false)?,
+            w3: b.projection(&p("w3"), d, hidden, false)?,
+            w2: b.projection(&p("w2"), hidden, d, false)?,
+        })
+    }
+
+    #[track_caller]
+    fn forward(&self, x: &Array) -> Array {
+        self.w2
+            .forward(&swiglu(&self.w1.forward(x), &self.w3.forward(x)))
+    }
+}
+
 /// A layer's MLP.
 #[derive(Debug, Clone, Module)]
 enum BlockMlp {
+    #[tree(rename = "mlp")]
     Dense(Box<Mlp>),
+    #[tree(rename = "mlp")]
     Moe(Box<MoeMlp>),
+    #[tree(rename = "mlp")]
     GptOss(Box<GptOssMlp>),
+    /// Granite 4's experts and shared MLP (`block_sparse_moe`, `shared_mlp`).
+    Granite(Box<GraniteMlp>),
+    #[tree(rename = "feed_forward")]
+    Lfm2(Box<FeedForward>),
 }
 
 impl BlockMlp {
@@ -1802,6 +2161,8 @@ impl BlockMlp {
             Self::Dense(m) => m.forward(x),
             Self::Moe(m) => m.forward(x),
             Self::GptOss(m) => m.forward(x),
+            Self::Granite(m) => m.forward(x),
+            Self::Lfm2(m) => m.forward(x),
         }
     }
 }
@@ -1811,9 +2172,15 @@ struct Block {
     /// Transparent: the mixer names itself (`self_attn`, `linear_attn`).
     #[tree(rename = "")]
     mixer: Mixer,
+    /// Transparent: each variant names itself (`mlp`, `feed_forward`, Granite's parts).
+    #[tree(rename = "")]
     mlp: BlockMlp,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    /// Transparent: the norms under the family's names.
+    #[tree(rename = "")]
+    norms: Norms,
+    /// Granite 4's factor on the mixer's and the MLP's outputs.
+    #[tree(skip)]
+    residual_multiplier: Option<f32>,
     /// The group the block is split across ([`Model::shard`]): its attention and MLP
     /// outputs are summed over it.
     #[tree(skip, static_unchecked)]
@@ -1822,6 +2189,50 @@ struct Block {
     /// mlx-lm's decoder layer).
     #[tree(rename = "")]
     gemma: Option<Box<gemma::Parts>>,
+}
+
+/// A block's two norms: before the mixer and before the MLP.
+#[derive(Debug, Clone, Module)]
+pub(crate) enum Norms {
+    Standard {
+        input_layernorm: RmsNorm,
+        post_attention_layernorm: RmsNorm,
+    },
+    /// LFM2's names.
+    Lfm2 {
+        operator_norm: RmsNorm,
+        ffn_norm: RmsNorm,
+    },
+}
+
+impl Norms {
+    pub(crate) fn standard(input: RmsNorm, post: RmsNorm) -> Self {
+        Self::Standard {
+            input_layernorm: input,
+            post_attention_layernorm: post,
+        }
+    }
+
+    pub(crate) fn input(&self) -> &RmsNorm {
+        match self {
+            Self::Standard {
+                input_layernorm: n, ..
+            }
+            | Self::Lfm2 {
+                operator_norm: n, ..
+            } => n,
+        }
+    }
+
+    pub(crate) fn post(&self) -> &RmsNorm {
+        match self {
+            Self::Standard {
+                post_attention_layernorm: n,
+                ..
+            }
+            | Self::Lfm2 { ffn_norm: n, .. } => n,
+        }
+    }
 }
 
 /// `x + r` and its normalisation, in one kernel ([`fast::add_rms_norm`]); `x` alone
@@ -1847,17 +2258,16 @@ impl Block {
         mask: AttentionMask<'_>,
         cache: &mut KvCache,
     ) -> (Array, Array) {
-        let (x, n) = add_norm(x, pending, &self.input_layernorm);
+        let (x, n) = add_norm(x, pending, self.norms.input());
         let mixed = match &self.mixer {
             Mixer::Attention(a) => a.forward(&n, mask, cache),
             Mixer::Linear(l) => l.forward(&n, cache),
+            Mixer::Mamba(m) => m.forward(&n, cache),
+            Mixer::ShortConv(m) => m.forward(&n, cache),
         };
-        let (h, n) = add_norm(
-            &x,
-            Some(&self.reduce(mixed)),
-            &self.post_attention_layernorm,
-        );
-        (h, self.reduce(self.mlp.forward(&n)))
+        let mixed = self.scaled(self.reduce(mixed));
+        let (h, n) = add_norm(&x, Some(&mixed), self.norms.post());
+        (h, self.scaled(self.reduce(self.mlp.forward(&n))))
     }
 
     /// [`Block::forward`] through a gradient checkpoint: the block's activations are
@@ -1898,6 +2308,15 @@ impl Block {
         }
     }
 
+    /// `y` times Granite 4's residual multiplier (mlx-lm's `h · residual_multiplier`).
+    #[track_caller]
+    fn scaled(&self, y: Array) -> Array {
+        match self.residual_multiplier {
+            Some(m) => y.multiply(f64::from(m)),
+            None => y,
+        }
+    }
+
     /// A sharded block's partial output summed over its group.
     #[track_caller]
     fn reduce(&self, y: Array) -> Array {
@@ -1916,17 +2335,16 @@ impl Block {
         layer: &mut PagedLayer,
         step: &PagedStep,
     ) -> (Array, Array) {
-        let (x, n) = add_norm(x, pending, &self.input_layernorm);
+        let (x, n) = add_norm(x, pending, self.norms.input());
         let mixed = match &self.mixer {
             Mixer::Attention(a) => a.forward_paged(&n, layer, step),
             Mixer::Linear(l) => l.forward_paged(&n, layer, step),
+            // `PagedCache::new` refuses models with these mixers.
+            Mixer::Mamba(_) | Mixer::ShortConv(_) => unreachable!("refused by PagedCache::new"),
         };
-        let (h, n) = add_norm(
-            &x,
-            Some(&self.reduce(mixed)),
-            &self.post_attention_layernorm,
-        );
-        (h, self.reduce(self.mlp.forward(&n)))
+        let mixed = self.scaled(self.reduce(mixed));
+        let (h, n) = add_norm(&x, Some(&mixed), self.norms.post());
+        (h, self.scaled(self.reduce(self.mlp.forward(&n))))
     }
 }
 
@@ -1934,10 +2352,29 @@ impl Block {
 struct Body {
     embed_tokens: TokenEmbedding,
     layers: Vec<Block>,
-    norm: RmsNorm,
+    /// Transparent: `norm`, or LFM2's `embedding_norm`.
+    #[tree(rename = "")]
+    norm: FinalNorm,
     /// Gemma 4's per-layer inputs (transparent: named as mlx-lm's text model).
     #[tree(rename = "")]
     per_layer: Option<Box<gemma::PerLayer>>,
+}
+
+/// The norm after the last layer, under the family's name.
+#[derive(Debug, Clone, Module)]
+pub(crate) enum FinalNorm {
+    #[tree(rename = "norm")]
+    Norm(RmsNorm),
+    #[tree(rename = "embedding_norm")]
+    Embedding(RmsNorm),
+}
+
+impl FinalNorm {
+    pub(crate) fn get(&self) -> &RmsNorm {
+        match self {
+            Self::Norm(n) | Self::Embedding(n) => n,
+        }
+    }
 }
 
 /// A causal language model of the Llama family. A [`Module`] with Hugging Face's
@@ -1988,6 +2425,10 @@ impl Model {
                     (LayerType::Linear, Some(sizes)) => {
                         Mixer::Linear(GatedDeltaNet::new(&b, &path("linear_attn"), c, sizes)?)
                     }
+                    (LayerType::Mamba, _) => Mixer::Mamba(Mamba2::new(&b, &path("mamba"), c)?),
+                    (LayerType::ShortConv, _) => {
+                        Mixer::ShortConv(ShortConv::new(&b, &path("conv"), c)?)
+                    }
                     _ => Mixer::Attention(Attention::new(
                         &b,
                         &path("self_attn"),
@@ -1998,6 +2439,15 @@ impl Model {
                 Ok(Block {
                     mixer,
                     mlp: match c.moe.as_ref().filter(|m| m.is_sparse(i)) {
+                        Some(moe) if c.granite.is_some() => BlockMlp::Granite(Box::new(
+                            GraniteMlp::new(&b, &format!("model.layers.{i}"), c.hidden_size, moe)?,
+                        )),
+                        None if c.lfm2.is_some() => BlockMlp::Lfm2(Box::new(FeedForward::new(
+                            &b,
+                            &path("feed_forward"),
+                            c.hidden_size,
+                            c.intermediate_size,
+                        )?)),
                         Some(moe) if c.model_type == "gpt_oss" => BlockMlp::GptOss(Box::new(
                             GptOssMlp::new(&b, &path("mlp"), c.hidden_size, moe)?,
                         )),
@@ -2015,8 +2465,17 @@ impl Model {
                             c.mlp_bias,
                         )?)),
                     },
-                    input_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps),
-                    post_attention_layernorm: Builder::norm(c.hidden_size, c.rms_norm_eps),
+                    norms: match c.lfm2 {
+                        Some(_) => Norms::Lfm2 {
+                            operator_norm: Builder::norm(c.hidden_size, c.rms_norm_eps),
+                            ffn_norm: Builder::norm(c.hidden_size, c.rms_norm_eps),
+                        },
+                        None => Norms::standard(
+                            Builder::norm(c.hidden_size, c.rms_norm_eps),
+                            Builder::norm(c.hidden_size, c.rms_norm_eps),
+                        ),
+                    },
+                    residual_multiplier: c.granite.map(|g| g.residual_multiplier),
                     group: None,
                     gemma: None,
                 })
@@ -2028,7 +2487,10 @@ impl Model {
             model: Body {
                 embed_tokens: b.embedding("model.embed_tokens", c.vocab_size, c.hidden_size)?,
                 layers,
-                norm: Builder::norm(c.hidden_size, c.rms_norm_eps),
+                norm: match c.lfm2 {
+                    Some(_) => FinalNorm::Embedding(Builder::norm(c.hidden_size, c.rms_norm_eps)),
+                    None => FinalNorm::Norm(Builder::norm(c.hidden_size, c.rms_norm_eps)),
+                },
                 per_layer: None,
             },
             lm_head: (!c.tie_word_embeddings)
@@ -2067,7 +2529,7 @@ impl Model {
                     PagedKind::Keys(a.window.map(|w| usize::try_from(w).unwrap_or(0)))
                 }
                 Mixer::Attention(_) => PagedKind::Shared,
-                Mixer::Linear(_) => PagedKind::States,
+                Mixer::Linear(_) | Mixer::Mamba(_) | Mixer::ShortConv(_) => PagedKind::States,
             })
             .collect()
     }
@@ -2099,9 +2561,27 @@ impl Model {
             .iter()
             .map(|b| match &b.mixer {
                 Mixer::Attention(a) => a.window.map_or_else(KvCache::default, KvCache::windowed),
-                Mixer::Linear(_) => KvCache::default(),
+                Mixer::Linear(_) | Mixer::Mamba(_) | Mixer::ShortConv(_) => KvCache::default(),
             })
             .collect()
+    }
+
+    /// Whether layer `i` is a short convolution (LFM2).
+    pub(crate) fn short_conv(&self, i: usize) -> bool {
+        matches!(
+            self.model.layers.get(i).map(|b| &b.mixer),
+            Some(Mixer::ShortConv(_))
+        )
+    }
+
+    /// The model's layers keep states that cannot be rolled back or paged (Mamba-2, short
+    /// convolutions): the family's name, for the refusal.
+    pub(crate) fn unpageable(&self) -> Option<&str> {
+        self.model
+            .layers
+            .iter()
+            .any(|b| matches!(b.mixer, Mixer::Mamba(_) | Mixer::ShortConv(_)))
+            .then_some(self.config.model_type.as_str())
     }
 
     /// [`new_cache`](Self::new_cache) with `options`' KV quantization.
@@ -2172,7 +2652,7 @@ impl Model {
         if let Some(stage) = &self.stage {
             return self.forward_stage(stage, tokens, mask, cache);
         }
-        let mut h = self.model.embed_tokens.forward(tokens);
+        let mut h = self.embed(tokens);
         let mut pending = None;
         for (layer, c) in self.model.layers.iter().zip(cache) {
             let (next, mlp) = match self.grad_checkpoint && c.uncached {
@@ -2181,7 +2661,7 @@ impl Model {
             };
             (h, pending) = (next, Some(mlp));
         }
-        let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
+        let (_, h) = add_norm(&h, pending.as_ref(), self.model.norm.get());
         (self.head(&h), h)
     }
 
@@ -2218,7 +2698,7 @@ impl Model {
             (h, pending) = (next, Some(mlp));
         }
         if stage.is_last() {
-            let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
+            let (_, h) = add_norm(&h, pending.as_ref(), self.model.norm.get());
             return (self.head(&h), h);
         }
         let (logits, h, sent) = self.stage_output(stage, tokens, &h, pending);
@@ -2237,7 +2717,7 @@ impl Model {
         tokens: &Array,
     ) -> (Array, Option<Array>) {
         if stage.is_first() {
-            return (self.model.embed_tokens.forward(tokens), None);
+            return (self.embed(tokens), None);
         }
         let shape = tokens.shape();
         let hidden = self.config.hidden_size as i32;
@@ -2279,9 +2759,14 @@ impl Model {
         (after(&logits), after(h), sent)
     }
 
-    /// The token embeddings of `tokens` (not evaluated).
+    /// The token embeddings of `tokens` (not evaluated), times Granite 4's
+    /// `embedding_multiplier`.
     pub(crate) fn embed(&self, tokens: &Array) -> Array {
-        self.model.embed_tokens.forward(tokens)
+        let h = self.model.embed_tokens.forward(tokens);
+        match self.config.granite {
+            Some(g) => h.multiply(f64::from(g.embedding_multiplier)),
+            None => h,
+        }
     }
 
     pub(crate) fn set_stage(&mut self, stage: crate::pipeline::Stage) {
@@ -2420,6 +2905,11 @@ impl Model {
             Some(head) => head.forward(h),
             None => self.model.embed_tokens.as_linear(h),
         };
+        // Granite 4's logits are divided by its `logits_scaling`.
+        let logits = match self.config.granite {
+            Some(g) => logits.divide(f64::from(g.logits_scaling)),
+            None => logits,
+        };
         match (&self.sharding, self.vocab_sharded) {
             // Every rank's vocabulary rows, joined along the last axis (the gather joins
             // along the first).
@@ -2493,11 +2983,7 @@ impl Model {
                 let (h, pending) = self.stage_input(stage, tokens);
                 (h, pending, stage.layers())
             }
-            None => (
-                self.model.embed_tokens.forward(tokens),
-                None,
-                0..layers.len(),
-            ),
+            None => (self.embed(tokens), None, 0..layers.len()),
         };
         for (layer, pages) in self.model.layers[range.clone()]
             .iter()
@@ -2509,7 +2995,7 @@ impl Model {
         match &self.stage {
             Some(stage) if !stage.is_last() => self.stage_output(stage, tokens, &h, pending).0,
             _ => {
-                let (_, h) = add_norm(&h, pending.as_ref(), &self.model.norm);
+                let (_, h) = add_norm(&h, pending.as_ref(), self.model.norm.get());
                 self.head(&h)
             }
         }

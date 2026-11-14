@@ -73,6 +73,57 @@ pub enum LayerType {
     Attention,
     /// Gated DeltaNet linear attention (Qwen 3.5), with a recurrent state.
     Linear,
+    /// A Mamba-2 mixer (Granite 4), with a convolution and an SSM state.
+    Mamba,
+    /// A gated short convolution (LFM2), with a convolution state.
+    ShortConv,
+}
+
+/// Granite 4's settings (mlx-lm's `granitemoehybrid`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Granite {
+    /// The embeddings' factor (`embedding_multiplier`).
+    pub embedding_multiplier: f32,
+    /// The factor of each mixer's and MLP's output before the residual addition.
+    pub residual_multiplier: f32,
+    /// The attention scale (`attention_multiplier`).
+    pub attention_multiplier: f32,
+    /// The logits' divisor (`logits_scaling`).
+    pub logits_scaling: f32,
+    /// Rotary embeddings in attention layers (`position_embedding_type` is not `nope`).
+    pub rope: bool,
+    /// The Mamba-2 mixers' sizes.
+    pub mamba: Mamba,
+}
+
+/// The sizes of Granite 4's Mamba-2 mixers (`mamba_*` settings).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Mamba {
+    /// SSM heads.
+    pub heads: usize,
+    /// Features per head.
+    pub head_dim: usize,
+    /// The SSM state per group (a multiple of 32).
+    pub state: usize,
+    /// Groups of `B` and `C` (heads a multiple of them).
+    pub groups: usize,
+    /// Width of the causal depthwise convolution.
+    pub conv_kernel: usize,
+    /// Biases on the input and output projections.
+    pub proj_bias: bool,
+    /// A bias on the convolution.
+    pub conv_bias: bool,
+    /// `dt`'s clip range (`time_step_limit`).
+    pub time_step_limit: (f32, f32),
+}
+
+/// LFM2's short convolutions (mlx-lm's `lfm2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lfm2 {
+    /// Width of the depthwise convolution (`conv_L_cache`).
+    pub conv_kernel: usize,
+    /// Biases on the convolution and its projections.
+    pub conv_bias: bool,
 }
 
 /// The sizes of Gated DeltaNet layers (`linear_*` settings).
@@ -198,7 +249,8 @@ impl Gemma4 {
 /// gpt-oss, Gemma 4) or a hybrid of attention and Gated DeltaNet layers (Qwen 3.5).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `gpt_oss` or `gemma4`.
+    /// `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `gpt_oss`, `gemma4`,
+    /// `granitemoehybrid` or `lfm2`.
     pub model_type: String,
     /// Width of the residual stream.
     pub hidden_size: usize,
@@ -251,6 +303,10 @@ pub struct Config {
     pub attention_sinks: bool,
     /// Gemma 4's settings.
     pub gemma4: Option<Gemma4>,
+    /// Granite 4's settings.
+    pub granite: Option<Granite>,
+    /// LFM2's settings.
+    pub lfm2: Option<Lfm2>,
     /// Multi-token-prediction decoder layers (`mtp_num_hidden_layers`, Qwen 3.5–3.8; 0
     /// without). The head exists once its weights are loaded ([`crate::Model::has_mtp`]).
     pub mtp_layers: usize,
@@ -352,8 +408,12 @@ impl Config {
             // mlx-lm's gpt-oss: biases on all four projections, no q/k norms.
             "gpt_oss" => (true, true, false),
             "gemma4" => (false, false, true),
+            "granitemoehybrid" => (flag("attention_bias"), flag("attention_bias"), false),
+            "lfm2" => (false, false, true),
             other => return Err(invalid(format!("unsupported model type {other:?}"))),
         };
+        let granite = model_type == "granitemoehybrid";
+        let lfm2 = model_type == "lfm2";
         let gpt_oss = model_type == "gpt_oss";
         let gemma = model_type == "gemma4";
         let hybrid = model_type == "qwen3_5";
@@ -388,6 +448,30 @@ impl Config {
                         .iter()
                         .map(|i| non_negative("mlp_only_layers", i))
                         .collect::<Result<_>>()?,
+                    router_bias: false,
+                    expert_bias: false,
+                    activation: Activation::SwiGlu,
+                })
+            }
+            _ if granite && opt_int("num_local_experts")?.unwrap_or(0) > 0 => {
+                // mlx-lm's Granite 4: a router over every expert, the softmax of the best `k`
+                // logits (as gpt-oss's, without biases), SwiGLU experts and a shared MLP.
+                let experts = int("num_local_experts")?;
+                let experts_per_token =
+                    positive("num_experts_per_tok", int("num_experts_per_tok")?)?;
+                if experts_per_token > experts {
+                    return Err(invalid(format!(
+                        "{experts_per_token} experts per token of {experts}"
+                    )));
+                }
+                Some(MixtureOfExperts {
+                    experts,
+                    experts_per_token,
+                    intermediate_size: int("intermediate_size")?,
+                    shared_intermediate_size: Some(int("shared_intermediate_size")?),
+                    norm_topk_prob: true,
+                    sparse_step: 1,
+                    dense_layers: Vec::new(),
                     router_bias: false,
                     expert_bias: false,
                     activation: Activation::SwiGlu,
@@ -453,7 +537,44 @@ impl Config {
             opt_int("head_dim")?.unwrap_or(if gemma { 256 } else { hidden_size / heads }),
         )?;
         let layers = int("num_hidden_layers")?;
-        let layer_types = if hybrid {
+        let layer_types = if granite {
+            c.get("layer_types")
+                .and_then(Json::as_array)
+                .ok_or_else(|| invalid("`layer_types` missing"))?
+                .iter()
+                .map(|t| match t.as_str() {
+                    Some("attention") => Ok(LayerType::Attention),
+                    Some("mamba") => Ok(LayerType::Mamba),
+                    other => Err(invalid(format!("unsupported layer type {other:?}"))),
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else if lfm2 {
+            match c.get("full_attn_idxs").and_then(Json::as_array) {
+                Some(idxs) => {
+                    let idxs = idxs
+                        .iter()
+                        .map(|i| non_negative("full_attn_idxs", i))
+                        .collect::<Result<Vec<_>>>()?;
+                    (0..layers)
+                        .map(|i| match idxs.contains(&i) {
+                            true => LayerType::Attention,
+                            false => LayerType::ShortConv,
+                        })
+                        .collect()
+                }
+                None => c
+                    .get("layer_types")
+                    .and_then(Json::as_array)
+                    .ok_or_else(|| invalid("`full_attn_idxs` or `layer_types` missing"))?
+                    .iter()
+                    .map(|t| match t.as_str() {
+                        Some("full_attention") => Ok(LayerType::Attention),
+                        Some("conv") => Ok(LayerType::ShortConv),
+                        other => Err(invalid(format!("unsupported layer type {other:?}"))),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }
+        } else if hybrid {
             match c.get("layer_types").and_then(Json::as_array) {
                 Some(types) => types
                     .iter()
@@ -541,8 +662,73 @@ impl Config {
         } else {
             None
         };
+        let granite_settings = match granite {
+            true => {
+                let mamba = Mamba {
+                    heads: positive("mamba_n_heads", int("mamba_n_heads")?)?,
+                    head_dim: positive("mamba_d_head", int("mamba_d_head")?)?,
+                    state: positive("mamba_d_state", int("mamba_d_state")?)?,
+                    groups: positive("mamba_n_groups", int("mamba_n_groups")?)?,
+                    conv_kernel: positive("mamba_d_conv", int("mamba_d_conv")?)?,
+                    proj_bias: flag("mamba_proj_bias"),
+                    conv_bias: flag("mamba_conv_bias"),
+                    time_step_limit: match c.get("time_step_limit").and_then(Json::as_array) {
+                        Some([lo, hi]) => (
+                            lo.as_f64().unwrap_or(0.001) as f32,
+                            hi.as_f64().unwrap_or(100.0) as f32,
+                        ),
+                        _ => (0.001, 100.0),
+                    },
+                };
+                if !mamba.heads.is_multiple_of(mamba.groups) {
+                    return Err(invalid("Mamba heads must be a multiple of groups"));
+                }
+                let multiplier =
+                    |k: &str| float(k).ok_or_else(|| invalid(format!("`{k}` missing")));
+                Some(Granite {
+                    embedding_multiplier: multiplier("embedding_multiplier")?,
+                    residual_multiplier: multiplier("residual_multiplier")?,
+                    attention_multiplier: multiplier("attention_multiplier")?,
+                    logits_scaling: multiplier("logits_scaling")?,
+                    rope: c.get("position_embedding_type").and_then(Json::as_str) != Some("nope"),
+                    mamba,
+                })
+            }
+            false => None,
+        };
+        let lfm2_settings = match lfm2 {
+            true => Some(Lfm2 {
+                conv_kernel: positive("conv_L_cache", int("conv_L_cache")?)?,
+                conv_bias: flag("conv_bias"),
+            }),
+            false => None,
+        };
+        // LFM2's MLP width (mlx-lm's `MLP`): `block_ff_dim` (or `intermediate_size`), adjusted
+        // to 2/3, scaled by `block_ffn_dim_multiplier` and rounded up to `block_multiple_of`.
+        let lfm2_ff = match lfm2 {
+            true => {
+                let mut ff = match opt_int("block_ff_dim")? {
+                    Some(ff) => ff,
+                    None => int("intermediate_size")?,
+                };
+                if flag("block_auto_adjust_ff_dim") {
+                    ff = 2 * ff / 3;
+                    if let Some(m) = float("block_ffn_dim_multiplier") {
+                        ff = (f64::from(m) * ff as f64) as usize;
+                    }
+                    let multiple = positive("block_multiple_of", int("block_multiple_of")?)?;
+                    ff = ff.div_ceil(multiple) * multiple;
+                }
+                Some(ff)
+            }
+            false => None,
+        };
         let partial = rope_float("partial_rotary_factor").unwrap_or(1.0);
-        let rope_dims = (head_dim as f32 * partial) as usize;
+        // Granite 4 without rotary embeddings (`nope`) rotates no feature.
+        let rope_dims = match granite_settings {
+            Some(g) if !g.rope => 0,
+            _ => (head_dim as f32 * partial) as usize,
+        };
         let gemma4 = match gemma {
             true => Some(gemma4(c, &opt_int, head_dim, kv_heads, layers)?),
             false => None,
@@ -560,11 +746,14 @@ impl Config {
         Ok(Self {
             hidden_size,
             num_hidden_layers: layers,
-            intermediate_size: match &moe {
+            intermediate_size: match (&moe, lfm2_ff) {
+                (_, Some(ff)) => ff,
                 // MoE configs may have no dense MLP width.
-                Some(m) => opt_int("intermediate_size")?.unwrap_or(m.intermediate_size),
-                None => int("intermediate_size")?,
+                (Some(m), _) => opt_int("intermediate_size")?.unwrap_or(m.intermediate_size),
+                (None, _) => int("intermediate_size")?,
             },
+            granite: granite_settings,
+            lfm2: lfm2_settings,
             moe,
             layer_types,
             layer_windows,
@@ -577,12 +766,15 @@ impl Config {
             num_key_value_heads: kv_heads,
             head_dim,
             vocab_size: positive("vocab_size", vocab_size)?,
-            rms_norm_eps: float("rms_norm_eps").unwrap_or(1e-6),
+            rms_norm_eps: float("rms_norm_eps")
+                .or_else(|| float("norm_eps"))
+                .unwrap_or(1e-6),
             // mlx-lm's defaults when the key is absent.
             rope_theta: rope_float("rope_theta").unwrap_or(match model_type.as_str() {
                 "qwen2" => 1e6,
                 "gpt_oss" => 150_000.0,
                 "qwen3_5" | "qwen3_5_moe" => 100_000.0,
+                "lfm2" => 1e6,
                 _ => 10_000.0,
             }),
             rope_scaling: match (hybrid, qwen3_moe) {
@@ -599,7 +791,8 @@ impl Config {
                 .get("tie_word_embeddings")
                 .or_else(|| c.get("tie_word_embeddings"))
                 .and_then(Json::as_bool)
-                .unwrap_or(gemma),
+                // mlx-lm's LFM2 always ties them; Granite 4 by default.
+                .unwrap_or(gemma || lfm2 || granite),
             qkv_bias,
             o_bias,
             mlp_bias: flag("mlp_bias"),

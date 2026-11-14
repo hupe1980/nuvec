@@ -8,12 +8,22 @@ All notable changes to nuvec are documented here. The format follows
 
 ### Added
 
+- Granite 4 (`granitemoehybrid`: Mamba-2 and attention layers, experts with a shared MLP
+  or dense) and LFM2 (`lfm2`: gated short convolutions and attention) in nuvec-lm, with
+  mlx-lm's parameter names and results, in mlx-community and Hugging Face layouts; prompt
+  caches and quantized KV caches work with them. Speculative decoding, the paged `Batcher`
+  and tensor parallelism refuse them.
 - Quantized KV caches, as mlx-lm's `kv_bits`, `kv_group_size` and `quantized_kv_start`:
   `GenerateOptions::kv_quant` (`KvQuant`), `KvCache::quantize`, `quantize_at`,
   `is_quantized` and `nbytes`. The attention equals mlx-lm's bit for bit; sliding-window
   layers and sinks are supported too. Prompt-cache files read and write `QuantizedKVCache`
   layers. The `generate` example takes `--kv-bits`, `--kv-group-size` and
   `--quantized-kv-start`.
+
+### Changed
+
+- `nuvec_lm::LayerType` has `Mamba` and `ShortConv` (breaking for exhaustive matches);
+  `Config` has `granite` and `lfm2`.
 
 ### Fixed
 

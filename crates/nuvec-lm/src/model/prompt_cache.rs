@@ -43,7 +43,10 @@ pub fn save_prompt_cache(
         let mut put = |key: String, a: Array| tensors.push((key, a));
         let class = if c.conv.is_some() || c.recurrent.is_some() {
             put(format!("{i}.0.0"), c.conv.clone().unwrap_or_else(none));
-            put(format!("{i}.0.1"), c.recurrent.clone().unwrap_or_else(none));
+            // LFM2's short convolutions keep one state (mlx-lm's `ArraysCache(size=1)`).
+            if c.recurrent.is_some() || !model.short_conv(i) {
+                put(format!("{i}.0.1"), c.recurrent.clone().unwrap_or_else(none));
+            }
             for j in [1, 2] {
                 put(format!("{i}.{j}"), none());
                 scalars.push((format!("{i}.{j}"), "none"));
@@ -223,9 +226,11 @@ pub fn load_prompt_cache(
                     ..KvCache::default()
                 }
             }
+            // Size 2 (Gated DeltaNet, Mamba-2: convolution and recurrent state) or 1 (LFM2's
+            // short convolution).
             "ArraysCache" => KvCache {
                 conv: present(tensor(format!("{i}.0.0"))?),
-                recurrent: present(tensor(format!("{i}.0.1"))?),
+                recurrent: t.get(&format!("{i}.0.1")).cloned().and_then(present),
                 ..KvCache::default()
             },
             other => {

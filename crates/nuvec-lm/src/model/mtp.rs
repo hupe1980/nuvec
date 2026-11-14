@@ -11,7 +11,8 @@ use nuvec::{Array, Error, Result, ops};
 use nuvec_nn::{Module, RmsNorm};
 
 use super::{
-    Attention, Block, BlockMlp, Builder, KvCache, Mixer, Mlp, Model, MoeMlp, Projection, add_norm,
+    Attention, Block, BlockMlp, Builder, KvCache, Mixer, Mlp, Model, MoeMlp, Norms, Projection,
+    add_norm,
 };
 use crate::config::{Config, LayerQuant};
 
@@ -44,8 +45,11 @@ impl MtpHead {
                             c.mlp_bias,
                         )?)),
                     },
-                    input_layernorm: Builder::norm(d, c.rms_norm_eps),
-                    post_attention_layernorm: Builder::norm(d, c.rms_norm_eps),
+                    norms: Norms::standard(
+                        Builder::norm(d, c.rms_norm_eps),
+                        Builder::norm(d, c.rms_norm_eps),
+                    ),
+                    residual_multiplier: None,
                     group: None,
                     gemma: None,
                 })

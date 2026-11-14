@@ -21,7 +21,7 @@ evaluation mode (`expected.safetensors`).
 Usage: `just lm-fixtures` (or `uv run scripts/lm_fixtures.py`; `--only chained_sampler,eos`
 records just those).
 
-`--only kv_quant` records mlx-lm's quantized KV caches (generation and a prompt cache) on the
+`--only hybrids` records Granite 4 and LFM2 models; `--only kv_quant` records mlx-lm's quantized KV caches (generation and a prompt cache) on the
 head-32 models.
 
 `--cached [repo…]` records, for each model of `CACHED` in the local Hugging Face cache (or
@@ -172,7 +172,8 @@ def main() -> None:
              "adapters": adapters, "fp": fp_models, "packed": packed_models,
              "ops": ops_fixtures, "gpt_oss": gpt_oss_models, "gemma4": gemma4_models,
              "o200k": o200k_splits, "spm": spm_tokenizers, "mtp": mtp_heads,
-             "ssm": ssm, "prompt_cache": prompt_caches, "kv_quant": kv_quant}[name]()
+             "ssm": ssm, "prompt_cache": prompt_caches, "kv_quant": kv_quant,
+             "hybrids": hybrids}[name]()
         return
     mx.random.seed(20261018)
     for name, (family, args, dtype, quant) in CASES.items():
@@ -477,6 +478,98 @@ def prompt_caches() -> None:
         mx.save_safetensors(str(OUT / name / "prompt_cache_next.safetensors"),
                             {"token": nxt, "logits": logits})
         print(f"{name}: prompt cache of {len(cache)} layers")
+
+
+GRANITE4 = dict(model_type="granitemoehybrid", vocab_size=128, hidden_size=64,
+                intermediate_size=32, num_hidden_layers=4, max_position_embeddings=512,
+                num_attention_heads=2, num_key_value_heads=1, attention_bias=False,
+                embedding_multiplier=1.5, attention_multiplier=0.25, logits_scaling=2.0,
+                residual_multiplier=0.5, rms_norm_eps=1e-6,
+                layer_types=["mamba", "mamba", "attention", "mamba"],
+                num_local_experts=8, num_experts_per_tok=2, shared_intermediate_size=64,
+                mamba_n_heads=4, mamba_d_head=16, mamba_proj_bias=False, mamba_d_state=32,
+                mamba_d_conv=4, mamba_n_groups=1, mamba_conv_bias=True,
+                position_embedding_type="rope", tie_word_embeddings=True,
+                rope_parameters={"rope_theta": 10000.0})
+LFM2 = dict(model_type="lfm2", vocab_size=128, hidden_size=64, num_hidden_layers=4,
+            num_attention_heads=2, num_key_value_heads=1, max_position_embeddings=512,
+            norm_eps=1e-5, conv_bias=False, conv_L_cache=3, block_dim=64,
+            block_multiple_of=16, block_ffn_dim_multiplier=1.0, block_auto_adjust_ff_dim=True,
+            block_ff_dim=96, full_attn_idxs=[1, 3], rope_theta=1e6)
+
+
+def hybrids() -> None:
+    """Granite 4 (`granitemoehybrid`: Mamba-2 and attention layers; MoE with a shared MLP,
+    or dense without RoPE) and LFM2 (`lfm2`: short convolutions and attention, its config
+    with `full_attn_idxs` only): float32 and 4-bit (Granite's router in 8 bits, mlx-lm's
+    `quant_predicate`), and Hugging Face layouts (`*_hf`: conv weights `[C, 1, K]`,
+    Granite's `input_linear`/`output_linear`); `prompt_cache.safetensors` for the float32
+    MoE Granite and LFM2."""
+    from mlx_lm.models import granitemoehybrid, lfm2
+    from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache
+
+    def build(family, args, seed, dtype=None, quant=None):
+        mx.random.seed(seed)
+        model = family.Model(family.ModelArgs.from_dict(args))
+        model.update(tree_map_random(model.parameters()))
+        config = dict(args)
+        if dtype is not None:
+            model.set_dtype(dtype)
+        if quant is not None:
+            group_size, bits = quant
+            config["quantization"] = {"group_size": group_size, "bits": bits}
+
+            def predicate(path, module):
+                if not hasattr(module, "to_quantized"):
+                    return False
+                if path.endswith("router.layer"):
+                    config["quantization"][path] = {"group_size": group_size, "bits": 8}
+                    return {"group_size": group_size, "bits": 8}
+                return True
+            nn.quantize(model, group_size=group_size, bits=bits, class_predicate=predicate)
+        mx.eval(model.parameters())
+        return model, config
+
+    def hf(weights):
+        out = {}
+        for k, v in weights.items():
+            if k.endswith("conv1d.weight") or k.endswith("conv.conv.weight"):
+                out[k] = v.transpose(0, 2, 1)
+            elif ".switch_mlp.gate_proj." in k:
+                up = weights[k.replace("gate_proj", "up_proj")]
+                out[k.replace("switch_mlp.gate_proj", "input_linear")] = mx.concatenate([v, up], 1)
+            elif ".switch_mlp.up_proj." in k:
+                continue
+            elif ".switch_mlp.down_proj." in k:
+                out[k.replace("switch_mlp.down_proj", "output_linear")] = v
+            else:
+                out[k] = v
+        return out
+
+    prompt = mx.array(PROMPT, dtype=mx.uint32)
+    dense = dict(GRANITE4, num_local_experts=None, num_experts_per_tok=None,
+                 shared_intermediate_size=None, position_embedding_type="nope")
+    for name, family, args, seed, dtype, quant in [
+        ("granite4_moe_f32", granitemoehybrid, GRANITE4, 20261114, None, None),
+        ("granite4_dense_f32", granitemoehybrid, dense, 20261115, None, None),
+        ("granite4_moe_q4", granitemoehybrid, GRANITE4, 20261116, mx.bfloat16, (32, 4)),
+        ("lfm2_f32", lfm2, LFM2, 20261117, None, None),
+        ("lfm2_q4", lfm2, LFM2, 20261118, mx.bfloat16, (32, 4)),
+    ]:
+        model, config = build(family, args, seed, dtype, quant)
+        weights = dict(tree_flatten(model.parameters()))
+        record(model, OUT / name, config, weights)
+        if quant is None and name != "granite4_dense_f32":
+            hf_name = name.replace("_f32", "_hf")
+            record(model, OUT / hf_name, config, hf(weights))
+            cache = make_prompt_cache(model)
+            model(prompt[None], cache=cache)
+            save_prompt_cache(str(OUT / name / "prompt_cache.safetensors"), cache,
+                              {"model": name})
+            nxt = mx.array([[PROMPT[-1]]], dtype=mx.uint32)
+            logits = model(nxt, cache=cache).astype(mx.float32)
+            mx.save_safetensors(str(OUT / name / "prompt_cache_next.safetensors"),
+                                {"token": nxt, "logits": logits})
 
 
 KV_QUANT = [(8, 32, 0), (4, 32, 0), (8, 32, len(PROMPT) + 3)]
