@@ -1,13 +1,14 @@
 //! Few-row products (B = 1..16 rows: dense, quantized, gathered), compared against 0.3.0's
 //! routing and MLX by `scripts/bench_rows.py` (`just bench-rows`). Prints
 //! `name<TAB>dtype<TAB>B<TAB>us` per case: time per product in sustained `async_eval`
-//! bursts after a warm-up (best of three).
+//! bursts after a warm-up (best of three). `BENCH_EXACT=1` builds and evaluates under
+//! `with_row_exact` (lanes that must equal their solo runs).
 
 use std::time::Instant;
 
 use nuvec_core::{
     Array, DType, Device, GatherQmm, Quant, Result, Stream, async_eval, eval, ops,
-    set_default_stream,
+    set_default_stream, with_row_exact,
 };
 
 fn uniform(shape: &[usize], dtype: DType) -> Result<Array> {
@@ -37,6 +38,26 @@ fn make(name: &str, dtype: DType, b: usize) -> Result<Op> {
         let (k, n) = (dims(name)[0], dims(name)[1]);
         let (x, w) = (uniform(&[b, k], dtype)?, uniform(&[n, k], dtype)?);
         return Ok(Box::new(move || Ok(x.matmul(&w.t()))));
+    }
+    if name.starts_with("affine4stream") {
+        // Decode's case: 16 weights in turn (128 MB), so each product reads from memory.
+        let (n, k) = (dims(name)[0], dims(name)[1]);
+        let ws = (0..16)
+            .map(|i| {
+                let w = uniform(&[n, k], dtype)?
+                    .add(i as f32 * 1e-3)
+                    .quantize(Quant::affine(64, 4));
+                eval(&w)?;
+                Ok(w)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let x = uniform(&[b, k], dtype)?;
+        let turn = std::cell::Cell::new(0usize);
+        return Ok(Box::new(move || {
+            let i = turn.get();
+            turn.set((i + 1) % ws.len());
+            Ok(x.quantized_matmul(&ws[i], true))
+        }));
     }
     if name.starts_with("affine") {
         let bits = if name.starts_with("affine8") { 8 } else { 4 };
@@ -98,6 +119,7 @@ const CASES: &[(&str, DType)] = &[
     ("dense-4096x4096", DType::F32),
     ("dense-head-1024x151936", DType::BF16),
     ("affine4-4096x4096", DType::BF16),
+    ("affine4stream-4096x4096", DType::BF16),
     ("affine4-12288x4096", DType::BF16),
     ("affine8-4096x4096", DType::BF16),
     ("gather_qmm4-moe128-768x2048", DType::BF16),
@@ -111,7 +133,14 @@ fn main() -> Result<()> {
     }
     set_default_stream(Stream::default_for(Device::gpu(0)));
     let filter = std::env::var("BENCH_FILTER").unwrap_or_default();
-    for &(name, dtype) in CASES.iter().filter(|(n, _)| n.contains(filter.as_str())) {
+    if std::env::var("BENCH_EXACT").as_deref() == Ok("1") {
+        return with_row_exact(|| run(&filter));
+    }
+    run(&filter)
+}
+
+fn run(filter: &str) -> Result<()> {
+    for &(name, dtype) in CASES.iter().filter(|(n, _)| n.contains(filter)) {
         let label = match dtype {
             DType::F16 => "float16",
             DType::BF16 => "bfloat16",

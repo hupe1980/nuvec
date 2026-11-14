@@ -25,6 +25,8 @@ The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each 
 | `gated_delta(q, k, v, g, beta, state)` | The Gated DeltaNet recurrence (Qwen 3.5's linear attention), returning the outputs and the new state |
 | `gated_delta_steps(q, k, v, g, beta, state)` | The same, returning the state after every step (to roll the recurrence back) |
 | `gated_delta_slots(q, k, v, g, beta, pool, slots)` | The same for a batch whose states live at slots of a pool, updated in place |
+| `ssm_update(x, a_log, b, c, d, dt, state)` | Mamba-2's one-token state update (Granite 4's SSM layers), mlx-lm's kernel and bits |
+| `ssm_scan(x, a_log, b, c, d, dt, state)` | Mamba-2's prompt pass (mlx-lm's `ssm_attn`, the SSD scan in chunks of 256), mlx-lm's bits |
 | `causal_conv1d_slots(x, w, pool, slots, silu)` | A causal depthwise convolution (optionally `silu`) for a batch whose last inputs live at slots of a pool, updated in place |
 | `paged_attention(q, k_cache, v_cache, block_tables, lengths, scale, &options)` | Attention for a batch of sequences of different lengths over a KV cache stored in fixed-size blocks, with the same window and sinks |
 | `moe_route(probs, k, normalize)` | A mixture of experts' routing: each row's top-k experts (in `argpartition`'s order) and their probabilities, optionally renormalised |

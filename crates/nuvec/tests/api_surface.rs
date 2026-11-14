@@ -1835,3 +1835,33 @@ mod spec_079 {
         let _ = residual;
     }
 }
+
+mod spec_099_100 {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use nuvec::{Array, Result, fast};
+    use nuvec_lm::{KvCache, Model};
+
+    #[test]
+    fn the_items_exist() {
+        const _: fn(&Array, &Array, &Array, &Array, &Array, &Array, &Array) -> (Array, Array) =
+            fast::ssm_update;
+        const _: fn(
+            &Array,
+            &Array,
+            &Array,
+            &Array,
+            &Array,
+            &Array,
+            Option<&Array>,
+        ) -> (Array, Array) = fast::ssm_scan;
+        let _ =
+            |p: &Path, m: &Model, c: &[KvCache], meta: &BTreeMap<String, String>| -> Result<()> {
+                nuvec_lm::save_prompt_cache(p, m, c, meta)
+            };
+        let _ = |p: &Path, m: &Model| -> Result<(Vec<KvCache>, BTreeMap<String, String>)> {
+            nuvec_lm::load_prompt_cache(p, m)
+        };
+    }
+}

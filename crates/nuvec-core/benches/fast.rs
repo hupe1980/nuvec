@@ -42,6 +42,11 @@ const CASES: &[(&str, &[usize])] = &[
     ("sdpa-verify8-4k", &[1, 32, 8, 8, 4096, 128]),
     ("sdpa-verify4-q36", &[1, 16, 2, 4, 8194, 256]),
     ("sdpa-verify8-q36", &[1, 16, 2, 8, 32768, 256]),
+    // Qwen3.8-27B's verification at a 21K-token context (MTP's 1.66× falls to 1.19× there):
+    // one row, and 4 and 8 rows.
+    ("sdpa-q38-decode-21k", &[1, 24, 4, 1, 21019, 256]),
+    ("sdpa-q38-verify4-21k", &[1, 24, 4, 4, 21022, 256]),
+    ("sdpa-q38-verify8-21k", &[1, 24, 4, 8, 21026, 256]),
     // Sliding windows (`-w<keys>`): gpt-oss (D 64, W 128) and Gemma 4 sliding layers
     // (D 256, W 1024).
     ("sdpa-wdecode-w128", &[1, 64, 8, 1, 4096, 64]),

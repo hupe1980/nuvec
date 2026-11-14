@@ -34,6 +34,7 @@
 mod chunked;
 pub(crate) mod imp;
 pub(crate) mod plan;
+mod ssm;
 
 use std::panic::Location;
 
@@ -819,6 +820,67 @@ pub fn gated_delta(
         &[q, k, v, g, beta, state],
         || {
             let (y, s) = imp::gated_delta(q, k, v, g, beta, state)?;
+            Ok([y, s])
+        },
+    );
+    (y, s)
+}
+
+/// Mamba-2's one-token state update (mlx-lm's `ssm_update` for one token), for `x`
+/// `[batch, 1, heads, head_dim]`, `b` and `c` `[batch, 1, groups, state]` (state a multiple
+/// of 32, heads a multiple of groups), `a_log` and `d` `[heads]`, `dt` `[batch, 1, heads]`
+/// (after mlx-lm's `compute_dt`: `clip(softplus(dt + dt_bias))` in float32) and `state`
+/// `[batch, heads, head_dim, state]`. Returns the output (`x`'s dtype) and the next state
+/// (`state`'s dtype): `state' = exp(−exp(a_log) · dt) · state + x · dt · b` and
+/// `y = Σ state' · c + x · d`.
+///
+/// On the GPU it is mlx-lm's Metal kernel, unchanged (its bits); on the CPU the same
+/// arithmetic in float32. No derivative (inference only).
+#[track_caller]
+pub fn ssm_update(
+    x: &Array,
+    a_log: &Array,
+    b: &Array,
+    c: &Array,
+    d: &Array,
+    dt: &Array,
+    state: &Array,
+) -> (Array, Array) {
+    let [y, s] = Array::sticky_n(
+        "ssm_update",
+        Location::caller(),
+        &[x, a_log, b, c, d, dt, state],
+        || {
+            let (y, s) = ssm::ssm_update(x, a_log, b, c, d, dt, state)?;
+            Ok([y, s])
+        },
+    );
+    (y, s)
+}
+
+/// Mamba-2's prompt pass (mlx-lm's `ssm_attn`, the SSD scan, without a mask): `x`
+/// `[batch, tokens, heads, head_dim]`, `b` and `c` `[batch, tokens, groups, state]`, `dt`
+/// `[batch, tokens, heads]` (after `compute_dt`, float32), `a_log` and `d` `[heads]`, and
+/// the state before the prompt if any. Tokens run in chunks of 256, each composed as
+/// mlx-lm's (segment sums, decays and products in its order), so the GPU gives mlx-lm's
+/// bits. Returns the output (`x`'s dtype) and the float32 state after the last token; one
+/// token with a state is [`ssm_update`]'s work.
+#[track_caller]
+pub fn ssm_scan(
+    x: &Array,
+    a_log: &Array,
+    b: &Array,
+    c: &Array,
+    d: &Array,
+    dt: &Array,
+    state: Option<&Array>,
+) -> (Array, Array) {
+    let [y, s] = Array::sticky_n(
+        "ssm_scan",
+        Location::caller(),
+        &operands(&[x, a_log, b, c, d, dt], &[state]),
+        || {
+            let (y, s) = ssm::ssm_scan(x, a_log, b, c, d, dt, state, 256)?;
             Ok([y, s])
         },
     );

@@ -6641,8 +6641,9 @@ mod metal {
                 return self.dispatch_groups(&name, &args, grid, [32, 2, 1]);
             }
             let fast = k % (pack_factor(bits, 32) * if bits == 2 { 1 } else { 2 } * 32) == 0;
-            if transpose && fast && !batched && m >= 4 {
-                // nuvec's few-row kernel: weights loaded once for two rows.
+            if transpose && fast && !batched && m >= 2 {
+                // nuvec's few-row kernel: weights loaded once for two rows, each with
+                // `qmv_fast`'s arithmetic (lanes: two cost about one).
                 args.push(Arg::bytes(&mb));
                 let name = format!(
                     "nuvec_affine_qmv_rows_{base}_pr{}_r2",
@@ -7448,6 +7449,7 @@ mod metal {
             donated: Option<Data>,
         ) -> Result<Vec<Data>> {
             use crate::distributed::{CollectiveOp, Input, Ready};
+            crate::distributed::check_gpu_ranks(group)?;
             let device = self
                 .device()
                 .ok_or(Error::UnsupportedDevice(Device::gpu(0)))?;

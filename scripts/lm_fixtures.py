@@ -168,7 +168,8 @@ def main() -> None:
             {"chained_sampler": chained_sampler, "eos": eos, "samplers": samplers,
              "adapters": adapters, "fp": fp_models, "packed": packed_models,
              "ops": ops_fixtures, "gpt_oss": gpt_oss_models, "gemma4": gemma4_models,
-             "o200k": o200k_splits, "spm": spm_tokenizers, "mtp": mtp_heads}[name]()
+             "o200k": o200k_splits, "spm": spm_tokenizers, "mtp": mtp_heads,
+             "ssm": ssm, "prompt_cache": prompt_caches}[name]()
         return
     mx.random.seed(20261018)
     for name, (family, args, dtype, quant) in CASES.items():
@@ -215,6 +216,8 @@ def main() -> None:
     ops_fixtures()
     gpt_oss_models()
     mtp_heads()
+    ssm()
+    prompt_caches()
 
 
 # Floating-point quantized models, as `mlx_lm.convert --q-mode` writes them (its own
@@ -414,6 +417,63 @@ def ops_fixtures() -> None:
     path = OUT.parent.parent.parent / "nuvec-nn/tests/fixtures/mlx_lm_ops.safetensors"
     mx.save_safetensors(str(path), out)
     print(f"ops: {len(out)} tensors -> {path}")
+
+
+def ssm() -> None:
+    """mlx-lm's Mamba-2 one-token update (its Metal kernel) and prompt scan (`ssm_attn`), in
+    `ssm.safetensors`: per case `<case>.<input>` and `<case>.y`, `<case>.state`."""
+    import numpy as np
+    from mlx_lm.models import ssm as ssm_ops
+
+    g = np.random.default_rng(20261114)
+
+    def rand(*shape, scale=1.0, dtype=mx.float32):
+        return mx.array((g.standard_normal(shape) * scale).astype(np.float32)).astype(dtype)
+
+    out = {}
+    # (name, batch, heads, groups, head_dim, state, x dtype, state dtype, tokens)
+    cases = [("f32", 2, 8, 2, 16, 64, mx.float32, mx.float32, 1),
+             ("bf16", 1, 8, 1, 32, 128, mx.bfloat16, mx.float32, 1),
+             ("f16", 2, 4, 4, 16, 32, mx.float16, mx.float16, 1),
+             ("prompt", 1, 8, 2, 16, 64, mx.float32, mx.float32, 300),
+             ("prompt_bf16", 1, 8, 2, 16, 64, mx.bfloat16, mx.float32, 37)]
+    for name, n, h, gr, dh, ds, dt, st, t in cases:
+        ins = dict(x=rand(n, t, h, dh, dtype=dt), a_log=rand(h, scale=0.5),
+                   b=rand(n, t, gr, ds, dtype=dt), c=rand(n, t, gr, ds, dtype=dt),
+                   d=rand(h, dtype=dt), dt=rand(n, t, h, dtype=dt), dt_bias=rand(h),
+                   state=rand(n, h, dh, ds, scale=0.5, dtype=st))
+        y, state = ssm_ops.ssm_update(ins["x"], ins["a_log"], ins["b"], ins["c"], ins["d"],
+                                      ins["dt"], ins["dt_bias"], ins["state"])
+        ins["dt_after"] = ssm_ops.compute_dt(ins["dt"], ins["dt_bias"], (0.001, 100.0))
+        for k, v in ins.items():
+            out[f"{name}.{k}"] = v
+        out[f"{name}.y"], out[f"{name}.next"] = y, state
+    mx.eval(out)
+    path = OUT / "ssm.safetensors"
+    mx.save_safetensors(str(path), out)
+    print(f"ssm: {len(out)} tensors -> {path}")
+
+
+def prompt_caches() -> None:
+    """mlx-lm's `save_prompt_cache` after the prompt of `qwen3_f32` (KVCache), `qwen3_5_f32`
+    (ArraysCache and KVCache) and `gpt_oss_f32` (RotatingKVCache, window shorter than the
+    prompt), with the logits of the next token, in `<model>/prompt_cache.safetensors` and
+    `<model>/prompt_cache_next.safetensors`."""
+    from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache
+    from mlx_lm.utils import load_model
+
+    for name in ("qwen3_f32", "qwen3_5_f32", "gpt_oss_f32"):
+        model, _ = load_model(OUT / name)
+        cache = make_prompt_cache(model)
+        prompt = mx.array(PROMPT, dtype=mx.uint32)
+        model(prompt[None], cache=cache)
+        save_prompt_cache(str(OUT / name / "prompt_cache.safetensors"), cache,
+                          {"model": name})
+        nxt = mx.array([[PROMPT[-1]]], dtype=mx.uint32)
+        logits = model(nxt, cache=cache).astype(mx.float32)
+        mx.save_safetensors(str(OUT / name / "prompt_cache_next.safetensors"),
+                            {"token": nxt, "logits": logits})
+        print(f"{name}: prompt cache of {len(cache)} layers")
 
 
 # gpt-oss (mlx-lm's `gpt_oss`): sliding (W 4, shorter than the prompt) and full layers,

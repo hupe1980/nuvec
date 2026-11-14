@@ -18,6 +18,8 @@ use crate::config::{
 };
 
 mod gemma;
+mod prompt_cache;
+pub use prompt_cache::{load_prompt_cache, save_prompt_cache};
 mod mtp;
 mod shard;
 
@@ -1818,6 +1820,15 @@ impl Model {
                 Mixer::Linear(_) => KvCache::default(),
             })
             .collect()
+    }
+
+    /// The factor between mlx-lm's cached keys and this model's for layer `layer` at
+    /// `dtype`: YaRN's mscale where it is folded into the attention scale (float32), else 1.
+    pub(crate) fn cached_key_factor(&self, layer: usize, dtype: DType) -> f32 {
+        match self.model.layers.get(layer).map(|b| &b.mixer) {
+            Some(Mixer::Attention(a)) if a.mscale != 1.0 && !a.explicit_mscale(dtype) => a.mscale,
+            _ => 1.0,
+        }
     }
 
     /// The logits `[B, L, vocab]` for tokens `[B, L]` with no cache, as mlx-lm's

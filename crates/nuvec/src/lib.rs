@@ -115,7 +115,9 @@
 //!   weights once give a row other low bits than its one-row product. The row-wise
 //!   operations of a decode step are row-independent always: `rms_norm`, `add_rms_norm`, `rope` and
 //!   `norm_rope` with per-row offsets, element-wise operations, vector attention over equal
-//!   key lengths, `gated_delta` and `gated_delta_slots`.
+//!   key lengths, `gated_delta` and `gated_delta_slots`. On the CPU every product of up to
+//!   16 rows reduces each element in one order that depends only on K, so these rules hold
+//!   there too, in or outside [`with_row_exact`].
 //! - **Batch items of quantized products:** under [`with_row_exact`], a quantized product
 //!   over `[B, L, K]` (tiled, `L` above the matrix-vector limit) gives each item the bits of
 //!   its product alone (`[1, L, K]`): the split-K partitions are counted per item, so
@@ -124,9 +126,11 @@
 //! - **Speculative verification (the serial rule):** attention with 2 to 8 causal query
 //!   rows gives each row the bits of the one-query call over its causal key prefix
 //!   ([`fast::scaled_dot_product_attention`]); in float32 at head sizes 192 and 256, for at
-//!   most `32 / gqa` rows (more compose). With [`speculative::accept_greedy`] and
-//!   [`fast::gated_delta_steps_with`], run under [`with_row_exact`], a verification step
-//!   decodes exactly the tokens serial decoding would.
+//!   most `32 / gqa` rows (more compose). The CPU's composed attention keeps the rule (a
+//!   key prefix padded by masked keys reduces to the same bits). With
+//!   [`speculative::accept_greedy`] and [`fast::gated_delta_steps_with`], run under
+//!   [`with_row_exact`], a verification step decodes exactly the tokens serial decoding
+//!   would.
 //! - **Sliding windows:** a vector-kernel attention row with a window gives the bits of
 //!   the unmasked one-query call over exactly its window's keys, so a compacted contiguous
 //!   cache and the paged cache give the same bits (a batch-invariant `Batcher` serves

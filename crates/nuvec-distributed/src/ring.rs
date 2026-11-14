@@ -27,6 +27,8 @@ pub(crate) struct Ring {
     failed: std::sync::Mutex<Option<String>>,
     /// How long a transfer may make no progress before it fails.
     timeout: Duration,
+    /// A hash of the node list: ranks of one ring share it ([`Communicator::membership`]).
+    membership: u64,
 }
 
 fn peer_error(peer: usize, what: &str, e: impl std::fmt::Display) -> Error {
@@ -165,6 +167,12 @@ impl Ring {
             scratch: (0..parts).map(|_| std::sync::Mutex::default()).collect(),
             failed: std::sync::Mutex::new(None),
             timeout,
+            membership: {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                nodes.hash(&mut h);
+                h.finish()
+            },
         })
     }
 
@@ -657,6 +665,10 @@ impl Ring {
 impl Communicator for Ring {
     fn rank(&self) -> usize {
         self.rank
+    }
+
+    fn membership(&self) -> Option<u64> {
+        Some(self.membership)
     }
 
     fn size(&self) -> usize {
