@@ -90,3 +90,8 @@ all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "deny"
 multiple_unsafe_ops_per_block = "deny"
 missing_safety_doc = "deny"
+
+# Tests and examples run optimized (debug assertions and overflow checks stay on): the
+# suites' CPU reference paths are 20–40× slower unoptimized. Dependents ignore this.
+[profile.dev]
+opt-level = 1
