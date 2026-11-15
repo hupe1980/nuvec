@@ -6,6 +6,8 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-15
+
 ### Added
 
 - DFlash speculative decoding (`DFlashDrafter`): z-lab's DFlash and DFlash 2 block
@@ -744,7 +746,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/hupe1980/nuvec/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/hupe1980/nuvec/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/hupe1980/nuvec/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/hupe1980/nuvec/compare/v0.9.0...v0.10.0
