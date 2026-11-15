@@ -2597,15 +2597,16 @@ template <typename T, int group_size, int bits, bool fast, bool partial_rows, in
   }
 }
 
-// ── Quantize and dequantize (no global scale) ──
+// ── Quantize and dequantize (MLX's, with the NVFP4 global scale) ──
 
 // One thread per value; a group is 32 (mx modes) or 16 (nvfp4, half a SIMD group) adjacent
 // threads.
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, bool has_global_scale = false>
 [[kernel]] void fp_quantize(
     const device T* w [[buffer(0)]],
     device uint8_t* out [[buffer(1)]],
     device uint8_t* scales [[buffer(2)]],
+    const device float* global_scale [[buffer(3)]],
     uint2 tidx [[thread_position_in_grid]],
     uint2 grid_dim [[threads_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -2613,6 +2614,9 @@ template <typename T, int group_size, int bits>
   size_t index = tidx.x + grid_dim.x * size_t(tidx.y);
 
   float scale_enc = 1.0f;
+  if constexpr (has_global_scale) {
+    scale_enc = (F8E4M3_MAX * F4E2M1_MAX) / *global_scale;
+  }
 
   float scale_dec_b;
   float w_thread = w[index];
@@ -2624,7 +2628,9 @@ template <typename T, int group_size, int bits>
     scale_dec_b = simd_lid < 16 ? w_max_l : w_max_r;
   }
   scale_dec_b /= bits == 4 ? F4E2M1_MAX : F8E4M3_MAX;
-  if constexpr (use_mx_scale) {
+  if constexpr (has_global_scale) {
+    scale_dec_b *= scale_enc;
+  } else if constexpr (use_mx_scale) {
     scale_dec_b = mx_scale_round_up(scale_dec_b);
   }
 
@@ -2650,11 +2656,12 @@ template <typename T, int group_size, int bits>
 }
 
 // One thread per packed byte (two E2M1 values or one E4M3 value).
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, bool has_global_scale = false>
 [[kernel]] void fp_dequantize(
     const device uint8_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
-    device T* out [[buffer(2)]],
+    const device float* global_scale [[buffer(2)]],
+    device T* out [[buffer(3)]],
     uint2 index [[thread_position_in_grid]],
     uint2 grid_dim [[threads_per_grid]]) {
   constexpr bool use_mx_scale = group_size == 32;
@@ -2665,9 +2672,17 @@ template <typename T, int group_size, int bits>
 
   out += oindex;
 
+  float inv_scale_enc = 1.0f;
+  if constexpr (has_global_scale) {
+    inv_scale_enc = *global_scale / (F8E4M3_MAX * F4E2M1_MAX);
+  }
+
   using ScaleType = metal::conditional_t<use_mx_scale, fp8_e8m0, fp8_e4m3>;
   auto q_scale = ((device ScaleType*)(scales))[gindex];
   auto scale = float(q_scale);
+  if constexpr (has_global_scale) {
+    scale *= inv_scale_enc;
+  }
 
   uint val = w[offset];
 #pragma clang loop unroll(full)
@@ -2680,6 +2695,49 @@ template <typename T, int group_size, int bits>
     }
     out[i] = static_cast<T>(scale * Dequantize<bits>{}(d));
   }
+}
+
+// The values the quantization represents, in `T` (`qqmm`'s activations), one thread per
+// value, with MLX's rounding (`(scale / scale_enc) · code`).
+template <typename T, int group_size, int bits, bool has_global_scale = false>
+[[kernel]] void fp_quantize_dequantize(
+    const device T* w [[buffer(0)]],
+    const device float* global_scale [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    uint2 tidx [[thread_position_in_grid]],
+    uint2 grid_dim [[threads_per_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr bool use_mx_scale = group_size == 32;
+  size_t index = tidx.x + grid_dim.x * size_t(tidx.y);
+
+  float scale_enc = 1.0f;
+  if constexpr (has_global_scale) {
+    scale_enc = (F8E4M3_MAX * F4E2M1_MAX) / *global_scale;
+  }
+
+  float scale_dec_b;
+  float w_thread = w[index];
+  if constexpr (use_mx_scale) {
+    scale_dec_b = simd_max(abs(w_thread));
+  } else {
+    float w_max_l = simd_max(simd_lid < 16 ? abs(w_thread) : 0.0);
+    float w_max_r = simd_max(simd_lid >= 16 ? abs(w_thread) : 0.0);
+    scale_dec_b = simd_lid < 16 ? w_max_l : w_max_r;
+  }
+  scale_dec_b /= bits == 4 ? F4E2M1_MAX : F8E4M3_MAX;
+  if constexpr (has_global_scale) {
+    scale_dec_b *= scale_enc;
+  } else if constexpr (use_mx_scale) {
+    scale_dec_b = mx_scale_round_up(scale_dec_b);
+  }
+
+  using ScaleType = metal::conditional_t<use_mx_scale, fp8_e8m0, fp8_e4m3>;
+  auto scale = float(ScaleType(scale_dec_b));
+
+  float scale_enc_b = (scale == 0) ? 0.0f : (scale_enc / scale);
+  uint8_t output = Quantize<bits>{}(w_thread * scale_enc_b);
+
+  out[index] = static_cast<T>((scale / scale_enc) * Dequantize<bits>{}(output));
 }
 
 } // namespace fpq

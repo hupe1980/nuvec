@@ -207,13 +207,12 @@ fn main() -> Result<()> {
             let indices = Array::from_slice(&ids, [m]);
             let scale = random::uniform(0.5, 2.0, [experts.max(1)], DType::F32, None);
             nuvec_core::eval(&(&wq, &x, &scale))?;
+            let wq = match global {
+                true => wq.with_global_scale(scale.clone()),
+                false => wq,
+            };
             let product = || -> Array {
                 let options = GatherQmm::default().sorted_indices(true);
-                let options = if global {
-                    options.global_scale(&scale)
-                } else {
-                    options
-                };
                 match gathered {
                     true => x.gather_qmm(&wq, None, Some(&indices), options),
                     false => x.quantized_matmul(&wq, transpose),

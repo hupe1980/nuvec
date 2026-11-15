@@ -861,7 +861,11 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
         Primitive::Quantize { quant } => {
             let (group_size, bits) = quant.checked("quantize")?;
             if quant.mode != crate::QuantMode::Affine {
-                let (packed, scales) = kernels::fp_quantize(operands[0], group_size, bits)?;
+                let g = operands
+                    .get(1)
+                    .map(|&g| kernels::scalar_f32(g))
+                    .transpose()?;
+                let (packed, scales) = kernels::fp_quantize(operands[0], group_size, bits, g)?;
                 return Ok(vec![Data::new(packed), Data::new(scales)]);
             }
             let (packed, scales, biases) = kernels::quantize(operands[0], group_size, bits)?;
@@ -877,7 +881,13 @@ fn cpu(primitive: &Primitive, operands: &[Operand<'_>]) -> Result<Vec<Data>> {
                 crate::QuantMode::Affine => {
                     kernels::dequantize(operands[0], operands[1], operands[2], group_size, bits)?
                 }
-                _ => kernels::fp_dequantize(operands[0], operands[1], group_size, bits, *dtype)?,
+                _ => {
+                    let g = operands
+                        .get(2)
+                        .map(|&g| kernels::scalar_f32(g))
+                        .transpose()?;
+                    kernels::fp_dequantize(operands[0], operands[1], group_size, bits, *dtype, g)?
+                }
             })
         }
         Primitive::QuantizedMatmul {

@@ -222,8 +222,22 @@ pub(crate) fn block_masked_compose(
 pub enum QqmmWeight<'a> {
     /// A float weight `[N, K]` and the mode to quantize it (and the activations) in.
     Dense(&'a Array, Quant),
-    /// A weight quantized with a floating-point mode.
+    /// A float weight `[N, K]` quantized to NVFP4 with this float32 global scale
+    /// (MLX's `global_scale_w`).
+    Scaled(&'a Array, &'a Array),
+    /// A weight quantized with a floating-point mode (and, NVFP4, its global scale).
     Quantized(&'a Quantized),
+}
+
+impl QqmmWeight<'_> {
+    /// The arrays the product reads.
+    pub(crate) fn arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::Dense(w, _) => vec![w],
+            Self::Scaled(w, g) => vec![w, g],
+            Self::Quantized(q) => q.arrays().collect(),
+        }
+    }
 }
 
 impl<'a> From<&'a Array> for QqmmWeight<'a> {
@@ -274,8 +288,10 @@ fn real_not_f64(name: &str, what: &str, x: &Array) -> Result<()> {
     Ok(())
 }
 
-/// MLX's `qqmm` product: its matrix-vector kernels for every row count (`dispatch_qmv`).
-fn row_product(x: &Array, w: &Quantized) -> Result<Array> {
+/// MLX's `qqmm` product: its matrix-vector kernels for every row count (`dispatch_qmv`),
+/// or with global scales and weights quantized beforehand (`matrix`), its `qmm_t` from the
+/// vector limit.
+fn row_product(x: &Array, w: &Quantized, matrix: bool) -> Result<Array> {
     crate::quantized::quantized_product(
         x,
         &w.weight,
@@ -283,48 +299,103 @@ fn row_product(x: &Array, w: &Quantized) -> Result<Array> {
         w.biases.as_ref(),
         true,
         w.quant,
-        true,
+        !matrix,
+        w.global_scale.as_ref(),
     )
 }
 
-/// `x` through its quantization: the values `quant` represents, in `x`'s dtype.
-fn fake_quant(x: &Array, quant: Quant) -> Result<Array> {
-    ops::dequantize(&ops::quantize(x, quant), x.dtype()).into_result()
+/// `x` through its quantization: the values `quant` represents, in `x`'s dtype (MLX's
+/// `fp_quantize_dequantize`, with an optional NVFP4 global scale).
+fn fake_quant(x: &Array, quant: Quant, global_scale: Option<&Array>) -> Result<Array> {
+    let op = crate::fast::imp::FastOp::QuantizeDequantize { quant };
+    let mut inputs = vec![x.clone()];
+    inputs.extend(global_scale.cloned());
+    // Recorded on both devices: the CPU runs the kernel's arithmetic.
+    Ok(Array::from_op(crate::graph::Primitive::Fast(op), inputs)?.swap_remove(0))
+}
+
+/// MLX's `qqmm` rule: NVFP4 global scales for both operands or neither.
+fn qq_scales<'a>(
+    name: &str,
+    w: &QqmmWeight<'a>,
+    global_scale_x: Option<&'a Array>,
+) -> Result<Option<(&'a Array, &'a Array)>> {
+    let gw = match w {
+        QqmmWeight::Dense(..) => None,
+        QqmmWeight::Scaled(_, g) => Some(*g),
+        QqmmWeight::Quantized(q) => q.global_scale.as_ref(),
+    };
+    match (global_scale_x, gw) {
+        (Some(x), Some(w)) => Ok(Some((x, w))),
+        (None, None) => Ok(None),
+        _ => Err(invalid(
+            name,
+            "for nvfp4, give global scales for both the activations and the weight, or neither",
+        )),
+    }
 }
 
 /// MLX's `qqmm` on a 2-D activation: `x_q · w_qᵀ` with both quantized in `quant`'s mode.
-fn qqmm_2d(x: &Array, w: QqmmWeight<'_>) -> Result<Array> {
+fn qqmm_2d(x: &Array, w: QqmmWeight<'_>, global_scale_x: Option<&Array>) -> Result<Array> {
     let name = "qqmm";
+    let scales = qq_scales(name, &w, global_scale_x)?;
+    let gx = scales.map(|(x, _)| x);
     match w {
         QqmmWeight::Quantized(q) => {
             let quant = qq_quant(name, q.quant)?;
-            row_product(&fake_quant(x, quant)?, q)
+            row_product(&fake_quant(x, quant, gx)?, q, scales.is_some())
         }
-        QqmmWeight::Dense(w, quant) => {
-            let quant = qq_quant(name, quant)?;
-            real_not_f64(name, "weight", w)?;
-            // MLX's backward: the cotangent and the transposed operands quantized too.
-            let f = custom_function_flat(move |p: &[Array]| {
-                let wq = ops::quantize(&p[1], quant);
-                Ok(vec![row_product(&fake_quant(&p[0], quant)?, &wq)?])
-            })
-            .with_vjp(move |p: &[Array], _o: &[Array], c: &[Array]| {
-                let wt = ops::swapaxes(&p[1], -1, -2);
-                let xt = ops::swapaxes(&p[0], -1, -2);
-                let ct = ops::swapaxes(&c[0], -1, -2);
-                Ok(vec![
-                    qqmm_2d(&c[0], QqmmWeight::Dense(&wt, quant))?,
-                    qqmm_2d(&ct, QqmmWeight::Dense(&xt, quant))?,
-                ])
-            });
-            Ok(f.call(&[x.clone(), w.clone()])?.remove(0))
+        QqmmWeight::Dense(w, quant) => dense_qqmm(x, w, qq_quant(name, quant)?, None),
+        QqmmWeight::Scaled(w, gw) => {
+            let gx = gx.expect("both scales");
+            dense_qqmm(x, w, Quant::new(QuantMode::Nvfp4), Some((gx, gw)))
         }
     }
 }
 
+/// `qqmm` of a dense weight, quantized for the product, with MLX's backward
+/// (`QQMatmul::vjp`): the cotangent and the transposed operands quantized too, the
+/// cotangent's global scale its largest magnitude (float32) when global scales are given.
+fn dense_qqmm(
+    x: &Array,
+    w: &Array,
+    quant: Quant,
+    scales: Option<(&Array, &Array)>,
+) -> Result<Array> {
+    real_not_f64("qqmm", "weight", w)?;
+    let product = move |x: &Array, w: &Array, gx: Option<&Array>, gw: Option<&Array>| {
+        let wq = match gw {
+            Some(g) => ops::quantize_scaled(w, g),
+            None => ops::quantize(w, quant),
+        };
+        row_product(&fake_quant(x, quant, gx)?, &wq, false)
+    };
+    let mut primals = vec![x.clone(), w.clone()];
+    if let Some((gx, gw)) = scales {
+        primals.extend([gx.clone(), gw.clone()]);
+    }
+    let f = custom_function_flat(move |p: &[Array]| {
+        Ok(vec![product(&p[0], &p[1], p.get(2), p.get(3))?])
+    })
+    .with_vjp(move |p: &[Array], _o: &[Array], c: &[Array]| {
+        let c = &c[0];
+        let gc = (p.len() == 4).then(|| c.abs().max(..).astype(DType::F32));
+        let wt = ops::swapaxes(&p[1], -1, -2);
+        let xt = ops::swapaxes(&p[0], -1, -2);
+        let ct = ops::swapaxes(c, -1, -2);
+        let mut grads = vec![
+            product(c, &wt, gc.as_ref(), p.get(3))?,
+            product(&ct, &xt, gc.as_ref(), p.get(2))?,
+        ];
+        grads.extend(p[2..].iter().map(ops::zeros_like));
+        Ok(grads)
+    });
+    Ok(f.call(&primals)?.remove(0))
+}
+
 /// MLX's `qqmm`: `x` (`[..., K]`, a vector or a batch of rows) times `wᵀ` (`[N, K]`) with
 /// both quantized in a floating-point mode.
-pub(crate) fn qqmm(x: &Array, w: QqmmWeight<'_>) -> Result<Array> {
+pub(crate) fn qqmm(x: &Array, w: QqmmWeight<'_>, global_scale_x: Option<&Array>) -> Result<Array> {
     real_not_f64("qqmm", "activation", x)?;
     let (lead, x2) = match x.ndim() {
         0 => {
@@ -343,7 +414,7 @@ pub(crate) fn qqmm(x: &Array, w: QqmmWeight<'_>) -> Result<Array> {
             )
         }
     };
-    let y = qqmm_2d(&x2, w)?;
+    let y = qqmm_2d(&x2, w, global_scale_x)?;
     let n = *y.dims().last().expect("an axis");
     Ok(match lead {
         None => y.reshape([n as i32]),
@@ -362,19 +433,31 @@ pub(crate) fn gather_qqmm(
     lhs_indices: Option<&Array>,
     rhs_indices: Option<&Array>,
     sorted_indices: bool,
+    global_scale_x: Option<&Array>,
 ) -> Result<Array> {
     let name = "gather_qqmm";
     real_not_f64(name, "activation", x)?;
-    let owned;
-    let (q, quant) = match w {
-        QqmmWeight::Quantized(q) => (q, qq_quant(name, q.quant)?),
+    let scales = qq_scales(name, &w, global_scale_x)?;
+    let mut q = match w {
+        QqmmWeight::Quantized(q) => {
+            qq_quant(name, q.quant)?;
+            q.clone()
+        }
         QqmmWeight::Dense(w, quant) => {
-            let quant = qq_quant(name, quant)?;
             real_not_f64(name, "weight", w)?;
-            owned = ops::quantize(w, quant);
-            (&owned, quant)
+            ops::quantize(w, qq_quant(name, quant)?)
+        }
+        QqmmWeight::Scaled(w, g) => {
+            real_not_f64(name, "weight", w)?;
+            ops::quantize_scaled(w, g)
         }
     };
+    // MLX broadcasts the weight's one global scale to every expert.
+    if let Some(g) = q.global_scale.take() {
+        let experts = &q.weight.dims()[..q.weight.ndim() - 2];
+        q.global_scale = Some(g.reshape([] as [i32; 0]).broadcast_to(experts));
+    }
+    let x = fake_quant(x, q.quant, scales.map(|(x, _)| x))?;
     let options = GatherQmm::default().sorted_indices(sorted_indices);
-    ops::gather_qmm(&fake_quant(x, quant)?, q, lhs_indices, rhs_indices, options).into_result()
+    ops::gather_qmm(&x, &q, lhs_indices, rhs_indices, options).into_result()
 }

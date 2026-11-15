@@ -1652,7 +1652,7 @@ mod metal {
             if let Primitive::Quantize { quant } = primitive {
                 let (group_size, bits) = quant.checked("quantize")?;
                 if quant.mode != crate::QuantMode::Affine {
-                    return self.fp_quantize(operands[0], outputs, quant.mode);
+                    return self.fp_quantize(operands, outputs, quant.mode);
                 }
                 return self.quantize(operands[0], outputs, group_size, bits);
             }
@@ -4359,6 +4359,9 @@ mod metal {
             if *op == FastOp::SegmentedMm {
                 return self.segmented_mm(operands, &outputs[0]);
             }
+            if let FastOp::QuantizeDequantize { quant } = *op {
+                return self.quantize_dequantize(operands, &outputs[0], quant.mode);
+            }
             if let FastOp::BlockMaskedMm {
                 block_size,
                 out_mask,
@@ -4617,6 +4620,7 @@ mod metal {
                 | FastOp::Hadamard { .. }
                 | FastOp::SegmentedMm
                 | FastOp::BlockMaskedMm { .. }
+                | FastOp::QuantizeDequantize { .. }
                 | FastOp::PagedAttention { .. }
                 | FastOp::PagedWrite
                 | FastOp::MoeRoute { .. }
@@ -6115,14 +6119,39 @@ mod metal {
 
         /// MLX's `fp_quantize` (mxfp4, mxfp8, nvfp4): one thread per value, a group in
         /// adjacent lanes of a SIMD group (MLX's `get_quantize_kernel_dims`).
+        /// MLX's `fp_quantize_dequantize` (`qqmm`'s activations); an NVFP4 global scale
+        /// (`operands[1]`) selects `_hgs`.
+        fn quantize_dequantize(
+            &mut self,
+            operands: &[Operand<'_>],
+            o: &Output,
+            mode: crate::QuantMode,
+        ) -> Result<Vec<Data>> {
+            let hgs = if operands.len() > 1 { "_hgs" } else { "" };
+            let name = format!("nuvec_{mode}_quantize_dequantize_{}{hgs}", o.dtype.name());
+            let x = self.packed(operands[0], true)?;
+            let g = operands.get(1).map(|&g| self.packed(g, true)).transpose()?;
+            let mut out = Buffer::try_alloc_gpu(o.size * o.dtype.size())?;
+            let args = [
+                x.arg(),
+                g.as_ref().map_or_else(|| x.arg(), Packed::arg),
+                Arg::write(out.metal_mut().expect("device storage")),
+            ];
+            self.dispatch_linear(&name, &args, o.size)?;
+            Ok(vec![Data::new(out)])
+        }
+
+        /// MLX's `fp_quantize`; an NVFP4 global scale (`operands[1]`) selects `_hgs`.
         fn fp_quantize(
             &mut self,
-            w: Operand<'_>,
+            operands: &[Operand<'_>],
             outputs: &[Output],
             mode: crate::QuantMode,
         ) -> Result<Vec<Data>> {
-            let name = format!("nuvec_{mode}_quantize_{}", w.0.dtype.name());
-            let w = self.packed(w, true)?;
+            let hgs = if operands.len() > 1 { "_hgs" } else { "" };
+            let name = format!("nuvec_{mode}_quantize_{}{hgs}", operands[0].0.dtype.name());
+            let w = self.packed(operands[0], true)?;
+            let g = operands.get(1).map(|&g| self.packed(g, true)).transpose()?;
             let n = w.shape.iter().product::<usize>();
             let alloc = |o: &Output| Buffer::try_alloc_gpu(o.size * o.dtype.size());
             let (mut packed, mut scales) = (alloc(&outputs[0])?, alloc(&outputs[1])?);
@@ -6130,6 +6159,8 @@ mod metal {
                 w.arg(),
                 Arg::write(packed.metal_mut().expect("device storage")),
                 Arg::write(scales.metal_mut().expect("device storage")),
+                // Without a global scale the kernel does not read it.
+                g.as_ref().map_or_else(|| w.arg(), Packed::arg),
             ];
             self.dispatch_linear(&name, &args, n)?;
             Ok(vec![Data::new(packed), Data::new(scales)])
@@ -6189,6 +6220,34 @@ mod metal {
             ];
             let b = u8::from(batched);
             let output = buffer.metal_mut().expect("device storage");
+            if let Some(&g) = operands.get(3) {
+                // An NVFP4 global scale (transposed, one batch: the recording's condition):
+                // MLX's `QQMatmul` routing, `qmm_t` for bf16 quantized weights from the
+                // vector limit, else `dispatch_qmv` without `qmv_quad` and `qmv_wide`.
+                let g = self.packed(g, true)?;
+                let fast = k % (32 / bits * 2 * 32) == 0;
+                let matrix = !vector_rows
+                    && out.dtype == DType::BF16
+                    && k.is_multiple_of(32)
+                    && m >= qmv_batch_limit(k, n, generation, class);
+                let mut args = vec![w.arg(), s.arg(), g.arg(), x.arg(), Arg::write(output)];
+                args.extend([Arg::bytes(&kb), Arg::bytes(&nb)]);
+                if matrix {
+                    args.push(Arg::bytes(&mb));
+                    let al = u8::from(n.is_multiple_of(32));
+                    let name = format!("nuvec_{mode}_qmm_t_{dtype}_al{al}_batch0_hgs");
+                    let grid = [n.div_ceil(32), m.div_ceil(32), 1];
+                    return self.dispatch_groups(&name, &args, grid, [32, 2, 2]);
+                }
+                let name = match fast {
+                    true => format!(
+                        "nuvec_{mode}_qmv_fast_{dtype}_batch0_pr{}_r4_hgs",
+                        u8::from(!n.is_multiple_of(8))
+                    ),
+                    false => format!("nuvec_{mode}_qmv_{dtype}_batch0_hgs"),
+                };
+                return self.dispatch_groups(&name, &args, [m, n.div_ceil(8), 1], [32, 2, 1]);
+            }
             let quad = k == 128 || k == 64;
             // Row-exact (built or evaluated inside `with_row_exact`): matrix-vector products
             // up to `rows` rows; else MLX's routing, with `qmv_wide` from 2 rows.
@@ -6634,10 +6693,14 @@ mod metal {
                 self.packed(operands[0], true)?,
                 self.packed(operands[1], true)?,
             );
-            let name = format!("nuvec_{mode}_dequantize_{}", out.dtype.name());
+            // An NVFP4 global scale is the third operand (MLX's convention: no biases).
+            let g = operands.get(2).map(|&g| self.packed(g, true)).transpose()?;
+            let hgs = if g.is_some() { "_hgs" } else { "" };
+            let name = format!("nuvec_{mode}_dequantize_{}{hgs}", out.dtype.name());
             let args = [
                 w.arg(),
                 s.arg(),
+                g.as_ref().map_or_else(|| s.arg(), Packed::arg),
                 Arg::write(buffer.metal_mut().expect("device storage")),
             ];
             self.dispatch_linear(&name, &args, out.size / (8 / bits))
@@ -6717,6 +6780,53 @@ mod metal {
             // are partitioned as alone (`item`), so prompts prefilled together keep their
             // solo bits.
             let split = !batched && (exact || item == m);
+            if transpose && !exact && flat && m <= 16 {
+                // MLX's `qmv_mma` (`use_qmv_mma`, without the Neural Accelerators): 4 and
+                // 8 bits, from 3 rows (4 from generation 15), large aligned matrices, not
+                // on Ultra parts.
+                let nax = crate::NAX_ROUTE.with(std::cell::Cell::get)
+                    && self.device().is_some_and(|d| d.nax().is_active());
+                let offset = |p: &Packed<'_>| match p.arg() {
+                    Arg::Read(_, o) => o,
+                    _ => 0,
+                };
+                let size = out.dtype.size();
+                if !nax
+                    && class != 'd'
+                    && m >= if generation >= 15 { 4 } else { 3 }
+                    && k.is_multiple_of(128)
+                    && offset(&x).is_multiple_of(8 * size)
+                    && offset(&w).is_multiple_of(16)
+                    && offset(&s).is_multiple_of(2)
+                    && matches!(bits, 4 | 8)
+                    && n >= 512
+                    && k >= 512
+                    && n * k >= 1 << 21
+                    && n.is_multiple_of(16)
+                {
+                    let tm = if m > 8 { 2 } else { 1 };
+                    let bn = if generation < 15 && tm == 1 && n.is_multiple_of(32) {
+                        32
+                    } else {
+                        16
+                    };
+                    let ints = |v: usize| (v as i32).to_le_bytes();
+                    let (kb, nb, mb) = (ints(k), ints(n), ints(m));
+                    let output = buffer.metal_mut().expect("device storage");
+                    let args = [
+                        w.arg(),
+                        s.arg(),
+                        b.arg(),
+                        x.arg(),
+                        Arg::write(output),
+                        Arg::bytes(&kb),
+                        Arg::bytes(&nb),
+                        Arg::bytes(&mb),
+                    ];
+                    let name = format!("nuvec_affine_qmv_mma_{base}_wk4_bn{bn}_tm{tm}");
+                    return self.dispatch_groups(&name, &args, [n / bn, 1, 1], [32, 4, 1]);
+                }
+            }
             if item >= limit && transpose && split {
                 // The K partitions are chosen from one item's rows (`x`'s second-to-last
                 // dimension), not from all of them: each item of `[B, L, K]` then gets the

@@ -1221,7 +1221,14 @@ impl Primitive {
                     .collect());
             }
             Self::Quantize { quant } => {
-                let [w] = self.arity::<1>(inputs)?;
+                let w = match inputs {
+                    [w] => w,
+                    [w, g] => {
+                        self.global_scale(*quant, g)?;
+                        w
+                    }
+                    _ => return Err(self.arity::<1>(inputs).unwrap_err()),
+                };
                 let (group_size, bits) = quant.checked(self.name())?;
                 let n = w.ndim();
                 if !matches!(w.dtype(), DType::F16 | DType::BF16 | DType::F32) {
@@ -1252,7 +1259,13 @@ impl Primitive {
             }
             Self::Dequantize { quant, dtype } => {
                 let affine = quant.mode == crate::QuantMode::Affine;
-                let w = self.quantized_arity(inputs, 2 + usize::from(affine))?;
+                // A floating-point mode's third input is an NVFP4 global scale.
+                let scaled = !affine && inputs.len() == 3;
+                if scaled {
+                    self.global_scale(*quant, &inputs[2])?;
+                }
+                let w =
+                    self.quantized_arity(inputs, 2 + usize::from(affine) + usize::from(scaled))?;
                 let mut shape: Shape = w.dims().into();
                 let n = shape.len();
                 shape[n - 1] = self.quantized_columns(w, &inputs[1..], *quant)?;
@@ -1267,7 +1280,13 @@ impl Primitive {
                 quant, transpose, ..
             } => {
                 let affine = quant.mode == crate::QuantMode::Affine;
-                let x = self.quantized_arity(inputs, 3 + usize::from(affine))?;
+                // A floating-point mode's fourth input is an NVFP4 global scale.
+                let scaled = !affine && inputs.len() == 4;
+                if scaled {
+                    self.global_scale(*quant, &inputs[3])?;
+                }
+                let x =
+                    self.quantized_arity(inputs, 3 + usize::from(affine) + usize::from(scaled))?;
                 let (w, scales) = (&inputs[1], &inputs[2]);
                 let columns = self.quantized_columns(w, &inputs[2..], *quant)?;
                 let rows = w.dims()[w.ndim() - 2];
@@ -1356,6 +1375,25 @@ impl Primitive {
 
     /// The first input of a quantized primitive with `arity` inputs (affine has one more:
     /// the biases).
+    /// MLX's `validate_global_scale`: NVFP4 only, one float32 value.
+    pub(crate) fn global_scale(&self, quant: crate::Quant, g: &Array) -> Result<()> {
+        let name = self.name();
+        if quant.mode != crate::QuantMode::Nvfp4 {
+            return Err(Error::InvalidArgument(format!(
+                "{name}: a global scale is only supported for nvfp4, got {}",
+                quant.mode
+            )));
+        }
+        if g.size() != 1 || g.dtype() != DType::F32 {
+            return Err(Error::InvalidArgument(format!(
+                "{name}: the global scale must be one float32 value, got {} {:?}",
+                g.dtype(),
+                g.dims()
+            )));
+        }
+        Ok(())
+    }
+
     fn quantized_arity<'a>(&self, inputs: &'a [Array], arity: usize) -> Result<&'a Array> {
         if inputs.len() != arity {
             return Err(Error::InvalidArgument(format!(

@@ -81,7 +81,6 @@ fn serve(model: &Model) -> Vec<Vec<Event>> {
             blocks: Some(32),
             block_size: 4,
             max_batch: 4,
-            batch_invariant: true,
             ..Default::default()
         },
     )
@@ -89,6 +88,7 @@ fn serve(model: &Model) -> Vec<Vec<Event>> {
     for (p, max) in [(&[1u32, 2, 3][..], 6), (&[4, 5, 6, 7, 8], 3), (&[9, 10], 5)] {
         let o = GenerateOptions {
             max_tokens: max,
+            row_exact: true,
             ..GenerateOptions::default()
         };
         b.submit(p.to_vec(), o).unwrap();
@@ -225,6 +225,7 @@ fn sampling_and_failure(g: Group) {
         &sharded,
         &[1, 2, 3, 1, 2, 3, 1, 2],
         GenerateOptions {
+            row_exact: true,
             max_tokens: 8,
             ..GenerateOptions::default()
         },

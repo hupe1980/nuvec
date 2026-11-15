@@ -18,6 +18,7 @@
 #define NUVEC_FP_ALL(mode, iname, T, gs, b)                                               \
     NUVEC_FP(mode, quantize, iname, T, gs, b, "")                                         \
     NUVEC_FP(mode, dequantize, iname, T, gs, b, "")                                       \
+    NUVEC_FP(mode, quantize_dequantize, iname, T, gs, b, "")                              \
     NUVEC_FP(mode, qmv_quad, iname, T, gs, b, "_d64_batch0", 64, false)                   \
     NUVEC_FP(mode, qmv_quad, iname, T, gs, b, "_d64_batch1", 64, true)                    \
     NUVEC_FP(mode, qmv_quad, iname, T, gs, b, "_d128_batch0", 128, false)                 \
@@ -65,6 +66,19 @@
 
 // nvfp4 only: the global-scale gathers and the narrow `qmv_fast` (M5, MLX's `r_2`).
 #define NUVEC_FP_NV(iname, T)                                                             \
+    NUVEC_FP(nvfp4, quantize, iname, T, 16, 4, "_hgs", true)                              \
+    NUVEC_FP(nvfp4, dequantize, iname, T, 16, 4, "_hgs", true)                            \
+    NUVEC_FP(nvfp4, quantize_dequantize, iname, T, 16, 4, "_hgs", true)                   \
+    NUVEC_FP(nvfp4, qmv_fast, iname, T, 16, 4, "_batch0_pr0_r4_hgs", false, false, true, 4) \
+    NUVEC_FP(nvfp4, qmv_fast, iname, T, 16, 4, "_batch0_pr1_r4_hgs", false, true, true, 4) \
+    NUVEC_FP(nvfp4, qmv_fast, iname, T, 16, 4, "_batch1_pr0_r4_hgs", true, false, true, 4) \
+    NUVEC_FP(nvfp4, qmv_fast, iname, T, 16, 4, "_batch1_pr1_r4_hgs", true, true, true, 4) \
+    NUVEC_FP(nvfp4, qmv, iname, T, 16, 4, "_batch0_hgs", false, false, true)              \
+    NUVEC_FP(nvfp4, qmv, iname, T, 16, 4, "_batch1_hgs", true, false, true)               \
+    NUVEC_FP(nvfp4, qmm_t, iname, T, 16, 4, "_al0_batch0_hgs", false, false, true)        \
+    NUVEC_FP(nvfp4, qmm_t, iname, T, 16, 4, "_al1_batch0_hgs", true, false, true)         \
+    NUVEC_FP(nvfp4, qmm_t, iname, T, 16, 4, "_al0_batch1_hgs", false, true, true)         \
+    NUVEC_FP(nvfp4, qmm_t, iname, T, 16, 4, "_al1_batch1_hgs", true, true, true)          \
     NUVEC_FP(nvfp4, gather_qmv_fast, iname, T, 16, 4, "_hgs", true)                       \
     NUVEC_FP(nvfp4, gather_qmv, iname, T, 16, 4, "_hgs", true)                            \
     NUVEC_FP(nvfp4, gather_qvm, iname, T, 16, 4, "_hgs", true)                            \

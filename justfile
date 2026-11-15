@@ -189,6 +189,14 @@ bench-attention-route *filter:
 bench-rows *filter:
     uv run scripts/bench_rows.py {{filter}}
 
+# Decode attention over 8- and 4-bit KV caches against bf16 (4K–64K keys): nuvec vs MLX.
+bench-kv-attention:
+    uv run scripts/bench_kv_attention.py
+
+# DFlash decoding (Qwen3-8B 4-bit, 4-bit drafter) against plain decoding: nuvec vs dflash-mlx.
+bench-dflash:
+    uv run scripts/bench_dflash.py
+
 # Verify attention (1–8 causal rows over 4K–32K keys): nuvec vs MLX, and each against one row.
 bench-verify *filter:
     uv run scripts/bench_verify.py {{filter}}

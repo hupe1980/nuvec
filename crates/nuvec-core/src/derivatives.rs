@@ -258,6 +258,7 @@ fn scale_bias_grads(
                 Some(&zeros_like(biases)?),
                 quant,
                 None,
+                None,
             )?;
             Some(sum(
                 &multiply(&dw, grouped(&codes, group_size)?)?,
@@ -770,9 +771,20 @@ impl Primitive {
                     return Err(no_weight_gradient("quantized_matmul"));
                 }
                 let (x, w, scales) = (&inputs[0], &inputs[1], &inputs[2]);
-                let biases = inputs.get(3);
+                // The fourth input: affine biases, or a floating-point mode's global scale.
+                let affine = quant.mode == crate::QuantMode::Affine;
+                let biases = inputs.get(3).filter(|_| affine);
+                let global = inputs.get(3).filter(|_| !affine);
                 let dx = match wanted[0] {
-                    true => Some(quantized_matmul(g, w, scales, biases, !transpose, *quant)?),
+                    true => Some(quantized_matmul(
+                        g,
+                        w,
+                        scales,
+                        biases,
+                        !transpose,
+                        *quant,
+                        global,
+                    )?),
                     false => None,
                 };
                 let Some(biases) = biases else {
@@ -1029,6 +1041,7 @@ impl Primitive {
                     Some(&tangent(2)?),
                     *quant,
                     None,
+                    None,
                 ))
             }
             Self::Dequantize { quant, .. } => match tangents[1] {
@@ -1037,16 +1050,20 @@ impl Primitive {
             },
             Self::QuantizedMatmul { quant, transpose, .. } => {
                 let (x, w) = (&inputs[0], &inputs[1]);
-                let biases = inputs.get(3);
+                let affine = quant.mode == crate::QuantMode::Affine;
+                let biases = inputs.get(3).filter(|_| affine);
+                let global = inputs.get(3).filter(|_| !affine);
                 let mut total = match &tangents[0] {
-                    Some(t) => quantized_matmul(t, w, &inputs[2], biases, *transpose, *quant)?,
+                    Some(t) => {
+                        quantized_matmul(t, w, &inputs[2], biases, *transpose, *quant, global)?
+                    }
                     None => zeros_like(out)?,
                 };
                 if biases.is_none() && tangents[2].is_some() {
                     return Err(no_scale_gradient("quantized_matmul", *quant));
                 }
                 if biases.is_some() && (tangents[2].is_some() || tangents[3].is_some()) {
-                    let dw = dequantize(w, &tangent(2)?, Some(&tangent(3)?), *quant, None)?;
+                    let dw = dequantize(w, &tangent(2)?, Some(&tangent(3)?), *quant, None, None)?;
                     let dw = if *transpose { swap_last(&dw)? } else { dw };
                     total = ops::add(&total, matmul(x, &dw)?)?;
                 }

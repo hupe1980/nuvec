@@ -8,10 +8,10 @@
 //! (as mlx-lm's `BatchGenerator`).
 //!
 //! Products route as MLX routes them, so a request's tokens can depend in their low bits
-//! on the requests batched with it, as in mlx-lm. With
-//! [`batch_invariant`](BatcherOptions::batch_invariant), every step runs row-exact
-//! ([`nuvec::with_row_exact`]): each request gets the tokens it gets alone, at some cost in
-//! throughput.
+//! on the requests batched with it, as in mlx-lm. A request with
+//! [`row_exact`](GenerateOptions::row_exact) gets the tokens it gets alone: while it is
+//! queued or running, every step runs row-exact ([`nuvec::with_row_exact`]), at some cost
+//! in throughput.
 //!
 //! Decoding is pipelined as [`generate`](crate::generate()): a step submits the next
 //! decoding step, fed with the tokens of the step before, then reads those tokens (one
@@ -128,11 +128,6 @@ pub struct BatcherOptions {
     /// with its own step in flight. `None` (the default): one per stage, so every stage
     /// works on a different one; 1 steps them as one batch. No effect on a whole model.
     pub micro_batches: Option<usize>,
-    /// Whether each request gets the tokens it gets alone ([`crate::generate()`]), whatever
-    /// it is batched with: every step then runs row-exact ([`nuvec::with_row_exact`]), at
-    /// some cost in throughput. Off by default (MLX's routing, as mlx-lm's
-    /// `BatchGenerator`).
-    pub batch_invariant: bool,
     /// The share of the free memory a default block count takes (0.9).
     pub memory_fraction: f64,
 }
@@ -147,7 +142,6 @@ impl Default for BatcherOptions {
             block_size: 16,
             max_batch: 32,
             micro_batches: None,
-            batch_invariant: false,
             memory_fraction: 0.9,
         }
     }
@@ -223,8 +217,6 @@ pub struct Batcher<'a> {
     /// Batched prefills so far.
     #[cfg(test)]
     batched: usize,
-    /// Whether steps run row-exact ([`BatcherOptions::batch_invariant`]).
-    invariant: bool,
     /// Micro-batches kept in flight ([`BatcherOptions::micro_batches`]); `None`: one per
     /// stage.
     micro: Option<usize>,
@@ -235,10 +227,10 @@ pub struct Batcher<'a> {
 impl Drop for Batcher<'_> {
     /// Waits for the step in flight (its errors are moot).
     fn drop(&mut self) {
-        let invariant = self.invariant;
+        let exact = self.row_exact();
         for f in std::mem::take(&mut self.in_flight) {
             let wait = || eval(std::slice::from_ref(&f.tokens));
-            let _ = if invariant {
+            let _ = if exact {
                 nuvec::with_row_exact(wait)
             } else {
                 wait()
@@ -268,7 +260,6 @@ impl<'a> Batcher<'a> {
             fault: None,
             #[cfg(test)]
             batched: 0,
-            invariant: options.batch_invariant,
             micro: options.micro_batches,
             steps: 0,
         })
@@ -547,11 +538,18 @@ impl<'a> Batcher<'a> {
     /// nothing else waits (see the module documentation) and reads the step in flight.
     /// Returns the tokens produced and the requests finished, in order.
     pub fn step(&mut self) -> Result<Vec<Event>> {
-        if self.invariant {
+        if self.row_exact() {
             nuvec::with_row_exact(|| self.step_now())
         } else {
             self.step_now()
         }
+    }
+
+    /// Whether steps run row-exact: a queued or running request asks for it
+    /// ([`GenerateOptions::row_exact`]).
+    fn row_exact(&self) -> bool {
+        self.waiting.iter().any(|w| w.options.row_exact)
+            || self.running.iter().any(|r| r.request.options.row_exact)
     }
 
     fn step_now(&mut self) -> Result<Vec<Event>> {
@@ -965,6 +963,7 @@ mod tests {
     fn greedy(max_tokens: usize) -> GenerateOptions {
         GenerateOptions {
             max_tokens,
+            row_exact: true,
             ..Default::default()
         }
     }
@@ -1021,7 +1020,6 @@ mod tests {
                     blocks: Some(32),
                     block_size: 4,
                     max_batch: 3,
-                    batch_invariant: true,
                     ..Default::default()
                 },
             )
@@ -1085,7 +1083,6 @@ mod tests {
                     blocks: Some(10),
                     block_size: 4,
                     max_batch: 3,
-                    batch_invariant: true,
                     ..Default::default()
                 },
             )
@@ -1184,13 +1181,16 @@ mod tests {
                     blocks: Some(256),
                     block_size: 4,
                     max_batch: requests.len(),
-                    batch_invariant: true,
                     ..Default::default()
                 },
             )
             .unwrap();
             for (p, o) in &requests {
-                batcher.submit(p.clone(), o.clone()).unwrap();
+                let o = GenerateOptions {
+                    row_exact: true,
+                    ..o.clone()
+                };
+                batcher.submit(p.clone(), o).unwrap();
             }
             let (tokens, _) = run(&mut batcher, requests.len(), 100, |_, _| {});
             assert_eq!(batcher.batched > 0, batched, "{name} ({n} tokens)");

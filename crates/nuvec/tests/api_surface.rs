@@ -633,7 +633,7 @@ mod spec_063 {
             s.remember(&[1, 2, 3]);
             let _: Vec<u32> = s.suggest(&[1, 2], 1);
             const _: fn(&Model) -> Result<MtpDrafter> = MtpDrafter::new;
-            const _: fn(&Model) -> usize = nuvec_lm::verify_rows;
+            const _: fn(&Model, bool) -> usize = nuvec_lm::verify_rows;
             const _: fn(&Model) -> bool = Model::has_mtp;
             const _: fn(&Model, &Array, &Array, &mut [nuvec_lm::KvCache]) -> Array =
                 Model::mtp_forward;
@@ -898,7 +898,6 @@ mod spec_063 {
                 block_size: 16,
                 max_batch: 8,
                 micro_batches: None,
-                batch_invariant: true,
                 memory_fraction: 0.9,
             };
             b.validate()?;
@@ -1081,12 +1080,15 @@ mod spec_063 {
             let _: Array = ops::hadamard_transform(a, Some(0.5));
             let _: Array = ops::segmented_mm(a, b, a);
             let _: Array = ops::block_masked_mm(a, b, 32, Some(a), None, None);
-            let _: Array = ops::qqmm(a, b);
-            let _: Array = ops::qqmm(a, (b, QuantMode::Mxfp8));
-            let _: Array = ops::qqmm(a, (b, Quant::new(QuantMode::Nvfp4)));
-            let _: Array = ops::qqmm(a, q);
+            let _: Array = ops::qqmm(a, b, None);
+            let _: Array = ops::qqmm(a, (b, QuantMode::Mxfp8), None);
+            let _: Array = ops::qqmm(a, (b, Quant::new(QuantMode::Nvfp4)), None);
+            let _: Array = ops::qqmm(a, q, None);
+            let _: Array = ops::qqmm(a, QqmmWeight::Scaled(b, a), Some(a));
             let _: QqmmWeight<'_> = q.into();
-            let _: Array = ops::gather_qqmm(a, q, None, Some(b), true);
+            let _: Array = ops::gather_qqmm(a, q, None, Some(b), true, None);
+            let _: nuvec::Quantized = ops::quantize_scaled(a, b).with_global_scale(a.clone());
+            let _: Option<Array> = ops::quantize(a, QuantMode::Nvfp4).global_scale;
             let _: nuvec::Result<(Vec<Vec<usize>>, String)> =
                 ops::einsum_path("ij,jk->ik", &[a.clone(), b.clone()]);
         }
@@ -1380,16 +1382,18 @@ mod spec_055 {
     const _: fn(&Array, DType) -> Array = ops::view;
     const _: fn(&Array) -> Array = ops::to_fp8;
     const _: fn(&Array, DType) -> Array = ops::from_fp8;
-    const _: fn(&Array, &Quantized, Option<&Array>, Option<&Array>, GatherQmm<'_>) -> Array =
+    const _: fn(&Array, &Quantized, Option<&Array>, Option<&Array>, GatherQmm) -> Array =
         ops::gather_qmm;
 
     fn gather(x: &Array, q: &Quantized, rhs: &Array, scale: &Array) -> Array {
-        let o = GatherQmm::default()
-            .transpose(true)
-            .sorted_indices(true)
-            .global_scale(scale);
-        let _: (bool, bool, Option<&Array>) = (o.transpose, o.sorted_indices, o.global_scale);
-        x.gather_qmm(q, None, Some(rhs), o)
+        let o = GatherQmm::default().transpose(true).sorted_indices(true);
+        let _: (bool, bool) = (o.transpose, o.sorted_indices);
+        x.gather_qmm(
+            &q.clone().with_global_scale(scale.clone()),
+            None,
+            Some(rhs),
+            o,
+        )
     }
 
     #[test]

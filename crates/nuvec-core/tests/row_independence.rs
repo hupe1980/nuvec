@@ -407,12 +407,13 @@ mod gather {
                     [e],
                 );
                 let fp = |q: &'static Quantized, global: Option<&'static Array>| {
+                    let q = match global {
+                        Some(g) => q.clone().with_global_scale(g.clone()),
+                        None => q.clone(),
+                    };
                     Box::new(move |x: &Array, ids: &Array, sorted: bool| {
-                        let mut options = GatherQmm::default().sorted_indices(sorted);
-                        if let Some(g) = global {
-                            options = options.global_scale(g);
-                        }
-                        ops::gather_qmm(x, q, None, Some(ids), options)
+                        let options = GatherQmm::default().sorted_indices(sorted);
+                        ops::gather_qmm(x, &q, None, Some(ids), options)
                     }) as Box<dyn Fn(&Array, &Array, bool) -> Array>
                 };
                 let (mx4, mx8, nv4, scale): (&'static _, &'static _, &'static _, &'static _) = (

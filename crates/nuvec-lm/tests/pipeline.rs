@@ -113,7 +113,7 @@ fn stages(g: Group, name: &str) {
     assert_eq!(got, want, "{name}: generated tokens on rank {}", g.rank());
 
     // The Batcher: several requests (ending early, one cancelled) give, on every rank, each
-    // request's batch-invariant events of the whole model (one micro-batch per stage in
+    // request's row-exact events of the whole model (one micro-batch per stage in
     // flight interleaves the requests differently).
     let want = per_request(&serve(&whole));
     let got = per_request(&serve(&staged));
@@ -145,13 +145,13 @@ fn serve(model: &Model) -> Vec<Event> {
             blocks: Some(32),
             block_size: 4,
             max_batch: 4,
-            batch_invariant: true,
             ..Default::default()
         },
     )
     .unwrap();
     let greedy = |max_tokens| GenerateOptions {
         max_tokens,
+        row_exact: true,
         ..GenerateOptions::default()
     };
     let prompts: [&[u32]; 4] = [&[1, 2, 3], &[4, 5, 6, 7, 8], &[9, 10], &[11, 12, 13, 14]];

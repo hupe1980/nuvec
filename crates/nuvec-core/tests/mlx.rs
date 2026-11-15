@@ -116,6 +116,7 @@ fn cpu_differs(case: &Case) -> bool {
         case.op.as_str(),
         "quantized_matmul" | "gather_qmm" | "qqmm" | "gather_qqmm" | "block_masked_mm"
     ) || case.name.starts_with("affine-dequantize-")
+        || case.name.starts_with("vjp-qqmm-")
         || case.name.starts_with("sdpa-d512-")
         || case.name.starts_with("power-gpu-")
         || case.name.starts_with("hadamard-gpu-")

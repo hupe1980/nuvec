@@ -830,6 +830,59 @@ fn few_row_products_equal_one_row_products_bit_for_bit() {
     });
 }
 
+/// MLX's few-row `qmv_mma` (3–16 rows of 4- and 8-bit products over large matrices,
+/// routed as MLX's): every instance exists, and products match the dequantized product.
+#[test]
+fn few_row_mma_products_match_the_dequantized_product() {
+    if cfg!(miri) {
+        return;
+    }
+    let Some(device) = nuvec_gpu::Device::shared() else {
+        return;
+    };
+    let names: std::collections::BTreeSet<String> =
+        device.kernel_names().unwrap().into_iter().collect();
+    for t in ["float32", "float16", "bfloat16"] {
+        for gs in GROUPS {
+            for b in [4, 8] {
+                for tile in ["bn16_tm1", "bn16_tm2", "bn32_tm1"] {
+                    let name = format!("nuvec_affine_qmv_mma_{t}_gs{gs}_b{b}_wk4_{tile}");
+                    assert!(names.contains(&name), "{name}");
+                }
+            }
+        }
+    }
+    with_stream(Device::gpu(0), || {
+        // (K, N, group, bits): N · K = 2^21, the smallest MLX routes to it.
+        for (k, n, gs, bits) in [
+            (4096, 512, 64, 4),
+            (2048, 1024, 32, 8),
+            (1024, 2048, 128, 4),
+        ] {
+            for dtype in [DType::BF16, DType::F16, DType::F32] {
+                let w = random::normal([n, k], dtype, 0.0, 1.0, &random::key(1));
+                let (wq, sc, bi) = parts(aq(&w, gs, bits));
+                for m in [3, 4, 7, 8, 9, 16] {
+                    // Rows 1.. of a larger array: an aligned non-zero offset.
+                    let xs = random::normal([m + 1, k], dtype, 0.0, 1.0, &random::key(2));
+                    let x = xs.i((1..m + 1, ..));
+                    let got = x.quantized_matmul(&qw(&wq, &sc, &bi, gs, bits), true);
+                    let want = with_stream(Device::cpu(), || {
+                        reference(&x.astype(DType::F32), &wq, &sc, &bi, true, gs, bits)
+                    });
+                    let tol = if dtype == DType::F32 { 1e-5 } else { 1e-2 };
+                    assert_close(
+                        &format!("{dtype} m{m} k{k} n{n} gs{gs} b{bits}"),
+                        &got,
+                        &want,
+                        tol,
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// The floating-point modes with their group sizes.
 const FP_MODES: [(QuantMode, i32); 3] = [
     (QuantMode::Mxfp4, 32),
@@ -1316,11 +1369,10 @@ mod fp_gpu {
                     let scale = Array::from_slice(&scale, [e]);
                     for global in [false, mode == QuantMode::Nvfp4] {
                         let run = || {
-                            let q = w.quantize(mode);
-                            let mut options =
-                                GatherQmm::default().transpose(t).sorted_indices(sorted);
+                            let mut q = w.quantize(mode);
+                            let options = GatherQmm::default().transpose(t).sorted_indices(sorted);
                             if global {
-                                options = options.global_scale(&scale);
+                                q = q.with_global_scale(scale.clone());
                             }
                             x.gather_qmm(&q, None, Some(&rhs), options)
                                 .astype(DType::F32)
@@ -1370,28 +1422,24 @@ mod fp_gpu {
         let mx = w.quantize(QuantMode::Mxfp4);
         let message = |a: Array| a.check().unwrap_err().to_string();
         let gs = ops::full([4], 1.0f32);
-        let opts = GatherQmm::default().global_scale(&gs);
+        let opts = GatherQmm::default();
+        let scaled = |q: &Quantized, g: &Array| q.clone().with_global_scale(g.clone());
         assert!(
-            message(x.gather_qmm(&mx, None, Some(&ids), opts))
+            message(x.gather_qmm(&scaled(&mx, &gs), None, Some(&ids), opts))
                 .contains("only supported for 'nvfp4'")
         );
         let wrong = ops::full([3], 1.0f32);
-        let opts = GatherQmm::default().global_scale(&wrong);
         assert!(
-            message(x.gather_qmm(&nv, None, Some(&ids), opts)).contains("one entry per expert")
+            message(x.gather_qmm(&scaled(&nv, &wrong), None, Some(&ids), opts))
+                .contains("one entry per expert")
         );
         let half = gs.astype(DType::F16);
-        let opts = GatherQmm::default().global_scale(&half);
-        assert!(message(x.gather_qmm(&nv, None, Some(&ids), opts)).contains("dtype float32"));
-        let opts = GatherQmm::default().global_scale(&gs);
-        assert!(message(x.gather_qmm(&nv, None, None, opts)).contains("without indices"));
+        assert!(
+            message(x.gather_qmm(&scaled(&nv, &half), None, Some(&ids), opts))
+                .contains("dtype float32")
+        );
         let _ = x
-            .gather_qmm(
-                &nv,
-                None,
-                Some(&ids),
-                GatherQmm::default().global_scale(&gs),
-            )
+            .gather_qmm(&scaled(&nv, &gs), None, Some(&ids), opts)
             .check()
             .unwrap();
     }
@@ -1520,10 +1568,11 @@ fn fp_derivatives_match_finite_differences() {
                         &format!("{mode} gather sorted={sorted} global={global}"),
                         &x,
                         &|x| {
-                            let mut options = GatherQmm::default().sorted_indices(sorted);
-                            if global {
-                                options = options.global_scale(&scale);
-                            }
+                            let options = GatherQmm::default().sorted_indices(sorted);
+                            let q = match global {
+                                true => q.clone().with_global_scale(scale.clone()),
+                                false => q.clone(),
+                            };
                             x.gather_qmm(&q, None, Some(&ids), options)
                                 .multiply(&c)
                                 .sum(..)
@@ -1649,11 +1698,12 @@ fn fp_derivatives_and_vmap() {
             let x = random(&mut rng, &[5, 1, k], DType::F32);
             let g = random(&mut rng, &[5, 1, n], DType::F32);
             for global in [false, mode == QuantMode::Nvfp4] {
-                let mut options = GatherQmm::default().sorted_indices(sorted);
-                if global {
-                    options = options.global_scale(&gscale);
-                }
-                let f = |xs: &[Array]| Ok(vec![xs[0].gather_qmm(&q, None, Some(&rhs), options)]);
+                let options = GatherQmm::default().sorted_indices(sorted);
+                let qg = match global {
+                    true => q.clone().with_global_scale(gscale.clone()),
+                    false => q.clone(),
+                };
+                let f = |xs: &[Array]| Ok(vec![xs[0].gather_qmm(&qg, None, Some(&rhs), options)]);
                 let mut dense = q.dequantize(DType::F32);
                 if global {
                     dense = dense * (gscale.reshape([e, 1, 1]) / (448.0 * 6.0));
@@ -1674,8 +1724,13 @@ fn fp_derivatives_and_vmap() {
                 // On the GPU and on the CPU (where the product runs its fallback graph).
                 for device in [default_device(), Device::cpu()] {
                     let f = |xs: &[Array]| {
-                        let options = GatherQmm::default().global_scale(&xs[0]);
-                        Ok(vec![x.gather_qmm(&q, None, Some(&rhs), options)])
+                        let qg = q.clone().with_global_scale(xs[0].clone());
+                        Ok(vec![x.gather_qmm(
+                            &qg,
+                            None,
+                            Some(&rhs),
+                            GatherQmm::default(),
+                        )])
                     };
                     let refused = with_stream(device, || {
                         vjp_flat(f, std::slice::from_ref(&gscale), std::slice::from_ref(&g))
@@ -1824,4 +1879,37 @@ fn constructors_carry_the_bias_rule() {
         rebuilt.dequantize(DType::F32).to_vec::<f32>().unwrap(),
         fp.dequantize(DType::F32).to_vec::<f32>().unwrap()
     );
+}
+
+/// NVFP4 global scales, as MLX validates them: one float32 value (one per expert for
+/// gathers), NVFP4 only, and `qqmm`'s two scales both or neither. A scaled weight carries
+/// its scale through `dequantize` and `quantized_matmul` (on both devices).
+#[test]
+fn global_scales_are_validated_and_carried() {
+    let mut rng = Rng::new(0x6A);
+    let w = random(&mut rng, &[8, 64], DType::F32);
+    let x = random(&mut rng, &[3, 64], DType::F32);
+    let g = w.abs().max(..);
+    let message = |a: Array| a.check().unwrap_err().to_string();
+    // The scale's shape and dtype.
+    let two = ops::full([2], 1.0f32);
+    assert!(message(ops::quantize_scaled(&w, &two).weight).contains("one float32 value"));
+    let half = g.astype(DType::F16);
+    assert!(message(ops::quantize_scaled(&w, &half).weight).contains("one float32 value"));
+    // NVFP4 only.
+    let mx = w.quantize(QuantMode::Mxfp4).with_global_scale(g.clone());
+    assert!(message(mx.dequantize(DType::F32)).contains("only supported for nvfp4"));
+    // Both scales or neither.
+    let scaled = ops::quantize_scaled(&w, &g);
+    assert!(message(ops::qqmm(&x, &scaled, None)).contains("both"));
+    assert!(message(ops::qqmm(&x, &w, Some(&g))).contains("both"));
+    // The weight's scale is used: the product equals x · dequantize(w)ᵀ.
+    let dense = scaled.dequantize(DType::F32);
+    for device in [Device::cpu(), default_device()] {
+        with_stream(device, || {
+            let got = x.quantized_matmul(&scaled, true);
+            let want = x.matmul(&dense.t());
+            assert_close(&format!("{device:?}"), &got, &want, 1e-5);
+        });
+    }
 }

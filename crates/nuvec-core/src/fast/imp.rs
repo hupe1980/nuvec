@@ -115,6 +115,13 @@ pub enum FastOp {
         /// Whether the operand masks follow.
         op_mask: bool,
     },
+    /// `(x[, global_scale])`: `x` through its floating-point quantization, the values it
+    /// represents in `x`'s dtype (MLX's `fp_quantize_dequantize`, `qqmm`'s activations), with
+    /// an optional NVFP4 global scale.
+    QuantizeDequantize {
+        /// The floating-point mode, group size and bits.
+        quant: crate::Quant,
+    },
     /// `(x)`: [`hadamard_transform`](crate::ops::hadamard_transform) over the last axis.
     Hadamard {
         /// `f32::to_bits` of the scale.
@@ -681,6 +688,7 @@ impl FastOp {
             Self::Hadamard { .. } => "hadamard_transform",
             Self::SegmentedMm => "segmented_mm",
             Self::BlockMaskedMm { .. } => "block_masked_mm",
+            Self::QuantizeDequantize { .. } => "quantize_dequantize",
             Self::PagedAttention { .. } => "paged_attention",
             Self::PagedWrite => "paged_write",
             Self::MoeRoute { .. } => "moe_route",
@@ -716,6 +724,7 @@ impl FastOp {
             Self::BlockMaskedMm {
                 out_mask, op_mask, ..
             } => 2 + usize::from(*out_mask) + 2 * usize::from(*op_mask),
+            Self::QuantizeDequantize { .. } => inputs.len().clamp(1, 2),
             Self::PagedAttention { sinks, .. } => 5 + usize::from(*sinks),
             Self::PagedWrite => 3,
             Self::ConvSlots { .. } => 4,
@@ -787,6 +796,7 @@ impl FastOp {
             }
             Self::ConvSlots { .. } => vec![like(x), like(&inputs[2])],
             Self::Hadamard { .. } => vec![like(x)],
+            Self::QuantizeDequantize { .. } => vec![like(x)],
             Self::BlockMaskedMm { .. } => {
                 let mut shape = x.dims().to_vec();
                 *shape.last_mut().expect("a matrix") =
@@ -968,6 +978,20 @@ impl FastOp {
             }
             Self::Hadamard { .. } => {
                 crate::hadamard::decompose(last(x)).is_ok() && x.size() <= u32::MAX as usize
+            }
+            Self::QuantizeDequantize { quant } => {
+                let gs = quant.group_size as usize;
+                let scale_ok = inputs.get(1).is_none_or(|g| {
+                    quant.mode == crate::QuantMode::Nvfp4
+                        && g.size() == 1
+                        && g.dtype() == DType::F32
+                });
+                quant.mode != crate::QuantMode::Affine
+                    && kernel_float(x)
+                    && x.ndim() >= 1
+                    && gs > 0
+                    && last(x) % gs == 0
+                    && scale_ok
             }
             Self::BlockMaskedMm {
                 block_size,
@@ -1492,6 +1516,18 @@ impl FastOp {
                 vec![crate::conv::compose(x, &inputs[1], &conv)?]
             }
             Self::Hadamard { scale } => vec![crate::hadamard::compose(x, f32::from_bits(*scale))?],
+            // As a graph: quantize then dequantize (one rounding apart from the kernel's with a
+            // global scale; the CPU runs the kernel's arithmetic, `eval_cpu`).
+            Self::QuantizeDequantize { quant } => {
+                let q = match inputs.get(1) {
+                    Some(g) => crate::ops::quantize_scaled(x, g),
+                    None => crate::ops::quantize(x, *quant),
+                };
+                vec![crate::IntoResult::into_result(crate::ops::dequantize(
+                    &q,
+                    x.dtype(),
+                ))?]
+            }
             Self::BlockMaskedMm {
                 block_size,
                 out_mask,
@@ -1705,6 +1741,7 @@ impl FastOp {
             | Self::Hadamard { .. }
             | Self::SegmentedMm
             | Self::BlockMaskedMm { .. }
+            | Self::QuantizeDequantize { .. }
             | Self::RmsNormVjp { .. }
             | Self::LayerNormVjp { .. }
             | Self::CrossEntropyVjp
@@ -1880,6 +1917,16 @@ impl FastOp {
 
     /// Runs the fallback graph on the CPU over evaluated operands, for work no kernel takes.
     pub(crate) fn eval_cpu(&self, operands: &[Operand<'_>]) -> Result<Vec<crate::array::Data>> {
+        if let Self::QuantizeDequantize { quant } = self {
+            // The kernel's arithmetic (MLX's rounding with a global scale).
+            let (group_size, bits) = quant.checked(self.name())?;
+            let g = operands
+                .get(1)
+                .map(|&g| crate::kernels::scalar_f32(g))
+                .transpose()?;
+            let out = crate::kernels::fp_quantize_dequantize(operands[0], group_size, bits, g)?;
+            return Ok(vec![crate::array::Data::new(out)]);
+        }
         if let Self::Attention { passes: 0, .. } = self {
             // Laid out as `output_strides` declares: `[B, L, H, D]` in memory.
             return run_on_cpu(operands, |leaves| {
