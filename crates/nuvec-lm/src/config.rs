@@ -386,7 +386,10 @@ impl Config {
         let drafter = top
             .get("architectures")
             .and_then(Json::as_array)
-            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("DFlashDraftModel")));
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|v| matches!(v.as_str(), Some("DFlashDraftModel" | "DFlash2DraftModel")))
+            });
         if drafter {
             return Err(invalid(
                 "a DFlash drafter, not a model: load it with `DFlashDrafter::load`",
