@@ -1315,6 +1315,36 @@ mod gpu {
         }
     }
 
+    /// The masked GEMM's derivatives (the composition's, with the kernel's forward) on the
+    /// GPU against the CPU: both operands and float operand masks, a boolean output mask.
+    #[test]
+    fn block_masked_mm_gradients_match_the_cpu() {
+        if crate::common::require_gpu().is_none() {
+            return;
+        }
+        let mut rng = Rng::new(0x97);
+        let out = Array::from_slice(&[true, false, true, true, false, true], [3, 2]);
+        let xs = [
+            random(&mut rng, &[70, 45], DType::F32),
+            random(&mut rng, &[45, 50], DType::F32),
+            random(&mut rng, &[3, 2], DType::F32),
+            random(&mut rng, &[2, 2], DType::F32),
+        ];
+        let g = random(&mut rng, &[70, 50], DType::F32);
+        let f = |xs: &[Array]| -> Result<Vec<Array>> {
+            Ok(vec![ops::block_masked_mm(
+                &xs[0],
+                &xs[1],
+                32,
+                Some(&out),
+                Some(&xs[2]),
+                Some(&xs[3]),
+            )])
+        };
+        // Both devices are within 1.4e-5 of float64 (the masks scale the operands).
+        both("block_masked_mm gradients", 5e-5, || with_grads(f, &xs, &g));
+    }
+
     /// The Hadamard kernels (one pass, two passes above 8192, the order-m stage, half
     /// types kept in float32 between passes) against the CPU's composition.
     #[test]

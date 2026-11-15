@@ -21,7 +21,7 @@ evaluation mode (`expected.safetensors`).
 Usage: `just lm-fixtures` (or `uv run scripts/lm_fixtures.py`; `--only chained_sampler,eos`
 records just those).
 
-`--only hybrids` records Granite 4 and LFM2 models; `--only kv_quant` records mlx-lm's quantized KV caches (generation and a prompt cache) on the
+`--only hybrids` records Granite 4 and LFM2 models; `--only lfm2_moe` records LFM2-MoE models; `--only kv_quant` records mlx-lm's quantized KV caches (generation and a prompt cache) on the
 head-32 models.
 
 `--cached [repo…]` records, for each model of `CACHED` in the local Hugging Face cache (or
@@ -173,7 +173,7 @@ def main() -> None:
              "ops": ops_fixtures, "gpt_oss": gpt_oss_models, "gemma4": gemma4_models,
              "o200k": o200k_splits, "spm": spm_tokenizers, "mtp": mtp_heads,
              "ssm": ssm, "prompt_cache": prompt_caches, "kv_quant": kv_quant,
-             "hybrids": hybrids}[name]()
+             "hybrids": hybrids, "lfm2_moe": lfm2_moe_models}[name]()
         return
     mx.random.seed(20261018)
     for name, (family, args, dtype, quant) in CASES.items():
@@ -562,6 +562,85 @@ def hybrids() -> None:
         if quant is None and name != "granite4_dense_f32":
             hf_name = name.replace("_f32", "_hf")
             record(model, OUT / hf_name, config, hf(weights))
+            cache = make_prompt_cache(model)
+            model(prompt[None], cache=cache)
+            save_prompt_cache(str(OUT / name / "prompt_cache.safetensors"), cache,
+                              {"model": name})
+            nxt = mx.array([[PROMPT[-1]]], dtype=mx.uint32)
+            logits = model(nxt, cache=cache).astype(mx.float32)
+            mx.save_safetensors(str(OUT / name / "prompt_cache_next.safetensors"),
+                                {"token": nxt, "logits": logits})
+
+
+LFM2_MOE = dict(model_type="lfm2_moe", vocab_size=128, hidden_size=64, intermediate_size=96,
+                moe_intermediate_size=32, num_hidden_layers=4, num_experts=8,
+                num_experts_per_tok=2, norm_topk_prob=True, num_attention_heads=2,
+                num_key_value_heads=1, max_position_embeddings=512, use_expert_bias=True,
+                num_dense_layers=1, norm_eps=1e-5, conv_bias=False, conv_L_cache=3,
+                rope_theta=1e6, routed_scaling_factor=1.5, full_attn_idxs=[1, 3])
+
+
+def lfm2_moe_models() -> None:
+    """LFM2-MoE (`lfm2_moe`: a dense first layer, then sigmoid-routed experts whose bias
+    selects but does not weight them): float32, its Hugging Face layout (`lfm2_moe_hf`:
+    conv weights `[C, 1, K]`, `w1`/`w2`/`w3` names, one tensor per expert) and 4-bit with
+    the router in 8 bits (mlx-lm's `quant_predicate`); `prompt_cache.safetensors` for the
+    float32 model."""
+    from mlx_lm.models import lfm2_moe
+    from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache
+
+    def build(seed, dtype=None, quant=None):
+        mx.random.seed(seed)
+        model = lfm2_moe.Model(lfm2_moe.ModelArgs.from_dict(LFM2_MOE))
+        model.update(tree_map_random(model.parameters()))
+        config = dict(LFM2_MOE)
+        if dtype is not None:
+            model.set_dtype(dtype)
+            # mlx-lm's `cast_predicate`: the expert bias stays float32.
+            for layer in model.layers:
+                ff = layer.feed_forward
+                if hasattr(ff, "expert_bias"):
+                    ff.expert_bias = ff.expert_bias.astype(mx.float32)
+        if quant is not None:
+            group_size, bits = quant
+            config["quantization"] = {"group_size": group_size, "bits": bits}
+
+            def predicate(path, module):
+                if not hasattr(module, "to_quantized"):
+                    return False
+                if path.endswith("feed_forward.gate"):
+                    config["quantization"][path] = {"group_size": group_size, "bits": 8}
+                    return {"group_size": group_size, "bits": 8}
+                return True
+            nn.quantize(model, group_size=group_size, bits=bits, class_predicate=predicate)
+        mx.eval(model.parameters())
+        return model, config
+
+    def hf(weights):
+        names = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+        out = {}
+        for k, v in weights.items():
+            if k.endswith("conv.conv.weight"):
+                out[k] = v.transpose(0, 2, 1)
+            elif ".switch_mlp." in k:
+                proj = k.split(".switch_mlp.")[1].split(".")[0]
+                for e in range(v.shape[0]):
+                    out[k.replace(f"switch_mlp.{proj}", f"experts.{e}.{names[proj]}")] = v[e]
+            elif ".feed_forward." in k and any(f".{p}." in k for p in names):
+                proj = next(p for p in names if f".{p}." in k)
+                out[k.replace(f".{proj}.", f".{names[proj]}.")] = v
+            else:
+                out[k] = v
+        return out
+
+    prompt = mx.array(PROMPT, dtype=mx.uint32)
+    for name, seed, dtype, quant in [("lfm2_moe_f32", 20261119, None, None),
+                                     ("lfm2_moe_q4", 20261120, mx.bfloat16, (32, 4))]:
+        model, config = build(seed, dtype, quant)
+        weights = dict(tree_flatten(model.parameters()))
+        record(model, OUT / name, config, weights)
+        if quant is None:
+            record(model, OUT / "lfm2_moe_hf", config, hf(weights))
             cache = make_prompt_cache(model)
             model(prompt[None], cache=cache)
             save_prompt_cache(str(OUT / name / "prompt_cache.safetensors"), cache,

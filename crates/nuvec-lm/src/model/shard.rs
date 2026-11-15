@@ -394,7 +394,10 @@ impl Block {
                 experts_per_token: m.experts_per_token,
             })),
             // Unreachable: their mixers are refused above.
-            BlockMlp::Granite(_) | BlockMlp::Lfm2(_) => {
+            BlockMlp::Granite(_)
+            | BlockMlp::Lfm2(_)
+            | BlockMlp::Lfm2Dense(_)
+            | BlockMlp::Lfm2Moe(_) => {
                 return Err(nuvec::Error::InvalidArgument(format!(
                     "{path}: Granite 4 and LFM2 MLPs are not split across ranks"
                 )));

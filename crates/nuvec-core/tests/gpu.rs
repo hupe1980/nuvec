@@ -1275,3 +1275,142 @@ fn gather_mv_matches_the_cpu() {
         }
     }
 }
+
+#[test]
+fn block_masked_mm_matches_the_cpu() {
+    if crate::common::require_gpu().is_none() {
+        return;
+    }
+    let mut rng = Rng::new(0xB10C);
+    let mut random = |shape: &[usize]| {
+        let n = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|_| rng.f64() as f32 * 0.1).collect();
+        Array::from_slice(&v, shape)
+    };
+    let mut bits = Rng::new(0x5EED);
+    let mut mask = |shape: &[usize]| {
+        let n = shape.iter().product();
+        let v: Vec<bool> = (0..n).map(|_| bits.below(2) == 1).collect();
+        Array::from_slice(&v, shape)
+    };
+    let scale = |m: &Array| m.astype(DType::F32).multiply(1.5).add(0.25);
+    // (name, a, b, block size, output, left and right masks, dtype)
+    type Case = (&'static str, Array, Array, i32, [Option<Array>; 3], DType);
+    let cases: Vec<Case> = vec![
+        (
+            "aligned out",
+            random(&[128, 96]),
+            random(&[96, 160]),
+            32,
+            [Some(mask(&[4, 5])), None, None],
+            DType::F32,
+        ),
+        (
+            "unaligned olr",
+            random(&[70, 45]),
+            random(&[45, 50]),
+            32,
+            [
+                Some(mask(&[3, 2])),
+                Some(mask(&[3, 2])),
+                Some(mask(&[2, 2])),
+            ],
+            DType::F32,
+        ),
+        (
+            "bs64 float operands",
+            random(&[65, 130]),
+            random(&[130, 70]),
+            64,
+            [
+                None,
+                Some(scale(&mask(&[2, 3]))),
+                Some(scale(&mask(&[3, 2]))),
+            ],
+            DType::F32,
+        ),
+        (
+            "transposed float out",
+            random(&[96, 64]).t(),
+            random(&[128, 96]).t(),
+            32,
+            [
+                Some(scale(&mask(&[2, 4]))),
+                Some(mask(&[2, 3])),
+                Some(mask(&[3, 4])),
+            ],
+            DType::F32,
+        ),
+        (
+            "left only",
+            random(&[64, 64]),
+            random(&[64, 64]),
+            32,
+            [None, Some(mask(&[2, 2])), None],
+            DType::F32,
+        ),
+        (
+            "broadcast batch",
+            random(&[3, 40, 33]),
+            random(&[33, 20]),
+            32,
+            [Some(mask(&[1, 2, 1])), None, None],
+            DType::F32,
+        ),
+        (
+            "two batch axes",
+            random(&[2, 1, 64, 48]),
+            random(&[3, 48, 32]),
+            32,
+            [
+                Some(mask(&[2, 3, 2, 1])),
+                Some(mask(&[2, 2])),
+                Some(mask(&[3, 2, 1])),
+            ],
+            DType::F32,
+        ),
+        (
+            "float16",
+            random(&[96, 80]),
+            random(&[80, 64]),
+            32,
+            [
+                Some(mask(&[3, 2])),
+                Some(mask(&[3, 3])),
+                Some(mask(&[3, 2])),
+            ],
+            DType::F16,
+        ),
+        (
+            "bfloat16 float out",
+            random(&[128, 128]),
+            random(&[128, 128]),
+            64,
+            [Some(scale(&mask(&[2, 2]))), None, None],
+            DType::BF16,
+        ),
+    ];
+    for (name, a, b, bs, [o, l, r], dtype) in &cases {
+        let f = || {
+            ops::block_masked_mm(
+                &a.astype(*dtype),
+                &b.astype(*dtype),
+                *bs,
+                o.as_ref(),
+                l.as_ref(),
+                r.as_ref(),
+            )
+            .astype(DType::F32)
+        };
+        let got = on(Device::gpu(0), f).to_vec::<f32>().unwrap();
+        let want = on(Device::cpu(), f).to_vec::<f32>().unwrap();
+        assert_eq!(got.len(), want.len(), "{name}");
+        let tol = if *dtype == DType::F32 { 1e-5 } else { 2e-2 };
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= tol * w.abs().max(1.0),
+                "{name} {i}: {g} vs {w}"
+            );
+        }
+    }
+}

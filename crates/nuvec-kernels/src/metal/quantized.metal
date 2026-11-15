@@ -85,11 +85,13 @@ NUVEC_QMV_QUAD_GS(float32, float)
 NUVEC_QMV_QUAD_GS(float16, half)
 NUVEC_QMV_QUAD_GS(bfloat16, bfloat16_t)
 
-// nuvec's few-row products (quantized.h, `affine_qmv_rows`), every bit width, two rows
-// per threadgroup (more are slower).
+// nuvec's few-row products (quantized.h, `affine_qmv_rows`), every bit width, two or
+// three rows per threadgroup (three for odd counts; four are slower).
 #define NUVEC_QMV_ROWS_B(iname, T, gs, b)                                                \
     NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr0_r2", false, 2)                                \
-    NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr1_r2", true, 2)
+    NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr1_r2", true, 2)                                 \
+    NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr0_r3", false, 3)                                \
+    NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr1_r3", true, 3)
 #define NUVEC_QMV_ROWS(iname, T, gs)                                                     \
     NUVEC_QMV_ROWS_B(iname, T, gs, 1) NUVEC_QMV_ROWS_B(iname, T, gs, 2)                   \
     NUVEC_QMV_ROWS_B(iname, T, gs, 3) NUVEC_QMV_ROWS_B(iname, T, gs, 4)                   \

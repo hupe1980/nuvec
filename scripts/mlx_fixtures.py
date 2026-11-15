@@ -1857,6 +1857,22 @@ case("block_masked_mm-batched", "block_masked_mm",
      [make("float32", (2, 40, 33)), make("float32", (33, 20)), make("bool", (2, 2, 1))],
      block_size=32, masks="o")
 
+# block_masked_mm on MLX's GPU (its masked GEMM): half types, both mask types, unaligned
+# shapes, a broadcast batch.
+for dt, masks, bs, shape, kind in [("bfloat16", "o", 32, (128, 96, 160), "bool"),
+                                   ("float16", "olr", 32, (70, 45, 50), "bool"),
+                                   ("bfloat16", "lr", 64, (65, 130, 70), "bfloat16"),
+                                   ("float32", "olr", 64, (128, 128, 128), "float32")]:
+    m, k, n = shape
+    blocks = lambda v: (v + bs - 1) // bs  # noqa: E731
+    dims = {"o": (blocks(m), blocks(n)), "l": (blocks(m), blocks(k)), "r": (blocks(k), blocks(n))}
+    ms = [make(kind, dims[c]) for c in masks]
+    case_gpu(f"block_masked_mm-gpu-{dt}-{masks}-{bs}", "block_masked_mm",
+             [make(dt, (m, k)), make(dt, (k, n))] + ms, block_size=bs, masks=masks)
+case_gpu("block_masked_mm-gpu-batched", "block_masked_mm",
+         [make("bfloat16", (3, 40, 33)), make("bfloat16", (33, 20)), make("bool", (1, 2, 1))],
+         block_size=32, masks="o")
+
 # qqmm and gather_qqmm on MLX's GPU: dense and quantized weights, vectors and
 # batches, each floating-point mode.
 for mode in ["nvfp4", "mxfp8", "mxfp4"]:

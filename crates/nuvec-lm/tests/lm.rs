@@ -475,20 +475,32 @@ fn hugging_face_lfm2_checkpoints_are_sanitized() {
     check("lfm2_hf", 1e-4);
 }
 
-/// Granite 4 and LFM2 keep states that cannot be rolled back or paged: speculative
-/// decoding and the paged `Batcher` refuse them, naming the family; a quantized KV cache
-/// quantizes their attention layers and leaves the states as they are.
+/// LFM2-MoE: a dense first layer, then sigmoid-routed experts whose bias chooses but does
+/// not weight them (renormalised and scaled), with LFM2's convolutions and attention.
 #[test]
-fn granite4_and_lfm2_refuse_rollback_and_paging() {
-    use nuvec_lm::{
-        Batcher, BatcherOptions, DraftPolicy, KvQuant, PromptLookup, speculative_generate,
-    };
+fn lfm2_moe_matches_mlx_lm() {
+    check("lfm2_moe_f32", 1e-4);
+}
+
+/// LFM2-MoE in Hugging Face's layout (`w1`/`w3`/`w2`, one tensor per expert).
+#[test]
+fn hugging_face_lfm2_moe_checkpoints_are_sanitized() {
+    check("lfm2_moe_hf", 1e-4);
+}
+
+/// Granite 4 and LFM2 keep states that cannot be paged: the paged `Batcher` refuses them,
+/// naming the family; a quantized KV cache quantizes their attention layers and leaves the
+/// states as they are.
+#[test]
+fn granite4_and_lfm2_refuse_paging() {
+    use nuvec_lm::{Batcher, BatcherOptions, KvQuant};
     if !gpu() {
         return;
     }
     for (name, family) in [
         ("granite4_moe_f32", "granitemoehybrid"),
         ("lfm2_f32", "lfm2"),
+        ("lfm2_moe_f32", "lfm2_moe"),
     ] {
         let (dir, prompt, ..) = fixture(name);
         let model = load_model(&dir).unwrap();
@@ -496,17 +508,6 @@ fn granite4_and_lfm2_refuse_rollback_and_paging() {
             max_tokens: 4,
             ..Default::default()
         };
-        let speculative = speculative_generate(
-            &model,
-            &prompt,
-            options.clone(),
-            Box::new(PromptLookup::default()),
-            DraftPolicy::Fixed(4),
-        );
-        let Err(err) = speculative else {
-            panic!("{name}: speculative decoding not refused")
-        };
-        assert!(err.to_string().contains(family), "{name}: {err}");
         let Err(err) = Batcher::new(&model, BatcherOptions::default()) else {
             panic!("{name}: the paged Batcher not refused")
         };
@@ -558,6 +559,7 @@ fn half_precision_qwen3_5_stays_close_to_mlx_lm() {
         "qwen3_5_moe_nvfp4",
         "granite4_moe_q4",
         "lfm2_q4",
+        "lfm2_moe_q4",
     ] {
         let (got, want) = logits(name);
         // Routing near a tie may pick another expert after a one-ulp difference (which
@@ -1234,7 +1236,8 @@ fn sampling_draws_only_kept_tokens() {
 
 /// Speculative decoding gives mlx-lm's greedy tokens whatever the drafter proposes: the
 /// true continuation (everything accepted, fewer steps), wrong tokens (everything
-/// rejected), or prompt lookup; hybrid models too (their Gated DeltaNet states roll back).
+/// rejected), or prompt lookup; hybrid models too (their Gated DeltaNet, Mamba-2 and
+/// short-convolution states roll back).
 #[test]
 fn speculative_decoding_keeps_the_greedy_output() {
     use nuvec_lm::{Draft, DraftPolicy, Drafter, Model, PromptLookup, speculative_generate};
@@ -1253,7 +1256,8 @@ fn speculative_decoding_keeps_the_greedy_output() {
             Ok(Draft::from_tokens(&d))
         }
     }
-    // Hybrids roll their Gated DeltaNet state back to the last accepted position.
+    // Hybrids roll their recurrent and convolution states back to the last accepted
+    // position.
     for name in [
         "qwen3_f32",
         "llama_bf16",
@@ -1261,6 +1265,10 @@ fn speculative_decoding_keeps_the_greedy_output() {
         "qwen3_5_moe_f32",
         "gpt_oss_f32",
         "gemma4_e_f32",
+        "granite4_moe_f32",
+        "granite4_dense_f32",
+        "lfm2_f32",
+        "lfm2_moe_f32",
     ] {
         let (dir, prompt, _, _, greedy) = fixture(name);
         let model = load_model(&dir).unwrap();
@@ -2902,6 +2910,7 @@ fn prompt_caches_load_mlx_lm_files_and_round_trip() {
         "gpt_oss_f32",
         "granite4_moe_f32",
         "lfm2_f32",
+        "lfm2_moe_f32",
     ] {
         let (path, prompt, ..) = fixture(name);
         let model = load_model(&path).unwrap();

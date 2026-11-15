@@ -324,7 +324,7 @@ mod affine {
                         let wn = pattern(&[k, 640], dtype, case + 100);
                         let wqn = wn.quantize(Quant::affine(gs, bits));
                         for rows in (2..=ROW_INDEPENDENT_ROWS as i32)
-                            .filter(|r| [2, 3, 4, 7, 8, 13, 16].contains(r))
+                            .filter(|r| [2, 3, 4, 5, 6, 7, 8, 13, 16].contains(r))
                         {
                             let base = pattern(&[rows + 2, k], dtype, rows as u64);
                             let layouts = [

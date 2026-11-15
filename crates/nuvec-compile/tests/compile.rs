@@ -562,3 +562,37 @@ fn row_exact_products_are_not_merged() {
         assert!(merged_would_differ > 0, "the two routings were merged");
     }
 }
+
+/// A compiled function that captures an evaluated output whose sibling was released (mrun's
+/// Gated DeltaNet state, kept across steps; its output dropped): the released sibling is not
+/// captured, and the function computes from the kept one.
+#[test]
+fn captured_outputs_with_released_siblings_compile() {
+    if !gpu() {
+        return;
+    }
+    let n = |shape: &[usize], scale: f32| {
+        nuvec_core::random::normal(shape, DType::F32, 0.0, 1.0, None).multiply(scale)
+    };
+    let (q, k, v) = (
+        n(&[1, 4, 1, 32], 0.1),
+        n(&[1, 4, 1, 32], 0.1),
+        n(&[1, 4, 1, 8], 1.0),
+    );
+    let (g, beta) = (
+        nuvec_core::ops::full([1, 4, 1], 0.9f32),
+        nuvec_core::ops::full([1, 4, 1], 0.5f32),
+    );
+    let state0 = nuvec_core::ops::zeros([1, 1, 8, 32], DType::F32);
+    let (y, state) = nuvec_core::fast::gated_delta(&q, &k, &v, &g, &beta, &state0);
+    nuvec_core::eval(&[&y, &state]).unwrap();
+    drop(y);
+    let s = state.clone();
+    let f = compile_flat(move |xs: &[Array]| Ok(vec![xs[0].multiply(&s)]));
+    let got = f(&[Array::from(2.0f32)]).unwrap();
+    let want = state.multiply(2.0f32);
+    assert_eq!(
+        got[0].to_vec::<f32>().unwrap(),
+        want.to_vec::<f32>().unwrap()
+    );
+}

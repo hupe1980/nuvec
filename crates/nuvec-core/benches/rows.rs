@@ -60,7 +60,7 @@ fn make(name: &str, dtype: DType, b: usize) -> Result<Op> {
         }));
     }
     if name.starts_with("affine") {
-        let bits = if name.starts_with("affine8") { 8 } else { 4 };
+        let bits = name["affine".len()..="affine".len()].parse().unwrap_or(4);
         let (n, k) = (dims(name)[0], dims(name)[1]);
         let wq = uniform(&[n, k], dtype)?.quantize(Quant::affine(64, bits));
         eval(&wq)?;
@@ -122,6 +122,9 @@ const CASES: &[(&str, DType)] = &[
     ("affine4stream-4096x4096", DType::BF16),
     ("affine4-12288x4096", DType::BF16),
     ("affine8-4096x4096", DType::BF16),
+    ("affine2-4096x4096", DType::BF16),
+    ("affine3-4096x4096", DType::BF16),
+    ("affine6-4096x4096", DType::BF16),
     ("gather_qmm4-moe128-768x2048", DType::BF16),
     ("gather_qmm4-sorted-moe128-768x2048", DType::BF16),
     ("gather_mm-moe64-512x1024", DType::BF16),

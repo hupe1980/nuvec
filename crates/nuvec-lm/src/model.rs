@@ -357,11 +357,13 @@ pub struct KvCache {
     recurrent: Option<Array>,
     /// Positions cached.
     offset: i32,
-    /// Whether Gated DeltaNet layers keep every step's state ([`KvCache::keep_steps`]).
+    /// Whether recurrent and convolution layers keep every step's state
+    /// ([`KvCache::keep_steps`]).
     keep_steps: bool,
-    /// From the last forward with `keep_steps`: every step's recurrent state
-    /// (`[B, T, ...]`) and the convolution's input (`[B, kernel − 1 + T, channels]`).
-    steps: Option<(Array, Array)>,
+    /// From the last forward with `keep_steps`: every step's recurrent state (`[B, T, ...]`;
+    /// none for a short convolution) and the convolution's input
+    /// (`[B, kernel − 1 + T, channels]`).
+    steps: Option<(Option<Array>, Array)>,
     /// Attention keys and values are returned, not kept ([`Model::forward_uncached`]).
     uncached: bool,
     /// Quantized keys and values (codes, scales, biases each), once [`KvCache::quantize`]d.
@@ -639,10 +641,11 @@ impl KvCache {
         self.state().iter().map(Array::nbytes).sum()
     }
 
-    /// Makes Gated DeltaNet layers keep the state after every position of the following
-    /// forwards ([`nuvec::fast::gated_delta_steps`]), so that [`trim`](Self::trim) can roll
-    /// them back. It costs writing each position's state; speculative decoding turns it on
-    /// for verification only. Attention layers ignore it.
+    /// Makes recurrent and convolution layers (Gated DeltaNet, Mamba-2, short convolutions)
+    /// keep the state after every position of the following forwards, so that
+    /// [`trim`](Self::trim) can roll them back. It costs writing each position's state (and
+    /// Mamba-2 runs its one-step update per position, as plain decoding does); speculative
+    /// decoding turns it on for verification only. Attention layers ignore it.
     pub fn keep_steps(&mut self, on: bool) {
         self.keep_steps = on;
         if !on {
@@ -662,24 +665,24 @@ impl KvCache {
             }
             let Some((states, input)) = self.steps.take() else {
                 return Err(invalid(
-                    "a Gated DeltaNet layer rolls back only after a forward that kept its \
-                     steps (KvCache::keep_steps)"
+                    "a recurrent or convolution layer rolls back only after a forward that \
+                     kept its steps (KvCache::keep_steps)"
                         .into(),
                 ));
             };
-            let [_, t, ..] = states.shape() else {
-                return Err(invalid("a Gated DeltaNet layer without steps".into()));
-            };
-            let t = *t;
+            // The convolution's window: the input holds it before the forward's positions.
+            let window = self.conv.as_ref().map_or(0, |c| c.shape()[1]);
+            let t = input.shape()[1] - window;
             let Some(kept) = i32::try_from(n).ok().filter(|&n| n < t).map(|n| t - n) else {
                 return Err(invalid(format!(
                     "cannot roll back {n} of the last forward's {t} positions"
                 )));
             };
-            self.recurrent = Some(states.i((.., kept - 1)));
+            if let Some(states) = states {
+                self.recurrent = Some(states.i((.., kept - 1)));
+            }
             // The last `kernel − 1` inputs before the rejected positions (a copy: the view
             // would keep the whole input alive).
-            let window = input.shape()[1] - t;
             self.conv = Some(input.i((.., kept..kept + window)).multiply(1.0));
             self.offset -= t - kept;
             return Ok(());
@@ -1512,7 +1515,7 @@ impl GatedDeltaNet {
         let out = if cache.keep_steps {
             let (out, states) = fast::gated_delta_steps(&q, &k, &v, &g, &beta, &state);
             cache.recurrent = Some(states.i((.., l - 1)));
-            cache.steps = Some((states, input));
+            cache.steps = Some((Some(states), input));
             out
         } else {
             let (out, state) = fast::gated_delta(&q, &k, &v, &g, &beta, &state);
@@ -1688,6 +1691,7 @@ impl Mamba2 {
             self.conv1d.weight.value(),
             self.conv1d.bias.as_ref(),
         ));
+        let kept_input = cache.keep_steps.then(|| input.clone());
         let parts = conv.split_at(&[inner, inner + groups * state], -1);
         let [h, bm, cm]: [Array; 3] = parts.try_into().expect("three parts");
         let h = h.reshape([b, l, heads, head_dim]);
@@ -1699,9 +1703,25 @@ impl Mamba2 {
             .maximum(f64::from(lo))
             .minimum(f64::from(hi));
         let d = self.d.value().astype(h.dtype());
-        let (y, next) = match cache.recurrent.take() {
-            Some(s) if l == 1 => fast::ssm_update(&h, self.a_log.value(), &bm, &cm, &d, &dt, &s),
-            s => fast::ssm_scan(&h, self.a_log.value(), &bm, &cm, &d, &dt, s.as_ref()),
+        let a_log = self.a_log.value();
+        let (y, next) = match (cache.recurrent.take(), kept_input) {
+            // Verification keeping its steps: plain decoding's one-step update per position
+            // (so each position has decoding's bits), every state kept for a rollback.
+            (Some(mut s), Some(input)) => {
+                let (mut ys, mut states) = (Vec::new(), Vec::new());
+                for t in 0..l {
+                    let at = |a: &Array| a.i((.., t..t + 1));
+                    let (y, next) =
+                        fast::ssm_update(&at(&h), a_log, &at(&bm), &at(&cm), &d, &at(&dt), &s);
+                    ys.push(y);
+                    states.push(next.expand_dims(1));
+                    s = next;
+                }
+                cache.steps = Some((Some(ops::concatenate(&states, 1)), input));
+                (ops::concatenate(&ys, 1), s)
+            }
+            (Some(s), None) if l == 1 => fast::ssm_update(&h, a_log, &bm, &cm, &d, &dt, &s),
+            (s, _) => fast::ssm_scan(&h, a_log, &bm, &cm, &d, &dt, s.as_ref()),
         };
         cache.recurrent = Some(next);
         cache.offset += l;
@@ -1747,6 +1767,9 @@ impl ShortConv {
         let parts = self.in_proj.forward(x).split(3, -1);
         let [bm, cm, h]: [Array; 3] = parts.try_into().expect("three parts");
         let input = conv_input(cache, &bm.multiply(&h), self.kernel);
+        if cache.keep_steps {
+            cache.steps = Some((None, input.clone()));
+        }
         let conv = depthwise(&input, self.conv.weight.value(), self.conv.bias.as_ref());
         cache.offset += l;
         self.out_proj.forward(&cm.multiply(&conv))
@@ -2139,6 +2162,57 @@ impl FeedForward {
     }
 }
 
+/// LFM2-MoE's experts (mlx-lm's `Lfm2MoeSparseMoeBlock`): sigmoid router scores; the best
+/// `k` by score plus the expert bias, which chooses but does not weight; the unbiased scores
+/// of those, renormalised (`+ 1e-6`) if configured, scaled by `routed_scaling_factor` and
+/// cast to the activations' type, weight the SwiGLU experts' outputs.
+#[derive(Debug, Clone, Module)]
+struct Lfm2MoeMlp {
+    gate: Projection,
+    switch_mlp: SwitchGlu,
+    expert_bias: Option<Param>,
+    #[tree(skip)]
+    experts_per_token: i32,
+    #[tree(skip)]
+    norm_topk_prob: bool,
+    #[tree(skip)]
+    scale: f32,
+}
+
+impl Lfm2MoeMlp {
+    fn new(b: &Builder<'_>, path: &str, c: &Config, moe: &MixtureOfExperts) -> Result<Self> {
+        let p = |name: &str| format!("{path}.{name}");
+        let (d, e) = (c.hidden_size, moe.experts);
+        let lfm2 = c.lfm2.unwrap_or_else(|| unreachable!("an LFM2 model"));
+        Ok(Self {
+            gate: b.projection(&p("gate"), d, e, false)?,
+            switch_mlp: SwitchGlu::new(b, &p("switch_mlp"), d, moe)?,
+            expert_bias: lfm2.expert_bias.then(|| param(&[e], DType::F32)),
+            experts_per_token: int(path, moe.experts_per_token)?,
+            norm_topk_prob: moe.norm_topk_prob,
+            scale: lfm2.routed_scaling_factor,
+        })
+    }
+
+    #[track_caller]
+    fn forward(&self, x: &Array) -> Array {
+        let k = self.experts_per_token;
+        let scores = self.gate.forward(x).sigmoid();
+        let choose = match &self.expert_bias {
+            Some(bias) => scores.astype(DType::F32).add(bias.value()),
+            None => scores.clone(),
+        };
+        let e = choose.shape().last().copied().unwrap_or(k);
+        let top = ops::argpartition(&choose, e - k, -1).i((nuvec::Ellipsis, e - k..));
+        let mut weights = ops::take_along_axis(&scores, &top, -1);
+        if self.norm_topk_prob {
+            weights = weights.divide(weights.sum_keepdims(-1).add(1e-6f32));
+        }
+        let weights = weights.multiply(self.scale).astype(x.dtype());
+        fast::weighted_sum(&self.switch_mlp.forward(x, &top), &weights)
+    }
+}
+
 /// A layer's MLP.
 #[derive(Debug, Clone, Module)]
 enum BlockMlp {
@@ -2152,6 +2226,11 @@ enum BlockMlp {
     Granite(Box<GraniteMlp>),
     #[tree(rename = "feed_forward")]
     Lfm2(Box<FeedForward>),
+    /// LFM2-MoE's dense layers (`gate_proj`, `up_proj`, `down_proj`).
+    #[tree(rename = "feed_forward")]
+    Lfm2Dense(Box<Mlp>),
+    #[tree(rename = "feed_forward")]
+    Lfm2Moe(Box<Lfm2MoeMlp>),
 }
 
 impl BlockMlp {
@@ -2163,6 +2242,8 @@ impl BlockMlp {
             Self::GptOss(m) => m.forward(x),
             Self::Granite(m) => m.forward(x),
             Self::Lfm2(m) => m.forward(x),
+            Self::Lfm2Dense(m) => m.forward(x),
+            Self::Lfm2Moe(m) => m.forward(x),
         }
     }
 }
@@ -2439,6 +2520,18 @@ impl Model {
                 Ok(Block {
                     mixer,
                     mlp: match c.moe.as_ref().filter(|m| m.is_sparse(i)) {
+                        Some(moe) if c.lfm2.is_some() => BlockMlp::Lfm2Moe(Box::new(
+                            Lfm2MoeMlp::new(&b, &path("feed_forward"), c, moe)?,
+                        )),
+                        None if c.model_type == "lfm2_moe" => {
+                            BlockMlp::Lfm2Dense(Box::new(Mlp::new(
+                                &b,
+                                &path("feed_forward"),
+                                c.hidden_size,
+                                c.intermediate_size,
+                                false,
+                            )?))
+                        }
                         Some(moe) if c.granite.is_some() => BlockMlp::Granite(Box::new(
                             GraniteMlp::new(&b, &format!("model.layers.{i}"), c.hidden_size, moe)?,
                         )),

@@ -93,4 +93,4 @@ SuffixDecoding drafts from earlier turns as well as the current context, so it a
 
 ## Scope
 
-Speculation runs at batch 1 on the contiguous cache, for every supported model, hybrids included. The `Batcher` and paged caches do not speculate.
+Speculation runs at batch 1 on the contiguous cache, for every supported model: Gated DeltaNet, Mamba-2 and short-convolution layers keep each verified position's state and roll back to the last accepted one, and Mamba-2 verifies with decoding's one-step update, so the tokens are plain decoding's. The `Batcher` and paged caches do not speculate.

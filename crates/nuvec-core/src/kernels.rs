@@ -355,6 +355,7 @@ pub(crate) fn addmm(
         strides,
         size: n,
         slot: Default::default(),
+        handles: Default::default(),
         inflight: Default::default(),
     };
     let product = Data::new(matmul(a, b)?);
@@ -723,6 +724,7 @@ pub(crate) fn matmul(a: Operand<'_>, b: Operand<'_>) -> Result<Buffer> {
                 flags: m.flags,
                 size: m.size,
                 slot: Default::default(),
+                handles: Default::default(),
                 inflight: Default::default(),
             };
             let (ma, mb) = (row(a.0), row(b.0));
@@ -1005,6 +1007,7 @@ pub(crate) fn strided(dtype: DType, shape: &[usize], strides: &[isize]) -> Outpu
         flags: shape::flags_for(shape, strides),
         size: shape.iter().product(),
         slot: Default::default(),
+        handles: Default::default(),
         inflight: Default::default(),
     }
 }

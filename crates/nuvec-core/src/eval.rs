@@ -270,13 +270,13 @@ fn evaluate(node: &Arc<Node>, gpu: &mut GpuEval) {
         }
         Ok((outputs, false)) => {
             for (output, data) in node.outputs.iter().zip(outputs) {
-                let _ = output.slot.set(Ok(data));
+                output.slot.set(Ok(data));
             }
             None
         }
         Err(err) => {
             for output in &node.outputs {
-                let _ = output.slot.set(Err(err.clone()));
+                output.slot.set(Err(err.clone()));
             }
             Some(err)
         }
@@ -304,7 +304,11 @@ struct Running<'a> {
 
 impl Running<'_> {
     fn finish(mut self, state: State) {
+        let done = matches!(state, State::Done);
         *self.node.lock() = state;
+        if done {
+            self.node.mark_evaluated();
+        }
         self.done.finish();
         // Dropping `self` now releases `done` without failing the node.
         self.finished = true;
@@ -318,7 +322,7 @@ impl Drop for Running<'_> {
         }
         let error = Error::Backend("the evaluation of this array panicked".into());
         for output in &self.node.outputs {
-            let _ = output.slot.set(Err(error.clone()));
+            output.slot.set(Err(error.clone()));
         }
         *self.node.lock() = State::Failed { error };
         self.done.finish();
@@ -504,23 +508,22 @@ fn owned(input: &mut Array, gpu: &mut GpuEval) -> Option<Data> {
     if let Some(base) = Arc::get_mut(base) {
         let out = base.outputs.get_mut(at)?;
         if let Some(Ok(data)) = out.slot.get() {
-            // The slot and (if it was published from in-flight work) the in-flight copy.
+            // The slot, this read's copy and (if it was published from in-flight work) the
+            // in-flight copy.
             let published = matches!(*state, crate::array::InFlightState::Set(_));
-            if !usable(data, out, 1 + usize::from(published)) {
+            if !usable(&data, out, 2 + usize::from(published)) {
                 return None;
             }
+            drop(data);
             if published {
                 *state = crate::array::InFlightState::Unset;
             }
-            return match out.slot.take() {
-                Some(Ok(data)) => Some(data),
-                _ => None,
-            };
+            return out.slot.take();
         }
     }
     // In flight: only weak references from pending work remain besides ours.
     let out = base.outputs.get(at)?;
-    if out.slot.get().is_some() {
+    if out.slot.is_set() {
         return None;
     }
     let crate::array::InFlightState::Set(data) = &*state else {
@@ -545,21 +548,14 @@ fn owned_on_cpu(input: &mut Array) -> Option<Data> {
     if out.inflight.get().is_some() {
         return None;
     }
-    let Some(Ok(data)) = out.slot.get() else {
-        return None;
-    };
-    let whole = data.offset == 0 && data.buffer.len() == out.size * out.dtype.size();
-    if !(out.flags.row_contiguous
-        && whole
-        && Arc::strong_count(&data.buffer) == 1
-        && data.buffer.cpu_writable())
+    let (size, dtype, contiguous) = (out.size, out.dtype, out.flags.row_contiguous);
+    let data = out.slot.data_mut()?;
+    let whole = data.offset == 0 && data.buffer.len() == size * dtype.size();
+    if !(contiguous && whole && Arc::strong_count(&data.buffer) == 1 && data.buffer.cpu_writable())
     {
         return None;
     }
-    match out.slot.take() {
-        Some(Ok(data)) => Some(data),
-        _ => None,
-    }
+    out.slot.take()
 }
 
 /// An update written into its donated base (input 0), or an element-wise operation or
