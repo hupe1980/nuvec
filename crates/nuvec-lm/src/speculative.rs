@@ -399,8 +399,9 @@ impl<D: Drafter> std::fmt::Debug for SpeculativeGeneration<'_, D> {
 
 /// Starts generating after `prompt` (at least one token) with speculative decoding:
 /// `drafter` proposes tokens as `policy` says (at most [`verify_rows`]` − 1` per step).
-/// Gated DeltaNet layers keep every position's state while a draft is verified, and roll
-/// back to the last accepted one ([`KvCache::keep_steps`]).
+/// Recurrent and convolution layers (Gated DeltaNet, Mamba-2, short convolutions) keep every
+/// position's state while a draft is verified, and roll back to the last accepted one
+/// ([`KvCache::keep_steps`]).
 ///
 /// Greedy (temperature 0) output is plain greedy decoding's, bit for bit. With a
 /// temperature, a verification accepts by the lossless rule
@@ -421,11 +422,6 @@ pub fn speculative_generate<'a, D: Drafter>(
     }
     if model.stage().is_some() {
         return invalid("not supported on a pipelined model");
-    }
-    if let Some(family) = model.unpageable() {
-        return invalid(&format!(
-            "{family}'s Mamba-2 or short-convolution layers cannot roll back rejected drafts"
-        ));
     }
     options.validate()?;
     let auto = drafter.auto(model);

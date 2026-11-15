@@ -36,6 +36,10 @@ pub enum Error {
     Io(String),
     /// An argument of a boundary function (transforms, loaders) is invalid.
     InvalidArgument(String),
+    /// The output's data was released: it was evaluated, every handle to it was dropped,
+    /// and it was reached again through a sibling ([`crate::graph::siblings`]), as MLX
+    /// detaches siblings after evaluation.
+    Released,
 }
 
 /// The reason an operation rejected its arguments (see [`Error::Op`]).
@@ -248,6 +252,7 @@ impl fmt::Display for Error {
             Self::Backend(msg) => write!(f, "GPU backend error: {msg}"),
             Self::UnsupportedDevice(device) => write!(f, "no backend for device {device}"),
             Self::Io(msg) => write!(f, "I/O error: {msg}"),
+            Self::Released => write!(f, "the output was released after its handles were dropped"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
         }
     }

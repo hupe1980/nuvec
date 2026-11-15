@@ -133,6 +133,7 @@ impl Drop for Tracing {
                     }
                 }
             };
+            node.mark_evaluated();
             drop(inputs); // detach outside the lock
         }
     }
@@ -156,10 +157,7 @@ struct Step {
 impl Step {
     fn outputs(&self) -> Vec<Array> {
         (0..self.node.outputs.len() as u32)
-            .map(|output| Array {
-                node: self.node.clone(),
-                output,
-            })
+            .map(|output| Array::handle(self.node.clone(), output))
             .collect()
     }
 }

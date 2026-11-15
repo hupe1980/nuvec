@@ -114,7 +114,7 @@ fn transcendental(case: &Case) -> bool {
 fn cpu_differs(case: &Case) -> bool {
     matches!(
         case.op.as_str(),
-        "quantized_matmul" | "gather_qmm" | "qqmm" | "gather_qqmm"
+        "quantized_matmul" | "gather_qmm" | "qqmm" | "gather_qqmm" | "block_masked_mm"
     ) || case.name.starts_with("affine-dequantize-")
         || case.name.starts_with("sdpa-d512-")
         || case.name.starts_with("power-gpu-")

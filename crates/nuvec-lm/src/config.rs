@@ -117,13 +117,18 @@ pub struct Mamba {
     pub time_step_limit: (f32, f32),
 }
 
-/// LFM2's short convolutions (mlx-lm's `lfm2`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// LFM2's short convolutions (mlx-lm's `lfm2` and `lfm2_moe`).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Lfm2 {
     /// Width of the depthwise convolution (`conv_L_cache`).
     pub conv_kernel: usize,
     /// Biases on the convolution and its projections.
     pub conv_bias: bool,
+    /// LFM2-MoE: a bias added to the router's scores to choose experts (not to weight them;
+    /// `use_expert_bias`).
+    pub expert_bias: bool,
+    /// LFM2-MoE: the chosen experts' weights are scaled by this (`routed_scaling_factor`).
+    pub routed_scaling_factor: f32,
 }
 
 /// The sizes of Gated DeltaNet layers (`linear_*` settings).
@@ -409,11 +414,12 @@ impl Config {
             "gpt_oss" => (true, true, false),
             "gemma4" => (false, false, true),
             "granitemoehybrid" => (flag("attention_bias"), flag("attention_bias"), false),
-            "lfm2" => (false, false, true),
+            "lfm2" | "lfm2_moe" => (false, false, true),
             other => return Err(invalid(format!("unsupported model type {other:?}"))),
         };
         let granite = model_type == "granitemoehybrid";
-        let lfm2 = model_type == "lfm2";
+        let lfm2_moe = model_type == "lfm2_moe";
+        let lfm2 = model_type == "lfm2" || lfm2_moe;
         let gpt_oss = model_type == "gpt_oss";
         let gemma = model_type == "gemma4";
         let hybrid = model_type == "qwen3_5";
@@ -448,6 +454,29 @@ impl Config {
                         .iter()
                         .map(|i| non_negative("mlp_only_layers", i))
                         .collect::<Result<_>>()?,
+                    router_bias: false,
+                    expert_bias: false,
+                    activation: Activation::SwiGlu,
+                })
+            }
+            // mlx-lm's LFM2-MoE: dense layers below `num_dense_layers`, then sigmoid-routed
+            // SwiGLU experts (no shared expert).
+            experts if lfm2_moe && experts > 0 => {
+                let experts_per_token =
+                    positive("num_experts_per_tok", int("num_experts_per_tok")?)?;
+                if experts_per_token > experts {
+                    return Err(invalid(format!(
+                        "{experts_per_token} experts per token of {experts}"
+                    )));
+                }
+                Some(MixtureOfExperts {
+                    experts,
+                    experts_per_token,
+                    intermediate_size: int("moe_intermediate_size")?,
+                    shared_intermediate_size: None,
+                    norm_topk_prob: flag("norm_topk_prob"),
+                    sparse_step: 1,
+                    dense_layers: (0..opt_int("num_dense_layers")?.unwrap_or(0)).collect(),
                     router_bias: false,
                     expert_bias: false,
                     activation: Activation::SwiGlu,
@@ -700,12 +729,14 @@ impl Config {
             true => Some(Lfm2 {
                 conv_kernel: positive("conv_L_cache", int("conv_L_cache")?)?,
                 conv_bias: flag("conv_bias"),
+                expert_bias: lfm2_moe && flag("use_expert_bias"),
+                routed_scaling_factor: float("routed_scaling_factor").unwrap_or(1.0),
             }),
             false => None,
         };
         // LFM2's MLP width (mlx-lm's `MLP`): `block_ff_dim` (or `intermediate_size`), adjusted
         // to 2/3, scaled by `block_ffn_dim_multiplier` and rounded up to `block_multiple_of`.
-        let lfm2_ff = match lfm2 {
+        let lfm2_ff = match lfm2 && !lfm2_moe {
             true => {
                 let mut ff = match opt_int("block_ff_dim")? {
                     Some(ff) => ff,
@@ -774,7 +805,7 @@ impl Config {
                 "qwen2" => 1e6,
                 "gpt_oss" => 150_000.0,
                 "qwen3_5" | "qwen3_5_moe" => 100_000.0,
-                "lfm2" => 1e6,
+                "lfm2" | "lfm2_moe" => 1e6,
                 _ => 10_000.0,
             }),
             rope_scaling: match (hybrid, qwen3_moe) {

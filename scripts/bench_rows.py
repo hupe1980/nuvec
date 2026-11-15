@@ -65,7 +65,7 @@ def mlx_op(name: str, dt, b: int):
             return mx.quantized_matmul(x, wq, s, bi, transpose=True, group_size=64, bits=4)
         return op
     if name.startswith("affine"):
-        bits = 8 if name.startswith("affine8") else 4
+        bits = int(name[len("affine")])
         n, k = dims
         wq, s, bi = mx.quantize(u(n, k), group_size=64, bits=bits)
         x = u(b, k)

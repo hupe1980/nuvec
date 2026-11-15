@@ -62,7 +62,7 @@ Weights quantized elsewhere (a checkpoint's tensors) become a `Quantized` with `
 
 ## Products on the GPU
 
-Products use MLX's kernels, chosen by shape as MLX chooses them: matrix-vector kernels for few rows, as in decode; tiled kernels for many rows; split-K when the output is small but the inner dimension long. From 2 rows, MLX's multi-vector kernel reads each weight group once for several rows, so a row's low bits can depend on how many rows share a product, as in MLX. Built or evaluated under `nuvec::with_row_exact` (speculative verification, `BatcherOptions::batch_invariant`, lanes of independent sequences), up to 8 rows run as matrix-vector products in which each row's result equals its single-row product bit for bit; affine products read each weight once for two rows, so two lanes cost about one.
+Products use MLX's kernels, chosen by shape as MLX chooses them: matrix-vector kernels for few rows, as in decode; tiled kernels for many rows; split-K when the output is small but the inner dimension long. From 2 rows, MLX's multi-vector kernel reads each weight group once for several rows, so a row's low bits can depend on how many rows share a product, as in MLX. Built or evaluated under `nuvec::with_row_exact` (speculative verification, `BatcherOptions::batch_invariant`, lanes of independent sequences), up to 8 rows run as matrix-vector products in which each row's result equals its single-row product bit for bit; affine products read each weight once for two or three rows (three at 3, 6 and 8 bits), so two lanes cost about one.
 
 ## Mixture of experts
 

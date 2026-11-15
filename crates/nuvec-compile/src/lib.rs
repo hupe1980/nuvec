@@ -1029,7 +1029,8 @@ impl Builder {
         let Some(primitive) =
             primitive.filter(|p| effect(p) || !args.iter().all(|r| matches!(r, Ref::Const(_))))
         else {
-            for s in &siblings {
+            // Released siblings (evaluated, every handle dropped) are not needed by anyone.
+            for s in siblings.iter().filter(|s| !graph::is_released(s)) {
                 let c = self.constant(s);
                 self.refs.insert(Self::key(s), Ref::Const(c));
             }

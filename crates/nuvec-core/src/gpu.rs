@@ -193,7 +193,7 @@ mod stub {
         }
         pub(crate) fn defer(&mut self, node: Arc<Node>, outputs: Vec<Data>) {
             for (output, data) in node.outputs.iter().zip(outputs) {
-                let _ = output.slot.set(Ok(data));
+                output.slot.set(Ok(data));
             }
         }
         pub(crate) fn slice_update_in_place(
@@ -366,7 +366,7 @@ mod metal {
                 (Ok(()), Some(d)) => Ok(d),
                 (Ok(()), None) => continue,
             };
-            let _ = output.slot.set(value);
+            output.slot.set(value);
         }
     }
 
@@ -714,6 +714,23 @@ mod metal {
                 GemmBuffer::View(b) => Arg::Read(b, self.offset),
                 GemmBuffer::Copy(b) => Arg::Read(b.metal().expect("device storage"), 0),
             }
+        }
+    }
+
+    /// How many of `m ≥ 2` row-exact rows the few-row kernel takes three at a time (the rest
+    /// in pairs). Measured on an M4 Pro (`just bench-rows`): three rows cost less per row
+    /// than two at 3, 6 and 8 bits, so they take as many triples as fit (a remainder of one
+    /// becomes two pairs); at 4 bits three rows cost two pairs (the unpacked codes spill), so
+    /// it takes pairs; the other widths take one triple for an odd count.
+    fn triple_rows(m: usize, bits: usize) -> usize {
+        match bits {
+            3 | 6 | 8 => match m % 3 {
+                0 => m,
+                1 => m - 4,
+                _ => m - 2,
+            },
+            4 => 0,
+            _ => 3 * (m % 2),
         }
     }
 
@@ -3364,6 +3381,125 @@ mod metal {
             Ok(vec![Data::new(out)])
         }
 
+        /// MLX's `block_masked_mm`: its masked steel GEMM (`bm = bn` = the block size,
+        /// `bk = 16`, 2 × 2 simdgroups), which writes zeros for masked output blocks and
+        /// skips masked operand blocks.
+        fn block_masked_mm(
+            &mut self,
+            operands: &[Operand<'_>],
+            o: &Output,
+            (block_size, out_mask, op_mask): (usize, bool, bool),
+        ) -> Result<Vec<Data>> {
+            let mut out = Buffer::try_alloc_gpu(o.size * o.dtype.size())?;
+            if o.size == 0 {
+                return Ok(vec![Data::new(out)]);
+            }
+            let nd = o.shape.len();
+            let (m, n, k) = (
+                o.shape[nd - 2],
+                o.shape[nd - 1],
+                operands[0].0.shape[nd - 1],
+            );
+            let ga = self.gemmand(operands[0], m, k)?;
+            let gb = self.gemmand(operands[1], k, n)?;
+            let masks = operands[2..]
+                .iter()
+                .map(|&op| self.packed(op, false))
+                .collect::<Result<Vec<_>>>()?;
+            // At least one batch dimension (MLX's kernel reads the first batch stride).
+            let batch_shape = match &o.shape[..nd - 2] {
+                [] => vec![1],
+                shape => shape.to_vec(),
+            };
+            let batch: usize = batch_shape.iter().product();
+            let bnd = batch_shape.len();
+            let batch_of = |strides: &[isize]| -> Vec<i64> {
+                match strides.len() < 2 + bnd {
+                    true => vec![0; bnd],
+                    false => strides[..strides.len() - 2]
+                        .iter()
+                        .map(|&s| s as i64)
+                        .collect(),
+                }
+            };
+            let pad = |s: &[isize]| -> Vec<i64> {
+                match s.is_empty() {
+                    true => vec![0; bnd],
+                    false => s.iter().map(|&s| s as i64).collect(),
+                }
+            };
+            let mut batch_strides = pad(&ga.batch_strides);
+            batch_strides.extend(pad(&gb.batch_strides));
+            let mut mask_strides: Vec<i32> = Vec::new();
+            for mask in &masks {
+                batch_strides.extend(batch_of(&mask.strides));
+                let l = mask.strides.len();
+                mask_strides.extend([mask.strides[l - 1] as i32, mask.strides[l - 2] as i32]);
+            }
+            let kind = |at: Option<usize>| match at.map(|i| operands[i].0.dtype) {
+                None => "nomask",
+                Some(DType::Bool) => "bool",
+                Some(_) => "typed",
+            };
+            let out_kind = kind(out_mask.then_some(2));
+            let op_kind = kind(op_mask.then_some(2 + usize::from(out_mask)));
+            let name = format!(
+                "nuvec_block_masked_mm_{out_kind}_{op_kind}_{}{}_{}_bs{block_size}",
+                if ga.transposed { 't' } else { 'n' },
+                if gb.transposed { 't' } else { 'n' },
+                o.dtype.name()
+            );
+            let (bm, bk) = (block_size, 16);
+            let constants = [
+                (200, m.is_multiple_of(bm)),
+                (201, n.is_multiple_of(bm)),
+                (202, k.is_multiple_of(bk)),
+            ];
+            let pipeline = self.pipeline_with(&name, &constants)?;
+            let (tiles_n, tiles_m) = (n.div_ceil(bm), m.div_ceil(bm));
+            let params = GemmParams {
+                m: m as i32,
+                n: n as i32,
+                k: k as i32,
+                lda: ga.ld,
+                ldb: gb.ld,
+                ldd: n as i32,
+                tiles_n: tiles_n as i32,
+                tiles_m: tiles_m as i32,
+                batch_stride_a: batch_strides[0],
+                batch_stride_b: batch_strides[bnd],
+                batch_stride_d: (m * n) as i64,
+                swizzle_log: 0,
+                gemm_k_iterations_aligned: (k / bk) as i32,
+                batch_ndim: bnd as i32,
+                _pad: 0,
+            };
+            mask_strides.push(0); // never empty (Metal rejects empty inline data)
+            let shape = shape_bytes(&batch_shape);
+            // Absent masks: any buffer (the kernel does not read it).
+            let mask_arg = |i: usize| masks.get(i).map_or_else(|| ga.arg(), Packed::arg);
+            let (out_at, op_at) = (0, usize::from(out_mask));
+            let args = [
+                ga.arg(),
+                gb.arg(),
+                Arg::write(out.metal_mut().expect("device storage")),
+                Arg::bytes(bytemuck::bytes_of(&params)),
+                Arg::bytes(&shape),
+                Arg::bytes(bytemuck::cast_slice(&batch_strides)),
+                if out_mask { mask_arg(out_at) } else { ga.arg() },
+                if op_mask { mask_arg(op_at) } else { ga.arg() },
+                if op_mask {
+                    mask_arg(op_at + 1)
+                } else {
+                    ga.arg()
+                },
+                Arg::bytes(bytemuck::cast_slice(&mask_strides)),
+            ];
+            self.encode_groups(&pipeline, &args, [tiles_n, tiles_m, batch], [32, 2, 2])?;
+            self.counted()?;
+            Ok(vec![Data::new(out)])
+        }
+
         /// MLX's `hadamard_mn_contiguous`: `n = m · n1 · n2` with passes over `n1` (strided by
         /// `n2`) and `n2` of at most 8,192, then the order-`m` stage, in place.
         fn hadamard(&mut self, x: Operand<'_>, o: &Output, scale: f32) -> Result<Vec<Data>> {
@@ -4223,6 +4359,18 @@ mod metal {
             if *op == FastOp::SegmentedMm {
                 return self.segmented_mm(operands, &outputs[0]);
             }
+            if let FastOp::BlockMaskedMm {
+                block_size,
+                out_mask,
+                op_mask,
+            } = *op
+            {
+                return self.block_masked_mm(
+                    operands,
+                    &outputs[0],
+                    (block_size, out_mask, op_mask),
+                );
+            }
             if let FastOp::Hadamard { scale } = *op {
                 return self.hadamard(operands[0], &outputs[0], f32::from_bits(scale));
             }
@@ -4468,6 +4616,7 @@ mod metal {
                 | FastOp::Conv { .. }
                 | FastOp::Hadamard { .. }
                 | FastOp::SegmentedMm
+                | FastOp::BlockMaskedMm { .. }
                 | FastOp::PagedAttention { .. }
                 | FastOp::PagedWrite
                 | FastOp::MoeRoute { .. }
@@ -6655,19 +6804,36 @@ mod metal {
             }
             let fast = k % (pack_factor(bits, 32) * if bits == 2 { 1 } else { 2 } * 32) == 0;
             if transpose && fast && !batched && m >= 2 {
-                // nuvec's few-row kernel: weights loaded once for two rows, each with
-                // `qmv_fast`'s arithmetic (lanes: two cost about one).
-                args.push(Arg::bytes(&mb));
-                let name = format!(
-                    "nuvec_affine_qmv_rows_{base}_pr{}_r2",
-                    u8::from(!n.is_multiple_of(8))
-                );
-                return self.dispatch_groups(
-                    &name,
-                    &args,
-                    [m.div_ceil(2), n.div_ceil(8), 1],
-                    [32, 2, 1],
-                );
+                // nuvec's few-row kernel: weights loaded once for two or three rows, each
+                // with `qmv_fast`'s arithmetic (lanes: two cost about one).
+                drop(args);
+                let partial = u8::from(!n.is_multiple_of(8));
+                let threes = triple_rows(m, bits);
+                let size = out.dtype.size();
+                let Arg::Read(xb, xo) = x.arg() else {
+                    unreachable!("an operand is read")
+                };
+                for (first, rows, r) in [(0, threes, 3), (threes, m - threes, 2)] {
+                    if rows == 0 {
+                        continue;
+                    }
+                    let rb = ints(rows);
+                    let output = buffer.metal_mut().expect("device storage");
+                    let args = [
+                        w.arg(),
+                        s.arg(),
+                        b.arg(),
+                        Arg::Read(xb, xo + first * k * size),
+                        Arg::Write(output, first * n * size),
+                        Arg::bytes(&kb),
+                        Arg::bytes(&nb),
+                        Arg::bytes(&rb),
+                    ];
+                    let name = format!("nuvec_affine_qmv_rows_{base}_pr{partial}_r{r}");
+                    let grid = [rows.div_ceil(r), n.div_ceil(8), 1];
+                    self.dispatch_groups(&name, &args, grid, [32, 2, 1])?;
+                }
+                return Ok(());
             }
             if batched {
                 args.extend(batch_info.iter().map(|v| Arg::bytes(v)));
@@ -7903,7 +8069,7 @@ mod metal {
                     p.exposed.push(true);
                 }
             }
-            let slot = |i: usize| nodes[i].0.outputs[0].slot.get().map(Result::is_ok);
+            let slot = |i: usize| nodes[i].0.outputs[0].slot.get().map(|r| r.is_ok());
             // Completion handlers may run out of order: nothing is published before chunk 0.
             shared.complete(1, Ok(()));
             assert_eq!((slot(0), slot(1)), (None, None));

@@ -2,7 +2,7 @@
 //!
 //! - **Models:** Llama, Mistral, Qwen 2, Qwen 3, Qwen 3 MoE, Qwen 3.5 (hybrid Gated
 //!   DeltaNet and attention, dense or mixture-of-experts), gpt-oss, Gemma 4 (text), Granite 4
-//!   (Mamba-2 and attention) and LFM2 (short convolutions and attention), from Hugging Face
+//!   (Mamba-2 and attention) and LFM2 and LFM2-MoE (short convolutions and attention), from Hugging Face
 //!   or MLX checkpoints, including MLX's quantized ones. Aligned files are
 //!   memory-mapped without a copy; mlx-community checkpoints (unpadded headers) are read
 //!   once at load, in parallel.
@@ -223,7 +223,7 @@ fn dropped(name: &str, config: &Config) -> bool {
 fn sanitize(weights: BTreeMap<String, Array>, config: &Config) -> Result<BTreeMap<String, Array>> {
     let weights = match config.model_type.as_str() {
         "gpt_oss" => sanitize_gpt_oss(weights)?,
-        "granitemoehybrid" | "lfm2" => sanitize_granite_lfm2(weights, config)?,
+        "granitemoehybrid" | "lfm2" | "lfm2_moe" => sanitize_granite_lfm2(weights, config)?,
         _ => weights,
     };
     let mut weights: BTreeMap<String, Array> = weights
@@ -333,13 +333,34 @@ fn sanitize(weights: BTreeMap<String, Array>, config: &Config) -> Result<BTreeMa
 /// mlx-lm's `granitemoehybrid.sanitize` and `lfm2.sanitize`: convolutions stored `[C, 1, K]`
 /// as `[C, K, 1]`; Granite 4's experts (`input_linear` `[E, 2·I, D]`: gate then up;
 /// `output_linear`) as `switch_mlp`, and a dense model's `shared_mlp` as its `mlp`; a
-/// redundant `lm_head.weight` beside tied embeddings dropped.
+/// redundant `lm_head.weight` beside tied embeddings dropped; LFM2-MoE's `w1`/`w3`/`w2` as
+/// `gate_proj`/`up_proj`/`down_proj` and its per-expert tensors stacked (`lfm2_moe.sanitize`).
 fn sanitize_granite_lfm2(
     weights: BTreeMap<String, Array>,
     config: &Config,
 ) -> Result<BTreeMap<String, Array>> {
     let mut out = BTreeMap::new();
+    // LFM2-MoE in Hugging Face's layout: `w1`/`w3`/`w2` names and one tensor per expert,
+    // stacked as mlx-lm's `sanitize` stacks them.
+    let lfm2_moe = config.model_type == "lfm2_moe";
+    let mut experts: BTreeMap<String, Vec<(usize, Array)>> = BTreeMap::new();
     for (k, v) in weights {
+        let k = match lfm2_moe {
+            true => k
+                .replace(".w1.weight", ".gate_proj.weight")
+                .replace(".w3.weight", ".up_proj.weight")
+                .replace(".w2.weight", ".down_proj.weight"),
+            false => k,
+        };
+        if lfm2_moe
+            && let Some((base, rest)) = k.split_once(".feed_forward.experts.")
+            && let Some((e, proj)) = rest.split_once('.')
+            && let Ok(e) = e.parse::<usize>()
+        {
+            let key = format!("{base}.feed_forward.switch_mlp.{proj}");
+            experts.entry(key).or_default().push((e, v));
+            continue;
+        }
         let conv = k.ends_with("conv1d.weight") || k.ends_with(".conv.conv.weight");
         if conv && v.ndim() == 3 && v.shape()[2] != 1 {
             out.insert(k, v.transpose([0, 2, 1]).check()?);
@@ -368,6 +389,11 @@ fn sanitize_granite_lfm2(
         } else {
             out.insert(k, v);
         }
+    }
+    for (key, mut parts) in experts {
+        parts.sort_by_key(|(e, _)| *e);
+        let parts: Vec<Array> = parts.into_iter().map(|(_, v)| v).collect();
+        out.insert(key, nuvec::ops::stack(&parts, 0).check()?);
     }
     Ok(out)
 }

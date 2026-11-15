@@ -33,7 +33,7 @@ def mlx_results() -> dict[str, float]:
     sa, sb = n(256, 4096), n(4096, 256)
     segments = mx.array([[i * 512, (i + 1) * 512] for i in range(8)], dtype=mx.int32)
     ma, mb = n(1024, 1024), n(1024, 1024)
-    mask = mx.random.bernoulli(0.5, (32, 32))
+    mask = (mx.arange(32)[:, None] + mx.arange(32)[None]) % 2 == 0  # half the blocks
     qx, qx1, qw = n(256, 4096), n(1, 4096), n(4096, 4096)
     wq, ws = mx.quantize(qw, mode="nvfp4")
     mx.eval(h1, h2, h3, e1, e2, e3, sa, sb, segments, ma, mb, mask, qx, qx1, wq, ws)

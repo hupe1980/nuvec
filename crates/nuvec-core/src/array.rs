@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::panic::Location;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::ThreadId;
 
@@ -25,7 +26,6 @@ use crate::{DType, Device, Element, Error, Result, Stream, default_stream};
 /// it remembers the operation, the caller's source location and the reason, every array
 /// computed from it fails with the same error, and the error surfaces as `Err` from
 /// [`Array::check`], [`Array::eval`], [`Array::item`] or [`Array::to_vec`].
-#[derive(Clone)]
 #[must_use = "arrays are lazy: an unused result computes nothing (and may hold an error)"]
 pub struct Array {
     pub(crate) node: Arc<Node>,
@@ -40,6 +40,9 @@ pub(crate) struct Node {
     pub(crate) trace: Option<TraceId>,
     pub(crate) outputs: SmallVec<[Output; 1]>,
     pub(crate) state: Mutex<State>,
+    /// Set once the node is `Done`: from then on an output with no handle releases its
+    /// data (MLX's `detach`).
+    pub(crate) evaluated: AtomicBool,
     /// Whether the node is a failed array: an operation rejected its arguments, or one of
     /// its inputs had failed, when it was recorded (see [`Array::is_failed`]).
     pub(crate) failed: bool,
@@ -55,7 +58,10 @@ pub(crate) struct Output {
     pub(crate) flags: Flags,
     pub(crate) size: usize,
     /// Set exactly once, when the node is evaluated (or at creation for leaves).
-    pub(crate) slot: OnceLock<Result<Data>>,
+    pub(crate) slot: Slot,
+    /// Handles ([`Array`]s) to this output, counted for nodes with several outputs only:
+    /// when it falls to zero on an evaluated node, the output releases its data.
+    pub(crate) handles: AtomicUsize,
     /// GPU data whose command buffer is committed on the device timeline but may not have
     /// completed: later GPU work (ordered after it on the device) may read it before `slot` is set.
     /// Shared with the committed work that publishes it, which locks it before it reaches
@@ -85,6 +91,8 @@ pub(crate) enum InFlightState {
     Set(Data),
     /// Taken over by a consumer that writes into it in place; never published.
     Donated,
+    /// Released: no handle is left (see [`Output::release`]); never published.
+    Released,
 }
 
 impl InFlight {
@@ -137,6 +145,93 @@ impl Data {
         Self {
             buffer: Arc::new(buffer),
             offset: 0,
+        }
+    }
+}
+
+/// An output's result: set once (when the node is evaluated, or at creation for leaves),
+/// then read; successful data can be released when no handle is left ([`Output::release`]),
+/// errors stay. A release that races a late `set` (GPU completion) still drops the data:
+/// `set` checks the flag after storing, `release` sets it before looking.
+#[derive(Default)]
+pub(crate) struct Slot {
+    cell: OnceLock<Result<Mutex<Option<Data>>>>,
+    released: AtomicBool,
+}
+
+impl Slot {
+    pub(crate) fn new(value: Result<Data>) -> Self {
+        Self {
+            cell: OnceLock::from(value.map(|d| Mutex::new(Some(d)))),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    fn held(m: &Mutex<Option<Data>>) -> MutexGuard<'_, Option<Data>> {
+        m.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn read(r: &Result<Mutex<Option<Data>>>) -> Result<Data> {
+        match r {
+            Ok(m) => Self::held(m).clone().ok_or(Error::Released),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    /// Stores the result once; later calls are ignored.
+    pub(crate) fn set(&self, value: Result<Data>) {
+        if self.cell.set(value.map(|d| Mutex::new(Some(d)))).is_ok() && self.released.load(SeqCst) {
+            self.clear();
+        }
+    }
+
+    /// The result, if set: the data (a released output's is [`Error::Released`]) or the
+    /// error.
+    pub(crate) fn get(&self) -> Option<Result<Data>> {
+        self.cell.get().map(Self::read)
+    }
+
+    /// Whether the result is set.
+    pub(crate) fn is_set(&self) -> bool {
+        self.cell.get().is_some()
+    }
+
+    /// The error, if the result is one.
+    pub(crate) fn error(&self) -> Option<&Error> {
+        self.cell.get().and_then(|r| r.as_ref().err())
+    }
+
+    /// Blocks until the result is set, then reads it.
+    pub(crate) fn wait(&self) -> Result<Data> {
+        Self::read(self.cell.wait())
+    }
+
+    /// The data of a slot owned outright, borrowed (donation's checks count its handles).
+    pub(crate) fn data_mut(&mut self) -> Option<&Data> {
+        match self.cell.get_mut()? {
+            Ok(m) => m.get_mut().unwrap_or_else(PoisonError::into_inner).as_ref(),
+            Err(_) => None,
+        }
+    }
+
+    /// Takes the data out of a slot owned outright (donation).
+    pub(crate) fn take(&mut self) -> Option<Data> {
+        match self.cell.get_mut()? {
+            Ok(m) => m.get_mut().unwrap_or_else(PoisonError::into_inner).take(),
+            Err(_) => None,
+        }
+    }
+
+    /// Drops the data now and any data set later (errors stay).
+    pub(crate) fn release(&self) {
+        self.released.store(true, SeqCst);
+        self.clear();
+    }
+
+    fn clear(&self) {
+        if let Some(Ok(m)) = self.cell.get() {
+            let data = Self::held(m).take();
+            drop(data);
         }
     }
 }
@@ -235,6 +330,18 @@ impl Node {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Marks the node evaluated (`Done`) and releases the outputs no handle refers to.
+    pub(crate) fn mark_evaluated(&self) {
+        self.evaluated.store(true, SeqCst);
+        if self.outputs.len() > 1 {
+            for output in &self.outputs {
+                if output.handles.load(SeqCst) == 0 {
+                    output.release();
+                }
+            }
+        }
+    }
+
     /// Whether the transform this node depends on is running (see [`Array::is_tracer`]).
     pub(crate) fn is_tracer(&self) -> bool {
         self.trace.is_some_and(crate::transforms::is_live)
@@ -258,7 +365,7 @@ impl Output {
         dtype: DType,
         shape: Shape,
         strides: Option<Strides>,
-        slot: OnceLock<Result<Data>>,
+        slot: Slot,
     ) -> Result<Self> {
         // One pass: the element count (checked), the byte size (checked) and the public
         // `i32` dimensions (each must fit, as in MLX's `Shape`).
@@ -287,8 +394,17 @@ impl Output {
             flags,
             size,
             slot,
+            handles: AtomicUsize::new(0),
             inflight: Arc::default(),
         })
+    }
+
+    /// Drops this output's data (MLX's `detach` of a sibling): the slot's and the
+    /// in-flight copy's; data published later is dropped too.
+    pub(crate) fn release(&self) {
+        let data = std::mem::replace(&mut *self.inflight.lock(), InFlightState::Released);
+        drop(data);
+        self.slot.release();
     }
 }
 
@@ -302,12 +418,13 @@ impl Array {
 
     /// A node that is already evaluated, holding `data` (or a sticky error).
     pub(crate) fn leaf(data: Result<Data>, dtype: DType, shape: Shape) -> Result<Self> {
-        let output = Output::new(dtype, shape, None, OnceLock::from(data))?;
+        let output = Output::new(dtype, shape, None, Slot::new(data))?;
         Ok(Self::from_node(Node {
             stream: default_stream(),
             trace: None,
             outputs: SmallVec::from_buf([output]),
             state: Mutex::new(State::Done),
+            evaluated: AtomicBool::new(true),
             failed: false,
         }))
     }
@@ -316,21 +433,17 @@ impl Array {
     /// (a 0-D shape if `shape` is not a valid one). It takes no buffer.
     #[cold]
     pub(crate) fn failed(error: Error, dtype: DType, shape: &[usize]) -> Self {
-        let output = Output::new(
-            dtype,
-            shape.into(),
-            None,
-            OnceLock::from(Err(error.clone())),
-        )
-        .unwrap_or_else(|_| {
-            Output::new(dtype, Shape::new(), None, OnceLock::from(Err(error)))
-                .unwrap_or_else(|_| unreachable!("a 0-D output is always valid"))
-        });
+        let output = Output::new(dtype, shape.into(), None, Slot::new(Err(error.clone())))
+            .unwrap_or_else(|_| {
+                Output::new(dtype, Shape::new(), None, Slot::new(Err(error)))
+                    .unwrap_or_else(|_| unreachable!("a 0-D output is always valid"))
+            });
         Self::from_node(Node {
             stream: default_stream(),
             trace: None,
             outputs: SmallVec::from_buf([output]),
             state: Mutex::new(State::Done),
+            evaluated: AtomicBool::new(true),
             failed: true,
         })
     }
@@ -459,7 +572,7 @@ impl Array {
         let outputs = primitive
             .output_specs(&inputs)?
             .into_iter()
-            .map(|spec| Output::new(spec.dtype, spec.shape, spec.strides, OnceLock::new()))
+            .map(|spec| Output::new(spec.dtype, spec.shape, spec.strides, Slot::default()))
             .collect::<Result<SmallVec<_>>>()?;
         let count = outputs.len() as u32;
         let node = Arc::new(Node {
@@ -467,21 +580,31 @@ impl Array {
             trace,
             outputs,
             state: Mutex::new(State::Pending { primitive, inputs }),
+            evaluated: AtomicBool::new(false),
             failed: false,
         });
         Ok((0..count)
-            .map(|output| Self {
-                node: node.clone(),
-                output,
-            })
+            .map(|output| Self::handle(node.clone(), output))
             .collect())
     }
 
     fn from_node(node: Node) -> Self {
-        Self {
-            node: Arc::new(node),
-            output: 0,
+        Self::handle(Arc::new(node), 0)
+    }
+
+    /// A handle to output `output` of `node`: the one way to make an [`Array`] (it counts
+    /// the output's handles).
+    pub(crate) fn handle(node: Arc<Node>, output: u32) -> Self {
+        let a = Self { node, output };
+        if a.counted() {
+            a.out().handles.fetch_add(1, SeqCst);
         }
+        a
+    }
+
+    /// Whether this output's handles are counted (its node has several outputs).
+    fn counted(&self) -> bool {
+        self.node.outputs.len() > 1
     }
 
     // ── Graph (for graph transformations such as `compile`) ──────────────────
@@ -508,10 +631,7 @@ impl Array {
 
     /// The error this array evaluated to, if it has already failed.
     pub(crate) fn slot_error(&self) -> Option<Error> {
-        match self.out().slot.get() {
-            Some(Err(e)) => Some(e.clone()),
-            _ => None,
-        }
+        self.out().slot.error().cloned()
     }
 
     // ── Failure (record time, never evaluates) ───────────────────────────────
@@ -544,9 +664,9 @@ impl Array {
 
     /// The error of a failed array (see [`Array::is_failed`]), without evaluating.
     pub fn error(&self) -> Option<&Error> {
-        match (self.node.failed, self.out().slot.get()) {
-            (true, Some(Err(e))) => Some(e),
-            _ => None,
+        match self.node.failed {
+            true => self.out().slot.error(),
+            false => None,
         }
     }
 
@@ -651,7 +771,7 @@ impl Array {
 
     /// Whether the array has been evaluated (successfully or not).
     pub fn is_evaluated(&self) -> bool {
-        self.out().slot.get().is_some()
+        self.out().slot.is_set()
     }
 
     // ── Evaluation and readback ──────────────────────────────────────────────
@@ -680,7 +800,7 @@ impl Array {
                 &data.buffer.bytes()[start..start + self.nbytes()],
             ))
         } else {
-            let gathered = crate::kernels::contiguous(out, data)?;
+            let gathered = crate::kernels::contiguous(out, &data)?;
             Ok(T::read_bytes(gathered.bytes()))
         }
     }
@@ -725,8 +845,8 @@ impl Array {
     }
 
     /// The evaluated data, if evaluation succeeded.
-    pub(crate) fn data(&self) -> Option<&Data> {
-        self.out().slot.get().and_then(|r| r.as_ref().ok())
+    pub(crate) fn data(&self) -> Option<Data> {
+        self.out().slot.get().and_then(Result::ok)
     }
 }
 
@@ -763,6 +883,32 @@ impl fmt::Display for Array {
     }
 }
 
+impl Clone for Array {
+    fn clone(&self) -> Self {
+        Self::handle(self.node.clone(), self.output)
+    }
+}
+
+/// The last handle of an evaluated node's output releases the output's data, whatever its
+/// siblings do (MLX's `detach`).
+impl Drop for Array {
+    fn drop(&mut self) {
+        if self.counted()
+            && self.out().handles.fetch_sub(1, SeqCst) == 1
+            && self.node.evaluated.load(SeqCst)
+        {
+            self.out().release();
+        }
+    }
+}
+
+impl Array {
+    /// The node, this handle dropped.
+    fn into_node(self) -> Arc<Node> {
+        self.node.clone()
+    }
+}
+
 /// A cheap placeholder: a 0-D float32 zero. Handy with [`std::mem::take`] to update an array
 /// held in a struct by value, so the update can write in place:
 /// `self.k = std::mem::take(&mut self.k).at(..).set(&v);`.
@@ -779,8 +925,8 @@ impl Default for Array {
 impl Drop for Node {
     fn drop(&mut self) {
         let mut stack = take_inputs(self);
-        while let Some(Array { node, .. }) = stack.pop() {
-            if let Some(mut node) = Arc::into_inner(node) {
+        while let Some(a) = stack.pop() {
+            if let Some(mut node) = Arc::into_inner(a.into_node()) {
                 stack.append(&mut take_inputs(&mut node));
             }
         }

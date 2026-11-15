@@ -6,6 +6,28 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- LFM2-MoE (`lfm2_moe`) in nuvec-lm, with mlx-lm's results, in mlx-community and Hugging
+  Face layouts.
+- Speculative decoding on Granite 4 and LFM2: Mamba-2 and short-convolution states roll
+  back rejected drafts; the tokens equal plain decoding's.
+- `graph::is_released` and `Error::Released`: a sibling whose handles were all dropped
+  after evaluation has released its data, as MLX detaches siblings.
+
+### Changed
+
+- Row-exact affine products of 3–8 rows (lanes, verification) take three rows per weight
+  read where that is cheaper: 8-bit at 0.68–0.98× MLX's time at every count (3 rows from
+  1.11×), 3-bit 3 and 6 rows at parity. Each row keeps its one-row bits.
+- `block_masked_mm` runs MLX's masked GEMM: 1.01× MLX's time, from 1.94×.
+- `nuvec_lm::Lfm2` has `expert_bias` and `routed_scaling_factor`, and is no longer `Eq`.
+
+### Fixed
+
+- An evaluated output no longer keeps its siblings' data (mrun's B7): keeping
+  `fast::gated_delta`'s state and dropping its output frees the output at once.
+
 ## [0.11.0] - 2026-11-15
 
 ### Added

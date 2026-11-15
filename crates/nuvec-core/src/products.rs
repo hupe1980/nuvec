@@ -1,7 +1,6 @@
 //! MLX's special matrix products: `segmented_mm` (one product per segment of the inner
 //! axis), `block_masked_mm` (block masks on the operands and the output) and the
-//! products of quantized activations and weights, `qqmm` and `gather_qqmm`. They are
-//! compositions of nuvec's products, so they differentiate and batch as those do.
+//! products of quantized activations and weights, `qqmm` and `gather_qqmm`.
 
 use crate::custom::custom_function_flat;
 use crate::{
@@ -71,7 +70,8 @@ pub(crate) fn segmented_compose(a: &Array, b: &Array, segments: &Array) -> Resul
 /// MLX's `block_masked_mm`: `a [..., M, K] · b [..., K, N]` with `block_size`-square masks
 /// (32 or 64) on the output (`[..., ⌈M/bs⌉, ⌈N/bs⌉]`), the left operand (`[..., ⌈M/bs⌉,
 /// ⌈K/bs⌉]`) and the right one (`[..., ⌈K/bs⌉, ⌈N/bs⌉]`): boolean masks select blocks,
-/// float masks scale them. Without masks it is `matmul`.
+/// float masks scale them. Without masks it is `matmul`. MLX's masked GEMM, which skips
+/// masked blocks; the operands, masks and batches broadcast as MLX's.
 pub(crate) fn block_masked_mm(
     a: &Array,
     b: &Array,
@@ -114,8 +114,7 @@ pub(crate) fn block_masked_mm(
     let (a, b) = (a.try_astype(dtype)?, b.try_astype(dtype)?);
     let bs = block_size as usize;
     let blocks = |v: usize| v.div_ceil(bs);
-    // A block mask spread over its elements and cut to `rows × cols`.
-    let expand = |mask: &Array, what: &str, rows: usize, cols: usize| -> Result<Array> {
+    let check = |mask: &Array, what: &str, rows: usize, cols: usize| -> Result<()> {
         let nd = mask.ndim();
         if nd < 2 || mask.dims()[nd - 2] != blocks(rows) || mask.dims()[nd - 1] != blocks(cols) {
             return Err(invalid(
@@ -128,31 +127,93 @@ pub(crate) fn block_masked_mm(
                 ),
             ));
         }
-        let spread = ops::repeat(&ops::repeat(mask, block_size, -2), block_size, -1);
-        let cut = spread.i((crate::Ellipsis, 0..rows, 0..cols));
-        Ok(if mask.dtype() == DType::Bool {
-            cut
-        } else {
-            cut.astype(dtype)
-        })
+        Ok(())
     };
-    let apply =
-        |x: &Array, mask: Option<&Array>, what: &str, rows: usize, cols: usize| -> Result<Array> {
-            Ok(match mask {
-                None => x.clone(),
-                Some(mask) => {
-                    let e = expand(mask, what, rows, cols)?;
-                    if e.dtype() == DType::Bool {
-                        ops::where_(&e, x, 0.0).astype(dtype)
-                    } else {
-                        x.multiply(&e)
-                    }
-                }
-            })
+    let batch_of = |x: &Array| x.dims()[..x.ndim() - 2].to_vec();
+    let mut batch = crate::graph::broadcast_shapes(name, &batch_of(&a), &batch_of(&b))?;
+    for (mask, what, rows, cols) in [
+        (mask_out, "output", m, n),
+        (mask_lhs, "left", m, k),
+        (mask_rhs, "right", k, n),
+    ] {
+        if let Some(mask) = mask {
+            check(mask, what, rows, cols)?;
+            batch = crate::graph::broadcast_shapes(name, &batch, &batch_of(mask))?;
+        }
+    }
+    let full = |x: &Array, rows: usize, cols: usize| -> Result<Array> {
+        let mut shape = batch.clone();
+        shape.extend([rows, cols]);
+        ops::broadcast_to(x, shape.as_slice()).into_result()
+    };
+    // Boolean masks stay boolean; the others take the output's dtype (MLX's casts). The
+    // operand masks share one type: a missing one is ones.
+    let typed = |mask: &Array| -> Result<Array> {
+        match mask.dtype() {
+            DType::Bool => Ok(mask.clone()),
+            _ => mask.try_astype(dtype),
+        }
+    };
+    let mut inputs = vec![full(&a, m, k)?, full(&b, k, n)?];
+    if let Some(mask) = mask_out {
+        inputs.push(full(&typed(mask)?, blocks(m), blocks(n))?);
+    }
+    let op_mask = mask_lhs.is_some() || mask_rhs.is_some();
+    if op_mask {
+        let kind = match [mask_lhs, mask_rhs]
+            .iter()
+            .flatten()
+            .all(|m| m.dtype() == DType::Bool)
+        {
+            true => DType::Bool,
+            false => dtype,
         };
-    let a = apply(&a, mask_lhs, "left", m, k)?;
-    let b = apply(&b, mask_rhs, "right", k, n)?;
-    apply(&a.matmul(&b), mask_out, "output", m, n)?.into_result()
+        for (mask, rows, cols) in [(mask_lhs, m, k), (mask_rhs, k, n)] {
+            let mask = match mask {
+                Some(mask) => mask.try_astype(kind)?,
+                None => ops::ones([blocks(rows), blocks(cols)].as_slice(), kind),
+            };
+            inputs.push(full(&mask, blocks(rows), blocks(cols))?);
+        }
+    }
+    let op = crate::fast::imp::FastOp::BlockMaskedMm {
+        block_size: bs,
+        out_mask: mask_out.is_some(),
+        op_mask,
+    };
+    Ok(crate::fast::imp::record_or_fallback(op, inputs)?.swap_remove(0))
+}
+
+/// [`block_masked_mm`] composed (the fallback, and the derivatives): the masks spread over
+/// their blocks' elements, the operands masked, one product, the output masked. `inputs`
+/// are [`FastOp::BlockMaskedMm`](crate::fast::imp::FastOp::BlockMaskedMm)'s.
+pub(crate) fn block_masked_compose(
+    inputs: &[Array],
+    block_size: usize,
+    out_mask: bool,
+) -> Result<Array> {
+    let (a, b) = (&inputs[0], &inputs[1]);
+    let dtype = a.dtype();
+    let (m, k) = (a.dims()[a.ndim() - 2], a.dims()[a.ndim() - 1]);
+    let n = b.dims()[b.ndim() - 1];
+    let bs = block_size as i32;
+    let apply = |x: &Array, mask: Option<&Array>, rows: usize, cols: usize| -> Array {
+        let Some(mask) = mask else {
+            return x.clone();
+        };
+        let spread = ops::repeat(&ops::repeat(mask, bs, -2), bs, -1);
+        let cut = spread.i((crate::Ellipsis, 0..rows, 0..cols));
+        match mask.dtype() {
+            DType::Bool => ops::where_(&cut, x, 0.0).astype(dtype),
+            _ => x.multiply(cut.astype(dtype)),
+        }
+    };
+    let at = 2 + usize::from(out_mask);
+    let (lhs, rhs) = (inputs.get(at), inputs.get(at + 1));
+    let a = apply(a, lhs, m, k);
+    let b = apply(b, rhs, k, n);
+    let out = if out_mask { inputs.get(2) } else { None };
+    apply(&a.matmul(&b), out, m, n).into_result()
 }
 
 /// The weight of [`qqmm`](crate::ops::qqmm): dense (quantized with its mode for the

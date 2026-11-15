@@ -34,7 +34,13 @@ fn main() -> Result<()> {
         [8, 2],
     );
     let (ma, mb) = (normal(&[1024, 1024], bf), normal(&[1024, 1024], bf));
-    let mask = random::bernoulli(0.5, [32, 32], None);
+    // A checkerboard: half the output blocks, the same ones as the MLX side.
+    let mask = Array::from_slice(
+        &(0..32 * 32)
+            .map(|i| (i / 32 + i % 32) % 2 == 0)
+            .collect::<Vec<bool>>(),
+        [32, 32],
+    );
     let (qx, qx1, qw) = (
         normal(&[256, 4096], bf),
         normal(&[1, 4096], bf),

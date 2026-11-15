@@ -55,14 +55,19 @@ pub fn inputs(a: &Array) -> Vec<Array> {
 }
 
 /// Every output of the operation that produces `a`, in order (`a` is the one at
-/// [`output_index`]).
+/// [`output_index`]). After evaluation, an output whose handles were all dropped has
+/// released its data ([`is_released`]).
 pub fn siblings(a: &Array) -> Vec<Array> {
     (0..a.node.outputs.len() as u32)
-        .map(|output| Array {
-            node: a.node.clone(),
-            output,
-        })
+        .map(|output| Array::handle(a.node.clone(), output))
         .collect()
+}
+
+/// Whether `a`'s data was released: its operation was evaluated and every handle to it
+/// was dropped (it was reached again through [`siblings`]). Reading it fails with
+/// [`crate::Error::Released`].
+pub fn is_released(a: &Array) -> bool {
+    matches!(a.out().slot.get(), Some(Err(crate::Error::Released)))
 }
 
 /// Which output of its operation `a` is.

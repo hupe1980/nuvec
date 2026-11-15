@@ -103,6 +103,18 @@ pub enum FastOp {
     /// `(a, b, segments)`: [`segmented_mm`](crate::ops::segmented_mm), `a [M, K]` and `b [K, N]`
     /// of one dtype, `segments [..., 2]` uint32.
     SegmentedMm,
+    /// `(a, b[, out_mask][, lhs_mask, rhs_mask])`:
+    /// [`block_masked_mm`](crate::ops::block_masked_mm), `a [..., M, K]` and `b [..., K, N]`
+    /// of one dtype and batch; the masks `[..., blocks, blocks]` of that batch, boolean or of
+    /// the dtype (the operand masks of one type).
+    BlockMaskedMm {
+        /// The masks' block size: 32 or 64.
+        block_size: usize,
+        /// Whether an output mask follows `b`.
+        out_mask: bool,
+        /// Whether the operand masks follow.
+        op_mask: bool,
+    },
     /// `(x)`: [`hadamard_transform`](crate::ops::hadamard_transform) over the last axis.
     Hadamard {
         /// `f32::to_bits` of the scale.
@@ -668,6 +680,7 @@ impl FastOp {
             Self::Conv { .. } => "conv",
             Self::Hadamard { .. } => "hadamard_transform",
             Self::SegmentedMm => "segmented_mm",
+            Self::BlockMaskedMm { .. } => "block_masked_mm",
             Self::PagedAttention { .. } => "paged_attention",
             Self::PagedWrite => "paged_write",
             Self::MoeRoute { .. } => "moe_route",
@@ -700,6 +713,9 @@ impl FastOp {
             }
             Self::RmsNorm { .. } | Self::CrossEntropy | Self::Conv { .. } => 2,
             Self::SegmentedMm => 3,
+            Self::BlockMaskedMm {
+                out_mask, op_mask, ..
+            } => 2 + usize::from(*out_mask) + 2 * usize::from(*op_mask),
             Self::PagedAttention { sinks, .. } => 5 + usize::from(*sinks),
             Self::PagedWrite => 3,
             Self::ConvSlots { .. } => 4,
@@ -771,6 +787,12 @@ impl FastOp {
             }
             Self::ConvSlots { .. } => vec![like(x), like(&inputs[2])],
             Self::Hadamard { .. } => vec![like(x)],
+            Self::BlockMaskedMm { .. } => {
+                let mut shape = x.dims().to_vec();
+                *shape.last_mut().expect("a matrix") =
+                    inputs[1].dims().last().copied().unwrap_or(0);
+                vec![(x.dtype(), shape)]
+            }
             Self::SegmentedMm => {
                 let s = inputs[2].dims();
                 let mut shape = s[..s.len() - 1].to_vec();
@@ -946,6 +968,44 @@ impl FastOp {
             }
             Self::Hadamard { .. } => {
                 crate::hadamard::decompose(last(x)).is_ok() && x.size() <= u32::MAX as usize
+            }
+            Self::BlockMaskedMm {
+                block_size,
+                out_mask,
+                op_mask,
+            } => {
+                let (b, nd) = (&inputs[1], x.ndim());
+                let fits = |a: &Array| a.size() <= i32::MAX as usize;
+                let shaped = nd >= 2
+                    && b.ndim() == nd
+                    && b.dtype() == x.dtype()
+                    && x.dims()[..nd - 2] == b.dims()[..nd - 2]
+                    && x.dims()[nd - 1] == b.dims()[nd - 2]
+                    && fits(x)
+                    && fits(b);
+                if !shaped || !matches!(block_size, 32 | 64) || !(*out_mask || *op_mask) {
+                    return invalid(format!(
+                        "operands {:?} and {:?} with block size {block_size}",
+                        x.dims(),
+                        b.dims()
+                    ));
+                }
+                let (m, k, n) = (x.dims()[nd - 2], x.dims()[nd - 1], b.dims()[nd - 1]);
+                let blocks = |v: usize| v.div_ceil(*block_size);
+                let mask = |a: &Array, rows: usize, cols: usize| {
+                    a.ndim() == nd
+                        && a.dims()[..nd - 2] == x.dims()[..nd - 2]
+                        && a.dims()[nd - 2..] == [blocks(rows), blocks(cols)]
+                        && (a.dtype() == DType::Bool || a.dtype() == x.dtype())
+                };
+                let mut at = 2;
+                let out_fits = !*out_mask || mask(&inputs[2], m, n);
+                at += usize::from(*out_mask);
+                let op_fits = !*op_mask
+                    || (mask(&inputs[at], m, k)
+                        && mask(&inputs[at + 1], k, n)
+                        && inputs[at].dtype() == inputs[at + 1].dtype());
+                out_fits && op_fits
             }
             Self::SegmentedMm => {
                 let (b, s) = (&inputs[1], &inputs[2]);
@@ -1432,6 +1492,15 @@ impl FastOp {
                 vec![crate::conv::compose(x, &inputs[1], &conv)?]
             }
             Self::Hadamard { scale } => vec![crate::hadamard::compose(x, f32::from_bits(*scale))?],
+            Self::BlockMaskedMm {
+                block_size,
+                out_mask,
+                ..
+            } => vec![crate::products::block_masked_compose(
+                inputs,
+                *block_size,
+                *out_mask,
+            )?],
             Self::SegmentedMm => vec![crate::products::segmented_compose(
                 x, &inputs[1], &inputs[2],
             )?],
@@ -1635,6 +1704,7 @@ impl FastOp {
             | Self::Conv { .. }
             | Self::Hadamard { .. }
             | Self::SegmentedMm
+            | Self::BlockMaskedMm { .. }
             | Self::RmsNormVjp { .. }
             | Self::LayerNormVjp { .. }
             | Self::CrossEntropyVjp
@@ -1864,7 +1934,7 @@ pub(crate) fn run_on_cpu(
             let data = a.data().expect("evaluated");
             Ok(crate::array::Data::new(crate::kernels::contiguous(
                 a.out(),
-                data,
+                &data,
             )?))
         })
         .collect()
