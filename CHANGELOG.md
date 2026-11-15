@@ -6,6 +6,8 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-15
+
 ### Added
 
 - Granite 4 (`granitemoehybrid`: Mamba-2 and attention layers, experts with a shared MLP
@@ -687,7 +689,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/hupe1980/nuvec/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/hupe1980/nuvec/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/hupe1980/nuvec/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/hupe1980/nuvec/compare/v0.7.0...v0.8.0
