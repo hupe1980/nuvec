@@ -11,6 +11,14 @@ use nuvec_lm::{
     PromptLookup, Stop, Stopped, Tokenizer, generate, load_model, speculative_generate,
 };
 
+/// `options` with tokens equal to `generate`'s, bit for bit ([`GenerateOptions::row_exact`]).
+fn exact(options: GenerateOptions) -> GenerateOptions {
+    GenerateOptions {
+        row_exact: true,
+        ..options
+    }
+}
+
 const FIXTURES: [&str; 5] = [
     "qwen3_f32",
     "qwen3_5_f32",
@@ -105,7 +113,7 @@ fn speculative(model: &Model, prompt: &[u32], options: &GenerateOptions) -> Run 
     let mut g = speculative_generate(
         model,
         prompt,
-        options.clone(),
+        exact(options.clone()),
         PromptLookup::default(),
         DraftPolicy::Fixed(4),
     )
@@ -128,13 +136,16 @@ fn batched(
             blocks: Some(blocks),
             block_size: 4,
             max_batch: requests.len(),
-            batch_invariant: true,
             ..Default::default()
         },
     )
     .unwrap();
     for (prompt, options) in requests {
-        b.submit(prompt.clone(), options.clone()).unwrap();
+        let options = GenerateOptions {
+            row_exact: true,
+            ..options.clone()
+        };
+        b.submit(prompt.clone(), options).unwrap();
     }
     let mut tokens = vec![Vec::new(); requests.len()];
     let mut reasons = vec![None; requests.len()];

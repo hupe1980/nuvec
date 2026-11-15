@@ -174,14 +174,19 @@ def block_masked(p: dict[str, str], xs: list[mx.array]) -> mx.array:
 
 
 def qq(p: dict[str, str], xs: list[mx.array]) -> mx.array:
-    """`qqmm` (x, w) or `gather_qqmm` (x, w, rhs_indices), `w` quantized first with `q=1`."""
+    """`qqmm` (x, w) or `gather_qqmm` (x, w, rhs_indices), `w` quantized first with `q=1`;
+    with `gs=1` the last two inputs are `global_scale_x` and `global_scale_w`."""
     mode = p["mode"]
+    gsx = gsw = None
+    if p.get("gs") == "1":
+        xs, (gsx, gsw) = xs[:-2], xs[-2:]
     w, scales = xs[1], None
     if p.get("q") == "1":
-        w, scales = mx.quantize(w, mode=mode)
+        w, scales = mx.quantize(w, mode=mode, global_scale=gsw)
     if len(xs) == 2:
-        return mx.qqmm(xs[0], w, scales, mode=mode)
-    return mx.gather_qqmm(xs[0], w, scales, rhs_indices=xs[2], mode=mode)
+        return mx.qqmm(xs[0], w, scales, mode=mode, global_scale_x=gsx, global_scale_w=gsw)
+    return mx.gather_qqmm(xs[0], w, scales, rhs_indices=xs[2], mode=mode,
+                          global_scale_x=gsx, global_scale_w=gsw)
 
 
 def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
@@ -332,11 +337,13 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
         return mx.fast.scaled_dot_product_attention(xs[0], xs[1], xs[2], scale=float(p["scale"]),
                                                     mask=mask, sinks=sinks)
     if op == "quantize":
-        return list(mx.quantize(xs[0], **qparams(p)))
+        g = xs[1] if p.get("gs") == "1" else None
+        return list(mx.quantize(xs[0], global_scale=g, **qparams(p)))
     if op == "dequantize":
-        biases = xs[2] if len(xs) > 2 else None
+        g = xs[2] if p.get("gs") == "1" else None
+        biases = xs[2] if len(xs) > 2 and g is None else None
         dtype = DTYPES[int(p["dtype"])][1] if "dtype" in p else None
-        return mx.dequantize(xs[0], xs[1], biases, dtype=dtype, **qparams(p))
+        return mx.dequantize(xs[0], xs[1], biases, dtype=dtype, global_scale=g, **qparams(p))
     if op in ("quantized_matmul", "quantized_matmul_xsb"):
         if op == "quantized_matmul":
             x, w, s = xs[:3]
@@ -1955,6 +1962,45 @@ def write(out: Path, cases: list[tuple[str, str, list[mx.array], list[mx.array]]
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(bytes(blob))
     print(f"wrote {len(cases)} cases, {len(blob)} bytes -> {out.name}")
+
+
+# Last, so the cases above keep their random inputs.
+# NVFP4 global scales (MLX 0.32.3+): quantize, dequantize, qqmm and gather_qqmm on the GPU.
+def amax(a: mx.array) -> mx.array:
+    return mx.max(mx.abs(a)).astype(mx.float32)
+
+
+for dt in ["float32", "float16", "bfloat16"]:
+    for shape in [(3, 64), (5, 160)]:
+        w = make(dt, shape)
+        if shape[0] == 5:
+            w[1, :16] = 0  # a zero group
+        g = amax(w)
+        case_gpu(f"fp-quantize-gs-{dt}-{shape[1]}", "quantize", [w, g], mode="nvfp4", gs=1)
+        with mx.stream(mx.gpu):
+            wq, scales = mx.quantize(w, mode="nvfp4", global_scale=g)
+            mx.eval(wq, scales)
+        case_gpu(f"fp-dequantize-gs-{dt}-{shape[1]}", "dequantize", [wq, scales, g],
+                 mode="nvfp4", gs=1)
+    for q in ["0", "1"]:
+        for rows in [1, 5, 40]:
+            x, w = make(dt, (rows, 128)), make(dt, (24, 128))
+            case_gpu(f"qqmm-gs-{dt}-q{q}-{rows}", "qqmm", [x, w, amax(x), amax(w)],
+                     mode="nvfp4", q=q, gs=1)
+        x, w = make(dt, (6, 1, 64)), make(dt, (3, 16, 64))
+        idx = mx.array([2, 0, 1, 1, 2, 0], dtype=mx.uint32)
+        case_gpu(f"gather_qqmm-gs-{dt}-q{q}", "gather_qqmm", [x, w, idx, amax(x), amax(w)],
+                 mode="nvfp4", q=q, gs=1)
+
+xg, wg = make("bfloat16", (32, 64)), make("bfloat16", (32, 64))
+cg = make("bfloat16", (32, 32))
+gx, gw = amax(xg), amax(wg)
+with mx.stream(mx.gpu):
+    _, grads = mx.vjp(lambda a, b: [mx.qqmm(a, b, mode="nvfp4", global_scale_x=gx,
+                                            global_scale_w=gw)], [xg, wg], [cg])
+    mx.eval(grads)
+gpu_cases.append(("vjp-qqmm-nvfp4-gs", "vjp|fn=qqmm|mode=nvfp4|q=0|gs=1|consts=2",
+                  [xg, wg, gx, gw, cg], list(grads)))
 
 
 def main() -> None:

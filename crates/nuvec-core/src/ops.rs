@@ -958,26 +958,44 @@ pub fn slice_update(a: &Array, update: &Array, index: impl crate::ArrayIndex) ->
 /// `w` quantized along its last axis; see [`Array::quantize`].
 #[track_caller]
 pub fn quantize(w: &Array, quant: impl Into<Quant>) -> Quantized {
-    let quant = quant.into();
-    let affine = quant.mode == QuantMode::Affine;
-    let mut out = Array::sticky_vec(
-        "quantize",
+    quantize_impl(w, quant.into(), None, Location::caller())
+}
+
+/// `w` quantized to NVFP4 with a float32 global scale (one value): the scales are relative
+/// to `global_scale / (448 · 6)`, as MLX's `quantize(..., global_scale=)`. The result carries
+/// the global scale.
+#[track_caller]
+pub fn quantize_scaled(w: &Array, global_scale: &Array) -> Quantized {
+    quantize_impl(
+        w,
+        Quant::new(QuantMode::Nvfp4),
+        Some(global_scale),
         Location::caller(),
-        &[w],
-        2 + usize::from(affine),
-        || {
-            let (q, s, b) = crate::quantized::quantize(w, quant)?;
-            let mut out = vec![q, s];
-            out.extend(b);
-            Ok(out)
-        },
-    );
+    )
+}
+
+fn quantize_impl(
+    w: &Array,
+    quant: Quant,
+    global_scale: Option<&Array>,
+    at: &'static Location<'static>,
+) -> Quantized {
+    let affine = quant.mode == QuantMode::Affine;
+    let mut ins: SmallVec<[&Array; 2]> = SmallVec::from_slice(&[w]);
+    ins.extend(global_scale);
+    let mut out = Array::sticky_vec("quantize", at, &ins, 2 + usize::from(affine), || {
+        let (q, s, b) = crate::quantized::quantize(w, quant, global_scale)?;
+        let mut out = vec![q, s];
+        out.extend(b);
+        Ok(out)
+    });
     let biases = affine.then(|| out.pop().expect("biases"));
     let scales = out.pop().expect("scales");
     Quantized {
         weight: out.pop().expect("codes"),
         scales,
         biases,
+        global_scale: global_scale.cloned(),
         quant,
     }
 }
@@ -990,7 +1008,14 @@ pub fn dequantize(w: &Quantized, dtype: impl Into<Option<DType>>) -> Array {
     let dtype = dtype.into();
     let ins: SmallVec<[&Array; 3]> = w.arrays().collect();
     Array::sticky("dequantize", Location::caller(), &ins, || {
-        crate::quantized::dequantize(&w.weight, &w.scales, w.biases.as_ref(), w.quant, dtype)
+        crate::quantized::dequantize(
+            &w.weight,
+            &w.scales,
+            w.biases.as_ref(),
+            w.quant,
+            dtype,
+            w.global_scale.as_ref(),
+        )
     })
 }
 
@@ -1007,6 +1032,7 @@ pub fn quantized_matmul(x: &Array, w: &Quantized, transpose: bool) -> Array {
             w.biases.as_ref(),
             transpose,
             w.quant,
+            w.global_scale.as_ref(),
         )
     })
 }
@@ -1019,11 +1045,10 @@ pub fn gather_qmm(
     w: &Quantized,
     lhs_indices: Option<&Array>,
     rhs_indices: Option<&Array>,
-    options: GatherQmm<'_>,
+    options: GatherQmm,
 ) -> Array {
     let mut ins: SmallVec<[&Array; 7]> = SmallVec::from_slice(&[x]);
     ins.extend(w.arrays());
-    ins.extend(options.global_scale);
     ins.extend(lhs_indices);
     ins.extend(rhs_indices);
     Array::sticky("gather_qmm", Location::caller(), &ins, || {
@@ -1036,6 +1061,7 @@ pub fn gather_qmm(
             rhs_indices,
             w.quant,
             options,
+            w.global_scale.as_ref(),
         )
     })
 }
@@ -1044,30 +1070,36 @@ pub fn gather_qmm(
 /// (MLX's `qqmm`): the activations are rounded to the values the mode represents, the
 /// weights quantized (a dense `w` in NVFP4 by default, or `(&w, QuantMode::Mxfp8)`) or
 /// taken quantized (`&Quantized`). With a dense weight both gradients are quantized
-/// products too, as MLX's.
+/// products too, as MLX's. NVFP4 global scales come as MLX's, both or neither:
+/// `global_scale_x` for the activations, the weight's own (`QqmmWeight::Scaled`, or the
+/// quantized weight's `global_scale`).
 ///
 /// ```
-/// use nuvec_core::{ops, random, DType, QuantMode};
+/// use nuvec_core::{ops, random, DType, QqmmWeight, QuantMode};
 /// let x = random::normal([4, 64], DType::F32, 0.0, 1.0, None);
 /// let w = random::normal([8, 64], DType::F32, 0.0, 1.0, None);
-/// assert_eq!(ops::qqmm(&x, &w).shape(), [4, 8]);
-/// assert_eq!(ops::qqmm(&x, (&w, QuantMode::Mxfp8)).shape(), [4, 8]);
+/// assert_eq!(ops::qqmm(&x, &w, None).shape(), [4, 8]);
+/// assert_eq!(ops::qqmm(&x, (&w, QuantMode::Mxfp8), None).shape(), [4, 8]);
+/// let (gx, gw) = (x.abs().max(..), w.abs().max(..));
+/// assert_eq!(ops::qqmm(&x, QqmmWeight::Scaled(&w, &gw), Some(&gx)).shape(), [4, 8]);
 /// ```
 #[track_caller]
-pub fn qqmm<'a>(x: &Array, w: impl Into<crate::QqmmWeight<'a>>) -> Array {
+pub fn qqmm<'a>(
+    x: &Array,
+    w: impl Into<crate::QqmmWeight<'a>>,
+    global_scale_x: Option<&Array>,
+) -> Array {
     let w = w.into();
-    let mut ins: SmallVec<[&Array; 4]> = SmallVec::from_slice(&[x]);
-    match &w {
-        crate::QqmmWeight::Dense(a, _) => ins.push(a),
-        crate::QqmmWeight::Quantized(q) => ins.extend(q.arrays()),
-    }
+    let mut ins: SmallVec<[&Array; 5]> = SmallVec::from_slice(&[x]);
+    ins.extend(w.arrays());
+    ins.extend(global_scale_x);
     Array::sticky("qqmm", Location::caller(), &ins, || {
-        crate::products::qqmm(x, w)
+        crate::products::qqmm(x, w, global_scale_x)
     })
 }
 
 /// [`gather_qmm`] of quantized activations with experts `w [E, N, K]` (dense or quantized,
-/// a floating-point mode; MLX's `gather_qqmm`), transposed.
+/// a floating-point mode; MLX's `gather_qqmm`), transposed; NVFP4 global scales as [`qqmm`]'s.
 #[track_caller]
 pub fn gather_qqmm<'a>(
     x: &Array,
@@ -1075,17 +1107,23 @@ pub fn gather_qqmm<'a>(
     lhs_indices: Option<&Array>,
     rhs_indices: Option<&Array>,
     sorted_indices: bool,
+    global_scale_x: Option<&Array>,
 ) -> Array {
     let w = w.into();
-    let mut ins: SmallVec<[&Array; 6]> = SmallVec::from_slice(&[x]);
-    match &w {
-        crate::QqmmWeight::Dense(a, _) => ins.push(a),
-        crate::QqmmWeight::Quantized(q) => ins.extend(q.arrays()),
-    }
+    let mut ins: SmallVec<[&Array; 7]> = SmallVec::from_slice(&[x]);
+    ins.extend(w.arrays());
     ins.extend(lhs_indices);
     ins.extend(rhs_indices);
+    ins.extend(global_scale_x);
     Array::sticky("gather_qqmm", Location::caller(), &ins, || {
-        crate::products::gather_qqmm(x, w, lhs_indices, rhs_indices, sorted_indices)
+        crate::products::gather_qqmm(
+            x,
+            w,
+            lhs_indices,
+            rhs_indices,
+            sorted_indices,
+            global_scale_x,
+        )
     })
 }
 
@@ -2549,7 +2587,7 @@ methods! {
         ///
         /// With sorted indices over many rows: where each expert's rows start (an int32 per
         /// expert); otherwise none.
-        fn gather_qmm(&self, w: &Quantized, lhs_indices: Option<&Array>, rhs_indices: Option<&Array>, options: GatherQmm<'_>) -> Array;
+        fn gather_qmm(&self, w: &Quantized, lhs_indices: Option<&Array>, rhs_indices: Option<&Array>, options: GatherQmm) -> Array;
         /// The bits reinterpreted as `dtype` (MLX's `view`): the same shape when the element
         /// sizes agree, else the last dimension scaled by their ratio (it must divide). Shares
         /// the buffer when the array is row-contiguous (or the sizes agree); copies otherwise.

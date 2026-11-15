@@ -908,12 +908,14 @@ pub(crate) fn from_fp8(a: Operand<'_>, dtype: DType) -> Result<Buffer> {
 /// E8M0) or encoded as E4M3 (nvfp4); the values are encoded as `w · (1 / scale)` (0 for a
 /// zero scale), two E2M1 codes per byte (low nibble first) or one E4M3 code per byte. The
 /// operations and their order are the Metal kernel's, with float32 subnormals flushed to
-/// zero as the GPU does ([`fp8::ftz`]), so the bytes are MLX's GPU bytes.
+/// zero as the GPU does ([`fp8::ftz`]), so the bytes are MLX's GPU bytes. With an NVFP4
+/// global scale `g`, scales are relative to `g / (448 · 6)` (`scale_enc = 448 · 6 / g`).
 /// Returns the packed codes and the uint8 scales.
 pub(crate) fn fp_quantize(
     w: Operand<'_>,
     group_size: usize,
     bits: usize,
+    g: Option<f32>,
 ) -> Result<(Buffer, Buffer)> {
     use crate::fp8;
     let values = cast(w, DType::F32)?;
@@ -928,10 +930,14 @@ pub(crate) fn fp_quantize(
     let bytes = packed.bytes_mut();
     let mut scales = output::<u8>(values.len() / group_size)?;
     let scale_codes = scales.bytes_mut();
+    let scale_enc = g.map(|g| fp8::ftz(fp8::E4M3_MAX * fp8::E2M1_MAX / g));
     for (g, group) in values.chunks_exact(group_size).enumerate() {
         let amax = group.iter().fold(0f32, |m, &v| m.max(fp8::ftz(v).abs()));
-        let scale = fp8::ftz(amax / max_element);
-        let (code, decoded) = if mx {
+        let mut scale = fp8::ftz(amax / max_element);
+        if let Some(enc) = scale_enc {
+            scale = fp8::ftz(scale * enc);
+        }
+        let (code, decoded) = if mx && scale_enc.is_none() {
             let rounded = fp8::mx_scale_round_up(scale);
             let code = fp8::e8m0_from_f32(rounded);
             (code, fp8::e8m0_to_f32(code))
@@ -944,7 +950,7 @@ pub(crate) fn fp_quantize(
         let inverse = if decoded == 0.0 {
             0.0
         } else {
-            fp8::ftz(1.0 / decoded)
+            fp8::ftz(scale_enc.unwrap_or(1.0) / decoded)
         };
         for (j, &v) in group.iter().enumerate() {
             let i = g * group_size + j;
@@ -966,13 +972,14 @@ pub(crate) fn fp_quantize(
 
 /// MLX's floating-point dequantization (`fp_dequantize`, Metal): each value is
 /// `float(scale) · float(code)` in float32 (subnormals flushed, as the GPU), rounded once to
-/// `dtype`.
+/// `dtype`; an NVFP4 global scale `g` multiplies the scale by `g / (448 · 6)` first.
 pub(crate) fn fp_dequantize(
     w: Operand<'_>,
     scales: Operand<'_>,
     group_size: usize,
     bits: usize,
     dtype: DType,
+    g: Option<f32>,
 ) -> Result<Buffer> {
     use crate::fp8;
     let codes = contiguous(w.0, w.1)?;
@@ -981,20 +988,85 @@ pub(crate) fn fp_dequantize(
     let s = s.bytes();
     let mx = group_size == 32;
     let n = w.0.size * 32 / bits;
+    let inv_scale_enc = g.map(|g| fp8::ftz(g / (fp8::E4M3_MAX * fp8::E2M1_MAX)));
     with_type!(dtype, T => {
         let mut out = output::<T>(n)?;
         for (i, o) in out.typed_mut::<T>().iter_mut().enumerate() {
             let code = s[i / group_size];
-            let scale = if mx { fp8::e8m0_to_f32(code) } else { fp8::e4m3_to_f32(code) };
+            let mut scale = fp8::ftz(if mx { fp8::e8m0_to_f32(code) } else { fp8::e4m3_to_f32(code) });
+            if let Some(inv) = inv_scale_enc {
+                scale = fp8::ftz(scale * inv);
+            }
             let value = if bits == 8 {
                 fp8::e4m3_to_f32(codes[i])
             } else {
                 fp8::e2m1_to_f32((codes[i / 2] >> (4 * (i % 2))) & 0xF)
             };
-            *o = round_to::<T>(f64::from(fp8::canonical(fp8::ftz(fp8::ftz(scale) * value))));
+            *o = round_to::<T>(f64::from(fp8::canonical(fp8::ftz(scale * value))));
         }
         Ok(out)
     })
+}
+
+/// MLX's `fp_quantize_dequantize` (`qqmm`'s activations): per group the scale as
+/// [`fp_quantize`] encodes it, the values `(scale / scale_enc) · float(code)` in float32
+/// (one rounding to the input's dtype).
+pub(crate) fn fp_quantize_dequantize(
+    w: Operand<'_>,
+    group_size: usize,
+    bits: usize,
+    g: Option<f32>,
+) -> Result<Buffer> {
+    use crate::fp8;
+    let values = cast(w, DType::F32)?;
+    let values = values.typed::<f32>();
+    let mx = group_size == 32;
+    let max_element = if bits == 4 {
+        fp8::E2M1_MAX
+    } else {
+        fp8::E4M3_MAX
+    };
+    let scale_enc = g.map_or(1.0, |g| fp8::ftz(fp8::E4M3_MAX * fp8::E2M1_MAX / g));
+    let mut real = vec![0f32; values.len()];
+    for (gi, group) in values.chunks_exact(group_size).enumerate() {
+        let amax = group.iter().fold(0f32, |m, &v| m.max(fp8::ftz(v).abs()));
+        let mut scale = fp8::ftz(amax / max_element);
+        if g.is_some() {
+            scale = fp8::ftz(scale * scale_enc);
+        }
+        let decoded = fp8::ftz(if mx && g.is_none() {
+            fp8::e8m0_to_f32(fp8::e8m0_from_f32(fp8::mx_scale_round_up(scale)))
+        } else {
+            fp8::e4m3_to_f32(fp8::e4m3_from_f32(scale))
+        });
+        let enc_b = if decoded == 0.0 {
+            0.0
+        } else {
+            fp8::ftz(scale_enc / decoded)
+        };
+        let dec = fp8::ftz(decoded / scale_enc);
+        for (j, &v) in group.iter().enumerate() {
+            let scaled = fp8::canonical(fp8::ftz(fp8::ftz(v) * enc_b));
+            let value = if bits == 8 {
+                fp8::e4m3_to_f32(fp8::e4m3_from_f32(scaled))
+            } else {
+                fp8::e2m1_to_f32(fp8::e2m1_from_f32(scaled))
+            };
+            real[gi * group_size + j] = fp8::canonical(fp8::ftz(dec * value));
+        }
+    }
+    with_type!(w.0.dtype, T => {
+        let mut out = output::<T>(real.len())?;
+        for (o, &v) in out.typed_mut::<T>().iter_mut().zip(&real) {
+            *o = round_to::<T>(f64::from(v));
+        }
+        Ok(out)
+    })
+}
+
+/// The one float32 value of a global-scale operand.
+pub(crate) fn scalar_f32(g: Operand<'_>) -> Result<f32> {
+    Ok(cast(g, DType::F32)?.typed::<f32>()[0])
 }
 
 /// Metadata for a matrix operand with explicit strides.
@@ -1027,7 +1099,11 @@ pub(crate) fn quantized_matmul(
     let fp = quant.mode != crate::QuantMode::Affine;
     let dense = match fp {
         false => dequantize(w, operands[2], operands[3], group_size, bits)?,
-        true => fp_dequantize(w, operands[2], group_size, bits, DType::F32)?,
+        true => {
+            // A floating-point mode's fourth operand is an NVFP4 global scale.
+            let g = operands.get(3).map(|&g| scalar_f32(g)).transpose()?;
+            fp_dequantize(w, operands[2], group_size, bits, DType::F32, g)?
+        }
     };
     let dense = Data::new(dense);
     let (xn, wn) = (x.0.shape.len(), w.0.shape.len());

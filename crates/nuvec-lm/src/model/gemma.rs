@@ -350,6 +350,19 @@ pub(super) fn forward(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array
 /// The final norm's output of a Gemma 4 model ([`Model::forward_hidden`]).
 #[track_caller]
 pub(super) fn hidden(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array {
+    hidden_with(m, tokens, cache, &[]).0
+}
+
+/// [`hidden`], also giving the outputs of layers `ids` concatenated along the features
+/// ([`Model::forward_layers`]).
+#[track_caller]
+pub(super) fn hidden_with(
+    m: &Model,
+    tokens: &Array,
+    cache: &mut [KvCache],
+    ids: &[usize],
+) -> (Array, Array) {
+    let mut outputs = vec![None; ids.len()];
     let (mut h, per_layer) = embed(m, tokens);
     let mask = match tokens.shape().get(1) {
         Some(&l) if l > 1 => AttentionMask::Causal,
@@ -372,9 +385,17 @@ pub(super) fn hidden(m: &Model, tokens: &Array, cache: &mut [KvCache]) -> Array 
         let (o, kv) = attention.forward_kv(&n, mask, c, shared);
         kvs[i] = Some((kv, shared.map_or(at, |(_, at)| at)));
         let (next, n) = after_attention(layer, p, (&h, &o), per_layer.as_ref(), i, next_norm(m, i));
+        for (slot, _) in ids.iter().enumerate().filter(|&(_, &id)| id == i) {
+            outputs[slot] = Some(next.clone());
+        }
         (h, normed) = (next, Some(n));
     }
-    normed.unwrap_or_else(|| m.model.norm.get().forward(&h))
+    let normed = normed.unwrap_or_else(|| m.model.norm.get().forward(&h));
+    let features = match ids.is_empty() {
+        true => normed.clone(),
+        false => ops::concatenate(&outputs.into_iter().flatten().collect::<Vec<_>>(), -1),
+    };
+    (normed, features)
 }
 
 /// [`Model::forward_paged`] of a Gemma 4 model: KV-shared layers attend to their source

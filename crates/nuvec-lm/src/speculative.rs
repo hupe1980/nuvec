@@ -3,16 +3,19 @@
 //! token. Verifying several tokens in one pass costs much less than generating them one by
 //! one, so every accepted draft token saves most of a step.
 //!
-//! The output is the model's greedy output, bit for bit: a verify pass computes each row
-//! as serial decode would (nuvec's row independence, up to
-//! [`nuvec::ROW_INDEPENDENT_ROWS`] rows, under which verification runs:
-//! [`nuvec::with_row_exact`]; and its attention planner's serial rule), and the verify
-//! width is capped where that holds. Speculation is batch 1 on the contiguous
-//! cache; the [`Batcher`](crate::Batcher) and paged caches decode without it.
+//! Verification routes products as MLX's, so greedy output can differ from plain greedy
+//! decoding's in low bits (and, at a near tie, in a token), as mlx-lm's. With
+//! [`GenerateOptions::row_exact`] it is plain greedy decoding's, bit for bit: a verify
+//! pass computes each row as serial decode would (nuvec's row independence, up to
+//! [`nuvec::ROW_INDEPENDENT_ROWS`] rows: [`nuvec::with_row_exact`]; and its attention
+//! planner's serial rule), and the verify width is capped where that holds. Speculation
+//! is batch 1 on the contiguous cache; the [`Batcher`](crate::Batcher) and paged caches
+//! decode without it.
 //!
-//! Drafters: [`PromptLookup`] (n-grams of the context, no model), [`MtpDrafter`] (the
-//! model's own multi-token-prediction head, Qwen 3.5–3.8) and [`SuffixDecoding`] (a
-//! suffix index over the prompt and earlier outputs).
+//! Drafters: [`DFlashDrafter`](crate::DFlashDrafter) (a block-diffusion drafter over the
+//! model's hidden states), [`PromptLookup`] (n-grams of the context, no model),
+//! [`MtpDrafter`] (the model's own multi-token-prediction head, Qwen 3.5–3.8) and
+//! [`SuffixDecoding`] (a suffix index over the prompt and earlier outputs).
 
 use nuvec::{Array, Result, async_eval, eval, ops};
 
@@ -82,6 +85,13 @@ pub trait Drafter {
         false
     }
 
+    /// With [`Drafter::needs_hidden`]: the decoder layers whose outputs `observe` gets,
+    /// concatenated (`[1, n, layers · hidden_size]`, [`Model::forward_layers`]), instead of
+    /// the final hidden state (DFlash drafters).
+    fn hidden_layers(&self) -> Option<Vec<usize>> {
+        None
+    }
+
     /// The draft length and break-even acceptance [`DraftPolicy::Auto`] uses for `model`
     /// (measured on an M4 Pro). The default: prompt lookup's.
     fn auto(&self, model: &Model) -> Auto {
@@ -117,6 +127,10 @@ impl<D: Drafter + ?Sized> Drafter for &mut D {
         (**self).needs_hidden()
     }
 
+    fn hidden_layers(&self) -> Option<Vec<usize>> {
+        (**self).hidden_layers()
+    }
+
     fn auto(&self, model: &Model) -> Auto {
         (**self).auto(model)
     }
@@ -133,6 +147,10 @@ impl<D: Drafter + ?Sized> Drafter for Box<D> {
 
     fn needs_hidden(&self) -> bool {
         (**self).needs_hidden()
+    }
+
+    fn hidden_layers(&self) -> Option<Vec<usize>> {
+        (**self).hidden_layers()
     }
 
     fn auto(&self, model: &Model) -> Auto {
@@ -338,11 +356,29 @@ pub struct SpeculativeStats {
     pub pauses: usize,
 }
 
-/// The most rows a verification has, so that each is computed as serial decode computes
-/// it: nuvec's row bound and, for head sizes 192 and 256 (whose float32 rows need the
-/// one-key-per-step kernel, and compose beyond one vector threadgroup), the rows of one
-/// threadgroup (32 SIMD-groups over the grouped query heads).
-pub fn verify_rows(model: &Model) -> usize {
+/// The logits of `tokens` and the hidden states `drafter` observes: its layers' outputs
+/// ([`Drafter::hidden_layers`]) or the final hidden state.
+fn forward_for<D: Drafter + ?Sized>(
+    model: &Model,
+    drafter: &D,
+    tokens: &Array,
+    cache: &mut [KvCache],
+) -> (Array, Array) {
+    match drafter.hidden_layers() {
+        Some(ids) => model.forward_layers(tokens, cache, &ids),
+        None => model.forward_hidden(tokens, cache),
+    }
+}
+
+/// The most rows a verification has. Row-exact ([`GenerateOptions::row_exact`]), each row
+/// is computed as serial decode computes it: nuvec's row bound and, for head sizes 192
+/// and 256 (whose float32 rows need the one-key-per-step kernel, and compose beyond one
+/// vector threadgroup), the rows of one threadgroup (32 SIMD-groups over the grouped
+/// query heads). Otherwise 16 (a DFlash block; MLX's few-row quantized kernel).
+pub fn verify_rows(model: &Model, row_exact: bool) -> usize {
+    if !row_exact {
+        return 16;
+    }
     let c = &model.config;
     let gqa = (c.num_attention_heads / c.num_key_value_heads.max(1)).max(1);
     match c.head_dim {
@@ -403,7 +439,8 @@ impl<D: Drafter> std::fmt::Debug for SpeculativeGeneration<'_, D> {
 /// position's state while a draft is verified, and roll back to the last accepted one
 /// ([`KvCache::keep_steps`]).
 ///
-/// Greedy (temperature 0) output is plain greedy decoding's, bit for bit. With a
+/// Greedy (temperature 0) output is plain greedy decoding's, bit for bit, with
+/// [`GenerateOptions::row_exact`] (see the [module documentation](self)). With a
 /// temperature, a verification accepts by the lossless rule
 /// ([`nuvec::speculative::accept_sampled`]) against the sampler's filtered distribution
 /// ([`crate::Sampler::probabilities`]), so tokens are distributed as plain sampling's (not
@@ -437,7 +474,7 @@ pub fn speculative_generate<'a, D: Drafter>(
         let chunk = Array::from_slice(&head[start..start + n], [1, n as i32]);
         let mut states: Vec<Array> = Vec::new();
         if drafter.needs_hidden() {
-            let (_, hidden) = model.forward_hidden(&chunk, &mut cache);
+            let (_, hidden) = forward_for(model, &drafter, &chunk, &mut cache);
             let next = Array::from_slice(&prompt[start + 1..start + n + 1], [n as i32]);
             drafter.observe(model, &next, Some(&hidden))?;
             states.push(hidden);
@@ -483,6 +520,14 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         }
     }
 
+    /// Runs `f` row-exact when the options ask for it ([`GenerateOptions::row_exact`]).
+    fn row_exact<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        match self.options.row_exact {
+            true => nuvec::with_row_exact(|| f(self)),
+            false => f(self),
+        }
+    }
+
     /// The counts so far.
     pub fn stats(&self) -> SpeculativeStats {
         self.stats
@@ -517,7 +562,7 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
     fn submit(&mut self, token: &Array, n: usize) -> Result<Array> {
         let input = token.reshape([1, 1]);
         let next = if self.drafter.needs_hidden() {
-            let (logits, hidden) = self.model.forward_hidden(&input, &mut self.cache);
+            let (logits, hidden) = forward_for(self.model, &self.drafter, &input, &mut self.cache);
             let next = self.choose(&logits, n)?;
             self.drafter.observe(self.model, &next, Some(&hidden))?;
             next
@@ -563,7 +608,7 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             cache.keep_steps(true);
         }
         let (logits, hidden) = if self.drafter.needs_hidden() {
-            let (logits, hidden) = self.model.forward_hidden(&input, &mut self.cache);
+            let (logits, hidden) = forward_for(self.model, &self.drafter, &input, &mut self.cache);
             (logits, Some(hidden))
         } else {
             (self.model.forward(&input, &mut self.cache), None)
@@ -658,7 +703,7 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         let left = self.options.max_tokens - self.produced;
         let max = self
             .draft_len()
-            .min(verify_rows(self.model) - 1)
+            .min(verify_rows(self.model, self.options.row_exact) - 1)
             .min(left.saturating_sub(1));
         let probed = self.probed.take();
         let draft = match self.pause.0 {
@@ -691,7 +736,7 @@ impl<D: Drafter> Drop for SpeculativeGeneration<'_, D> {
     /// have been reported by `next`), as [`crate::Generation`] does.
     fn drop(&mut self) {
         if let (true, Some(y)) = (self._wired.active, self.inflight.take()) {
-            let _ = nuvec::with_row_exact(|| eval(std::slice::from_ref(&y)));
+            let _ = self.row_exact(|_| eval(std::slice::from_ref(&y)));
         }
     }
 }
@@ -707,9 +752,9 @@ impl<D: Drafter> Iterator for SpeculativeGeneration<'_, D> {
             self.finished = Some(FinishReason::Length);
             return None;
         }
-        // Verification rows keep the bits of one-row decode steps (the prompt is prefilled
-        // as `generate` prefills it), so the tokens are plain decoding's.
-        let token = match nuvec::with_row_exact(|| self.advance()) {
+        // Row-exact, verification rows keep the bits of one-row decode steps (the prompt is
+        // prefilled as `generate` prefills it), so the tokens are plain decoding's.
+        let token = match self.row_exact(|s| s.advance()) {
             Ok(t) => t,
             Err(e) => {
                 self.finished = Some(FinishReason::Error(e.clone()));

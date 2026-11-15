@@ -557,26 +557,34 @@ fn a_rank_that_never_starts_fails_init() {
     if std::env::var(CHILD).is_ok() {
         return;
     }
-    let ports: Vec<u16> = (0..2)
-        .map(|_| {
-            TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        })
-        .collect();
-    let nodes: Vec<Vec<String>> = ports
-        .iter()
-        .map(|p| vec![format!("127.0.0.1:{p}")])
-        .collect();
     let options = nuvec_distributed::Options::default().timeout(Duration::from_secs(1));
-    let start = Instant::now();
-    let err = nuvec_distributed::init_with(&nodes, 0, &options)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("rank 1"), "{err}");
-    assert!(start.elapsed() < Duration::from_secs(10));
+    // Free ports, chosen again when a parallel test takes one between the probe and the bind.
+    for _ in 0..5 {
+        let ports: Vec<u16> = (0..2)
+            .map(|_| {
+                TcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap()
+                    .port()
+            })
+            .collect();
+        let nodes: Vec<Vec<String>> = ports
+            .iter()
+            .map(|p| vec![format!("127.0.0.1:{p}")])
+            .collect();
+        let start = Instant::now();
+        let err = nuvec_distributed::init_with(&nodes, 0, &options)
+            .unwrap_err()
+            .to_string();
+        if err.contains("Address already in use") {
+            continue;
+        }
+        assert!(err.contains("rank 1"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+        return;
+    }
+    panic!("no free port pair in five tries");
 }
 
 /// Whether the GPU evaluates here; sets the GPU stream if so.

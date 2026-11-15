@@ -9,6 +9,14 @@ use std::path::PathBuf;
 use nuvec::{Array, DType, Device, Stream, set_default_stream};
 use nuvec_lm::{GenerateOptions, generate, load_model};
 
+/// `options` with tokens equal to `generate`'s, bit for bit ([`GenerateOptions::row_exact`]).
+fn exact(options: GenerateOptions) -> GenerateOptions {
+    GenerateOptions {
+        row_exact: true,
+        ..options
+    }
+}
+
 fn gpu() -> bool {
     set_default_stream(Stream::default_for(Device::gpu(0)));
     let ok = !cfg!(miri) && (&Array::from(1.0f32) + 1.0).eval().is_ok();
@@ -167,6 +175,17 @@ fn parameter_paths_are_distinct() {
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         if !path.join("config.json").is_file() || !path.join("model.safetensors").is_file() {
+            continue;
+        }
+        if path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("dflash_")
+        {
+            let e = load_model(&path).unwrap_err().to_string();
+            assert!(e.contains("DFlashDrafter::load"), "{e}");
             continue;
         }
         let model = load_model(&path).unwrap();
@@ -900,7 +919,6 @@ fn batcher_serves_each_request_its_solo_tokens() {
                 blocks: Some(blocks),
                 block_size: 4,
                 max_batch: 3,
-                batch_invariant: true,
                 ..Default::default()
             },
         )
@@ -908,6 +926,7 @@ fn batcher_serves_each_request_its_solo_tokens() {
         for (p, max) in &requests {
             let options = GenerateOptions {
                 max_tokens: *max,
+                row_exact: true,
                 ..Default::default()
             };
             batcher.submit(p.clone(), options).unwrap();
@@ -983,13 +1002,16 @@ fn batched_prefill_gives_each_request_its_solo_tokens() {
                 blocks: Some(4 * 108 / 8 + 4),
                 block_size: 8,
                 max_batch: 4,
-                batch_invariant: true,
                 ..Default::default()
             },
         )
         .unwrap();
         for p in &prompts {
-            batcher.submit(p.clone(), options.clone()).unwrap();
+            let options = GenerateOptions {
+                row_exact: true,
+                ..options.clone()
+            };
+            batcher.submit(p.clone(), options).unwrap();
         }
         let mut got: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
         while batcher.is_busy() {
@@ -1048,13 +1070,16 @@ fn seeded_sampling_is_reproducible_alone_and_batched() {
             blocks: Some(64),
             block_size: 8,
             max_batch: 3,
-            batch_invariant: true,
             ..Default::default()
         },
     )
     .unwrap();
     for (p, o) in &requests {
-        batcher.submit(p.clone(), o.clone()).unwrap();
+        let o = GenerateOptions {
+            row_exact: true,
+            ..o.clone()
+        };
+        batcher.submit(p.clone(), o).unwrap();
     }
     let mut got: Vec<Vec<u32>> = vec![Vec::new(); requests.len()];
     while batcher.is_busy() {
@@ -1277,9 +1302,14 @@ fn speculative_decoding_keeps_the_greedy_output() {
             ..Default::default()
         };
         let run = |drafter: Box<dyn Drafter>| {
-            let mut g =
-                speculative_generate(&model, &prompt, options, drafter, DraftPolicy::Fixed(4))
-                    .unwrap();
+            let mut g = speculative_generate(
+                &model,
+                &prompt,
+                exact(options),
+                drafter,
+                DraftPolicy::Fixed(4),
+            )
+            .unwrap();
             let ids: Vec<u32> = g.by_ref().collect::<nuvec::Result<_>>().unwrap();
             (ids, g.stats())
         };
@@ -1456,7 +1486,7 @@ fn mtp_drafts_keep_the_greedy_output() {
             let g = speculative_generate(
                 &model,
                 &prompt,
-                options.clone(),
+                exact(options.clone()),
                 MtpDrafter::new(&model).unwrap(),
                 DraftPolicy::Fixed(k),
             )
@@ -1474,7 +1504,7 @@ fn mtp_drafts_keep_the_greedy_output() {
         let mut g = speculative_generate(
             &model,
             &long,
-            options,
+            exact(options),
             MtpDrafter::new(&model).unwrap(),
             DraftPolicy::Fixed(3),
         )
@@ -1561,7 +1591,7 @@ fn sampled_speculation_keeps_the_sampling_distribution() {
         let mut g = speculative_generate(
             &model,
             &prompt,
-            options(1000 + seed),
+            exact(options(1000 + seed)),
             Greedy(greedy.clone(), prompt.len()),
             DraftPolicy::Fixed(2),
         )
@@ -1594,7 +1624,7 @@ fn sampled_speculation_keeps_the_sampling_distribution() {
         speculative_generate(
             &model,
             &prompt,
-            options(7),
+            exact(options(7)),
             Greedy(greedy.clone(), prompt.len()),
             DraftPolicy::Fixed(2),
         )
@@ -1700,7 +1730,7 @@ fn sampled_speculation_passes_a_chi_square_test() {
             let mut g = speculative_generate(
                 &model,
                 &prompt,
-                options(runs + seed),
+                exact(options(runs + seed)),
                 drafter,
                 DraftPolicy::Fixed(2),
             )
@@ -1748,7 +1778,7 @@ fn suffix_decoding_keeps_the_greedy_output() {
         let mut g = speculative_generate(
             &model,
             &prompt,
-            options.clone(),
+            exact(options.clone()),
             &mut *suffix,
             DraftPolicy::Fixed(4),
         )
@@ -1878,12 +1908,15 @@ fn generation_stops_at_either_files_end_of_sequence_ids() {
                 blocks: Some(16),
                 block_size: 8,
                 max_batch: 2,
-                batch_invariant: true,
                 ..Default::default()
             },
         )
         .unwrap();
-        batcher.submit(prompt.clone(), options.clone()).unwrap();
+        let exact = GenerateOptions {
+            row_exact: true,
+            ..options.clone()
+        };
+        batcher.submit(prompt.clone(), exact).unwrap();
         let (mut got, mut reason) = (Vec::new(), None);
         while batcher.is_busy() {
             for event in batcher.step().unwrap() {
@@ -1969,7 +2002,6 @@ fn sampler_settings_are_checked_and_filters_chain_as_mlx_lm() {
             blocks: Some(16),
             block_size: 8,
             max_batch: 2,
-            batch_invariant: true,
             ..Default::default()
         },
     )
@@ -1989,7 +2021,7 @@ fn sampler_settings_are_checked_and_filters_chain_as_mlx_lm() {
             speculative_generate(
                 &model,
                 &prompt,
-                options.clone(),
+                exact(options.clone()),
                 PromptLookup::default(),
                 Default::default()
             )
@@ -2390,7 +2422,7 @@ fn speculative_decoding_handles_its_edge_cases() {
         let mut g = speculative_generate(
             &model,
             &prompt,
-            options(max),
+            exact(options(max)),
             drafter,
             DraftPolicy::Fixed(4),
         )
@@ -2405,7 +2437,7 @@ fn speculative_decoding_handles_its_edge_cases() {
     let one = speculative_generate(
         &model,
         &prompt[..1],
-        options(4),
+        exact(options(4)),
         Oracle {
             prompt: 1,
             tokens: Vec::new(),
@@ -2425,7 +2457,7 @@ fn speculative_decoding_handles_its_edge_cases() {
     let mut g = speculative_generate(
         &model,
         &prompt,
-        options(8),
+        exact(options(8)),
         Oracle {
             prompt: prompt.len(),
             tokens: Vec::new(),
@@ -3208,7 +3240,7 @@ fn kv_quant_speculative_equals_greedy() {
         let mut g = speculative_generate(
             &model,
             &prompt,
-            options,
+            exact(options),
             Box::new(PromptLookup::default()),
             DraftPolicy::Fixed(4),
         )
@@ -3269,4 +3301,143 @@ fn kv_quant_prompt_cache_round_trips() {
             .unwrap()
     };
     assert!(bits(&model.forward(token, &mut loaded)) == bits(&model.forward(token, &mut kv)));
+}
+
+/// The largest difference between two float32 arrays, relative to the largest magnitude.
+fn rel_diff(got: &nuvec::Array, want: &nuvec::Array) -> f32 {
+    let (g, w) = (
+        got.astype(DType::F32).to_vec::<f32>().unwrap(),
+        want.astype(DType::F32).to_vec::<f32>().unwrap(),
+    );
+    assert_eq!(g.len(), w.len());
+    let scale = w.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    g.iter()
+        .zip(&w)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max)
+        / scale
+}
+
+/// DFlash drafters (z-lab's reference, vendored in `scripts/dflash_fixtures.py`): the
+/// target's selected layer outputs over the prompt and the drafter's logits for the first
+/// block `[anchor, mask, …]` and its draft equal the reference's, for full-attention and
+/// sliding-window drafters, a 4-bit one, DFlash 2, a Gemma 4 target (soft cap) and a YaRN
+/// drafter with attention biases (gpt-oss).
+#[test]
+fn dflash_matches_the_reference() {
+    use nuvec_lm::{DFlashDrafter, Drafter};
+    if !gpu() {
+        return;
+    }
+    for (drafter_name, target_name, tol) in [
+        ("dflash_qwen3", "qwen3_f32", 1e-4),
+        ("dflash_qwen3_q4", "qwen3_f32", 1e-4),
+        ("dflash_qwen3_5", "qwen3_5_f32", 1e-4),
+        ("dflash_qwen3_v2", "qwen3_f32", 1e-4),
+        ("dflash_gemma4", "gemma4_e_f32", 1e-4),
+        ("dflash_gpt_oss", "gpt_oss_f32", 1e-4),
+    ] {
+        let (target_dir, prompt, ..) = fixture(target_name);
+        let model = load_model(&target_dir).unwrap();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(drafter_name);
+        let expected = nuvec::io::load_safetensors(dir.join("expected.safetensors"))
+            .unwrap()
+            .tensors;
+        let mut drafter = DFlashDrafter::load(&dir, &model).unwrap();
+        let ids = drafter.hidden_layers().unwrap();
+        let tokens = nuvec::Array::from_slice(&prompt, [1, prompt.len() as i32]);
+        let (_, features) = model.forward_layers(&tokens, &mut model.new_cache(), &ids);
+        let d = rel_diff(&features, &expected["target_layers"]);
+        assert!(d < tol, "{drafter_name}: target layers off by {d}");
+        drafter.observe(&model, &tokens, Some(&features)).unwrap();
+        let first = expected["first"].to_vec::<u32>().unwrap()[0];
+        let mut block = vec![drafter.config().mask_token_id; drafter.config().block_size];
+        block[0] = first;
+        let block = nuvec::Array::from_slice(&block, [1, block.len() as i32]);
+        let logits = drafter
+            .logits(&model, &block)
+            .reshape([block.size() as i32, -1]);
+        let d = rel_diff(&logits, &expected["logits"]);
+        assert!(d < tol, "{drafter_name}: logits off by {d}");
+        // The draft: the argmax of each masked position, or DFlash 2's selector path.
+        let n = drafter.config().block_size - 1;
+        let draft = drafter.draft(&model, &[first], n).unwrap();
+        let want = expected["draft"].to_vec::<u32>().unwrap();
+        assert_eq!(
+            draft.tokens.to_vec::<u32>().unwrap(),
+            want,
+            "{drafter_name}: draft"
+        );
+    }
+}
+
+/// Speculative decoding with a DFlash drafter gives plain greedy decoding's tokens (dense and
+/// hybrid targets), runs with a temperature, and a drafter for another target is refused.
+#[test]
+fn dflash_speculation_keeps_the_greedy_output() {
+    use nuvec_lm::{DFlashDrafter, DraftPolicy, Sampler, speculative_generate};
+    if !gpu() {
+        return;
+    }
+    let drafter_dir = |name: &str| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    };
+    for (drafter_name, target_name) in [
+        ("dflash_qwen3", "qwen3_f32"),
+        ("dflash_qwen3_5", "qwen3_5_f32"),
+        ("dflash_qwen3_v2", "qwen3_f32"),
+        ("dflash_gemma4", "gemma4_e_f32"),
+        ("dflash_gpt_oss", "gpt_oss_f32"),
+    ] {
+        let (dir, prompt, _, _, greedy) = fixture(target_name);
+        let model = load_model(&dir).unwrap();
+        let drafter = DFlashDrafter::load(drafter_dir(drafter_name), &model).unwrap();
+        let options = GenerateOptions {
+            max_tokens: greedy.len(),
+            ..Default::default()
+        };
+        let mut g = speculative_generate(
+            &model,
+            &prompt,
+            exact(options.clone()),
+            drafter,
+            DraftPolicy::Fixed(7),
+        )
+        .unwrap();
+        let ids: Vec<u32> = g.by_ref().collect::<nuvec::Result<_>>().unwrap();
+        assert_eq!(ids, greedy, "{drafter_name}: greedy");
+        assert!(g.stats().verifies > 0, "{drafter_name}: {:?}", g.stats());
+        let drafter = DFlashDrafter::load(drafter_dir(drafter_name), &model).unwrap();
+        let sampled = GenerateOptions {
+            sampler: Sampler {
+                temperature: 0.8,
+                ..Default::default()
+            },
+            seed: Some(7),
+            ..options
+        };
+        let n = speculative_generate(
+            &model,
+            &prompt,
+            exact(sampled),
+            drafter,
+            DraftPolicy::Fixed(7),
+        )
+        .unwrap()
+        .collect::<nuvec::Result<Vec<u32>>>()
+        .unwrap()
+        .len();
+        assert_eq!(n, greedy.len(), "{drafter_name}: sampled");
+    }
+    // A drafter reading layer 3 of a two-layer target.
+    let (dir, ..) = fixture("qwen3_f32");
+    let model = load_model(&dir).unwrap();
+    let err = DFlashDrafter::load(drafter_dir("dflash_qwen3_5"), &model)
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("target layer 3"), "{err}");
 }

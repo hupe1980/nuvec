@@ -58,11 +58,13 @@ let w_approx = q.dequantize(None);     // bfloat16
 
 Weights quantized elsewhere (a checkpoint's tensors) become a `Quantized` with `Quantized::affine(weight, scales, biases, group_size, bits)` (biases required, as in MLX) or `Quantized::fp(weight, scales, mode)`.
 
+NVFP4 takes an optional float32 global scale, as MLX's `global_scale`: `ops::quantize_scaled(w, g)` makes the scales relative to `g / (448 · 6)`, and the result carries `g` (`Quantized::global_scale`, or `with_global_scale` for a checkpoint's), so `dequantize`, `quantized_matmul` and `gather_qmm` apply it. `qqmm` and `gather_qqmm` take the activations' scale (`global_scale_x`) with the weight's, both or neither, with MLX's kernels.
+
 `view` reinterprets bits as another dtype (MLX's `mx.view`), and `to_fp8` / `from_fp8` convert floats to E4M3 bytes and back; checkpoints that store F8 tensors load them as `uint8`.
 
 ## Products on the GPU
 
-Products use MLX's kernels, chosen by shape as MLX chooses them: matrix-vector kernels for few rows, as in decode; tiled kernels for many rows; split-K when the output is small but the inner dimension long. From 2 rows, MLX's multi-vector kernel reads each weight group once for several rows, so a row's low bits can depend on how many rows share a product, as in MLX. Built or evaluated under `nuvec::with_row_exact` (speculative verification, `BatcherOptions::batch_invariant`, lanes of independent sequences), up to 8 rows run as matrix-vector products in which each row's result equals its single-row product bit for bit; affine products read each weight once for two or three rows (three at 3, 6 and 8 bits), so two lanes cost about one.
+Products use MLX's kernels, chosen by shape as MLX chooses them: matrix-vector kernels for few rows, as in decode; tiled kernels for many rows; split-K when the output is small but the inner dimension long. From 2 rows, MLX's multi-vector kernel reads each weight group once for several rows, and affine 4- and 8-bit products of 3 to 16 rows over large matrices (N · K ≥ 2²¹) run MLX's simdgroup-matrix kernel `qmv_mma` (from MLX `main`; 4 rows from M4 on, not on Ultra parts), so a row's low bits can depend on how many rows share a product, as in MLX. Built or evaluated under `nuvec::with_row_exact` (`GenerateOptions::row_exact` for speculative and batched requests, lanes of independent sequences), up to 8 rows run as matrix-vector products in which each row's result equals its single-row product bit for bit; affine products read each weight once for two or three rows (three at 3, 6 and 8 bits), so two lanes cost about one.
 
 ## Mixture of experts
 
@@ -80,7 +82,7 @@ let y = x.gather_qmm(&q, None, Some(&experts), GatherQmm::default().sorted_indic
 # assert_eq!(y.shape(), [4, 1, 128]);
 ```
 
-With rows sorted by expert (`sorted_indices`), at least 16 of them (more than 64 under `with_row_exact`) and at least four per expert on average, a grouped kernel reads each expert's weights once; otherwise each row gets its own product. NVFP4 experts can carry one float32 global scale each (`GatherQmm::global_scale`), as mlx-lm's `quantize_model(..., global_scale=True)` writes them. `gather_mm` is the same for full-precision weights.
+With rows sorted by expert (`sorted_indices`), at least 16 of them (more than 64 under `with_row_exact`) and at least four per expert on average, a grouped kernel reads each expert's weights once; otherwise each row gets its own product. NVFP4 experts can carry one float32 global scale each (`Quantized::global_scale`, shape `[experts]`), as mlx-lm's `quantize_model(..., global_scale=True)` writes them. `gather_mm` is the same for full-precision weights.
 
 ## Training through quantized weights
 

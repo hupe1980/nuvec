@@ -383,6 +383,15 @@ impl Config {
     /// settings (`text_config`) are used; the quantization is read from the top level.
     /// Zero heads, intervals or group sizes and negative integers are errors.
     pub fn from_json(top: &Json) -> Result<Self> {
+        let drafter = top
+            .get("architectures")
+            .and_then(Json::as_array)
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("DFlashDraftModel")));
+        if drafter {
+            return Err(invalid(
+                "a DFlash drafter, not a model: load it with `DFlashDrafter::load`",
+            ));
+        }
         let c = top.get("text_config").unwrap_or(top);
         let opt_int = |k: &str| match c.get(k) {
             None | Some(Json::Null) => Ok(None),
@@ -960,7 +969,7 @@ fn gemma4(
     })
 }
 
-fn rope_scaling(s: Option<&Json>) -> Result<RopeScaling> {
+pub(crate) fn rope_scaling(s: Option<&Json>) -> Result<RopeScaling> {
     let Some(s) = s.filter(|s| **s != Json::Null) else {
         return Ok(RopeScaling::None);
     };

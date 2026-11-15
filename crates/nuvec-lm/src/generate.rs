@@ -37,6 +37,13 @@ pub struct GenerateOptions {
     /// Quantized attention caches (mlx-lm's `kv_bits`, `kv_group_size`,
     /// `quantized_kv_start`); none by default.
     pub kv_quant: Option<KvQuant>,
+    /// Whether the tokens are [`generate()`]'s, bit for bit, however the request is run:
+    /// speculative verification and batched steps then compute every row as a one-row
+    /// decode step computes it ([`nuvec::with_row_exact`]), at some cost in speed. Off by
+    /// default: products route as MLX's, so speculative or batched tokens can differ in
+    /// their low bits (and so, at a near tie, in a token) from [`generate()`]'s, as
+    /// mlx-lm's. No effect on [`generate()`] itself.
+    pub row_exact: bool,
 }
 
 /// The sampling keys of one generation: split from its seed, one per token, or none (the
@@ -71,6 +78,7 @@ impl Default for GenerateOptions {
             ignore_eos: false,
             min_tokens: 0,
             kv_quant: None,
+            row_exact: false,
         }
     }
 }

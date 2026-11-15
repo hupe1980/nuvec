@@ -43,6 +43,26 @@ pub(crate) fn ranks_vanishing(
         }
         return None;
     }
+    // Free ports are picked before the ranks bind them, so another process can take one in
+    // between: such an attempt is repeated with new ports.
+    for attempt in 1.. {
+        match run_ranks(test, n, env, vanishing) {
+            Ok(outputs) => return Some(outputs),
+            Err(report) if attempt < 5 && report.contains("Address already in use") => continue,
+            Err(report) => panic!("{test}: a rank failed\n{report}"),
+        }
+    }
+    unreachable!()
+}
+
+/// One attempt of [`ranks_vanishing`] in the parent: every rank's output, or a report of
+/// every rank's output when one failed.
+fn run_ranks(
+    test: &str,
+    n: usize,
+    env: &[(&str, &str)],
+    vanishing: Option<usize>,
+) -> Result<Vec<String>, String> {
     let ports: Vec<u16> = (0..n)
         .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
         .collect::<Vec<_>>()
@@ -129,9 +149,9 @@ pub(crate) fn ranks_vanishing(
             .enumerate()
             .map(|(rank, (s, out, err))| format!("rank {rank} ({s:?}):\n{out}\n{err}"))
             .collect();
-        panic!("{test}: a rank failed\n{}", report.join("\n"));
+        return Err(report.join("\n"));
     }
-    Some(results.into_iter().map(|(_, out, _)| out).collect())
+    Ok(results.into_iter().map(|(_, out, _)| out).collect())
 }
 
 /// The lines of each rank's output starting with `BITS`, which must agree.

@@ -14,11 +14,13 @@
 //! stderr (every dispatch then runs alone, so throughput drops; `--max-tokens 1` profiles
 //! prefill). `--draft N` decodes speculatively with drafts of up to `N` tokens and adds
 //! the draft counts: `--drafter lookup` (default), `mtp` (with `--mtp-weights FILE` from
-//! `scripts/extract_mtp.py` unless the checkpoint has its `mtp.*` weights) or `suffix`;
+//! `scripts/extract_mtp.py` unless the checkpoint has its `mtp.*` weights), `suffix` or
+//! `dflash` (with `--dflash-dir DIR`, a DFlash drafter's directory; `--dflash-bits 4`
+//! quantizes its full-precision weights);
 //! `--policy auto` (default: the drafter's measured length and kill switch; `--draft`
 //! then only switches speculation on), `adaptive` (pause after rejected drafts) or
-//! `fixed`. `--text-file F`
-//! reads the prompt text from a file.
+//! `fixed`. `--row-exact` makes speculative and batched tokens plain decoding's, bit for
+//! bit (`GenerateOptions::row_exact`). `--text-file F` reads the prompt text from a file.
 //!
 //! Token-id prompts (files with one prompt per line, comma-separated ids):
 //!
@@ -27,8 +29,7 @@
 //!   process, then the peak memory (allocator plus mapped files) and its parts.
 //! - `--phase load --first-token-ids F`: seconds to a loaded model and to the first token.
 //! - `--batch N --ids-file F`: the first `N` lines served together by a `Batcher`
-//!   (128 tokens each, end-of-sequence ignored), compared with each prompt alone;
-//!   `--batch-invariant` serves them row-exact (`BatcherOptions::batch_invariant`).
+//!   (128 tokens each, end-of-sequence ignored), compared with each prompt alone.
 //!
 //! `--trace FILE` replays a multi-turn trace (turns separated by `---` lines; each turn's
 //! prompt is the history so far, earlier outputs included, plus the turn) with plain
@@ -103,6 +104,7 @@ fn main() -> nuvec::Result<()> {
     let phase = value("--phase");
     let mut options = GenerateOptions {
         max_tokens: number("--max-tokens", 128),
+        row_exact: args.iter().any(|a| a == "--row-exact"),
         ..Default::default()
     };
     let stops = number("--stops", 0);
@@ -135,7 +137,22 @@ fn main() -> nuvec::Result<()> {
                 "lookup" => Box::new(PromptLookup::default()),
                 "mtp" => Box::new(MtpDrafter::new(&model)?),
                 "suffix" => Box::new(SuffixDecoding::default()),
-                d => fail(&format!("--drafter {d}: lookup, mtp or suffix")),
+                "dflash" => {
+                    let dir = value("--dflash-dir").unwrap_or_else(|| fail("--dflash-dir"));
+                    let d = match value("--dflash-bits") {
+                        Some(b) => nuvec_lm::DFlashDrafter::load_quantized(
+                            &dir,
+                            &model,
+                            nuvec::Quant::affine(
+                                64,
+                                b.parse().unwrap_or_else(|_| fail("--dflash-bits")),
+                            ),
+                        )?,
+                        None => nuvec_lm::DFlashDrafter::load(&dir, &model)?,
+                    };
+                    Box::new(d)
+                }
+                d => fail(&format!("--drafter {d}: lookup, mtp, suffix or dflash")),
             };
             let policy = match policy.as_str() {
                 "auto" => DraftPolicy::Auto,
@@ -306,14 +323,12 @@ fn main() -> nuvec::Result<()> {
         let longest = prompts.iter().map(Vec::len).max().unwrap_or(0);
         let block_size = 16;
         let blocks = n * (longest + options.max_tokens).div_ceil(block_size) + n;
-        let invariant = args.iter().any(|a| a == "--batch-invariant");
         let mut batcher = Batcher::new(
             &model,
             BatcherOptions {
                 blocks: Some(blocks),
                 block_size,
                 max_batch: n,
-                batch_invariant: invariant,
                 ..Default::default()
             },
         )?;

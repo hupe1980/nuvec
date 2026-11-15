@@ -24,7 +24,6 @@ nuvec-distributed = { path = "crates/nuvec-distributed", version = "0.12.0" }
 nuvec-gpu = { path = "crates/nuvec-gpu", version = "0.12.0" }
 nuvec-io = { path = "crates/nuvec-io", version = "0.12.0" }
 nuvec-kernels = { path = "crates/nuvec-kernels", version = "0.12.0" }
-nuvec-lm = { path = "crates/nuvec-lm", version = "0.12.0" }
 nuvec-nn = { path = "crates/nuvec-nn", version = "0.12.0" }
 nuvec-macros = { path = "crates/nuvec-macros", version = "0.12.0" }
 

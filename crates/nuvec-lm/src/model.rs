@@ -1284,7 +1284,7 @@ impl Attention {
 
     /// At head size 512, one-token decode over the contiguous cache runs MLX's composition
     /// below 1,024 keys (or without 8 query heads per key head), not the vector kernel the
-    /// paged kernel equals: row-exact ([`nuvec::with_row_exact`], a batch-invariant
+    /// paged kernel equals: row-exact ([`nuvec::with_row_exact`], a row-exact request in a
     /// `Batcher`), those rows are computed as that decode computes them, over their keys
     /// gathered from the pools, so a sequence keeps its solo bits.
     #[track_caller]
@@ -1876,12 +1876,10 @@ impl SwitchProjection {
                 quant,
                 bias,
             } => {
-                let mut options = GatherQmm::default().sorted_indices(sorted);
-                if let Some(g) = global_scale {
-                    options = options.global_scale(g);
-                }
-                let q =
+                let options = GatherQmm::default().sorted_indices(sorted);
+                let mut q =
                     nuvec::Quantized::new(weight.clone(), scales.clone(), biases.clone(), *quant);
+                q.global_scale = global_scale.clone();
                 (x.gather_qmm(&q, None, Some(indices), options), bias)
             }
         };
@@ -1925,7 +1923,7 @@ impl SwitchGlu {
     #[track_caller]
     fn forward(&self, x: &Array, indices: &Array) -> Array {
         let [b, l, d] = x.shape_n::<3>().unwrap_or_default();
-        // Several prompts prefilled together by a batch-invariant `Batcher`: where an item
+        // Several prompts prefilled together row-exact by a `Batcher`: where an item
         // alone would take other kernels (sorting and the grouped kernels depend on the
         // number of rows), each item goes through the experts alone, so it keeps its bits.
         let k = indices.shape().get(2).copied().unwrap_or_default();
@@ -2758,6 +2756,60 @@ impl Model {
         (self.head(&h), h)
     }
 
+    /// [`Model::forward`], also giving the outputs of decoder layers `ids` (0-indexed: each
+    /// block's residual stream, before the final norm), concatenated along the features
+    /// (`[B, L, ids.len() · hidden_size]`), as DFlash drafters read them. Pipelined models
+    /// give a failed array for the features.
+    #[track_caller]
+    pub fn forward_layers(
+        &self,
+        tokens: &Array,
+        cache: &mut [KvCache],
+        ids: &[usize],
+    ) -> (Array, Array) {
+        if cache.len() != self.model.layers.len() {
+            let e = mismatched_layers(cache.len(), self.model.layers.len());
+            return (e.clone(), e);
+        }
+        let unsupported = |what: &str| {
+            Array::failure(
+                "forward_layers",
+                nuvec::OpErrorKind::InvalidArgument(format!("not supported for {what}")),
+            )
+        };
+        if self.stage.is_some() {
+            let logits = self.forward(tokens, cache);
+            return (logits, unsupported("a pipelined model"));
+        }
+        if let Some(&i) = ids.iter().find(|&&i| i >= self.model.layers.len()) {
+            return (
+                unsupported(&format!("layer {i}")),
+                unsupported(&format!("layer {i}")),
+            );
+        }
+        if self.config.gemma4.is_some() {
+            let (h, features) = gemma::hidden_with(self, tokens, cache, ids);
+            return (gemma::logits(self, &h), features);
+        }
+        let mask = match tokens.shape().get(1) {
+            Some(&l) if l > 1 => AttentionMask::Causal,
+            _ => AttentionMask::None,
+        };
+        let mut h = self.embed(tokens);
+        let mut pending = None;
+        let mut outputs = vec![None; ids.len()];
+        for (i, (layer, c)) in self.model.layers.iter().zip(cache).enumerate() {
+            let (next, mlp) = layer.forward(&h, pending.as_ref(), mask, c);
+            for (slot, _) in ids.iter().enumerate().filter(|&(_, &id)| id == i) {
+                outputs[slot] = Some(next.add(&mlp));
+            }
+            (h, pending) = (next, Some(mlp));
+        }
+        let (_, h) = add_norm(&h, pending.as_ref(), self.model.norm.get());
+        let features: Vec<Array> = outputs.into_iter().flatten().collect();
+        (self.head(&h), ops::concatenate(&features, -1))
+    }
+
     /// Sets whether each block recomputes its activations in the backward pass instead of
     /// keeping them (mlx-lm's `grad_checkpoint`), for forward passes without a cache
     /// ([`Model::forward_uncached`], [`Model::forward_hidden_uncached`]): less memory for
@@ -2854,6 +2906,16 @@ impl Model {
 
     /// The token embeddings of `tokens` (not evaluated), times Granite 4's
     /// `embedding_multiplier`.
+    /// The embedding table's rows times the embedding module's own scale (Gemma 4: √hidden,
+    /// mlx-lm's `embed_scale`; not Granite's multiplier), as DFlash drafters embed.
+    pub(crate) fn draft_embed(&self, tokens: &Array) -> Array {
+        let h = self.model.embed_tokens.forward(tokens);
+        match self.config.gemma4 {
+            Some(_) => h.multiply((self.config.hidden_size as f32).sqrt()),
+            None => h,
+        }
+    }
+
     pub(crate) fn embed(&self, tokens: &Array) -> Array {
         let h = self.model.embed_tokens.forward(tokens);
         match self.config.granite {
@@ -2993,15 +3055,22 @@ impl Model {
 
     /// The output head on the final hidden states.
     #[track_caller]
-    fn head(&self, h: &Array) -> Array {
+    pub(crate) fn head(&self, h: &Array) -> Array {
+        let logits = self.raw_head(h);
+        // Granite 4's logits are divided by its `logits_scaling`.
+        match self.config.granite {
+            Some(g) => logits.divide(f64::from(g.logits_scaling)),
+            None => logits,
+        }
+    }
+
+    /// The output head alone (`lm_head` or the tied embedding; every rank's vocabulary rows
+    /// when sharded), without Granite's scaling or Gemma's soft cap: what DFlash drafters
+    /// read.
+    pub(crate) fn raw_head(&self, h: &Array) -> Array {
         let logits = match &self.lm_head {
             Some(head) => head.forward(h),
             None => self.model.embed_tokens.as_linear(h),
-        };
-        // Granite 4's logits are divided by its `logits_scaling`.
-        let logits = match self.config.granite {
-            Some(g) => logits.divide(f64::from(g.logits_scaling)),
-            None => logits,
         };
         match (&self.sharding, self.vocab_sharded) {
             // Every rank's vocabulary rows, joined along the last axis (the gather joins

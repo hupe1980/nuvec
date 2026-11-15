@@ -226,18 +226,22 @@ impl Primitive {
             Self::MetalKernel(_) => Err(crate::Error::InvalidArgument("metal_kernel: no derivative or batching rule (wrap the kernel in `custom_function`)".into())),
             Self::Compiled(fused) => fused.vmap(inputs, axes),
             Self::Quantize { quant } => {
-                let (wq, scales, biases) = quantize(&front(x, axes[0])?, *quant)?;
+                let g = unbatched_scale(inputs, axes, 1)?;
+                let (wq, scales, biases) = quantize(&front(x, axes[0])?, *quant, g)?;
                 let mut out = vec![wq, scales];
                 out.extend(biases);
                 Ok((out, 0))
             }
             // Packed weights, scales and biases share their batch dimensions.
             Self::Dequantize { quant, dtype } => {
-                let parts = (0..inputs.len())
+                let affine = quant.mode == crate::QuantMode::Affine;
+                let g = if affine { None } else { unbatched_scale(inputs, axes, 2)? };
+                let n = inputs.len() - usize::from(g.is_some());
+                let parts = (0..n)
                     .map(|i| front_full(&inputs[i], axes[i], b))
                     .collect::<Result<Vec<_>>>()?;
                 Ok((
-                    vec![dequantize(&parts[0], &parts[1], parts.get(2), *quant, Some(*dtype))?],
+                    vec![dequantize(&parts[0], &parts[1], parts.get(2), *quant, Some(*dtype), g)?],
                     0,
                 ))
             }
@@ -245,8 +249,11 @@ impl Primitive {
             // dimensions; otherwise every operand gets the batch axis first, and 2-D weights
             // get size-1 axes for `x`'s other batch dimensions.
             Self::QuantizedMatmul { quant, transpose, .. } => {
+                let affine = quant.mode == crate::QuantMode::Affine;
+                let g = if affine { None } else { unbatched_scale(inputs, axes, 3)? };
                 let x = front(x, axes[0])?;
-                let mut weights: Vec<Array> = inputs[1..].to_vec();
+                let n = inputs.len() - usize::from(g.is_some());
+                let mut weights: Vec<Array> = inputs[1..n].to_vec();
                 if axes[1..].iter().any(Option::is_some) {
                     for (i, a) in weights.iter_mut().enumerate() {
                         *a = front_full(a, axes[i + 1], b)?;
@@ -262,6 +269,7 @@ impl Primitive {
                     weights.get(2),
                     *transpose,
                     *quant,
+                    g,
                 )?;
                 Ok((vec![out], 0))
             }
@@ -303,5 +311,20 @@ impl Primitive {
             .map(|a| broadcast_to(a, &shape))
             .collect::<Result<Vec<_>>>()?;
         Ok((record(self.clone(), operands)?, 0))
+    }
+}
+
+/// A primitive's NVFP4 global scale (input `at`, if present): one value for every batch item,
+/// so it cannot be batched.
+fn unbatched_scale<'a>(
+    inputs: &'a [Array],
+    axes: &[Option<usize>],
+    at: usize,
+) -> Result<Option<&'a Array>> {
+    match (inputs.get(at), axes.get(at).copied().flatten()) {
+        (Some(_), Some(_)) => Err(crate::Error::InvalidArgument(
+            "vmap: a batched nvfp4 global scale is not supported".into(),
+        )),
+        (g, _) => Ok(g),
     }
 }

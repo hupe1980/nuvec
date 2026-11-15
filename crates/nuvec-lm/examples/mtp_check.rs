@@ -10,6 +10,14 @@
 
 use nuvec_lm::{DraftPolicy, GenerateOptions, MtpDrafter, generate, speculative_generate};
 
+/// `options` with tokens equal to `generate`'s, bit for bit ([`GenerateOptions::row_exact`]).
+fn exact(options: GenerateOptions) -> GenerateOptions {
+    GenerateOptions {
+        row_exact: true,
+        ..options
+    }
+}
+
 fn main() -> nuvec::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let (mut model, tokenizer) = nuvec_lm::load(&args[1])?;
@@ -43,7 +51,7 @@ fn main() -> nuvec::Result<()> {
             let g = speculative_generate(
                 &model,
                 prompt,
-                options.clone(),
+                exact(options.clone()),
                 MtpDrafter::new(&model)?,
                 DraftPolicy::Fixed(k),
             )?;

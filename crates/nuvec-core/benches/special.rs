@@ -91,8 +91,8 @@ fn main() -> Result<()> {
             "block_masked_mm",
             Box::new(|| ops::block_masked_mm(&ma, &mb, 32, Some(&mask), None, None)),
         ),
-        ("qqmm-256", Box::new(|| ops::qqmm(&qx, &qq))),
-        ("qqmm-1", Box::new(|| ops::qqmm(&qx1, &qq))),
+        ("qqmm-256", Box::new(|| ops::qqmm(&qx, &qq, None))),
+        ("qqmm-1", Box::new(|| ops::qqmm(&qx1, &qq, None))),
     ];
     let filter = std::env::args()
         .skip(1)

@@ -161,13 +161,13 @@ paged.remove(id)?;                                     // its blocks are free ag
 # }
 ```
 
-Each sequence gets exactly the tokens it would get decoding alone. Hybrid models keep each sequence's Gated DeltaNet state in a slot of a state pool, updated in place.
+Run under `nuvec::with_row_exact`, each sequence gets exactly the tokens it would get decoding alone. Hybrid models keep each sequence's Gated DeltaNet state in a slot of a state pool, updated in place.
 
 ## Serving many requests
 
 `Batcher` queues requests, admits them while there is room, prefills them (on quantized models, prompts of the same length over 64 tokens admitted together are prefilled in one batch) and decodes them together. Each finishes as it would alone: at an end-of-sequence token, a stop, or its `max_tokens`. Decoding is pipelined as in `generate`: each `step` submits the next step before reading the previous one's tokens, so one step can be in flight between calls; a request that ends meanwhile emits nothing more.
 
-Products route as MLX routes them, so a request's output can differ in its low bits depending on what it is batched with, as with mlx-lm's `BatchGenerator`. `BatcherOptions::batch_invariant` serves every request exactly the tokens it gets alone, at some cost in throughput (up to about 20% on mixture-of-experts models at 8 requests).
+Products route as MLX routes them, so a request's output can differ in its low bits depending on what it is batched with, as with mlx-lm's `BatchGenerator`. A request with `GenerateOptions::row_exact` gets exactly the tokens it gets alone: while it is queued or running, every step runs row-exact, at some cost in throughput (up to about 20% on mixture-of-experts models at 8 requests). The same option makes speculative decoding's output plain decoding's.
 
 ```rust,no_run
 use nuvec_lm::{Batcher, BatcherOptions, Event, GenerateOptions, load};
@@ -195,7 +195,7 @@ while batcher.is_busy() {
 - `max_batch` is 32 by default, as mlx-lm's `BatchGenerator`.
 - `block_size` is 16 by default.
 - `blocks` is sized from memory by default: 90% (`memory_fraction`) of what the GPU's recommended working set leaves after the weights, at most room for `max_batch` sequences of 131,072 positions each. `Model::kv_bytes_per_position()` gives a position's size.
-- `batch_invariant` is described above; `micro_batches` applies to pipelined models (below).
+- `micro_batches` applies to pipelined models (below).
 
 Invalid options are refused with an error naming the field.
 

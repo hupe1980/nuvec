@@ -199,6 +199,9 @@ pub struct Quantized {
     pub scales: Array,
     /// One bias per group: required for affine, absent for the floating-point modes.
     pub biases: Option<Array>,
+    /// NVFP4 only: the float32 global scale the scales are relative to (MLX's
+    /// `global_scale`): one value, or one per expert (`[E]`) for stacked experts.
+    pub global_scale: Option<Array>,
     /// How the weights were quantized.
     pub quant: Quant,
 }
@@ -236,7 +239,16 @@ impl Quantized {
             weight,
             scales,
             biases,
+            global_scale: None,
             quant: quant.into(),
+        }
+    }
+
+    /// These NVFP4 weights with the global scale their scales are relative to.
+    pub fn with_global_scale(self, global_scale: Array) -> Self {
+        Self {
+            global_scale: Some(global_scale),
+            ..self
         }
     }
 
@@ -255,9 +267,13 @@ impl Quantized {
         Ok(())
     }
 
-    /// The arrays, in MLX's operand order: weight, scales and (affine) biases.
+    /// The arrays, in MLX's operand order: weight, scales, (affine) biases and (NVFP4) the
+    /// global scale.
     pub(crate) fn arrays(&self) -> impl Iterator<Item = &Array> {
-        [&self.weight, &self.scales].into_iter().chain(&self.biases)
+        [&self.weight, &self.scales]
+            .into_iter()
+            .chain(&self.biases)
+            .chain(&self.global_scale)
     }
 }
 
@@ -281,6 +297,7 @@ impl crate::tree::Leaves for Quantized {
         v.buffer("weight", &self.weight);
         v.buffer("scales", &self.scales);
         v.buffer("biases", &self.biases);
+        v.buffer("global_scale", &self.global_scale);
         v.static_field("quant", &self.quant);
     }
 }
@@ -290,6 +307,7 @@ impl crate::tree::Tree for Quantized {
         v.buffer("weight", &mut self.weight);
         v.buffer("scales", &mut self.scales);
         v.buffer("biases", &mut self.biases);
+        v.buffer("global_scale", &mut self.global_scale);
     }
 }
 
@@ -297,28 +315,24 @@ impl crate::tree::Tree for Quantized {
 /// `GatherQmm::default()` multiplies by the transposed weights (MLX's default).
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
-pub struct GatherQmm<'a> {
+pub struct GatherQmm {
     /// `x · wᵀ` (MLX's default) rather than `x · w`.
     pub transpose: bool,
     /// The right indices are sorted (rows grouped by expert), so one kernel can walk each
     /// expert's weights once.
     pub sorted_indices: bool,
-    /// nvfp4 only: one float32 scale per expert (`w.weight`'s batch shape), multiplying the
-    /// expert's decoded weights by `global_scale / (448 · 6)`. Needs the right indices.
-    pub global_scale: Option<&'a Array>,
 }
 
-impl Default for GatherQmm<'_> {
+impl Default for GatherQmm {
     fn default() -> Self {
         Self {
             transpose: true,
             sorted_indices: false,
-            global_scale: None,
         }
     }
 }
 
-impl<'a> GatherQmm<'a> {
+impl GatherQmm {
     /// Whether a gather of `rows` sorted index rows over `experts` weight batches takes the
     /// grouped kernel (each expert's rows in tiles), rather than one product per row. Two
     /// gathers that take the same kernel give a row the same bits, whatever other rows are
@@ -339,15 +353,6 @@ impl<'a> GatherQmm<'a> {
     pub fn sorted_indices(self, sorted_indices: bool) -> Self {
         Self {
             sorted_indices,
-            ..self
-        }
-    }
-
-    /// The per-expert nvfp4 global scale.
-    #[must_use]
-    pub fn global_scale(self, global_scale: &'a Array) -> Self {
-        Self {
-            global_scale: Some(global_scale),
             ..self
         }
     }
@@ -377,9 +382,15 @@ fn check_groups(op: &str, mode: QuantMode, scales: &Array, biases: Option<&Array
 /// dimension divisible by the group size). Returns the packed codes (uint32), the scales and,
 /// for affine, the biases, equal to MLX's bit for bit (the floating-point modes: MLX's Metal
 /// quantizer's).
-pub(crate) fn quantize(w: &Array, quant: Quant) -> Result<(Array, Array, Option<Array>)> {
+pub(crate) fn quantize(
+    w: &Array,
+    quant: Quant,
+    global_scale: Option<&Array>,
+) -> Result<(Array, Array, Option<Array>)> {
     quant.checked("quantize")?;
-    let mut out = Array::from_op(Primitive::Quantize { quant }, vec![w.clone()])?;
+    let mut inputs = vec![w.clone()];
+    inputs.extend(global_scale.cloned());
+    let mut out = Array::from_op(Primitive::Quantize { quant }, inputs)?;
     let biases = (quant.mode == QuantMode::Affine).then(|| out.pop().expect("three outputs"));
     let scales = out.pop().expect("scales");
     Ok((out.pop().expect("codes"), scales, biases))
@@ -393,6 +404,7 @@ pub(crate) fn dequantize(
     biases: Option<&Array>,
     quant: Quant,
     dtype: Option<DType>,
+    global_scale: Option<&Array>,
 ) -> Result<Array> {
     quant.checked("dequantize")?;
     check_groups("dequantize", quant.mode, scales, biases)?;
@@ -424,7 +436,9 @@ pub(crate) fn dequantize(
                 return Err(Error::unsupported_dtype("dequantize", dtype));
             }
             let primitive = Primitive::Dequantize { quant, dtype };
-            Ok(Array::from_op(primitive, vec![w.clone(), scales.clone()])?.swap_remove(0))
+            let mut inputs = vec![w.clone(), scales.clone()];
+            inputs.extend(global_scale.cloned());
+            Ok(Array::from_op(primitive, inputs)?.swap_remove(0))
         }
     }
 }
@@ -443,12 +457,15 @@ pub(crate) fn quantized_matmul(
     biases: Option<&Array>,
     transpose: bool,
     quant: Quant,
+    global_scale: Option<&Array>,
 ) -> Result<Array> {
-    quantized_product(x, w, scales, biases, transpose, quant, false)
+    quantized_product(x, w, scales, biases, transpose, quant, false, global_scale)
 }
 
 /// [`quantized_matmul`], with `rows` taking MLX's matrix-vector kernels for any number
-/// of rows (MLX's `dispatch_qmv`, as its `qqmm` does).
+/// of rows (MLX's `dispatch_qmv`, as its `qqmm` does). An NVFP4 global scale takes MLX's
+/// global-scale kernels (transposed, one batch), else `x · dequantize(w)ᵀ`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn quantized_product(
     x: &Array,
     w: &Array,
@@ -457,9 +474,20 @@ pub(crate) fn quantized_product(
     transpose: bool,
     quant: Quant,
     rows: bool,
+    global_scale: Option<&Array>,
 ) -> Result<Array> {
     quant.checked("quantized_matmul")?;
     check_groups("quantized_matmul", quant.mode, scales, biases)?;
+    if let Some(g) = global_scale
+        && (w.ndim() > 2 || x.ndim() > 2 || !transpose)
+    {
+        let dense = dequantize(w, scales, None, quant, Some(x.dtype()), Some(g))?;
+        let dense = match transpose {
+            true => crate::ops::swapaxes(&dense, -1, -2),
+            false => dense,
+        };
+        return crate::IntoResult::into_result(x.matmul(&dense));
+    }
     let dtype = match biases {
         Some(b) => promote_types(promote_types(x.dtype(), scales.dtype()), b.dtype()),
         None => x.dtype(),
@@ -493,6 +521,7 @@ pub(crate) fn quantized_product(
     }
     let mut inputs = vec![x];
     inputs.extend(groups);
+    inputs.extend(global_scale.cloned());
     let primitive = Primitive::QuantizedMatmul {
         quant,
         transpose,
@@ -565,15 +594,13 @@ pub(crate) fn gather_qmm(
     lhs_indices: Option<&Array>,
     rhs_indices: Option<&Array>,
     quant: Quant,
-    options: GatherQmm<'_>,
+    options: GatherQmm,
+    global_scale: Option<&Array>,
 ) -> Result<Array> {
     let invalid = |msg: String| Err(Error::InvalidArgument(format!("gather_qmm: {msg}")));
     quant.checked("gather_qmm")?;
     if lhs_indices.is_none() && rhs_indices.is_none() {
-        if options.global_scale.is_some() {
-            return invalid("global scale is not supported without indices".into());
-        }
-        return quantized_matmul(x, w, scales, biases, options.transpose, quant);
+        return quantized_matmul(x, w, scales, biases, options.transpose, quant, global_scale);
     }
     check_groups("gather_qmm", quant.mode, scales, biases)?;
     let dtype = match biases {
@@ -590,7 +617,7 @@ pub(crate) fn gather_qmm(
             w.dims()
         ));
     }
-    if let Some(gs) = options.global_scale {
+    if let Some(gs) = global_scale {
         if quant.mode != QuantMode::Nvfp4 {
             return invalid("global scale is only supported for 'nvfp4' quantization mode".into());
         }
@@ -615,7 +642,7 @@ pub(crate) fn gather_qmm(
         Some(b) => inputs.extend([astype(scales, dtype)?, astype(b, dtype)?]),
         None => inputs.push(scales.clone()),
     }
-    inputs.extend(options.global_scale.cloned());
+    inputs.extend(global_scale.cloned());
     inputs.extend([lhs, rhs.clone()]);
     // MLX's rule (`GatherQMM::eval_gpu`): the sorted kernel tiles each expert's rows, so it
     // pays only with at least 16 rows and 4 per expert on average; fewer take one product
@@ -629,7 +656,7 @@ pub(crate) fn gather_qmm(
     let op = crate::fast::imp::FastOp::GatherQmm {
         quant,
         transpose: options.transpose,
-        global_scale: options.global_scale.is_some(),
+        global_scale: global_scale.is_some(),
     };
     // Affine gathers have kernels for transposed weights only.
     let kernel = (options.transpose || quant.mode != QuantMode::Affine)
@@ -637,7 +664,7 @@ pub(crate) fn gather_qmm(
     // With a global scale the primitive runs on the CPU too (its fallback): it refuses the
     // global scale's derivative, as MLX's `GatherQMM`, where the graph would differentiate
     // through it.
-    let out = if kernel || options.global_scale.is_some() {
+    let out = if kernel || global_scale.is_some() {
         Array::from_op(Primitive::Fast(op), inputs)?.swap_remove(0)
     } else {
         op.fallback(&inputs)?.swap_remove(0)
@@ -669,13 +696,16 @@ pub(crate) fn gather_qmm_graph(
     );
     let Some(gs) = ops.global_scale else {
         let b = ops.biases.map(|b| rows(b, ops.rhs)).transpose()?;
-        return quantized_matmul(&x, &w, &s, b.as_ref(), transpose, quant);
+        return quantized_matmul(&x, &w, &s, b.as_ref(), transpose, quant, None);
     };
     let factor = crate::ops::imp::divide(
         &rows(&expand_dims(&expand_dims(gs, -1)?, -1)?, ops.rhs)?,
         crate::fp8::E4M3_MAX * crate::fp8::E2M1_MAX,
     )?;
-    let dense = multiply(&dequantize(&w, &s, None, quant, Some(DType::F32))?, &factor)?;
+    let dense = multiply(
+        &dequantize(&w, &s, None, quant, Some(DType::F32), None)?,
+        &factor,
+    )?;
     let dense = if transpose {
         let n = dense.ndim();
         let mut axes: Vec<usize> = (0..n).collect();

@@ -72,6 +72,10 @@ name = "verify"
 harness = false
 
 [[bench]]
+name = "kv_attention"
+harness = false
+
+[[bench]]
 name = "rows"
 harness = false
 

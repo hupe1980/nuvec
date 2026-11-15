@@ -485,7 +485,10 @@ pub fn run(case: &Case) -> Result<Vec<Array>> {
                 "r" => xs[0].i((Ellipsis, (..).step(-1))),
                 _ => xs[0].clone(),
             };
-            let q = x.quantize(quant(case));
+            let q = match p("gs") {
+                "1" => ops::quantize_scaled(&x, &xs[1]),
+                _ => x.quantize(quant(case)),
+            };
             let mut out = vec![q.weight, q.scales];
             out.extend(q.biases);
             Ok(out)
@@ -790,16 +793,28 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
                 _ => nuvec_core::QuantMode::Nvfp4,
             };
             let quant = nuvec_core::Quant::new(mode);
-            let q = ops::quantize(&xs[1], quant);
-            let w: nuvec_core::QqmmWeight<'_> = if p("q") == "1" {
-                (&q).into()
-            } else {
-                (&xs[1], quant).into()
+            // With `gs=1` the last two inputs are the activations' and the weight's scales.
+            let (xs, scales) = match p("gs") {
+                "1" => (
+                    &xs[..xs.len() - 2],
+                    Some((&xs[xs.len() - 2], &xs[xs.len() - 1])),
+                ),
+                _ => (&xs[..], None),
             };
+            let q = match scales {
+                Some((_, gw)) => ops::quantize_scaled(&xs[1], gw),
+                None => ops::quantize(&xs[1], quant),
+            };
+            let w: nuvec_core::QqmmWeight<'_> = match (p("q") == "1", scales) {
+                (true, _) => (&q).into(),
+                (false, Some((_, gw))) => nuvec_core::QqmmWeight::Scaled(&xs[1], gw),
+                (false, None) => (&xs[1], quant).into(),
+            };
+            let gx = scales.map(|(gx, _)| gx);
             if op == "qqmm" {
-                ops::qqmm(&xs[0], w)
+                ops::qqmm(&xs[0], w, gx)
             } else {
-                ops::gather_qqmm(&xs[0], w, None, Some(&xs[2]), false)
+                ops::gather_qqmm(&xs[0], w, None, Some(&xs[2]), false, gx)
             }
         }
         "hadamard_transform" => ops::hadamard_transform(
@@ -897,7 +912,12 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
         // The floating-point modes have no biases; `dtype` (a code) picks their output.
         "dequantize" => {
             let out = (!p("dtype").is_empty()).then(dtype);
-            q(&xs[0], &xs[1], xs.get(2)).dequantize(out)
+            match p("gs") {
+                "1" => q(&xs[0], &xs[1], None)
+                    .with_global_scale(xs[2].clone())
+                    .dequantize(out),
+                _ => q(&xs[0], &xs[1], xs.get(2)).dequantize(out),
+            }
         }
         "quantized_matmul" => xs[0].quantized_matmul(&q(&xs[1], &xs[2], xs.get(3)), t()),
         "quantized_matmul_xsb" => xs[0].quantized_matmul(&q(&xs[3], &xs[1], Some(&xs[2])), t()),
@@ -1030,13 +1050,14 @@ fn apply(case: &Case, op: &str, mut xs: Vec<Array>) -> Result<Array> {
             let gs = (p("gs") == "1").then(|| rest.next().unwrap());
             let lhs = p("idx").contains('l').then(|| rest.next().unwrap());
             let rhs = p("idx").contains('r').then(|| rest.next().unwrap());
-            let mut options = GatherQmm::default()
+            let options = GatherQmm::default()
                 .transpose(t())
                 .sorted_indices(p("sorted") == "1");
+            let mut w = q(&xs[1], &xs[2], None);
             if let Some(g) = gs {
-                options = options.global_scale(g);
+                w = w.with_global_scale(g.clone());
             }
-            xs[0].gather_qmm(&q(&xs[1], &xs[2], None), lhs, rhs, options)
+            xs[0].gather_qmm(&w, lhs, rhs, options)
         }
         "repeat" => {
             let repeats = p("repeats").parse().unwrap();

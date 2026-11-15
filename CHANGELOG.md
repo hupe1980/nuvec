@@ -6,6 +6,37 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- DFlash speculative decoding (`DFlashDrafter`): z-lab's DFlash and DFlash 2 block
+  drafters, bfloat16 or quantized on load, on Qwen 3–3.8, Gemma 4 and gpt-oss targets
+  (YaRN, attention biases, logit soft caps), each equal to z-lab's reference. On an M4 Pro
+  (4-bit): 2.16× plain decoding on Qwen3-8B (1.75× dflash-mlx), 2.05× on Qwen3.5-9B, 2.8×
+  with DFlash 2 on Qwen3.8-27B.
+- `GenerateOptions::row_exact`: speculative and batched tokens equal `generate`'s, bit for
+  bit.
+- NVFP4 global scales as MLX's: `ops::quantize_scaled`, `Quantized::global_scale` (used by
+  `dequantize`, `quantized_matmul` and `gather_qmm`), and `global_scale_x` with the
+  weight's scale in `qqmm` and `gather_qqmm` (`QqmmWeight::Scaled`), with MLX's kernels,
+  routing and backward; bit for bit with MLX's GPU.
+- `Model::forward_layers`: the logits and the outputs of chosen decoder layers.
+
+### Changed
+
+- Speculative decoding and the `Batcher` route products as MLX's by default (as mlx-lm);
+  `row_exact` opts in to exactness. `BatcherOptions::batch_invariant` is removed;
+  `verify_rows` takes the mode (16 rows, or 8 row-exact).
+- Affine 4- and 8-bit products of 3–16 rows over large matrices run MLX `main`'s
+  `qmv_mma`: an 8-row Qwen3-8B 4-bit forward pass costs about one decode step, from 2×.
+- `qqmm` and `gather_qqmm` take `global_scale_x: Option<&Array>`; `GatherQmm` lost
+  `global_scale` and its lifetime (the weight carries the scale); `Quantized` has
+  `global_scale`.
+- Loading a DFlash drafter directory as a model is an error naming `DFlashDrafter::load`.
+
+### Fixed
+
+- Multi-process distributed tests retry when a picked port is taken before a rank binds it.
+
 ## [0.12.0] - 2026-11-15
 
 ### Added

@@ -71,6 +71,7 @@ pub mod batch;
 #[cfg(feature = "chat")]
 pub mod chat;
 pub mod config;
+pub mod dflash;
 pub mod generate;
 pub mod lora;
 pub mod model;
@@ -89,6 +90,7 @@ pub use batch::{Batcher, BatcherOptions, Event, RequestId};
 #[cfg(feature = "chat")]
 pub use chat::{ChatTemplate, RenderOptions};
 pub use config::{Activation, Config, Gemma4, LayerQuant, PackedFormat, Quantization};
+pub use dflash::{DFlashConfig, DFlashDrafter};
 pub use generate::{FinishReason, GenerateOptions, Generation, WiredLimit, generate};
 pub use model::{KvCache, KvQuant, Model, load_prompt_cache, save_prompt_cache};
 pub use paged::{PagedCache, SeqId, decode_batch};

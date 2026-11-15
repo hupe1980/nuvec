@@ -85,6 +85,19 @@ NUVEC_QMV_QUAD_GS(float32, float)
 NUVEC_QMV_QUAD_GS(float16, half)
 NUVEC_QMV_QUAD_GS(bfloat16, bfloat16_t)
 
+// MLX's `qmv_mma` (quantized.h): 4 and 8 bits, `WK` 4, `BN` 16 or 32, one or two row tiles.
+#define NUVEC_QMV_MMA(iname, T, gs, b)                                                   \
+    NUVEC_Q(qmv_mma, iname, T, gs, b, "_wk4_bn16_tm1", 4, 16, 1)                          \
+    NUVEC_Q(qmv_mma, iname, T, gs, b, "_wk4_bn16_tm2", 4, 16, 2)                          \
+    NUVEC_Q(qmv_mma, iname, T, gs, b, "_wk4_bn32_tm1", 4, 32, 1)
+#define NUVEC_QMV_MMA_GS(iname, T)                                                       \
+    NUVEC_QMV_MMA(iname, T, 32, 4) NUVEC_QMV_MMA(iname, T, 32, 8)                         \
+    NUVEC_QMV_MMA(iname, T, 64, 4) NUVEC_QMV_MMA(iname, T, 64, 8)                         \
+    NUVEC_QMV_MMA(iname, T, 128, 4) NUVEC_QMV_MMA(iname, T, 128, 8)
+NUVEC_QMV_MMA_GS(float32, float)
+NUVEC_QMV_MMA_GS(float16, half)
+NUVEC_QMV_MMA_GS(bfloat16, bfloat16_t)
+
 // nuvec's few-row products (quantized.h, `affine_qmv_rows`), every bit width, two or
 // three rows per threadgroup (three for odd counts; four are slower).
 #define NUVEC_QMV_ROWS_B(iname, T, gs, b)                                                \

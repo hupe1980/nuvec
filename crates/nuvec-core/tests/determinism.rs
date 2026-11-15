@@ -71,14 +71,13 @@ fn workload() -> Result<Vec<Array>> {
         (37, QuantMode::Mxfp8),
         (38, QuantMode::Nvfp4),
     ] {
-        let q = experts.quantize(mode);
+        let mut q = experts.quantize(mode);
         out.push(
             normal(&[64, 4096], bf16_, seed).quantized_matmul(&w.i(..512).quantize(mode), true),
         );
-        let mut options = GatherQmm::default().sorted_indices(true);
-        let scale = Array::from_slice(&[0.5f32; 16], [16]);
+        let options = GatherQmm::default().sorted_indices(true);
         if mode == QuantMode::Nvfp4 {
-            options = options.global_scale(&scale);
+            q = q.with_global_scale(Array::from_slice(&[0.5f32; 16], [16]));
         }
         out.push(normal(&[512, 1, 1024], bf16_, seed + 10).gather_qmm(
             &q,

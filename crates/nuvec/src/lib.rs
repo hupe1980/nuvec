@@ -134,8 +134,8 @@
 //!   would.
 //! - **Sliding windows:** a vector-kernel attention row with a window gives the bits of
 //!   the unmasked one-query call over exactly its window's keys, so a compacted contiguous
-//!   cache and the paged cache give the same bits (a batch-invariant `Batcher` serves
-//!   window models' requests their solo tokens).
+//!   cache and the paged cache give the same bits (a `Batcher` serves window models'
+//!   row-exact requests their solo tokens).
 //! - **Routing is pure:** which kernel runs depends only on shapes, dtypes, options, the
 //!   row-exact mode and the GPU generation, never on memory state
 //!   ([`fast::plan_attention`] reports it).

@@ -39,6 +39,7 @@ fn fixture(name: &str) -> (Model, Vec<u32>) {
 fn greedy(max_tokens: usize) -> GenerateOptions {
     GenerateOptions {
         max_tokens,
+        row_exact: true,
         ..Default::default()
     }
 }
@@ -99,7 +100,6 @@ fn one_token_prompts_are_served() {
                 blocks: Some(32),
                 block_size: 4,
                 max_batch: 3,
-                batch_invariant: true,
                 ..Default::default()
             },
         )
@@ -142,7 +142,6 @@ fn unfittable_prompts_are_rejected_and_outgrown_requests_finish() {
                 blocks: Some(4),
                 block_size: 4,
                 max_batch: 2,
-                batch_invariant: true,
                 ..Default::default()
             },
         )
@@ -163,7 +162,6 @@ fn unfittable_prompts_are_rejected_and_outgrown_requests_finish() {
                 blocks: Some(4),
                 block_size: 4,
                 max_batch: 2,
-                batch_invariant: true,
                 ..Default::default()
             },
         )
@@ -197,7 +195,6 @@ fn cancelled_requests_finish_and_free_their_blocks() {
             blocks: Some(8),
             block_size: 4,
             max_batch: 2,
-            batch_invariant: true,
             ..Default::default()
         },
     )
@@ -314,7 +311,6 @@ fn a_request_ending_with_a_step_in_flight_emits_nothing_more() {
                 blocks: Some(64),
                 block_size: 4,
                 max_batch: 2,
-                batch_invariant: true,
                 ..Default::default()
             },
         )
