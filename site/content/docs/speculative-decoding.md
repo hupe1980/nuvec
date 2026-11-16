@@ -49,13 +49,13 @@ Verification routes products as MLX's, so greedy output can differ from plain gr
 
 ## Draft trees
 
-A DFlash drafter predicts every block position at once, so it also knows each position's runner-up tokens. A **draft tree** (DDTree, arXiv 2604.12989) verifies the most likely prefixes of those candidates in one pass instead of a single chain: each node is rotated at its depth and attends only to the context and its ancestors, the model's tokens pick the path, and the cache keeps that path. The tree is the best `n` prefixes by the drafter's probabilities, and its size each step maximises the expected tokens per measured verification time (EVICT, arXiv 2605.00342), so it follows what extra rows cost on the machine.
+A **draft tree** (DDTree, arXiv 2604.12989) verifies the most likely prefixes of a DFlash drafter's per-position candidates in one pass instead of a single chain: each node attends to the context and its ancestors, and the cache keeps the accepted path. Its size each step maximises the expected tokens per measured verification time (EVICT, arXiv 2605.00342).
 
 Trees apply to attention-only models (Qwen3, Qwen3-MoE, Llama, gpt-oss, Gemma 4) with DFlash drafters, and not with `row_exact` (a tree row attends over masked keys, so it cannot keep serial decoding's bits). DFlash 2 drafts chains (its selector scores pairs of positions).
 
 ## Policies
 
-- **`DraftPolicy::Auto`** (default): each drafter's measured draft length for the model. DFlash and MTP time plain decoding, chains and draft trees on the machine and text at hand, keep the fastest, and probe the others now and then (less often the more they lose), so speculation that does not pay falls back to plain decoding. Other drafters use a kill switch: when the accepted tokens per verification over the last 16 verifications fall below the drafter's break-even, the next 64 tokens are decoded plainly, then drafting resumes.
+- **`DraftPolicy::Auto`** (default): each drafter's measured draft length for the model. DFlash and MTP time plain decoding, chains and draft trees, keep the fastest and probe the others now and then, so speculation that does not pay falls back to plain decoding. Other drafters use a kill switch: when the accepted tokens per verification over the last 16 verifications fall below the drafter's break-even, the next 64 tokens are decoded plainly, then drafting resumes.
 - **`DraftPolicy::Tree(n)`**: a draft tree of up to `n` nodes every step where trees apply, a chain of `n` otherwise, for measurements.
 - **`DraftPolicy::Adaptive(n)`**: up to `n` tokens, pausing 1, 2, 4, … 16 steps after a fully rejected draft (prompt lookup's classic back-off).
 - **`DraftPolicy::Fixed(n)`**: up to `n` tokens every step, for measurements.
@@ -86,20 +86,20 @@ Qwen3-8B with `z-lab/Qwen3-8B-DFlash-b16` against dflash-mlx 0.1.8 (MLX 0.32.4) 
 
 Both accept the same share of drafts; nuvec's verification of 8 rows costs about one decode step. With `row_exact`, nuvec decodes the same tokens as plain decoding at plain decoding's speed.
 
-DSpark against DFlash on Qwen3-8B 4-bit, drafts of 7, 4-bit drafters, the same session (machine under load; tok/s):
+DSpark against DFlash on Qwen3-8B 4-bit, drafts of 7, 4-bit drafters (tok/s):
 
 | Prompt | Plain | `z-lab/Qwen3-8B-DFlash-b16` | `deepseek-ai/dspark_qwen3_8b_block7` |
 |---|---:|---:|---:|
 | Code (CSV function) | 49.0 | 130.1 (194 of 428 drafts accepted) | **132.6–149.2** (204 of 361) |
 | GSM8K "Natalia" | 45.1 | 101.0 (70 of 203) | **199.6–235.7** (88 of 91) |
 
-Draft trees against chains on Qwen3-8B with `z-lab/Qwen3-8B-DFlash-b16` (same prompt and settings):
+Draft trees against chains on Qwen3-8B with `z-lab/Qwen3-8B-DFlash-b16`:
 
 | Plain | Chain of 7 | Tree of 7 | Tree of 15 | `Auto` |
 |---:|---:|---:|---:|---:|
 | 54.0 tok/s | 135.2 | 135.5 | 98.6 | 130.6 |
 
-On an M4 Pro a verification costs one decode step up to 8 rows and 1.7× at 16 (the products become compute-bound), so a tree of 7 accepts 3% more tokens than the chain at the same cost, and a tree of 15 accepts 24% more but costs more than it gains; `Auto` spends a few percent of a 256-token run timing the alternatives. In a mixture of experts every extra row reads other experts: on Qwen3-Coder-30B-A3B with `z-lab/Qwen3-Coder-30B-A3B-DFlash` an 8-row verification costs four decode steps, chains decode about 10% slower than plain decoding, and `Auto` falls back to plain decoding's speed. Where rows cost less (M5 Neural Accelerators), `Auto` takes larger trees by itself.
+On an M4 Pro a verification costs one decode step up to 8 rows and 1.7× at 16, so a tree of 15 accepts 24% more tokens than the chain but costs more than it gains. On mixtures of experts extra rows read other experts (8 rows cost four decode steps on Qwen3-Coder-30B-A3B), so `Auto` decodes plainly.
 
 MTP, 4-bit models, 256 tokens after a short story opening, greedy, row-exact; MTP drafts one token per step (`Auto`).
 

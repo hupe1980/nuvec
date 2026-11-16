@@ -6,6 +6,8 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-16
+
 ### Added
 
 - Draft trees (DDTree) for DFlash drafters on attention-only models: the most likely
@@ -14,8 +16,8 @@ All notable changes to nuvec are documented here. The format follows
   `DFlashDrafter`, with their confidences (`last_confidence`).
 - `fast::quantized_attention`: decoding over a quantized KV cache in one kernel, 1.56×
   mlx-lm's decode speed on Qwen3-8B at 38K tokens with an 8-bit cache.
-- Prompts over quantized KV caches dequantize the cache for the fused attention instead
-  of building score matrices: 8-bit peak memory at 19K tokens 8.6 → 6.3 GB, prefill 1.26×.
+- Prompts over quantized KV caches run the fused attention: 8-bit peak memory at 19K
+  tokens 8.6 → 6.3 GB.
 - `KvQuant::rotate`: Hadamard-rotated keys; 3-bit caches at 1.16× bf16's perplexity
   (unrotated 1.87×). The `perplexity` example scores a text through a cache format.
 
@@ -23,8 +25,8 @@ All notable changes to nuvec are documented here. The format follows
 
 - `DraftPolicy::Auto` with DFlash and MTP drafters times plain decoding, chains and trees
   and keeps the fastest.
-- Row-exact products of 3 to 8 rows: groups of four at 3 and 6 bits, a triple at 4 bits,
-  and 3- and 6-bit codes decoded once per weight row (4-bit 3 rows 1.24× → 1.02× MLX).
+- Row-exact affine products read each weight once for up to four rows (4-bit 3 rows
+  1.24× → 1.02× MLX's time).
 - `qqmm` without global scales routes as `quantized_matmul` (MLX `main` #4796): 256 rows
   0.46× MLX 0.32.4's time.
 - M1 and M2 Ultra run the affine `qmv_mma` from 4 rows (ml-explore/mlx#4890).
@@ -777,7 +779,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/hupe1980/nuvec/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/hupe1980/nuvec/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/hupe1980/nuvec/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/hupe1980/nuvec/compare/v0.10.0...v0.11.0

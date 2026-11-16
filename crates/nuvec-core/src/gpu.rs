@@ -718,12 +718,10 @@ mod metal {
     }
 
     /// How the few-row kernel takes `m ≥ 2` row-exact rows: groups of `(rows, r, s)` — `rows`
-    /// rows, `r` per threadgroup, `s` outputs per SIMD-group — in order. Measured on an M4 Pro
-    /// (`just bench-rows`, spec 115): at 8 bits three rows cost less per row than two (as
-    /// many triples as fit; a remainder of one becomes two pairs); at 3 and 6 bits triples
-    /// where `m` is a multiple of three, else fours (which share the codes' loads), then a
-    /// triple or a pair; at 4 bits pairs, and one triple at two outputs per SIMD-group for an
-    /// odd count (four outputs spill); the other widths pairs and one triple for an odd count.
+    /// rows, `r` per threadgroup, `s` outputs per SIMD-group — in order, as fastest on an M4
+    /// Pro (`just bench-rows`): triples at 8 bits; at 3 and 6 bits triples for multiples of
+    /// three, else fours; at 4 bits pairs (one triple at two outputs for an odd count); other
+    /// widths pairs (one triple for an odd count).
     fn row_groups(m: usize, bits: usize) -> Vec<(usize, usize, usize)> {
         let mut groups = Vec::new();
         let mut add = |rows: usize, r: usize, s: usize| {
