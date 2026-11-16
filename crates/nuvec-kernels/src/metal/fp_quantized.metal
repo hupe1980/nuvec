@@ -57,6 +57,10 @@
     NUVEC_FP(mode, gather_qmm_n, iname, T, gs, b, "", false)                              \
     NUVEC_FP(mode, gather_qmm_rhs, iname, T, gs, b, "_nt", 16, 32, 32, 1, 2, true, false) \
     NUVEC_FP(mode, gather_qmm_rhs, iname, T, gs, b, "_nn", 16, 32, 32, 1, 2, false, false) \
+    NUVEC_FP(mode, qmv_mma, iname, T, gs, b, "_wk4_bn16_tm1", 4, 16, 1)                   \
+    NUVEC_FP(mode, qmv_mma, iname, T, gs, b, "_wk4_bn16_tm2", 4, 16, 2)                   \
+    NUVEC_FP(mode, qmv_mma, iname, T, gs, b, "_wk8_bn16_tm1", 8, 16, 1)                   \
+    NUVEC_FP(mode, qmv_mma, iname, T, gs, b, "_wk8_bn16_tm2", 8, 16, 2)                   \
     NUVEC_FP(mode, qmv_rows, iname, T, gs, b, "_fast1_pr0_r2", true, false, 2)            \
     NUVEC_FP(mode, qmv_rows, iname, T, gs, b, "_fast1_pr1_r2", true, true, 2)             \
     NUVEC_FP(mode, qmv_rows, iname, T, gs, b, "_fast1_pr0_r4", true, false, 4)            \

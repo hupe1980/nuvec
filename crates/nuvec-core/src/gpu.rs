@@ -6403,6 +6403,44 @@ mod metal {
             // Row-exact (built or evaluated inside `with_row_exact`): matrix-vector products
             // up to `rows` rows; else MLX's routing, with `qmv_wide` from 2 rows.
             let exact = built_exact || crate::row_exact();
+            if transpose && !exact && !vector_rows && flat && (6..=16).contains(&m) {
+                // MLX `main`'s `qmv_mma` for the floating-point modes (`use_qmv_mma` without
+                // the Neural Accelerators): from 6 rows, large aligned matrices; Ultra parts
+                // from 4096 × 4096; 8 SIMD-groups over K from generation 15.
+                let nax = crate::NAX_ROUTE.with(std::cell::Cell::get)
+                    && self.device().is_some_and(|d| d.nax().is_active());
+                let offset = |p: &Packed<'_>| match p.arg() {
+                    Arg::Read(_, o) => o,
+                    _ => 0,
+                };
+                let size = out.dtype.size();
+                let large = match class {
+                    'd' => n >= 4096 && k >= 4096,
+                    _ => n >= 512 && k >= 512 && n * k >= 1 << 22,
+                };
+                if !nax
+                    && large
+                    && n.is_multiple_of(16)
+                    && k.is_multiple_of(128)
+                    && offset(&x).is_multiple_of(8 * size)
+                    && offset(&w).is_multiple_of(16)
+                    && offset(&s).is_multiple_of(2)
+                {
+                    let tm = if m > 8 { 2 } else { 1 };
+                    let wk = if generation >= 15 { 8 } else { 4 };
+                    let args = [
+                        w.arg(),
+                        s.arg(),
+                        x.arg(),
+                        Arg::write(output),
+                        Arg::bytes(&kb),
+                        Arg::bytes(&nb),
+                        Arg::bytes(&mb),
+                    ];
+                    let name = format!("nuvec_{mode}_qmv_mma_{dtype}_wk{wk}_bn16_tm{tm}");
+                    return self.dispatch_groups(&name, &args, [n / 16, 1, 1], [32, wk, 1]);
+                }
+            }
             if transpose {
                 let limit = if vector_rows {
                     usize::MAX

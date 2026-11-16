@@ -97,6 +97,7 @@ const FP_SHAPES: &[(&str, usize, usize, usize, bool)] = &[
     ("qmvdown", 1, 11008, 4096, true),
     ("qmv-m4", 4, 4096, 4096, true),
     ("qmv-m8", 8, 4096, 4096, true),
+    ("qmv-m16", 16, 4096, 4096, true),
     ("qmm-m32", 32, 4096, 4096, true),
     ("qmm-m512", 512, 4096, 4096, true),
     ("qvm4096", 1, 4096, 4096, false),

@@ -1083,6 +1083,32 @@ fn embedding_lookup_and_gradient_on_the_gpu() {
 
 /// A cumulative op: `(a, axis, options)`.
 type ScanFn = fn(&Array, i32, ScanOptions) -> Array;
+/// Several rows that each need more than 1,024 sort blocks (MLX #4807: each row's merge
+/// partitions sit `n_blocks + 1` apart, not a threadgroup's width): sorted rows and their
+/// argsort equal the CPU's.
+#[test]
+fn multi_block_sorts_of_several_long_rows_match_the_cpu() {
+    if crate::common::require_gpu().is_none() {
+        return;
+    }
+    let mut rng = Rng::new(0x4807);
+    let n = 1 << 22;
+    let values: Vec<f32> = (0..2 * n)
+        .map(|_| rng.below(1 << 20) as f32 - 5e5)
+        .collect();
+    let a = Array::from_slice(&values, [2, n]);
+    let f = || a.sort(-1);
+    assert!(
+        f64s(&on(Device::cpu(), f)) == f64s(&on(Device::gpu(0), f)),
+        "sort of two rows of 2^22"
+    );
+    let g = || a.take_along_axis(&a.argsort(-1), -1);
+    assert!(
+        f64s(&on(Device::cpu(), g)) == f64s(&on(Device::gpu(0), g)),
+        "argsort of two rows of 2^22"
+    );
+}
+
 #[test]
 fn sort_and_scan_kernels_match_the_cpu() {
     if crate::common::require_gpu().is_none() {

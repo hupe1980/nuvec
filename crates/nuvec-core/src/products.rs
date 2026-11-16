@@ -288,10 +288,10 @@ fn real_not_f64(name: &str, what: &str, x: &Array) -> Result<()> {
     Ok(())
 }
 
-/// MLX's `qqmm` product: its matrix-vector kernels for every row count (`dispatch_qmv`),
-/// or with global scales and weights quantized beforehand (`matrix`), its `qmm_t` from the
-/// vector limit.
-fn row_product(x: &Array, w: &Quantized, matrix: bool) -> Result<Array> {
+/// MLX's `qqmm` product (MLX `main`, ml-explore/mlx#4796): `quantized_matmul`'s routes, or
+/// with `rows` (global scales on a weight quantized for the product) its matrix-vector
+/// kernels for every row count (`dispatch_qmv`).
+fn row_product(x: &Array, w: &Quantized, rows: bool) -> Result<Array> {
     crate::quantized::quantized_product(
         x,
         &w.weight,
@@ -299,7 +299,7 @@ fn row_product(x: &Array, w: &Quantized, matrix: bool) -> Result<Array> {
         w.biases.as_ref(),
         true,
         w.quant,
-        !matrix,
+        rows,
         w.global_scale.as_ref(),
     )
 }
@@ -343,7 +343,7 @@ fn qqmm_2d(x: &Array, w: QqmmWeight<'_>, global_scale_x: Option<&Array>) -> Resu
     match w {
         QqmmWeight::Quantized(q) => {
             let quant = qq_quant(name, q.quant)?;
-            row_product(&fake_quant(x, quant, gx)?, q, scales.is_some())
+            row_product(&fake_quant(x, quant, gx)?, q, false)
         }
         QqmmWeight::Dense(w, quant) => dense_qqmm(x, w, qq_quant(name, quant)?, None),
         QqmmWeight::Scaled(w, gw) => {
@@ -368,7 +368,7 @@ fn dense_qqmm(
             Some(g) => ops::quantize_scaled(w, g),
             None => ops::quantize(w, quant),
         };
-        row_product(&fake_quant(x, quant, gx)?, &wq, false)
+        row_product(&fake_quant(x, quant, gx)?, &wq, gw.is_some())
     };
     let mut primals = vec![x.clone(), w.clone()];
     if let Some((gx, gw)) = scales {

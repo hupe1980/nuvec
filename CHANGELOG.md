@@ -23,7 +23,16 @@ All notable changes to nuvec are documented here. The format follows
   and keeps the fastest.
 - Row-exact products of 3 to 8 rows: groups of four at 3 and 6 bits, a triple at 4 bits,
   and 3- and 6-bit codes decoded once per weight row (4-bit 3 rows 1.24× → 1.02× MLX).
+- `qqmm` without global scales routes as `quantized_matmul` (MLX `main` #4796): 256 rows
+  0.46× MLX 0.32.4's time.
+- MXFP4, MXFP8 and NVFP4 products of 6–16 rows run MLX `main`'s `fp_qmv_mma`: 8 rows
+  0.39–0.45× MLX 0.32.4's time.
 - `KvCache::quantize` is `KvCache::to_quantized` (mlx-lm's name; not `Array::quantize`).
+
+### Fixed
+
+- GPU sorts of several rows that each need more than 1,024 blocks (MLX `main` #4807: merge
+  partitions per row, 64-bit row offsets).
 
 ## [0.13.0] - 2026-11-15
 

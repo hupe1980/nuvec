@@ -830,6 +830,54 @@ fn few_row_products_equal_one_row_products_bit_for_bit() {
     });
 }
 
+/// MLX `main`'s few-row `qmv_mma` for the floating-point modes (6–16 rows of nvfp4, mxfp4
+/// and mxfp8 products over large matrices): every instance exists, and products match the
+/// dequantized product (the CPU's).
+#[test]
+fn fp_few_row_mma_products_match_the_dequantized_product() {
+    if cfg!(miri) {
+        return;
+    }
+    let Some(device) = nuvec_gpu::Device::shared() else {
+        return;
+    };
+    let names: std::collections::BTreeSet<String> =
+        device.kernel_names().unwrap().into_iter().collect();
+    for mode in ["nvfp4", "mxfp4", "mxfp8"] {
+        for t in ["float32", "float16", "bfloat16"] {
+            for tile in [
+                "wk4_bn16_tm1",
+                "wk4_bn16_tm2",
+                "wk8_bn16_tm1",
+                "wk8_bn16_tm2",
+            ] {
+                let name = format!("nuvec_{mode}_qmv_mma_{t}_{tile}");
+                assert!(names.contains(&name), "{name}");
+            }
+        }
+    }
+    with_stream(Device::gpu(0), || {
+        // N · K = 2^22, the smallest MLX routes to it.
+        let (k, n) = (4096, 1024);
+        for mode in [QuantMode::Nvfp4, QuantMode::Mxfp4, QuantMode::Mxfp8] {
+            for dtype in [DType::BF16, DType::F16, DType::F32] {
+                let w = random::normal([n, k], dtype, 0.0, 1.0, &random::key(3));
+                let q = w.quantize(mode);
+                let dense = with_stream(Device::cpu(), || q.dequantize(DType::F32));
+                for m in [6, 8, 9, 16] {
+                    let xs = random::normal([m + 1, k], dtype, 0.0, 1.0, &random::key(4));
+                    let x = xs.i((1..m + 1, ..));
+                    let got = x.quantized_matmul(&q, true);
+                    let want =
+                        with_stream(Device::cpu(), || x.astype(DType::F32).matmul(&dense.t()));
+                    let tol = if dtype == DType::F32 { 1e-5 } else { 1e-2 };
+                    assert_close(&format!("{mode} {dtype} m{m}"), &got, &want, tol);
+                }
+            }
+        }
+    });
+}
+
 /// MLX's few-row `qmv_mma` (3–16 rows of 4- and 8-bit products over large matrices,
 /// routed as MLX's): every instance exists, and products match the dequantized product.
 #[test]
@@ -2051,4 +2099,28 @@ fn quantized_attention_gradients_match_the_dequantized_attention() {
         }
     }
     set_default_stream(Stream::default_for(Device::gpu(0)));
+}
+
+/// `qqmm` without global scales on the matrix routes (MLX `main`, ml-explore/mlx#4796):
+/// 12–256 rows in every floating-point mode within 3e-2 of the dequantized product.
+#[test]
+fn qqmm_matrix_routes_match_the_dequantized_product() {
+    let Some(()) = common::require_gpu() else {
+        return;
+    };
+    set_default_stream(Stream::default_for(Device::gpu(0)));
+    let mut rng = Rng::new(4796);
+    for mode in [QuantMode::Nvfp4, QuantMode::Mxfp4, QuantMode::Mxfp8] {
+        for m in [12, 32, 256] {
+            let x = random(&mut rng, &[m, 1024], DType::BF16);
+            let w = random(&mut rng, &[1024, 1024], DType::BF16);
+            let dq = |a: &Array| a.quantize(mode).dequantize(DType::F32);
+            let want = dq(&x).matmul(&dq(&w).t());
+            let wq = w.quantize(mode);
+            let got = ops::qqmm(&x, &wq, None).astype(DType::F32);
+            let err = (&got - &want).abs().max(..).item::<f32>().unwrap()
+                / want.abs().max(..).item::<f32>().unwrap();
+            assert!(err < 3e-2, "{mode} m{m}: {err}");
+        }
+    }
 }
