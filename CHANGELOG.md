@@ -27,6 +27,7 @@ All notable changes to nuvec are documented here. The format follows
   and 3- and 6-bit codes decoded once per weight row (4-bit 3 rows 1.24× → 1.02× MLX).
 - `qqmm` without global scales routes as `quantized_matmul` (MLX `main` #4796): 256 rows
   0.46× MLX 0.32.4's time.
+- M1 and M2 Ultra run the affine `qmv_mma` from 4 rows (ml-explore/mlx#4890).
 - MXFP4, MXFP8 and NVFP4 products of 6–16 rows run MLX `main`'s `fp_qmv_mma`: 8 rows
   0.39–0.45× MLX 0.32.4's time.
 - `KvCache::quantize` is `KvCache::to_quantized` (mlx-lm's name; not `Array::quantize`).

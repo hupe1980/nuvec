@@ -6970,9 +6970,9 @@ mod metal {
             // solo bits.
             let split = !batched && (exact || item == m);
             if transpose && !exact && flat && m <= 16 {
-                // MLX's `qmv_mma` (`use_qmv_mma`, without the Neural Accelerators): 4 and
-                // 8 bits, from 3 rows (4 from generation 15), large aligned matrices, not
-                // on Ultra parts.
+                // MLX's `qmv_mma` (`use_qmv_mma`, without the Neural Accelerators; with
+                // ml-explore/mlx#4890): 4 and 8 bits, from 3 rows (4 from generation 15 and
+                // on M1/M2 Ultra), large aligned matrices, not on M3 Ultra and newer.
                 let nax = crate::NAX_ROUTE.with(std::cell::Cell::get)
                     && self.device().is_some_and(|d| d.nax().is_active());
                 let offset = |p: &Packed<'_>| match p.arg() {
@@ -6980,9 +6980,10 @@ mod metal {
                     _ => 0,
                 };
                 let size = out.dtype.size();
+                let ultra = class == 'd';
                 if !nax
-                    && class != 'd'
-                    && m >= if generation >= 15 { 4 } else { 3 }
+                    && !(ultra && generation >= 15)
+                    && m >= if ultra || generation >= 15 { 4 } else { 3 }
                     && k.is_multiple_of(128)
                     && offset(&x).is_multiple_of(8 * size)
                     && offset(&w).is_multiple_of(16)
