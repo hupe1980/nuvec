@@ -7,6 +7,7 @@
 const CONTRACTED: &[&str] = &[
     "sdpa.metal",
     "paged_attention.metal",
+    "sdpa_quantized.metal",
     "quantized.metal",
     "fp_quantized.metal",
     "gemm.metal",

@@ -14,6 +14,8 @@ All notable changes to nuvec are documented here. The format follows
   `DFlashDrafter`, with their confidences (`last_confidence`).
 - `fast::quantized_attention`: decoding over a quantized KV cache in one kernel, 1.56×
   mlx-lm's decode speed on Qwen3-8B at 38K tokens with an 8-bit cache.
+- Prompts over quantized KV caches dequantize the cache for the fused attention instead
+  of building score matrices: 8-bit peak memory at 19K tokens 8.6 → 6.3 GB, prefill 1.26×.
 - `KvQuant::rotate`: Hadamard-rotated keys; 3-bit caches at 1.16× bf16's perplexity
   (unrotated 1.87×). The `perplexity` example scores a text through a cache format.
 

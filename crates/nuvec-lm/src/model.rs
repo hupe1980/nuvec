@@ -1286,8 +1286,9 @@ impl Attention {
 /// Attention over quantized keys and values (`[B, kv_heads, S, ·]` triples): mlx-lm's
 /// `quantized_scaled_dot_product_attention` (scaled queries, `quantized_matmul` with
 /// the keys, the mask, a precise softmax, `quantized_matmul` with the values), with the
-/// layer's window and sinks, which mlx-lm refuses. One query row runs
-/// [`nuvec::fast::quantized_attention`] (except row-exact).
+/// layer's window and sinks, which mlx-lm refuses. Outside row-exact mode one query row runs
+/// [`nuvec::fast::quantized_attention`], and several the fused attention over the
+/// dequantized cache.
 #[track_caller]
 fn quantized_attention(
     q: &Array,
@@ -1296,9 +1297,11 @@ fn quantized_attention(
     mask: AttentionMask<'_>,
     (kv_heads, window, sinks): (i32, Option<i32>, Option<&Array>),
 ) -> Array {
-    let [b, hq, l, d] = q.shape_n::<4>().unwrap_or_default();
-    let (hkv, s) = (kv_heads, k[0].shape()[2]);
-    // One query row without a mask array: `fast::quantized_attention` (its kernel, or this
+    let (l, s) = (
+        q.shape().get(2).copied().unwrap_or_default(),
+        k[0].shape()[2],
+    );
+    // One query row without a mask array: `fast::quantized_attention` (its kernel, or the
     // composition where the kernel does not apply), over the window's keys. Row-exact
     // decoding keeps the composition, whose rows equal a verification's.
     if l == 1 && !matches!(mask, AttentionMask::Array(_)) && !nuvec::row_exact() {
@@ -1309,6 +1312,40 @@ fn quantized_attention(
         };
         return nuvec::fast::quantized_attention(q, &side(k), &side(v), scale, sinks);
     }
+    // Several query rows (prompts, verification): the cache dequantized and the fused
+    // attention, so no score matrix is materialized. Row-exact keeps mlx-lm's composition
+    // (its bits; verified rows equal decoded rows).
+    if !nuvec::row_exact() {
+        let dense = |t: &[Array; 3]| {
+            let [w, sc, bi] = t.clone();
+            nuvec::Quantized::affine(w, sc, bi, quant.group_size, quant.bits).dequantize(q.dtype())
+        };
+        let options = match (mask, window) {
+            (AttentionMask::Array(_), _) | (_, None) => fast::AttentionOptions::from(mask),
+            (_, Some(w)) => fast::AttentionOptions::causal().window(w),
+        };
+        return fast::scaled_dot_product_attention(
+            q,
+            &dense(k),
+            &dense(v),
+            scale,
+            &options.sinks(sinks),
+        );
+    }
+    quantized_attention_composed(q, (k, v, quant), scale, mask, (kv_heads, window, sinks))
+}
+
+/// mlx-lm's `quantized_scaled_dot_product_attention` (its bits), with windows and sinks.
+#[track_caller]
+fn quantized_attention_composed(
+    q: &Array,
+    (k, v, quant): (&[Array; 3], &[Array; 3], KvQuant),
+    scale: f32,
+    mask: AttentionMask<'_>,
+    (kv_heads, window, sinks): (i32, Option<i32>, Option<&Array>),
+) -> Array {
+    let [b, hq, l, d] = q.shape_n::<4>().unwrap_or_default();
+    let (hkv, s) = (kv_heads, k[0].shape()[2]);
     let rep = hq / hkv;
     let q = (q * scale).reshape([b, hkv, rep, l, d]);
     let weights = |t: &[Array; 3]| {
@@ -3647,8 +3684,8 @@ pub(crate) mod tests {
                     } else {
                         AttentionMask::None
                     };
-                    // mlx-lm's bits: the composition (one query row: row-exact); one query
-                    // row's kernel within float tolerance of them.
+                    // mlx-lm's bits: the composition; the default paths (one row's kernel,
+                    // several rows' fused attention) within float tolerance of them.
                     let run = || {
                         quantized_attention(
                             &get("q"),
@@ -3670,10 +3707,13 @@ pub(crate) mod tests {
                         .map(|(a, b)| (a - b).abs())
                         .fold(0.0, f32::max);
                     assert!(d < tol, "{tag}: fused {d} from mlx-lm");
-                    let got = match l {
-                        1 => nuvec::with_row_exact(run),
-                        _ => fused,
-                    };
+                    let got = quantized_attention_composed(
+                        &get("q"),
+                        (&k, &v, quant),
+                        0.125,
+                        mask,
+                        (2, None, None),
+                    );
                     let (g, w) = (
                         got.astype(DType::F32).to_vec::<f32>().unwrap(),
                         get("out").astype(DType::F32).to_vec::<f32>().unwrap(),
