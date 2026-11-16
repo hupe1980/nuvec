@@ -31,6 +31,21 @@ pub(crate) fn ranks_with(
         }
         return None;
     }
+    // A free port can be taken by another process before its rank binds it: retry then.
+    let mut report = String::new();
+    for _ in 0..5 {
+        match launch(test, n, env) {
+            Ok(outputs) => return Some(outputs),
+            Err(e) if e.contains("Address already in use") => report = e,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("{report}")
+}
+
+/// Starts `n` ranks of `test` on free ports; their standard outputs once all succeed, or the
+/// report of every rank (all are stopped) once one fails.
+fn launch(test: &str, n: usize, env: &[(&str, &str)]) -> Result<Vec<String>, String> {
     let ports: Vec<u16> = (0..n)
         .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
         .collect::<Vec<_>>()
@@ -61,43 +76,42 @@ pub(crate) fn ranks_with(
         })
         .collect();
     let deadline = Instant::now() + Duration::from_secs(120);
-    let mut outputs = Vec::new();
-    for (rank, child) in children.iter_mut().enumerate() {
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break Some(status);
-            }
-            if Instant::now() > deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let mut out = String::new();
-        let mut err = String::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut out)
-            .unwrap();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
-        match status {
-            Some(s) if s.success() => outputs.push(out),
-            _ => {
-                for c in &mut children {
-                    let _ = c.kill();
-                }
-                panic!("{test}: rank {rank} failed ({status:?})\n{out}\n{err}");
+    // Wait for every rank, or the first failure.
+    let mut statuses = vec![None; n];
+    let failed = loop {
+        for (rank, child) in children.iter_mut().enumerate() {
+            if statuses[rank].is_none() {
+                statuses[rank] = child.try_wait().unwrap();
             }
         }
+        if statuses.iter().flatten().any(|s| !s.success()) || Instant::now() > deadline {
+            break true;
+        }
+        if statuses.iter().all(Option::is_some) {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if failed {
+        for c in &mut children {
+            let _ = c.kill();
+        }
+    }
+    let mut outputs = Vec::new();
+    let mut report = String::new();
+    for (rank, child) in children.iter_mut().enumerate() {
+        let status = child.wait().ok();
+        let (mut out, mut err) = (String::new(), String::new());
+        let _ = child.stdout.take().unwrap().read_to_string(&mut out);
+        let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+        report.push_str(&format!("{test}: rank {rank} ({status:?})\n{out}\n{err}\n"));
+        outputs.push(out);
     }
     let _ = std::fs::remove_file(&hostfile);
-    Some(outputs)
+    match failed {
+        false => Ok(outputs),
+        true => Err(report),
+    }
 }
 
 /// The lines of each rank's output starting with `BITS`, which must agree.

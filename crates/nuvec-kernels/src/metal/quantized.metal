@@ -99,17 +99,26 @@ NUVEC_QMV_MMA_GS(float16, half)
 NUVEC_QMV_MMA_GS(bfloat16, bfloat16_t)
 
 // nuvec's few-row products (quantized.h, `affine_qmv_rows`), every bit width, two or
-// three rows per threadgroup (three for odd counts; four are slower).
+// three rows per threadgroup, four at 3 and 6 bits (`row_groups` in gpu.rs).
 #define NUVEC_QMV_ROWS_B(iname, T, gs, b)                                                \
     NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr0_r2", false, 2)                                \
     NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr1_r2", true, 2)                                 \
     NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr0_r3", false, 3)                                \
     NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr1_r3", true, 3)
+
+// Four rows at 3 and 6 bits; three rows at two outputs per SIMD-group at 4 bits (four
+// outputs spill there).
+#define NUVEC_QMV_ROWS_4(iname, T, gs, b)                                                \
+    NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr0_r4", false, 4)                                \
+    NUVEC_Q(qmv_rows, iname, T, gs, b, "_pr1_r4", true, 4)
 #define NUVEC_QMV_ROWS(iname, T, gs)                                                     \
     NUVEC_QMV_ROWS_B(iname, T, gs, 1) NUVEC_QMV_ROWS_B(iname, T, gs, 2)                   \
     NUVEC_QMV_ROWS_B(iname, T, gs, 3) NUVEC_QMV_ROWS_B(iname, T, gs, 4)                   \
     NUVEC_QMV_ROWS_B(iname, T, gs, 5) NUVEC_QMV_ROWS_B(iname, T, gs, 6)                   \
-    NUVEC_QMV_ROWS_B(iname, T, gs, 8)
+    NUVEC_QMV_ROWS_B(iname, T, gs, 8) NUVEC_QMV_ROWS_4(iname, T, gs, 3)                   \
+    NUVEC_QMV_ROWS_4(iname, T, gs, 6)                                                    \
+    NUVEC_Q(qmv_rows, iname, T, gs, 4, "_pr0_r3_s2", false, 3, 2)                          \
+    NUVEC_Q(qmv_rows, iname, T, gs, 4, "_pr1_r3_s2", true, 3, 2)
 #define NUVEC_QMV_ROWS_GS(iname, T) \
     NUVEC_QMV_ROWS(iname, T, 32) NUVEC_QMV_ROWS(iname, T, 64) NUVEC_QMV_ROWS(iname, T, 128)
 NUVEC_QMV_ROWS_GS(float32, float)

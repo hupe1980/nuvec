@@ -1,6 +1,6 @@
 +++
 title = "Speculative decoding"
-description = "Speculative decoding in nuvec-lm: DFlash block drafters, the model's own multi-token-prediction head, prompt lookup and SuffixDecoding drafts, verified in one forward pass, with output identical to plain decoding on request — up to 2.1× faster."
+description = "Speculative decoding in nuvec-lm: DFlash and DSpark block drafters, draft trees, the model's own multi-token-prediction head, prompt lookup and SuffixDecoding drafts, verified in one forward pass, with output identical to plain decoding on request — up to 2.8× faster."
 weight = 100
 [extra]
 group = "Libraries"
@@ -36,19 +36,27 @@ Verification routes products as MLX's, so greedy output can differ from plain gr
 
 | Drafter | Needs | Drafts well on |
 |---|---|---|
-| `DFlashDrafter` | a DFlash or DFlash 2 drafter trained for the model (z-lab's: Qwen 3–3.8, Gemma 4, gpt-oss, Llama 3.1, …) | any text, best on reasoning and math |
+| `DFlashDrafter` | a DFlash, DFlash 2 or DSpark drafter trained for the model (z-lab's: Qwen 3–3.8, Gemma 4, gpt-oss, Llama 3.1, …; DeepSeek's DSpark: Qwen3 4B–14B) | any text, best on reasoning and math |
 | `MtpDrafter` | the model's multi-token-prediction head (Qwen 3.5, 3.6, 3.8) | any text: the head predicts the model's next-but-one token |
 | `PromptLookup` | nothing | output that repeats its input: code edits, quotes, summaries, tool calls |
 | `SuffixDecoding` | nothing; remembers earlier requests | agent loops that repeat earlier prompts and outputs |
 
 - **DFlash** (arXiv 2602.06036) drafts a whole block in one forward pass of a small block-diffusion model that reads the target's hidden states from several layers. **DFlash 2** (e.g. `z-lab/Qwen3.8-27B-DFlash2`) adds convolutions over the block around each attention and MLP, and picks the draft with a candidate selector that rescores each position's top tokens against the previous choice. `DFlashDrafter::load(dir, &model)` loads either from a drafter directory in its bfloat16 weights; `load_quantized(dir, &model, Quant::affine(64, 4))` quantizes them on load (about twice as fast to draft). It shares the target's embeddings and output head, follows the drafter's RoPE (YaRN for gpt-oss), attention biases, embedding scale and logit soft cap (Gemma 4), and refuses drafters for another model. Not on pipelined models.
+- **DSpark** (arXiv 2607.05147, DeepSeek's DeepSpec checkpoints such as `deepseek-ai/dspark_qwen3_8b_block7`) is the DFlash backbone with two small heads: every block slot predicts the next token, one after another with a low-rank bias from the previous token (the Markov head), and a confidence head scores each drafted token (`DFlashDrafter::last_confidence`). `DFlashDrafter::load` reads it; its copies of the target's embeddings and head are not loaded.
 - **MTP.** The head (one decoder layer) takes the next token's embedding and the model's hidden state, and predicts the token after. Its first draft token comes from the last verified position; further ones reuse its own hidden state and are accepted less often. After each verification its cache is re-fed with the model's real hidden states, so it never drifts. `Model::attach_mtp` quantizes the head like the body (an 8-bit router stays 8-bit).
 - **SuffixDecoding** (arXiv 2411.04975) matches the longest suffix of the context in the prompt and a bounded store of earlier sequences, and drafts the most frequent continuation. Pass `&mut SuffixDecoding` and call `remember` after each request to keep its store across requests.
-- Write your own by implementing `Drafter::draft` (and `observe`, to follow the context; `needs_hidden`, to receive the model's hidden states).
+- Write your own by implementing `Drafter::draft` (and `observe`, to follow the context; `needs_hidden`, to receive the model's hidden states; `candidates`, to draft trees).
+
+## Draft trees
+
+A DFlash drafter predicts every block position at once, so it also knows each position's runner-up tokens. A **draft tree** (DDTree, arXiv 2604.12989) verifies the most likely prefixes of those candidates in one pass instead of a single chain: each node is rotated at its depth and attends only to the context and its ancestors, the model's tokens pick the path, and the cache keeps that path. The tree is the best `n` prefixes by the drafter's probabilities, and its size each step maximises the expected tokens per measured verification time (EVICT, arXiv 2605.00342), so it follows what extra rows cost on the machine.
+
+Trees apply to attention-only models (Qwen3, Qwen3-MoE, Llama, gpt-oss, Gemma 4) with DFlash drafters, and not with `row_exact` (a tree row attends over masked keys, so it cannot keep serial decoding's bits). DFlash 2 drafts chains (its selector scores pairs of positions).
 
 ## Policies
 
-- **`DraftPolicy::Auto`** (default): each drafter's measured draft length for the model, plus a kill switch. When the accepted tokens per verification over the last 16 verifications fall below the drafter's break-even, the next 64 tokens are decoded plainly (pipelined), then drafting resumes.
+- **`DraftPolicy::Auto`** (default): each drafter's measured draft length for the model. DFlash and MTP time plain decoding, chains and draft trees on the machine and text at hand, keep the fastest, and probe the others now and then (less often the more they lose), so speculation that does not pay falls back to plain decoding. Other drafters use a kill switch: when the accepted tokens per verification over the last 16 verifications fall below the drafter's break-even, the next 64 tokens are decoded plainly, then drafting resumes.
+- **`DraftPolicy::Tree(n)`**: a draft tree of up to `n` nodes every step where trees apply, a chain of `n` otherwise, for measurements.
 - **`DraftPolicy::Adaptive(n)`**: up to `n` tokens, pausing 1, 2, 4, … 16 steps after a fully rejected draft (prompt lookup's classic back-off).
 - **`DraftPolicy::Fixed(n)`**: up to `n` tokens every step, for measurements.
 
@@ -77,6 +85,21 @@ Qwen3-8B with `z-lab/Qwen3-8B-DFlash-b16` against dflash-mlx 0.1.8 (MLX 0.32.4) 
 | nuvec | 51.6 tok/s | **111.3 tok/s (2.16×)** | 71% |
 
 Both accept the same share of drafts; nuvec's verification of 8 rows costs about one decode step. With `row_exact`, nuvec decodes the same tokens as plain decoding at plain decoding's speed.
+
+DSpark against DFlash on Qwen3-8B 4-bit, drafts of 7, 4-bit drafters, the same session (machine under load; tok/s):
+
+| Prompt | Plain | `z-lab/Qwen3-8B-DFlash-b16` | `deepseek-ai/dspark_qwen3_8b_block7` |
+|---|---:|---:|---:|
+| Code (CSV function) | 49.0 | 130.1 (194 of 428 drafts accepted) | **132.6–149.2** (204 of 361) |
+| GSM8K "Natalia" | 45.1 | 101.0 (70 of 203) | **199.6–235.7** (88 of 91) |
+
+Draft trees against chains on Qwen3-8B with `z-lab/Qwen3-8B-DFlash-b16` (same prompt and settings):
+
+| Plain | Chain of 7 | Tree of 7 | Tree of 15 | `Auto` |
+|---:|---:|---:|---:|---:|
+| 54.0 tok/s | 135.2 | 135.5 | 98.6 | 130.6 |
+
+On an M4 Pro a verification costs one decode step up to 8 rows and 1.7× at 16 (the products become compute-bound), so a tree of 7 accepts 3% more tokens than the chain at the same cost, and a tree of 15 accepts 24% more but costs more than it gains; `Auto` spends a few percent of a 256-token run timing the alternatives. In a mixture of experts every extra row reads other experts: on Qwen3-Coder-30B-A3B with `z-lab/Qwen3-Coder-30B-A3B-DFlash` an 8-row verification costs four decode steps, chains decode about 10% slower than plain decoding, and `Auto` falls back to plain decoding's speed. Where rows cost less (M5 Neural Accelerators), `Auto` takes larger trees by itself.
 
 MTP, 4-bit models, 256 tokens after a short story opening, greedy, row-exact; MTP drafts one token per step (`Auto`).
 
@@ -113,4 +136,4 @@ SuffixDecoding drafts from earlier turns as well as the current context, so it a
 
 ## Scope
 
-Speculation runs at batch 1 on the contiguous cache, for every supported model: Gated DeltaNet, Mamba-2 and short-convolution layers keep each verified position's state and roll back to the last accepted one, and Mamba-2 verifies with decoding's one-step update, so with `row_exact` the tokens are plain decoding's. The `Batcher` and paged caches do not speculate.
+Speculation runs at batch 1 on the contiguous cache, for every supported model (draft trees on attention-only models): Gated DeltaNet, Mamba-2 and short-convolution layers keep each verified position's state and roll back to the last accepted one, and Mamba-2 verifies with decoding's one-step update, so with `row_exact` the tokens are plain decoding's. The `Batcher` and paged caches do not speculate.

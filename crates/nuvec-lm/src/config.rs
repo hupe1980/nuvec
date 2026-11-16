@@ -387,8 +387,12 @@ impl Config {
             .get("architectures")
             .and_then(Json::as_array)
             .is_some_and(|a| {
-                a.iter()
-                    .any(|v| matches!(v.as_str(), Some("DFlashDraftModel" | "DFlash2DraftModel")))
+                a.iter().any(|v| {
+                    matches!(
+                        v.as_str(),
+                        Some("DFlashDraftModel" | "DFlash2DraftModel" | "Qwen3DSparkModel")
+                    )
+                })
             });
         if drafter {
             return Err(invalid(

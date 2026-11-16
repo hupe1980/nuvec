@@ -8,6 +8,11 @@
 //! drafts its candidate selector's greedy path. Only the context's keys and values are
 //! cached. YaRN RoPE, attention biases, embedding scales and logit soft caps follow the
 //! drafter's config (gpt-oss and Gemma 4 drafters).
+//!
+//! DSpark (DeepSeek's DeepSpec `Qwen3DSparkModel`, arXiv 2607.05147, MIT) shares the
+//! backbone: every slot of `[anchor, mask, …]` predicts the next token, drafted one after
+//! another with a Markov head's bias from the previous token (`w2 · w1[prev]`), and a
+//! confidence head scores each drafted position.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -18,7 +23,7 @@ use nuvec::{Array, DType, Error, Param, Quant, Result, ops};
 use nuvec_nn::{Linear, QuantizedLinear, RmsNorm, Rope, RopeScaling};
 
 use crate::model::{Model, Projection};
-use crate::speculative::{Auto, Draft, Drafter};
+use crate::speculative::{Auto, Candidates, Draft, Drafter};
 
 /// A DFlash drafter's settings (`config.json`: Qwen3 fields and `dflash_config`).
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +64,9 @@ pub struct DFlashConfig {
     /// DFlash 2 (`DFlash2DraftModel`): the grouped dynamic causal convolutions' kernel size
     /// and group size, and the candidate selector's rank and top-k.
     pub v2: Option<DFlash2>,
+    /// DSpark (`Qwen3DSparkModel`): every block slot drafts, with the Markov head's rank (0:
+    /// none) and whether a confidence head scores the drafts.
+    pub dspark: Option<DSpark>,
     /// The vocabulary.
     pub vocab_size: usize,
 }
@@ -80,6 +88,16 @@ impl Lazy {
     }
 }
 
+/// DSpark's settings ([`DFlashConfig::dspark`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DSpark {
+    /// The Markov head's rank (0: no Markov head).
+    pub markov_rank: usize,
+    /// Whether a confidence head scores the drafts (with the Markov head's embedding of the
+    /// previous token, `confidence_head_with_markov`).
+    pub confidence: bool,
+}
+
 /// DFlash 2's settings ([`DFlashConfig::v2`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DFlash2 {
@@ -94,9 +112,9 @@ pub struct DFlash2 {
 }
 
 impl DFlashConfig {
-    /// Parses a DFlash `config.json` (`architectures: ["DFlashDraftModel"]` or
-    /// `["DFlash2DraftModel"]`). DFlash settings are read from `dflash_config`, then the top
-    /// level (as z-lab's reference).
+    /// Parses a DFlash `config.json` (`architectures: ["DFlashDraftModel"]`,
+    /// `["DFlash2DraftModel"]` or DeepSpec's `["Qwen3DSparkModel"]`). DFlash settings are read
+    /// from `dflash_config`, then the top level (as z-lab's reference).
     pub fn from_json(c: &Json) -> Result<Self> {
         let invalid = |m: String| Error::InvalidArgument(format!("DFlash config: {m}"));
         let arch = c
@@ -105,13 +123,14 @@ impl DFlashConfig {
             .and_then(|a| a.first())
             .and_then(Json::as_str)
             .unwrap_or("");
-        let v2 = match arch {
-            "DFlashDraftModel" => false,
-            "DFlash2DraftModel" => true,
+        let (v2, dspark) = match arch {
+            "DFlashDraftModel" => (false, false),
+            "DFlash2DraftModel" => (true, false),
+            "Qwen3DSparkModel" => (false, true),
             _ => {
                 return Err(invalid(format!(
-                    "not a DFlash drafter (architectures {arch:?}; DFlashDraftModel and \
-                     DFlash2DraftModel are supported)"
+                    "not a DFlash drafter (architectures {arch:?}; DFlashDraftModel, \
+                     DFlash2DraftModel and Qwen3DSparkModel are supported)"
                 )));
             }
         };
@@ -179,10 +198,9 @@ impl DFlashConfig {
             .or_else(|| c.get("rope_scaling"));
         let rope_scaling =
             crate::config::rope_scaling(scaling).map_err(|e| invalid(format!("RoPE: {e}")))?;
-        let ids = d
-            .get("target_layer_ids")
+        let ids = setting("target_layer_ids")
             .and_then(Json::as_array)
-            .ok_or_else(|| invalid("`dflash_config.target_layer_ids` missing".into()))?
+            .ok_or_else(|| invalid("`target_layer_ids` missing".into()))?
             .iter()
             .map(|v| v.as_i64().map(|v| v as usize))
             .collect::<Option<Vec<_>>>()
@@ -196,6 +214,29 @@ impl DFlashConfig {
                 selector_top_k: count("selector_top_k")?,
             }),
             false => None,
+        };
+        let dspark = match dspark {
+            false => None,
+            true => {
+                let rank = setting("markov_rank").and_then(Json::as_i64).unwrap_or(0) as usize;
+                let head = setting("markov_head_type").and_then(Json::as_str);
+                if rank > 0 && head.unwrap_or("vanilla") != "vanilla" {
+                    return Err(invalid(format!(
+                        "Markov head {head:?}: only \"vanilla\" is supported"
+                    )));
+                }
+                let flag = |k: &str| setting(k).and_then(Json::as_bool).unwrap_or(false);
+                let confidence = flag("enable_confidence_head");
+                if confidence && !(rank > 0 && flag("confidence_head_with_markov")) {
+                    return Err(invalid(
+                        "a confidence head without the Markov head's embedding".into(),
+                    ));
+                }
+                Some(DSpark {
+                    markov_rank: rank,
+                    confidence,
+                })
+            }
         };
         let hidden = int("hidden_size")?;
         if let Some(v) = v2.filter(|v| !hidden.is_multiple_of(v.conv_group_size)) {
@@ -215,10 +256,9 @@ impl DFlashConfig {
             rope_scaling,
             block_size: block.max(2),
             target_layer_ids: ids,
-            mask_token_id: d
-                .get("mask_token_id")
+            mask_token_id: setting("mask_token_id")
                 .and_then(Json::as_i64)
-                .ok_or_else(|| invalid("`dflash_config.mask_token_id` missing".into()))?
+                .ok_or_else(|| invalid("`mask_token_id` missing".into()))?
                 as u32,
             windows,
             causal,
@@ -226,6 +266,7 @@ impl DFlashConfig {
             input_embedding_scale: float("input_embedding_scale").unwrap_or(1.0),
             final_logit_softcap: float("final_logit_softcapping").filter(|&c| c > 0.0),
             v2,
+            dspark,
             vocab_size: int("vocab_size")?,
         })
     }
@@ -379,6 +420,13 @@ pub struct DFlashDrafter {
     rope: Rope,
     /// DFlash 2's candidate selector.
     selector: Option<Selector>,
+    /// DSpark's Markov head: the previous token's embedding (`w1`, `[V, r]`) and its
+    /// projection to logits (`w2`).
+    markov: Option<(Array, Projection)>,
+    /// DSpark's confidence head (`[h ; w1[prev]] → 1`).
+    confidence: Option<Projection>,
+    /// The last draft's confidence logits (`[n]`), with a confidence head.
+    last_confidence: Option<Array>,
     /// Per layer: the context's keys and values (`[1, kv_heads, S, head_dim]`), rotated at
     /// their positions; sliding layers keep the last `window − 1`.
     cache: Vec<Option<(Array, Array)>>,
@@ -476,6 +524,17 @@ impl DFlashDrafter {
                 Some((bases, predecessor, successor))
             }
         };
+        // DSpark's Markov embedding (a plain table).
+        let markov_w1 = match config.dspark {
+            Some(d) if d.markov_rank > 0 => {
+                let w1 = plain("markov_head.markov_w1.weight")?;
+                if w1.dtype() == DType::U32 {
+                    return Err(invalid("a quantized Markov embedding".into()));
+                }
+                Some(w1)
+            }
+            _ => None,
+        };
         let mut take = |k: &str| {
             weights
                 .remove(k)?
@@ -568,6 +627,19 @@ impl DFlashDrafter {
             }),
             _ => None,
         };
+        // DSpark's heads; its checkpoints' copies of the target's embeddings and head are
+        // never mapped (the target's are used).
+        let (markov, confidence) = match (config.dspark, markov_w1) {
+            (Some(d), Some(w1)) => {
+                let w2 = projection("markov_head.markov_w2")?;
+                let confidence = match d.confidence {
+                    true => Some(projection("confidence_head.proj")?),
+                    false => None,
+                };
+                (Some((w1, w2)), confidence)
+            }
+            _ => (None, None),
+        };
         let mut norm = |name: &str| -> Result<RmsNorm> {
             Ok(RmsNorm {
                 weight: Param::new(take(&format!("{name}.weight"))?),
@@ -596,6 +668,12 @@ impl DFlashDrafter {
         add(&fc);
         if let Some(sel) = &selector {
             add(&sel.projection);
+        }
+        if let Some((_, w2)) = &markov {
+            add(w2);
+        }
+        if let Some(c) = &confidence {
+            add(c);
         }
         for l in &layers {
             if let Some((a, m)) = &l.convs {
@@ -629,9 +707,55 @@ impl DFlashDrafter {
             norm: final_norm,
             rope,
             selector,
+            markov,
+            confidence,
+            last_confidence: None,
             cache,
             positions: 0,
         })
+    }
+
+    /// The confidence logits of the last draft's positions (`[n]`; `sigmoid` gives the
+    /// probability DSpark's confidence head gives each drafted token, given the ones before,
+    /// of being accepted), with a confidence head.
+    pub fn last_confidence(&self) -> Option<&Array> {
+        self.last_confidence.as_ref()
+    }
+
+    /// DSpark's draft of `n` tokens after `anchor`: every slot of `[anchor, mask…]` predicts
+    /// the next token, greedily, with the Markov head's bias from the previous token
+    /// (DeepSpec's `sample_block_tokens` at temperature 0); the confidences of the drafted
+    /// positions are kept.
+    fn draft_dspark(&mut self, model: &Model, anchor: u32, n: usize) -> Result<Array> {
+        let mut ids = vec![self.config.mask_token_id; n];
+        ids[0] = anchor;
+        let block = Array::from_slice(&ids, [1, n as i32]);
+        let hidden = self.hidden(model, &block);
+        let base = self.compute_logits(model, &hidden).reshape([n as i32, -1]);
+        let Some((w1, w2)) = &self.markov else {
+            return Ok(base.argmax(-1).astype(DType::U32));
+        };
+        let mut prev = Array::from_slice(&[anchor], [1]);
+        let mut tokens = Vec::with_capacity(n);
+        let mut prevs = Vec::with_capacity(n);
+        for k in 0..n as i32 {
+            let bias = w2.forward(&ops::take(w1, &prev, 0));
+            let step = base.i(k..k + 1).add(bias.astype(base.dtype()));
+            prevs.push(prev.clone());
+            prev = step.argmax(-1).astype(DType::U32);
+            tokens.push(prev.clone());
+        }
+        let tokens = ops::concatenate(&tokens, 0);
+        self.last_confidence = match &self.confidence {
+            Some(c) => {
+                let prevs = ops::take(w1, &ops::concatenate(&prevs, 0), 0);
+                let h = hidden.reshape([n as i32, -1]);
+                let features = ops::concatenate(&[h.clone(), prevs.astype(h.dtype())], -1);
+                Some(c.forward(&features).reshape([n as i32]).astype(DType::F32))
+            }
+            None => None,
+        };
+        Ok(tokens)
     }
 
     /// The drafter's settings.
@@ -792,6 +916,13 @@ impl DFlashDrafter {
 
 impl Drafter for DFlashDrafter {
     fn draft(&mut self, model: &Model, context: &[u32], max: usize) -> Result<Draft> {
+        if self.config.dspark.is_some() {
+            let n = max.min(self.config.block_size);
+            let Some(&anchor) = context.last().filter(|_| n > 0 && self.positions > 0) else {
+                return Ok(Draft::empty());
+            };
+            return Ok(Draft::new(self.draft_dspark(model, anchor, n)?.check()?));
+        }
         let n = max.min(self.config.block_size - 1);
         let Some(&anchor) = context.last().filter(|_| n > 0 && self.positions > 0) else {
             return Ok(Draft::empty());
@@ -809,6 +940,37 @@ impl Drafter for DFlashDrafter {
             None => logits.i(0).argmax(-1).astype(DType::U32),
         };
         Ok(Draft::new(tokens.check()?))
+    }
+
+    /// DFlash v1's per-position distributions (the positions are drafted independently);
+    /// DFlash 2's selector scores pairs of positions, so it drafts chains.
+    fn candidates(
+        &mut self,
+        model: &Model,
+        context: &[u32],
+        depth: usize,
+        k: usize,
+    ) -> Result<Option<Candidates>> {
+        let n = depth.min(self.config.block_size - 1);
+        let Some(&anchor) = context
+            .last()
+            .filter(|_| n > 0 && k > 0 && self.positions > 0)
+        else {
+            return Ok(None);
+        };
+        // DFlash 2's selector and DSpark's Markov head condition each position on the one
+        // before: chains.
+        if self.selector.is_some() || self.config.dspark.is_some() {
+            return Ok(None);
+        }
+        let mut ids = vec![self.config.mask_token_id; n + 1];
+        ids[0] = anchor;
+        let block = Array::from_slice(&ids, [1, ids.len() as i32]);
+        let hidden = self.hidden(model, &block).i((.., 1..1 + n as i32));
+        let logits = self.compute_logits(model, &hidden).i(0).astype(DType::F32);
+        let logprobs = logits.subtract(logits.logsumexp_keepdims(-1));
+        let (logprobs, tokens) = crate::speculative::top_k(&logprobs, k);
+        Ok(Some(Candidates::new(tokens.check()?, logprobs.check()?)))
     }
 
     fn observe(&mut self, _: &Model, _: &Array, hidden: Option<&Array>) -> Result<()> {
@@ -836,8 +998,12 @@ impl Drafter for DFlashDrafter {
     /// few-row kernel): on Qwen3-8B 4-bit (M4 Pro) 2.1× plain decoding, against 1.6× with
     /// the full block of 15, whose extra accepted tokens do not pay for 16 rows.
     fn auto(&self, _: &Model) -> Auto {
+        let drafts = match self.config.dspark {
+            Some(_) => self.config.block_size,
+            None => self.config.block_size - 1,
+        };
         Auto {
-            len: (self.config.block_size - 1).min(7),
+            len: drafts.min(7),
             break_even: 1.0,
         }
     }

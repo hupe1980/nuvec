@@ -2,10 +2,10 @@
 # requires-python = ">=3.11"
 # dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2"]
 # ///
-"""Decode attention over a quantized KV cache: one query row over 4K–64K keys (head 128,
+"""Decode attention over a quantized KV cache: one query row over 1K–64K keys (head 128,
 32 query and 8 key heads), bf16 vector attention against mlx-lm's quantized-cache attention
-(`quantized_scaled_dot_product_attention`) at 8 and 4 bits, nuvec against MLX on the same
-machine. Prints microseconds per call (32 calls evaluated together, median of 9) and each
+(`quantized_scaled_dot_product_attention`) at 8 and 4 bits, nuvec's
+(`fast::quantized_attention`) against MLX on the same machine. Prints microseconds per call (32 calls evaluated together, median of 9) and each
 variant's time against bf16.
 
 Usage: `just bench-kv-attention`.
@@ -22,7 +22,7 @@ from mlx_lm.models.base import quantized_scaled_dot_product_attention
 
 ROOT = Path(__file__).resolve().parent.parent
 CALLS, D, HQ, HKV = 32, 128, 32, 8
-KEYS = (4096, 16384, 65536)
+KEYS = (1024, 4096, 16384, 32768, 65536)
 
 
 def nuvec() -> dict[tuple[str, int], float]:

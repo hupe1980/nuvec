@@ -84,7 +84,7 @@ Products route as MLX's, so a request's batched tokens may differ in their low b
 
 `just bench-gemm`, `bench-quant`, `bench-fast` and `bench-compile` run the same kernels in nuvec and MLX: sustained asynchronous bursts after a warm-up, best of three, programs alternating. They report nuvec/MLX time (lower is better).
 
-`just bench-kv-attention` times one decode query's attention over 4K–64K keys with bf16, 8-bit and 4-bit caches, in nuvec and MLX (mlx-lm's composition for the quantized caches).
+`just bench-kv-attention` times one decode query's attention over 1K–64K keys with bf16, 8-bit and 4-bit caches, nuvec's `fast::quantized_attention` against mlx-lm's composition. On an M4 Pro at 32K keys nuvec takes 0.71× MLX's time at 8 bits and 0.81× at 4 bits; at 64K, 0.65× and 0.79×. `KV_BITS=8 just bench-lm` compares whole decoding with quantized caches.
 
 `just bench-verify` times speculative verification's attention, 1 to 8 causal rows over 4K to 32K keys, in nuvec and MLX, and each against one row. The per-row arithmetic that keeps each row's bits equal to serial decoding sets the cost, not reading the cache: rows that share one read of it take as long. On an M4 Pro, 8 rows take 3.6–6.8× one row's time and 0.47–1.02× MLX 0.32.4's.
 

@@ -58,6 +58,11 @@ pub fn save_prompt_cache(
                     "layer {i}: a quantized sliding-window cache (mlx-lm has none)"
                 )));
             }
+            if q.rotate {
+                return Err(invalid(format!(
+                    "layer {i}: a rotated quantized cache (mlx-lm has none)"
+                )));
+            }
             if model.cached_key_factor(i, k[1].dtype()) != 1.0 {
                 return Err(invalid(format!(
                     "layer {i}: quantized keys with a folded mscale cannot be rescaled"
@@ -210,6 +215,7 @@ pub fn load_prompt_cache(
                     bits: scalar(format!("{i}.4"))?,
                     group_size: scalar(format!("{i}.3"))?,
                     start: 0,
+                    rotate: false,
                 };
                 quant.validate()?;
                 let (qk, qv) = (triple(0)?, triple(1)?);

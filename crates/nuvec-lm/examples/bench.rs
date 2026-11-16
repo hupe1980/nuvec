@@ -158,7 +158,8 @@ fn main() -> nuvec::Result<()> {
                 "auto" => DraftPolicy::Auto,
                 "adaptive" => DraftPolicy::Adaptive(draft),
                 "fixed" => DraftPolicy::Fixed(draft),
-                p => fail(&format!("--policy {p}: adaptive or fixed")),
+                "tree" => DraftPolicy::Tree(draft),
+                p => fail(&format!("--policy {p}: auto, adaptive, fixed or tree")),
             };
             let g = speculative_generate(&model, ids, options, d, policy)?;
             speculative.insert(g)

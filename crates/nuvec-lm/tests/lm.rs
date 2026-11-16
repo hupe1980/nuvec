@@ -3106,6 +3106,7 @@ fn kv_quant_equals_mlx_lm() {
                 bits,
                 group_size,
                 start,
+                rotate: false,
             };
             let (quantized, converted) = run(Some(quant), &tokens);
             assert!(converted, "{name} {key}: not quantized");
@@ -3156,7 +3157,7 @@ fn kv_quant_cache_bytes() {
         ..Default::default()
     };
     for c in &mut quantized {
-        c.quantize(quant).unwrap();
+        c.to_quantized(quant).unwrap();
     }
     let (mut q, mut d) = (0, 0);
     for (qc, dc) in quantized.iter().zip(&dense) {
@@ -3187,6 +3188,7 @@ fn kv_quant_refusals() {
             bits,
             group_size,
             start: 0,
+            rotate: false,
         }),
         ..Default::default()
     };
@@ -3283,7 +3285,7 @@ fn kv_quant_prompt_cache_round_trips() {
     let head = Array::from_slice(&prompt, [1, prompt.len()]);
     model.forward(&head, &mut kv).eval().unwrap();
     for c in &mut kv {
-        c.quantize(KvQuant {
+        c.to_quantized(KvQuant {
             group_size: 32,
             ..Default::default()
         })
@@ -3336,6 +3338,7 @@ fn dflash_matches_the_reference() {
         ("dflash_qwen3_v2", "qwen3_f32", 1e-4),
         ("dflash_gemma4", "gemma4_e_f32", 1e-4),
         ("dflash_gpt_oss", "gpt_oss_f32", 1e-4),
+        ("dflash_qwen3_dspark", "qwen3_f32", 1e-4),
     ] {
         let (target_dir, prompt, ..) = fixture(target_name);
         let model = load_model(&target_dir).unwrap();
@@ -3361,8 +3364,10 @@ fn dflash_matches_the_reference() {
             .reshape([block.size() as i32, -1]);
         let d = rel_diff(&logits, &expected["logits"]);
         assert!(d < tol, "{drafter_name}: logits off by {d}");
-        // The draft: the argmax of each masked position, or DFlash 2's selector path.
-        let n = drafter.config().block_size - 1;
+        // The draft: the argmax of each masked position, DFlash 2's selector path, or
+        // DSpark's Markov-corrected path from every slot (with its confidences).
+        let dspark = drafter.config().dspark.is_some();
+        let n = drafter.config().block_size - usize::from(!dspark);
         let draft = drafter.draft(&model, &[first], n).unwrap();
         let want = expected["draft"].to_vec::<u32>().unwrap();
         assert_eq!(
@@ -3370,6 +3375,11 @@ fn dflash_matches_the_reference() {
             want,
             "{drafter_name}: draft"
         );
+        if dspark {
+            let got = drafter.last_confidence().expect("a confidence head");
+            let d = rel_diff(got, &expected["confidence"]);
+            assert!(d < tol, "{drafter_name}: confidences off by {d}");
+        }
     }
 }
 
@@ -3392,6 +3402,7 @@ fn dflash_speculation_keeps_the_greedy_output() {
         ("dflash_qwen3_v2", "qwen3_f32"),
         ("dflash_gemma4", "gemma4_e_f32"),
         ("dflash_gpt_oss", "gpt_oss_f32"),
+        ("dflash_qwen3_dspark", "qwen3_f32"),
     ] {
         let (dir, prompt, _, _, greedy) = fixture(target_name);
         let model = load_model(&dir).unwrap();
@@ -3411,6 +3422,53 @@ fn dflash_speculation_keeps_the_greedy_output() {
         let ids: Vec<u32> = g.by_ref().collect::<nuvec::Result<_>>().unwrap();
         assert_eq!(ids, greedy, "{drafter_name}: greedy");
         assert!(g.stats().verifies > 0, "{drafter_name}: {:?}", g.stats());
+        // Draft trees (attention-only targets with DFlash v1; chains otherwise), routed as
+        // MLX's: float32 fixtures keep the greedy tokens.
+        for policy in [
+            DraftPolicy::Tree(7),
+            DraftPolicy::Tree(15),
+            DraftPolicy::Auto,
+        ] {
+            let drafter = DFlashDrafter::load(drafter_dir(drafter_name), &model).unwrap();
+            let mut g =
+                speculative_generate(&model, &prompt, options.clone(), drafter, policy).unwrap();
+            let ids: Vec<u32> = g.by_ref().collect::<nuvec::Result<_>>().unwrap();
+            assert_eq!(ids, greedy, "{drafter_name}: {policy:?}");
+            let stats = g.stats();
+            assert!(stats.verifies > 0, "{drafter_name}: {policy:?} {stats:?}");
+            // Trees of 15 nodes, 7 deep, where trees apply: more nodes than a chain holds.
+            let tree = !matches!(
+                drafter_name,
+                "dflash_qwen3_5" | "dflash_qwen3_v2" | "dflash_qwen3_dspark"
+            );
+            if policy == DraftPolicy::Tree(15) && tree {
+                assert!(
+                    stats.drafted > 7 * stats.verifies,
+                    "{drafter_name}: {stats:?}"
+                );
+            }
+        }
+        let drafter = DFlashDrafter::load(drafter_dir(drafter_name), &model).unwrap();
+        let sampled_tree = GenerateOptions {
+            sampler: Sampler {
+                temperature: 0.8,
+                ..Default::default()
+            },
+            seed: Some(7),
+            ..options.clone()
+        };
+        let n = speculative_generate(
+            &model,
+            &prompt,
+            sampled_tree,
+            drafter,
+            DraftPolicy::Tree(15),
+        )
+        .unwrap()
+        .collect::<nuvec::Result<Vec<u32>>>()
+        .unwrap()
+        .len();
+        assert_eq!(n, greedy.len(), "{drafter_name}: sampled tree");
         let drafter = DFlashDrafter::load(drafter_dir(drafter_name), &model).unwrap();
         let sampled = GenerateOptions {
             sampler: Sampler {
@@ -3440,4 +3498,124 @@ fn dflash_speculation_keeps_the_greedy_output() {
         .err()
         .unwrap();
     assert!(err.to_string().contains("target layer 3"), "{err}");
+}
+
+/// Sampled draft trees are lossless: the first two tokens of tree speculation are
+/// distributed as plain sampling's, as close as two plain samplings with other seeds are.
+#[test]
+fn sampled_draft_trees_keep_the_distribution() {
+    use nuvec_lm::{DFlashDrafter, DraftPolicy, Sampler, speculative_generate};
+    use std::collections::{HashMap, HashSet};
+    if !gpu() {
+        return;
+    }
+    let (dir, prompt, ..) = fixture("qwen3_f32");
+    let model = load_model(&dir).unwrap();
+    let drafter_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dflash_qwen3");
+    let options = |seed| GenerateOptions {
+        max_tokens: 2,
+        sampler: Sampler {
+            temperature: 0.3,
+            ..Default::default()
+        },
+        seed: Some(seed),
+        ..Default::default()
+    };
+    let n = 400u64;
+    type Counts = HashMap<(u32, u32), f64>;
+    let mut counts: [Counts; 3] = Default::default();
+    for seed in 0..n {
+        let plain = |seed| -> Vec<u32> {
+            generate(&model, &prompt, options(seed))
+                .unwrap()
+                .collect::<nuvec::Result<_>>()
+                .unwrap()
+        };
+        let drafter = DFlashDrafter::load(&drafter_dir, &model).unwrap();
+        let tree: Vec<u32> = speculative_generate(
+            &model,
+            &prompt,
+            options(seed),
+            drafter,
+            DraftPolicy::Tree(7),
+        )
+        .unwrap()
+        .collect::<nuvec::Result<_>>()
+        .unwrap();
+        for (c, ids) in counts
+            .iter_mut()
+            .zip([plain(seed), plain(seed + 100_000), tree])
+        {
+            *c.entry((ids[0], ids[1])).or_default() += 1.0 / n as f64;
+        }
+    }
+    let tv = |a: &Counts, b: &Counts| {
+        let keys: HashSet<_> = a.keys().chain(b.keys()).collect();
+        keys.iter()
+            .map(|k| (a.get(k).unwrap_or(&0.0) - b.get(k).unwrap_or(&0.0)).abs())
+            .sum::<f64>()
+            / 2.0
+    };
+    let (noise, tree) = (tv(&counts[0], &counts[1]), tv(&counts[0], &counts[2]));
+    eprintln!(
+        "pairs: plain/plain {noise:.3}, plain/tree {tree:.3}, {} outcomes",
+        counts[0].len()
+    );
+    assert!(
+        tree < 1.5 * noise + 0.03,
+        "plain/tree {tree} against plain/plain {noise}"
+    );
+}
+
+/// Rotated key caches (`KvQuant::rotate`): the logits over a rotated quantized cache equal
+/// the unquantized cache's within quantization error (the rotation itself is exact), for
+/// the prompt and the next token, and such a cache is not saved in mlx-lm's format.
+#[test]
+fn rotated_kv_caches_keep_the_attention() {
+    use nuvec_lm::{KvQuant, save_prompt_cache};
+    if !gpu() {
+        return;
+    }
+    let (dir, prompt, ..) = fixture("qwen3_5_f32");
+    let model = load_model(&dir).unwrap();
+    let tokens = Array::from_slice(&prompt, [1, prompt.len() as i32]);
+    let next = Array::from_slice(&prompt[..1], [1, 1]);
+    let run = |quant: Option<KvQuant>| {
+        let mut kv = model.new_cache();
+        if let Some(q) = quant {
+            for c in &mut kv {
+                c.to_quantized(q).unwrap();
+            }
+        }
+        let first = model.forward(&tokens, &mut kv);
+        let second = model.forward(&next, &mut kv);
+        (first, second, kv)
+    };
+    let quant = |bits, rotate| KvQuant {
+        bits,
+        group_size: 32,
+        start: 0,
+        rotate,
+    };
+    let (dense, dense_next, _) = run(None);
+    for bits in [8, 4] {
+        let (plain, _, _) = run(Some(quant(bits, false)));
+        let (rotated, rotated_next, kv) = run(Some(quant(bits, true)));
+        let (d, d_next) = (
+            rel_diff(&rotated, &dense),
+            rel_diff(&rotated_next, &dense_next),
+        );
+        let p = rel_diff(&plain, &dense);
+        eprintln!("{bits} bits: rotated {d} / {d_next}, plain {p}");
+        let bound = if bits == 8 { 1e-2 } else { 1e-1 };
+        assert!(d < bound && d_next < bound, "{bits} bits: {d}, {d_next}");
+        if bits == 8 {
+            let file = std::env::temp_dir().join(format!(
+                "nuvec-kv-rotated-{}.safetensors",
+                std::process::id()
+            ));
+            let err = save_prompt_cache(&file, &model, &kv, &Default::default()).unwrap_err();
+            assert!(err.to_string().contains("rotated"), "{err}");
+        }
+    }
 }

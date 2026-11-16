@@ -388,6 +388,38 @@ class DFlash2DraftModel(DFlashDraftModel):
 
 # ── End of the vendored code. ──
 
+# ── DSpark (deepseek-ai/DeepSpec, deepspec/modeling/dspark: `VanillaMarkov`,
+#    `AcceptRatePredictor`, `Qwen3DSparkModel.predict_confidence_step`, eval/dspark/draft_ops.py;
+#    MIT License, Copyright (c) 2026 The DeepSpec Authors), ported from PyTorch to MLX. The
+#    backbone is DFlash's; every slot of `[anchor, mask, …]` predicts the next token. ──
+
+
+class DSparkDraftModel(DFlashDraftModel):
+    def __init__(self, config: DFlashConfig, markov_rank: int):
+        super().__init__(config)
+        self.markov_w1 = nn.Embedding(config.vocab_size, markov_rank)
+        self.markov_w2 = nn.Linear(markov_rank, config.vocab_size, bias=False)
+        self.confidence = nn.Linear(config.hidden_size + markov_rank, 1)
+
+    def propose(self, inputs, target_hidden, cache):
+        """`build_dspark_proposal` at temperature 0: the base logits of every slot, the
+        Markov-corrected greedy draft and each drafted position's confidence logit."""
+        hidden = self.hidden_states(inputs, target_hidden, cache)
+        base = self.compute_logits(hidden)
+        prev = inputs[:, 0]
+        tokens, prevs = [], []
+        for k in range(base.shape[1]):
+            prevs.append(prev)
+            step = base[:, k] + self.markov_w2(self.markov_w1(prev))
+            prev = mx.argmax(step, axis=-1).astype(mx.uint32)
+            tokens.append(prev)
+        prevs = mx.stack(prevs, axis=1)
+        features = mx.concatenate([hidden, self.markov_w1(prevs).astype(hidden.dtype)], axis=-1)
+        confidence = self.confidence(features)[..., 0]
+        return base, mx.stack(tokens, axis=1), confidence
+
+# ── End of the DSpark port. ──
+
 FIXTURES = Path(__file__).resolve().parent.parent / "crates/nuvec-lm/tests/fixtures"
 PROMPT = [3, 17, 92, 5, 64, 33, 101, 8, 77, 2, 45, 120, 9, 56]
 
@@ -410,6 +442,10 @@ CASES = [
     ("gemma4", "gemma4_e_f32",
      dict(layer_ids=[1, 4], layer_types=["sliding_attention", "full_attention"], window=8,
           block=8, softcap=1.5), 20261123, False),
+    # DSpark (DeepSpec's `Qwen3DSparkModel` layout): Markov head and confidence head.
+    ("qwen3_dspark", "qwen3_f32",
+     dict(layer_ids=[0, 1], layer_types=FULL2, window=None, block=7, dspark=8),
+     20261125, False),
     # gpt-oss: YaRN RoPE and attention biases.
     ("gpt_oss", "gpt_oss_f32",
      dict(layer_ids=[0, 1], layer_types=FULL2, window=None, block=8, bias=True,
@@ -446,11 +482,20 @@ def hf_config(target_cfg: dict, s: dict, layers: int) -> dict:
         cfg["final_logit_softcapping"] = s["softcap"]
     if "rope" in s:
         cfg["rope_scaling"] = s["rope"]
+    if "dspark" in s:
+        # DeepSpec's flat layout (no `dflash_config`).
+        del cfg["dflash_config"]
+        cfg.update({
+            "architectures": ["Qwen3DSparkModel"], "target_layer_ids": s["layer_ids"],
+            "mask_token_id": text["vocab_size"] - 1, "markov_rank": s["dspark"],
+            "markov_head_type": "vanilla", "enable_confidence_head": True,
+            "confidence_head_with_markov": True, "num_anchors": 512,
+        })
     return cfg
 
 
 def config_of(cfg: dict) -> DFlashConfig:
-    d = cfg["dflash_config"]
+    d = cfg.get("dflash_config", cfg)
     return DFlashConfig(
         hidden_size=cfg["hidden_size"], num_hidden_layers=cfg["num_hidden_layers"],
         num_attention_heads=cfg["num_attention_heads"],
@@ -501,8 +546,11 @@ def main() -> None:
         layers = len(inner.layers)
         cfg = hf_config(target_cfg, s, layers)
         mx.random.seed(seed)
-        v2 = "v2" in s
-        draft = (DFlash2DraftModel if v2 else DFlashDraftModel)(config_of(cfg))
+        v2, dspark = "v2" in s, "dspark" in s
+        if dspark:
+            draft = DSparkDraftModel(config_of(cfg), s["dspark"])
+        else:
+            draft = (DFlash2DraftModel if v2 else DFlashDraftModel)(config_of(cfg))
         if s.get("bias"):
             add_attention_biases(draft)
         draft.update(tree_map(lambda p: mx.random.normal(p.shape) * 0.2, draft.parameters()))
@@ -531,9 +579,15 @@ def main() -> None:
         logits = target(prompt)
         hidden = mx.concatenate([captured[i] for i in s["layer_ids"]], axis=-1)
         first = mx.argmax(logits[0, -1]).astype(mx.uint32)
-        mask = cfg["dflash_config"]["mask_token_id"]
+        mask = cfg.get("dflash_config", cfg)["mask_token_id"]
         block = mx.array([[int(first)] + [mask] * (s["block"] - 1)], dtype=mx.uint32)
-        if v2:
+        extra = {}
+        if dspark:
+            out, tokens, confidence = draft.propose(block, hidden, draft.make_cache())
+            out = out.astype(mx.float32)[0]
+            tokens = tokens[0].astype(mx.uint32)
+            extra["confidence"] = confidence[0].astype(mx.float32)
+        elif v2:
             # Every row's logits (the norm is per row, so rows 1… equal `logits_start=1`).
             h = draft.hidden_states(block, hidden, draft.make_cache())
             out = draft.compute_logits(h).astype(mx.float32)[0]
@@ -549,6 +603,16 @@ def main() -> None:
         weights = dict(tree_flatten(draft.parameters()))
         weights = {k: v for k, v in weights.items()
                    if not k.startswith(("embed_tokens", "lm_head"))}
+        if dspark:
+            # DeepSpec's names, and its copies of the target's embeddings and head.
+            for ours, theirs in [("markov_w1.weight", "markov_head.markov_w1.weight"),
+                                 ("markov_w2.weight", "markov_head.markov_w2.weight"),
+                                 ("confidence.weight", "confidence_head.proj.weight"),
+                                 ("confidence.bias", "confidence_head.proj.bias")]:
+                weights[theirs] = weights.pop(ours)
+            weights["embed_tokens.weight"] = inner.embed_tokens.weight
+            weights["lm_head.weight"] = draft.lm_head.weight if hasattr(draft.lm_head, "weight") \
+                else inner.embed_tokens.weight
         if v2:
             # z-lab's checkpoint names (the reference's loader maps them to `.weight`).
             for c in ("predecessor_codebook", "successor_codebook"):
@@ -557,7 +621,7 @@ def main() -> None:
         mx.save_safetensors(str(dest / "model.safetensors"), weights)
         mx.save_safetensors(str(dest / "expected.safetensors"), {
             "target_layers": hidden.astype(mx.float32), "first": first[None],
-            "logits": out, "draft": tokens})
+            "logits": out, "draft": tokens, **extra})
         print(f"dflash_{name}: {len(weights)} tensors, first {int(first)}, "
               f"draft {tokens.tolist()}")
 

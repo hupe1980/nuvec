@@ -145,6 +145,19 @@ pub enum FastOp {
         /// Whether the kernel is reversed (a convolution, not a correlation).
         flip: bool,
     },
+    /// `(q, k_codes, k_scales, k_biases, v_codes, v_scales, v_biases[, sinks])`:
+    /// [`quantized_attention`](crate::fast::quantized_attention) of one query row per head
+    /// (`q` `[B, Hq, 1, D]`) over affine-quantized keys and values (`[B, Hkv, S, ·]`).
+    QuantizedAttention {
+        /// `f32::to_bits` of the scale.
+        scale: u32,
+        /// Values per scale and bias.
+        group_size: u32,
+        /// Bits per value.
+        bits: u32,
+        /// Whether per-head sinks follow.
+        sinks: bool,
+    },
     /// `(q, k_cache, v_cache, block_tables, lengths[, sinks])`:
     /// [`paged_attention`](crate::fast::paged_attention).
     PagedAttention {
@@ -690,6 +703,7 @@ impl FastOp {
             Self::BlockMaskedMm { .. } => "block_masked_mm",
             Self::QuantizeDequantize { .. } => "quantize_dequantize",
             Self::PagedAttention { .. } => "paged_attention",
+            Self::QuantizedAttention { .. } => "quantized_attention",
             Self::PagedWrite => "paged_write",
             Self::MoeRoute { .. } => "moe_route",
             Self::WeightedSum => "weighted_sum",
@@ -726,6 +740,7 @@ impl FastOp {
             } => 2 + usize::from(*out_mask) + 2 * usize::from(*op_mask),
             Self::QuantizeDequantize { .. } => inputs.len().clamp(1, 2),
             Self::PagedAttention { sinks, .. } => 5 + usize::from(*sinks),
+            Self::QuantizedAttention { sinks, .. } => 7 + usize::from(*sinks),
             Self::PagedWrite => 3,
             Self::ConvSlots { .. } => 4,
             Self::AddRmsNorm { .. } | Self::RmsNormVjp { .. } | Self::LayerNorm { .. } => 3,
@@ -783,7 +798,9 @@ impl FastOp {
                 Some(_) => vec![like(x), like(x)],
                 None => vec![like(x)],
             },
-            Self::PagedAttention { .. } | Self::PagedWrite => vec![like(x)],
+            Self::PagedAttention { .. } | Self::PagedWrite | Self::QuantizedAttention { .. } => {
+                vec![like(x)]
+            }
             Self::MoeRoute { k, .. } => {
                 let mut shape = x.dims().to_vec();
                 *shape.last_mut().expect("1-D") = *k;
@@ -1068,6 +1085,12 @@ impl FastOp {
                         .try_fold(1usize, |p, &v| p.checked_mul(v))
                         .is_some_and(fits)
             }
+            Self::QuantizedAttention {
+                group_size,
+                bits,
+                sinks,
+                ..
+            } => quantized_attention_fits(inputs, *group_size as usize, *bits as usize, *sinks),
             Self::PagedAttention { sinks, .. } => {
                 let [q, k, v, tables, lengths] = &inputs[..5] else {
                     unreachable!("five inputs")
@@ -1540,6 +1563,17 @@ impl FastOp {
             Self::SegmentedMm => vec![crate::products::segmented_compose(
                 x, &inputs[1], &inputs[2],
             )?],
+            Self::QuantizedAttention {
+                scale,
+                group_size,
+                bits,
+                sinks,
+            } => vec![quantized_attention_graph(
+                inputs,
+                float(*scale),
+                (*group_size as i32, *bits as i32),
+                *sinks,
+            )],
             Self::PagedAttention { scale, window, .. } => {
                 vec![paged_attention_graph(inputs, float(*scale), *window)?]
             }
@@ -1733,6 +1767,7 @@ impl FastOp {
             | Self::ResidualRmsNorm { .. }
             | Self::NormRope { .. }
             | Self::PagedAttention { .. }
+            | Self::QuantizedAttention { .. }
             | Self::PagedWrite
             | Self::MoeRoute { .. }
             | Self::WeightedSum
@@ -3895,4 +3930,146 @@ fn gated_delta_graph(inputs: &[Array], steps: bool) -> Result<Vec<Array>> {
         (true, true) => zeros(&[b, 0, hv, dv, dk], state.dtype())?,
     };
     Ok(vec![y, s])
+}
+
+/// Whether [`FastOp::QuantizedAttention`]'s kernel takes these inputs: one query row per
+/// head, head size 64 or 128, 3, 4 or 8 bits in groups of 32, 64 or 128 (a group within a
+/// head), codes `uint32` and scales, biases and sinks in the queries' floating dtype, 1, 2,
+/// 4 or 8 query heads per key head.
+pub(crate) fn quantized_attention_fits(
+    inputs: &[Array],
+    group_size: usize,
+    bits: usize,
+    sinks: bool,
+) -> bool {
+    let q = &inputs[0];
+    let &[b, hq, l, d] = q.dims() else {
+        return false;
+    };
+    let dtype = q.dtype();
+    let side = |w: &Array, s: &Array, bi: &Array| {
+        let [wb, hkv, n, words] = w.dims() else {
+            return None;
+        };
+        let fits = *wb == b
+            && w.dtype() == DType::U32
+            && *words * 32 == d * bits
+            && s.dims() == [b, *hkv, *n, d / group_size.max(1)]
+            && bi.dims() == s.dims()
+            && s.dtype() == dtype
+            && bi.dtype() == dtype
+            && w.size() < i32::MAX as usize;
+        fits.then_some((*hkv, *n))
+    };
+    let (Some(k), Some(v)) = (
+        side(&inputs[1], &inputs[2], &inputs[3]),
+        side(&inputs[4], &inputs[5], &inputs[6]),
+    ) else {
+        return false;
+    };
+    let sinks_ok = !sinks || {
+        let s = &inputs[7];
+        s.ndim() == 1 && s.size() == hq && s.dtype() == dtype
+    };
+    matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
+        && l == 1
+        && matches!(d, 64 | 128)
+        && matches!(bits, 3 | 4 | 8)
+        && matches!(group_size, 32 | 64 | 128)
+        && d % group_size == 0
+        && k == v
+        && k.0 > 0
+        && hq % k.0 == 0
+        && matches!(hq / k.0, 1 | 2 | 4 | 8)
+        && sinks_ok
+}
+
+/// [`FastOp::QuantizedAttention`] composed as mlx-lm's
+/// `quantized_scaled_dot_product_attention` without a mask: the scaled queries grouped by key
+/// head, `quantized_matmul` with the keys, the sinks' column, a precise softmax,
+/// `quantized_matmul` with the values.
+pub(crate) fn quantized_attention_graph(
+    inputs: &[Array],
+    scale: f32,
+    (group_size, bits): (i32, i32),
+    sinks: bool,
+) -> Array {
+    let q = &inputs[0];
+    let [b, hq, l, d] = q.dims() else {
+        unreachable!("checked")
+    };
+    let (b, hq, l, d) = (*b as i32, *hq as i32, *l as i32, *d as i32);
+    let hkv = inputs[1].dims()[1] as i32;
+    let rep = hq / hkv;
+    let q = crate::ops::multiply(q, scale).reshape([b, hkv, rep, l, d]);
+    let weights = |at: usize| {
+        let e = |a: &Array| a.expand_dims(-3);
+        crate::Quantized::affine(
+            e(&inputs[at]),
+            e(&inputs[at + 1]),
+            e(&inputs[at + 2]),
+            group_size,
+            bits,
+        )
+    };
+    let scores = crate::ops::quantized_matmul(&q, &weights(1), true);
+    let s = scores.dims().last().copied().unwrap_or(0) as i32;
+    let probs = match sinks {
+        true => {
+            let column = inputs[7]
+                .astype(scores.dtype())
+                .reshape([1, hkv, rep, 1, 1]);
+            let column = crate::ops::broadcast_to(&column, [b, hkv, rep, l, 1]);
+            let p = crate::ops::softmax(&crate::ops::concatenate(&[scores, column], -1), -1);
+            p.i((.., .., .., .., ..s))
+        }
+        false => crate::ops::softmax(&scores, -1),
+    };
+    crate::ops::quantized_matmul(&probs, &weights(4), false).reshape([b, hq, l, d])
+}
+
+/// The body of [`crate::fast::quantized_attention`].
+pub(crate) fn quantized_attention(
+    q: &Array,
+    k: &crate::Quantized,
+    v: &crate::Quantized,
+    scale: f32,
+    sinks: Option<&Array>,
+) -> Result<Array> {
+    let (group_size, bits) = (k.quant.group_size, k.quant.bits);
+    if k.quant != v.quant || k.quant.mode != crate::QuantMode::Affine {
+        return Err(Error::InvalidArgument(
+            "quantized_attention: keys and values need one affine quantization".into(),
+        ));
+    }
+    let side = |t: &crate::Quantized| -> Result<[Array; 3]> {
+        let biases = t.biases.clone().ok_or_else(|| {
+            Error::InvalidArgument("quantized_attention: affine biases missing".into())
+        })?;
+        Ok([t.weight.clone(), t.scales.clone(), biases])
+    };
+    let mut inputs = vec![q.clone()];
+    inputs.extend(side(k)?);
+    inputs.extend(side(v)?);
+    inputs.extend(sinks.cloned());
+    let op = FastOp::QuantizedAttention {
+        scale: scale.to_bits(),
+        group_size: group_size as u32,
+        bits: bits as u32,
+        sinks: sinks.is_some(),
+    };
+    if !quantized_attention_fits(&inputs, group_size as usize, bits as usize, sinks.is_some()) {
+        if q.ndim() != 4 || k.weight.ndim() != 4 || v.weight.ndim() != 4 {
+            return Err(Error::InvalidArgument(
+                "quantized_attention: queries, keys and values must be 4-D".into(),
+            ));
+        }
+        return Ok(quantized_attention_graph(
+            &inputs,
+            scale,
+            (group_size, bits),
+            sinks.is_some(),
+        ));
+    }
+    one(op, inputs)
 }

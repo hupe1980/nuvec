@@ -5,7 +5,7 @@
 //!     --prompt "Write a story" [--max-tokens 256] [--temp 0] [--top-p 0] [--min-p 0] \
 //!     [--top-k 0] [--system-prompt TEXT] [--prefill-response TEXT] \
 //!     [--chat-template-config '{"enable_thinking": false}'] [--ignore-chat-template] \
-//!     [--kv-bits 8] [--kv-group-size 64] [--quantized-kv-start 5000]
+//!     [--kv-bits 8] [--kv-group-size 64] [--quantized-kv-start 5000] [--kv-rotate]
 //! ```
 //!
 //! `--model` is a directory or a Hugging Face repository in the local cache. As in mlx-lm,
@@ -66,6 +66,7 @@ fn main() -> nuvec::Result<()> {
             bits: bits.parse().expect("a number"),
             group_size: value("--kv-group-size").map_or(64, |v| v.parse().expect("a number")),
             start: value("--quantized-kv-start").map_or(5000, |v| v.parse().expect("a number")),
+            rotate: args.iter().any(|a| a == "--kv-rotate"),
         }),
         ..Default::default()
     };

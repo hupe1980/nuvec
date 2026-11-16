@@ -279,6 +279,30 @@ impl Rope {
         self.rope.rotation()
     }
 
+    /// No rotation (keys already rotated).
+    fn identity() -> Self {
+        Self {
+            rope: nuvec_nn::Rope::new(2),
+            identity: true,
+        }
+    }
+
+    /// `x` (`[1, H, L, D]`) normalised by `norm` (if any) and each position `l` rotated at
+    /// `positions[l]` (a draft tree's depths): [`fast::norm_rope_at`] over the positions as
+    /// a batch.
+    #[track_caller]
+    fn norm_rope_tree(&self, x: &Array, norm: Option<&RmsNorm>, positions: &Array) -> Array {
+        if self.identity {
+            return norm.map_or_else(
+                || x.clone(),
+                |n| fast::rms_norm(x, Some(n.weight.value()), n.eps),
+            );
+        }
+        let norm = norm.map(|n| (n.weight.value(), n.eps));
+        let rows = x.transpose([2, 1, 0, 3]);
+        fast::norm_rope_at(&rows, norm, self.rotation(), positions, None).transpose([2, 1, 0, 3])
+    }
+
     /// `x` (`[B, H, L, D]`) normalised by `norm` (if any) and rotated at positions
     /// `offset..`, written into `cache` if given ([`fast::norm_rope`]: one kernel from the
     /// projection to the cache).
@@ -366,7 +390,7 @@ pub struct KvCache {
     steps: Option<(Option<Array>, Array)>,
     /// Attention keys and values are returned, not kept ([`Model::forward_uncached`]).
     uncached: bool,
-    /// Quantized keys and values (codes, scales, biases each), once [`KvCache::quantize`]d.
+    /// Quantized keys and values (codes, scales, biases each), once quantized ([`KvCache::to_quantized`]).
     qkeys: Option<[Array; 3]>,
     qvalues: Option<[Array; 3]>,
     /// The quantization of keys and values written from now on.
@@ -374,6 +398,69 @@ pub struct KvCache {
     /// The quantization applied once the cache holds `start` positions
     /// ([`KvCache::quantize_at`]).
     auto: Option<KvQuant>,
+    /// The draft tree of the next forward (one verification): positions by depth and
+    /// attention to ancestors only.
+    tree: Option<TreeMask>,
+}
+
+/// A draft tree as attention sees it: each of the `L` new positions at the cache's offset
+/// plus its `depth` (`[L]`, int32), attending to the cached positions and to its
+/// `ancestors` (`[L, L]`, bool, itself included).
+#[derive(Debug, Clone)]
+pub(crate) struct TreeMask {
+    depth: Array,
+    ancestors: Array,
+    /// The mask of layers without a window after `base` cached positions, and the
+    /// positions there, built once.
+    plain: (i32, Array, Array),
+}
+
+impl TreeMask {
+    /// A tree of `depth` (`[L]`) and `ancestors` (`[L, L]`) written after `base` cached
+    /// positions.
+    pub(crate) fn new(depth: Array, ancestors: Array, base: usize) -> Self {
+        let l = depth.shape()[0];
+        let base = base as i32;
+        let plain = ops::concatenate(&[ops::full([l, base], true), ancestors.clone()], 1)
+            .reshape([1, 1, l, base + l]);
+        let positions = &depth + base;
+        Self {
+            depth,
+            ancestors,
+            plain: (base, plain, positions),
+        }
+    }
+
+    /// The positions of the new entries after `at` cached ones.
+    fn positions(&self, at: i32) -> Array {
+        match at == self.plain.0 {
+            true => self.plain.2.clone(),
+            false => &self.depth + at,
+        }
+    }
+
+    /// The mask of `L` queries over `s` keys, the last `L` the new ones: the earlier keys
+    /// within `window` of each query's position, then the ancestors.
+    fn mask(&self, at: i32, s: i32, window: Option<i32>) -> Array {
+        let l = self.depth.shape()[0];
+        let cached = s - l;
+        if window.is_none() && cached == self.plain.0 {
+            return self.plain.1.clone();
+        }
+        let (keep, ancestors) = match window {
+            None => (ops::full([l, cached], true), self.ancestors.clone()),
+            Some(w) => {
+                let query = self.positions(at).reshape([l, 1]);
+                let key = ops::arange(at - cached, at, 1).reshape([1, cached]);
+                let near = (&self.depth.reshape([l, 1]) - &self.depth.reshape([1, l])).less(w);
+                (
+                    (&query - &key).less(w),
+                    ops::logical_and(&self.ancestors, &near),
+                )
+            }
+        };
+        ops::concatenate(&[keep, ancestors], 1).reshape([1, 1, l, s])
+    }
 }
 
 /// mlx-lm's KV cache quantization (`kv_bits`, `kv_group_size`, `quantized_kv_start`): once an
@@ -388,6 +475,13 @@ pub struct KvQuant {
     pub group_size: i32,
     /// Cached positions from which a layer's cache is quantized (mlx-lm's 5000).
     pub start: usize,
+    /// Rotates each head's keys by the orthonormal Hadamard transform before quantizing them
+    /// (and the queries to match: `(Hq)·(Hk) = q·k`), which spreads the keys' outlier
+    /// features over the head and lowers the error of 3- and 4-bit caches; values, whose
+    /// outliers are per position, are quantized as they are. Head sizes `m · 2^k` (`m` in
+    /// 1, 12, 20, 28). Not in mlx-lm's format: prompt caches with rotated layers are not
+    /// saved.
+    pub rotate: bool,
 }
 
 impl Default for KvQuant {
@@ -396,6 +490,7 @@ impl Default for KvQuant {
             bits: 8,
             group_size: 64,
             start: 5000,
+            rotate: false,
         }
     }
 }
@@ -405,12 +500,58 @@ impl KvQuant {
         nuvec::Quant::affine(self.group_size, self.bits)
     }
 
+    /// `a`'s heads (its last axis) rotated, if this quantization rotates (the transform is
+    /// its own inverse).
+    pub(crate) fn rotated(self, a: &Array) -> Array {
+        match self.rotate {
+            true => ops::hadamard_transform(a, None),
+            false => a.clone(),
+        }
+    }
+
+    /// Keys quantized as this quantization stores them (rotated if it rotates): codes,
+    /// scales and biases.
+    fn encode(self, a: &Array) -> [Array; 3] {
+        let q = self.rotated(a).quantize(self.quant());
+        [q.weight, q.scales, q.biases.expect("affine")]
+    }
+
+    /// Values quantized (never rotated).
+    fn encode_values(self, a: &Array) -> [Array; 3] {
+        let q = a.quantize(self.quant());
+        [q.weight, q.scales, q.biases.expect("affine")]
+    }
+
     pub(crate) fn validate(self) -> Result<()> {
         if !matches!(self.bits, 2..=6 | 8) || !matches!(self.group_size, 32 | 64 | 128) {
             return Err(nuvec::Error::InvalidArgument(format!(
                 "KV quantization takes 2–6 or 8 bits and groups of 32, 64 or 128, not {} bits \
                  in groups of {}",
                 self.bits, self.group_size
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`validate`](Self::validate) for heads of `dims` features.
+    pub(crate) fn validate_heads(self, dims: [i32; 2]) -> Result<()> {
+        if dims.iter().any(|d| d % self.group_size != 0) {
+            return Err(nuvec::Error::InvalidArgument(format!(
+                "head dimensions {} and {} are not multiples of the KV quantization's group \
+                 size {}",
+                dims[0], dims[1], self.group_size
+            )));
+        }
+        let hadamard = |d: i32| {
+            [1, 12, 20, 28]
+                .iter()
+                .any(|&m| d % m == 0 && (d / m).count_ones() == 1)
+        };
+        if self.rotate && !dims.into_iter().all(hadamard) {
+            return Err(nuvec::Error::InvalidArgument(format!(
+                "rotated KV quantization: head dimensions {} and {} have no Hadamard transform \
+                 (m · 2^k, m in 1, 12, 20, 28)",
+                dims[0], dims[1]
             )));
         }
         Ok(())
@@ -458,6 +599,14 @@ impl KvCache {
         let (prev, start) = (self.offset, self.start);
         let l = values.shape().get(2).copied().unwrap_or_default();
         let end = prev + l;
+        if let Some(tree) = &self.tree {
+            // Rotated at their depths, then written as unrotated entries.
+            let rotated = rope.norm_rope_tree(keys, norm, &tree.positions(prev));
+            let tree = self.tree.take();
+            let kv = self.update(&Rope::identity(), None, &rotated, values);
+            self.tree = tree;
+            return kv;
+        }
         if self.uncached {
             self.offset = end;
             return Kv::Dense(rope.norm_rope(keys, norm, prev, None), values.clone());
@@ -515,11 +664,7 @@ impl KvCache {
         let (prev, start) = (self.offset, self.start);
         let l = values.shape().get(2).copied().unwrap_or_default();
         let end = prev + l;
-        let triple = |a: &Array| {
-            let q = a.quantize(quant.quant());
-            [q.weight, q.scales, q.biases.expect("affine")]
-        };
-        let new = [triple(keys), triple(values)];
+        let new = [quant.encode(keys), quant.encode_values(values)];
         let fits = self
             .qkeys
             .as_ref()
@@ -592,17 +737,10 @@ impl KvCache {
     /// Quantizes this attention layer's keys and values now (mlx-lm's
     /// `KVCache.to_quantized`) and every later write. Gated DeltaNet layers are left as
     /// they are.
-    pub fn quantize(&mut self, quant: KvQuant) -> Result<()> {
+    pub fn to_quantized(&mut self, quant: KvQuant) -> Result<()> {
         quant.validate()?;
         if let (Some(k), Some(v)) = (&self.keys, &self.values) {
-            let dims = (k.shape()[3], v.shape()[3]);
-            if dims.0 % quant.group_size != 0 || dims.1 % quant.group_size != 0 {
-                return Err(nuvec::Error::InvalidArgument(format!(
-                    "head dimensions {} and {} are not multiples of the KV quantization's \
-                     group size {}",
-                    dims.0, dims.1, quant.group_size
-                )));
-            }
+            quant.validate_heads([k.shape()[3], v.shape()[3]])?;
         }
         self.convert(quant);
         Ok(())
@@ -621,17 +759,13 @@ impl KvCache {
             return;
         }
         if let (Some(k), Some(v)) = (self.keys.take(), self.values.take()) {
-            let triple = |a: &Array| {
-                let q = a.quantize(quant.quant());
-                [q.weight, q.scales, q.biases.expect("affine")]
-            };
-            self.qkeys = Some(triple(&k));
-            self.qvalues = Some(triple(&v));
+            self.qkeys = Some(quant.encode(&k));
+            self.qvalues = Some(quant.encode_values(&v));
         }
         self.quant = Some(quant);
     }
 
-    /// Whether the keys and values are quantized ([`quantize`](Self::quantize)).
+    /// Whether the keys and values are quantized ([`to_quantized`](Self::to_quantized)).
     pub fn is_quantized(&self) -> bool {
         self.quant.is_some()
     }
@@ -651,6 +785,61 @@ impl KvCache {
         if !on {
             self.steps = None;
         }
+    }
+
+    /// Makes the next forward verify a draft tree (or not, with `None`): its positions by
+    /// depth, its attention to ancestors. Attention layers only.
+    pub(crate) fn set_tree(&mut self, tree: Option<TreeMask>) {
+        self.tree = tree;
+    }
+
+    /// The entries of the tree positions `path` (indices into the `L` positions written
+    /// after `base` cached ones; `path[0] == 0`, the root), gathered from each buffer, for
+    /// [`keep_path`](Self::keep_path); none if the path is the first `path.len()` positions.
+    /// Evaluate them before `keep_path`, so it writes in place.
+    pub(crate) fn path_rows(&self, base: usize, path: &[usize]) -> Result<Vec<Array>> {
+        let invalid = |m: String| nuvec::Error::InvalidArgument(m);
+        if self.conv.is_some() || self.recurrent.is_some() {
+            return Err(invalid("draft trees need attention layers".into()));
+        }
+        let written = self.offset() - base;
+        if path.iter().any(|&p| p >= written) {
+            return Err(invalid(format!(
+                "a path of {path:?} over {written} positions"
+            )));
+        }
+        if path.iter().enumerate().all(|(j, &p)| p == j) {
+            return Ok(Vec::new());
+        }
+        let at = base as i32 - self.start;
+        let moved: Vec<i32> = path.iter().map(|&p| at + p as i32).collect();
+        let index = Array::from_slice(&moved, [path.len() as i32]);
+        let buffers = [&self.keys, &self.values].into_iter().flatten();
+        let quantized = [&self.qkeys, &self.qvalues].into_iter().flatten().flatten();
+        Ok(buffers
+            .chain(quantized)
+            .map(|a| ops::take(a, &index, 2))
+            .collect())
+    }
+
+    /// Keeps the tree positions `path` as positions `base..base + path.len()`, in order,
+    /// writing `rows` ([`path_rows`](Self::path_rows)), and forgets the others.
+    pub(crate) fn keep_path(&mut self, base: usize, path: &[usize], rows: Vec<Array>) {
+        let at = base as i32 - self.start;
+        let n = path.len() as i32;
+        let mut rows = rows.into_iter();
+        let mut write = |a: Array| match rows.next() {
+            // The cache's only handle: written in place.
+            Some(r) => a.at((.., .., at..at + n)).set(&r),
+            None => a,
+        };
+        for a in [&mut self.keys, &mut self.values] {
+            *a = a.take().map(&mut write);
+        }
+        for t in [&mut self.qkeys, &mut self.qvalues] {
+            *t = t.take().map(|t| t.map(&mut write));
+        }
+        self.offset = base as i32 + n;
     }
 
     /// Forgets the last `n` positions (rejected speculative tokens): later writes overwrite
@@ -763,6 +952,7 @@ impl KvCache {
                 .map(|t| t.each_ref().map(|a| a.i(i..i + 1))),
             quant: self.quant,
             auto: self.auto,
+            tree: None,
         }
     }
 
@@ -1030,7 +1220,13 @@ impl Attention {
         let at = shared.map_or(cache.offset, |(_, at)| at);
         // The query and key (written into the cache) normalised and rotated in one kernel.
         let q = self.input_scale(q.transpose(HEADS_FIRST));
-        let q = self.rope.norm_rope(&q, self.qk_norms().0, at, None);
+        let tree = cache.tree.clone();
+        let q = match &tree {
+            Some(t) => self
+                .rope
+                .norm_rope_tree(&q, self.qk_norms().0, &t.positions(at)),
+            None => self.rope.norm_rope(&q, self.qk_norms().0, at, None),
+        };
         let kv = match shared {
             Some((kv, _)) => {
                 cache.offset += l;
@@ -1056,13 +1252,30 @@ impl Attention {
             }
         };
         let scale = self.scale(q.dtype());
+        // A tree's mask holds the window.
+        let keys = match &kv {
+            Kv::Dense(k, _) => k.shape()[2],
+            Kv::Quantized(k, ..) => k[0].shape()[2],
+        };
+        let tree = tree.map(|t| t.mask(at, keys, self.window));
+        let (mask, window) = match &tree {
+            Some(m) => (AttentionMask::Array(m), None),
+            None => (mask, self.window),
+        };
         let o = match &kv {
             Kv::Dense(k, v) => {
-                fast::scaled_dot_product_attention(&q, k, v, scale, &self.options(mask))
+                let options = match &tree {
+                    Some(_) => fast::AttentionOptions::from(mask)
+                        .sinks(self.sinks.as_ref().map(Param::value)),
+                    None => self.options(mask),
+                };
+                fast::scaled_dot_product_attention(&q, k, v, scale, &options)
             }
             Kv::Quantized(k, v, quant) => {
                 let sinks = self.sinks.as_ref().map(Param::value);
-                let layer = (self.kv_heads, self.window, sinks);
+                let layer = (self.kv_heads, window, sinks);
+                // Rotated keys: `(Hq)·(Hk) = q·k`.
+                let q = quant.rotated(&q);
                 quantized_attention(&q, (k, v, *quant), scale, mask, layer)
             }
         };
@@ -1073,7 +1286,8 @@ impl Attention {
 /// Attention over quantized keys and values (`[B, kv_heads, S, ·]` triples): mlx-lm's
 /// `quantized_scaled_dot_product_attention` (scaled queries, `quantized_matmul` with
 /// the keys, the mask, a precise softmax, `quantized_matmul` with the values), with the
-/// layer's window and sinks, which mlx-lm refuses.
+/// layer's window and sinks, which mlx-lm refuses. One query row runs
+/// [`nuvec::fast::quantized_attention`] (except row-exact).
 #[track_caller]
 fn quantized_attention(
     q: &Array,
@@ -1084,6 +1298,17 @@ fn quantized_attention(
 ) -> Array {
     let [b, hq, l, d] = q.shape_n::<4>().unwrap_or_default();
     let (hkv, s) = (kv_heads, k[0].shape()[2]);
+    // One query row without a mask array: `fast::quantized_attention` (its kernel, or this
+    // composition where the kernel does not apply), over the window's keys. Row-exact
+    // decoding keeps the composition, whose rows equal a verification's.
+    if l == 1 && !matches!(mask, AttentionMask::Array(_)) && !nuvec::row_exact() {
+        let from = window.map_or(0, |w| (s - w).max(0));
+        let side = |t: &[Array; 3]| {
+            let [w, sc, bi] = t.each_ref().map(|a| a.i((.., .., from..)));
+            nuvec::Quantized::affine(w, sc, bi, quant.group_size, quant.bits)
+        };
+        return nuvec::fast::quantized_attention(q, &side(k), &side(v), scale, sinks);
+    }
     let rep = hq / hkv;
     let q = (q * scale).reshape([b, hkv, rep, l, d]);
     let weights = |t: &[Array; 3]| {
@@ -2676,6 +2901,14 @@ impl Model {
     }
 
     /// [`new_cache`](Self::new_cache) with `options`' KV quantization.
+    /// Whether every layer is an attention layer (no recurrent or convolution state).
+    pub(crate) fn attention_only(&self) -> bool {
+        self.model
+            .layers
+            .iter()
+            .all(|b| matches!(b.mixer, Mixer::Attention(_)))
+    }
+
     pub(crate) fn new_cache_for(&self, options: &crate::GenerateOptions) -> Result<Vec<KvCache>> {
         let mut cache = self.new_cache();
         if let Some(q) = options.kv_quant {
@@ -3270,6 +3503,7 @@ pub(crate) mod tests {
             bits: 8,
             group_size: 32,
             start: 0,
+            rotate: false,
         };
         let k = normal([b, hkv, s, d], DType::F32, 0.0, 1.0, &key(1));
         let v = normal([b, hkv, s, d], DType::F32, 0.0, 1.0, &key(2));
@@ -3329,6 +3563,56 @@ pub(crate) mod tests {
                 }
             }
         }
+        // A draft tree of 6 rows (root, two children, two grandchildren under the first, one
+        // under the second) over the quantized cache, as `Attention::forward_kv` passes it:
+        // the tree's mask (window folded in) and no window.
+        let l = 6;
+        let parents = [0usize, 0, 0, 1, 1, 2];
+        let mut depth = vec![0i32; l];
+        let mut ancestors = vec![false; l * l];
+        for i in 0..l {
+            let mut a = i;
+            loop {
+                ancestors[i * l + a] = true;
+                if a == 0 {
+                    break;
+                }
+                depth[i] += 1;
+                a = parents[a];
+            }
+        }
+        let tree = TreeMask::new(
+            Array::from_slice(&depth, [l as i32]),
+            Array::from_slice(&ancestors, [l as i32, l as i32]),
+            (s - l as i32) as usize,
+        );
+        let q = normal([b, hq, l as i32, d], DType::F32, 0.0, 1.0, &key(5));
+        for window in [None, Some(9)] {
+            for with_sinks in [false, true] {
+                let sinks = with_sinks.then_some(&sinks);
+                let mask = tree.mask(s - l as i32, s, window);
+                let got = quantized_attention(
+                    &q,
+                    (&kq, &vq, quant),
+                    0.125,
+                    AttentionMask::Array(&mask),
+                    (hkv, None, sinks),
+                );
+                let options =
+                    fast::AttentionOptions::from(AttentionMask::Array(&mask)).sinks(sinks);
+                let want = fast::scaled_dot_product_attention(&q, &kd, &vd, 0.125, &options);
+                let (g, w) = (got.to_vec::<f32>().unwrap(), want.to_vec::<f32>().unwrap());
+                let diff = g
+                    .iter()
+                    .zip(&w)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(
+                    diff < 1e-4,
+                    "tree, window {window:?} sinks {with_sinks}: {diff}"
+                );
+            }
+        }
     }
 
     /// The attention equals mlx-lm's `quantized_scaled_dot_product_attention` bit for bit on
@@ -3356,19 +3640,40 @@ pub(crate) mod tests {
                         bits,
                         group_size: 32,
                         start: 0,
+                        rotate: false,
                     };
                     let mask = if l > 1 {
                         AttentionMask::Causal
                     } else {
                         AttentionMask::None
                     };
-                    let got = quantized_attention(
-                        &get("q"),
-                        (&k, &v, quant),
-                        0.125,
-                        mask,
-                        (2, None, None),
+                    // mlx-lm's bits: the composition (one query row: row-exact); one query
+                    // row's kernel within float tolerance of them.
+                    let run = || {
+                        quantized_attention(
+                            &get("q"),
+                            (&k, &v, quant),
+                            0.125,
+                            mask,
+                            (2, None, None),
+                        )
+                    };
+                    let fused = run();
+                    let tol = if dt == "f32" { 1e-5 } else { 2e-2 };
+                    let (f, o) = (
+                        fused.astype(DType::F32).to_vec::<f32>().unwrap(),
+                        get("out").astype(DType::F32).to_vec::<f32>().unwrap(),
                     );
+                    let d = f
+                        .iter()
+                        .zip(&o)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0, f32::max);
+                    assert!(d < tol, "{tag}: fused {d} from mlx-lm");
+                    let got = match l {
+                        1 => nuvec::with_row_exact(run),
+                        _ => fused,
+                    };
                     let (g, w) = (
                         got.astype(DType::F32).to_vec::<f32>().unwrap(),
                         get("out").astype(DType::F32).to_vec::<f32>().unwrap(),
@@ -3389,6 +3694,34 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// Rotation takes head sizes with a Hadamard transform (`m · 2^k`, `m` in 1, 12, 20, 28).
+    #[test]
+    fn rotated_kv_quantization_checks_head_sizes() {
+        let quant = |group_size| KvQuant {
+            group_size,
+            rotate: true,
+            ..Default::default()
+        };
+        for d in [64, 128, 256, 96] {
+            assert!(quant(32).validate_heads([d, d]).is_ok(), "{d}");
+        }
+        assert!(quant(32).validate_heads([160, 160]).is_ok(), "20 · 8");
+        assert!(quant(32).validate_heads([224, 224]).is_ok(), "28 · 8");
+        assert!(
+            quant(32).validate_heads([288, 288]).is_err(),
+            "288 = 9 · 32"
+        );
+        assert!(
+            quant(64).validate_heads([96, 96]).is_err(),
+            "group 64 of 96"
+        );
+        let plain = KvQuant {
+            group_size: 32,
+            ..Default::default()
+        };
+        assert!(plain.validate_heads([288, 288]).is_ok());
     }
 
     #[test]

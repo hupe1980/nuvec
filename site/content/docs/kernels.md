@@ -28,6 +28,7 @@ The `fast` module exposes MLX's fused operations and a few of nuvec's own. Each 
 | `ssm_update(x, a_log, b, c, d, dt, state)` | Mamba-2's one-token state update (Granite 4's SSM layers), mlx-lm's kernel and bits |
 | `ssm_scan(x, a_log, b, c, d, dt, state)` | Mamba-2's prompt pass (mlx-lm's `ssm_attn`, the SSD scan in chunks of 256), mlx-lm's bits |
 | `causal_conv1d_slots(x, w, pool, slots, silu)` | A causal depthwise convolution (optionally `silu`) for a batch whose last inputs live at slots of a pool, updated in place |
+| `quantized_attention(q, k, v, scale, sinks)` | One query row's attention over affine-quantized keys and values (mlx-lm's quantized KV cache), dequantized in registers: 3, 4 or 8 bits, head sizes 64 and 128, 1–8 query heads per key head; other shapes run mlx-lm's composition |
 | `paged_attention(q, k_cache, v_cache, block_tables, lengths, scale, &options)` | Attention for a batch of sequences of different lengths over a KV cache stored in fixed-size blocks, with the same window and sinks |
 | `moe_route(probs, k, normalize)` | A mixture of experts' routing: each row's top-k experts (in `argpartition`'s order) and their probabilities, optionally renormalised |
 | `weighted_sum(x, w)` | The experts' outputs weighted and summed over the `k` experts |

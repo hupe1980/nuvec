@@ -717,21 +717,58 @@ mod metal {
         }
     }
 
-    /// How many of `m ≥ 2` row-exact rows the few-row kernel takes three at a time (the rest
-    /// in pairs). Measured on an M4 Pro (`just bench-rows`): three rows cost less per row
-    /// than two at 3, 6 and 8 bits, so they take as many triples as fit (a remainder of one
-    /// becomes two pairs); at 4 bits three rows cost two pairs (the unpacked codes spill), so
-    /// it takes pairs; the other widths take one triple for an odd count.
-    fn triple_rows(m: usize, bits: usize) -> usize {
+    /// How the few-row kernel takes `m ≥ 2` row-exact rows: groups of `(rows, r, s)` — `rows`
+    /// rows, `r` per threadgroup, `s` outputs per SIMD-group — in order. Measured on an M4 Pro
+    /// (`just bench-rows`, spec 115): at 8 bits three rows cost less per row than two (as
+    /// many triples as fit; a remainder of one becomes two pairs); at 3 and 6 bits triples
+    /// where `m` is a multiple of three, else fours (which share the codes' loads), then a
+    /// triple or a pair; at 4 bits pairs, and one triple at two outputs per SIMD-group for an
+    /// odd count (four outputs spill); the other widths pairs and one triple for an odd count.
+    fn row_groups(m: usize, bits: usize) -> Vec<(usize, usize, usize)> {
+        let mut groups = Vec::new();
+        let mut add = |rows: usize, r: usize, s: usize| {
+            if rows > 0 {
+                groups.push((rows, r, s));
+            }
+        };
         match bits {
-            3 | 6 | 8 => match m % 3 {
-                0 => m,
-                1 => m - 4,
-                _ => m - 2,
-            },
-            4 => 0,
-            _ => 3 * (m % 2),
+            8 => {
+                let threes = match m % 3 {
+                    0 => m,
+                    1 => m - 4,
+                    _ => m - 2,
+                };
+                add(threes, 3, 4);
+                add(m - threes, 2, 4);
+            }
+            3 | 6 if m.is_multiple_of(3) => add(m, 3, 4),
+            3 | 6 => {
+                let (fours, rest) = match m % 4 {
+                    1 => (m - 5, 5),
+                    r => (m - r, r),
+                };
+                add(fours, 4, 4);
+                match rest {
+                    5 => {
+                        add(3, 3, 4);
+                        add(2, 2, 4);
+                    }
+                    3 => add(3, 3, 4),
+                    r => add(r, 2, 4),
+                }
+            }
+            4 => {
+                let odd = m % 2;
+                add(3 * odd, 3, 2);
+                add(m - 3 * odd, 2, 4);
+            }
+            _ => {
+                let odd = m % 2;
+                add(3 * odd, 3, 4);
+                add(m - 3 * odd, 2, 4);
+            }
         }
+        groups
     }
 
     /// A matrix-vector kernel's block shape (MLX's choice in `gemv_axbpy`/`gemv`).
@@ -4377,6 +4414,18 @@ mod metal {
             if let FastOp::Hadamard { scale } = *op {
                 return self.hadamard(operands[0], &outputs[0], f32::from_bits(scale));
             }
+            if let FastOp::QuantizedAttention {
+                scale,
+                group_size,
+                bits,
+                sinks,
+            } = *op
+            {
+                let mut out = alloc(&outputs[0])?;
+                let options = (f32::from_bits(scale), group_size, bits, sinks);
+                self.quantized_attention(operands, options, &mut out)?;
+                return Ok(vec![Data::new(out)]);
+            }
             if let FastOp::PagedAttention {
                 scale,
                 window,
@@ -4622,6 +4671,7 @@ mod metal {
                 | FastOp::BlockMaskedMm { .. }
                 | FastOp::QuantizeDequantize { .. }
                 | FastOp::PagedAttention { .. }
+                | FastOp::QuantizedAttention { .. }
                 | FastOp::PagedWrite
                 | FastOp::MoeRoute { .. }
                 | FastOp::WeightedSum
@@ -4905,6 +4955,107 @@ mod metal {
             let buffer = Arc::get_mut(&mut base.buffer).expect("donated data has one handle");
             self.row_softmax("softmax", out.dtype, (rows, axis), None, causal, buffer)?;
             Ok(base)
+        }
+
+        /// [`crate::fast::FastOp::QuantizedAttention`]: the quantized first pass
+        /// (`sdpa_vector_q_2pass_1`, one SIMD-group per query head, MLX's key partitions)
+        /// and MLX's second.
+        fn quantized_attention(
+            &mut self,
+            operands: &[Operand<'_>],
+            (scale, group_size, bits, sinks): (f32, u32, u32, bool),
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            // Threads per threadgroup (the kernel's tile of keys).
+            const TG: usize = 128;
+            let q = self.packed(operands[0], true)?;
+            let (b, hq, d) = (q.shape[0], q.shape[1], q.shape[3]);
+            let (hkv, lk) = (operands[1].0.shape[1], operands[1].0.shape[2]);
+            let gqa = hq / hkv;
+            // Each (batch, key head) a whole stride apart, positions a stride apart, the
+            // last axis contiguous.
+            let ok = |m: &Output| {
+                m.strides[3] == 1
+                    && (m.shape[0] == 1
+                        || m.shape[1] == 1
+                        || m.strides[0] == m.strides[1] * m.shape[1] as isize)
+            };
+            let mut sides = Vec::with_capacity(2);
+            for at in [1, 4] {
+                let w = self.view_if(operands[at], ok(operands[at].0))?;
+                let same = operands[at + 1].0.strides == operands[at + 2].0.strides;
+                let s = self.view_if(operands[at + 1], same && ok(operands[at + 1].0))?;
+                let bi = self.view_if(operands[at + 2], same && ok(operands[at + 2].0))?;
+                sides.push((w, s, bi));
+            }
+            let head = |p: &Packed<'_>| match p.shape[1] {
+                1 => p.strides[0],
+                _ => p.strides[1],
+            } as i64;
+            let mut strides = [0i64; 8];
+            for (i, (w, s, _)) in sides.iter().enumerate() {
+                strides[4 * i..4 * i + 4].copy_from_slice(&[
+                    head(w),
+                    w.strides[2] as i64,
+                    head(s),
+                    s.strides[2] as i64,
+                ]);
+            }
+            let sinks = match sinks {
+                true => Some(self.packed(operands[7], true)?),
+                false => None,
+            };
+            // Key partitions (multiples of 32, as MLX's second pass reads them): 32 up to
+            // 8K keys, else about 512 threadgroups (M4 Pro, `just bench-kv-attention`).
+            let blocks = match lk {
+                ..=8192 => 32,
+                _ => (512 / (hkv * b).max(1)).next_power_of_two().clamp(32, 1024),
+            };
+            let rows = b * hq;
+            let dtype = operands[0].0.dtype;
+            let dtn = dtype.name();
+            let mut partial = Buffer::try_alloc_gpu(rows * blocks * d * dtype.size())?;
+            let mut sums = Buffer::try_alloc_gpu(rows * blocks * 4)?;
+            let mut maxs = Buffer::try_alloc_gpu(rows * blocks * 4)?;
+            let n = i32::try_from(lk)
+                .map_err(|_| Error::InvalidArgument("quantized_attention: too long".into()))?
+                .to_le_bytes();
+            let sc = scale.to_le_bytes();
+            {
+                let mut args = vec![q.arg()];
+                for (w, s, bi) in &sides {
+                    args.extend([w.arg(), s.arg(), bi.arg()]);
+                }
+                args.extend([
+                    Arg::write(partial.metal_mut().expect("device storage")),
+                    Arg::write(sums.metal_mut().expect("device storage")),
+                    Arg::write(maxs.metal_mut().expect("device storage")),
+                    Arg::bytes(&n),
+                    Arg::bytes(bytemuck::bytes_of(&strides)),
+                    Arg::bytes(&sc),
+                ]);
+                match &sinks {
+                    Some(s) => args.push(s.arg()),
+                    None => args.push(q.arg()),
+                }
+                let name = format!(
+                    "nuvec_sdpa_vector_q_2pass_1_{dtn}_{d}_b{bits}_gs{group_size}_g{gqa}{}",
+                    if sinks.is_some() { "_sinks" } else { "" }
+                );
+                let pipeline = self.pipeline(&name)?;
+                self.encode_groups(&pipeline, &args, [hkv, b, blocks], [TG, 1, 1])?;
+                self.counted()?;
+            }
+            let bl = (blocks as i32).to_le_bytes();
+            let args = [
+                Arg::read(partial.metal().expect("device storage")),
+                Arg::read(sums.metal().expect("device storage")),
+                Arg::read(maxs.metal().expect("device storage")),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(&bl),
+            ];
+            let name = format!("nuvec_sdpa_vector_2pass_2_{dtn}_{d}");
+            self.dispatch_groups(&name, &args, [b * hq, 1, 1], [1024, 1, 1])
         }
 
         /// [`crate::fast::FastOp::PagedAttention`]: one threadgroup of 32 SIMD-groups per
@@ -6914,19 +7065,21 @@ mod metal {
             }
             let fast = k % (pack_factor(bits, 32) * if bits == 2 { 1 } else { 2 } * 32) == 0;
             if transpose && fast && !batched && m >= 2 {
-                // nuvec's few-row kernel: weights loaded once for two or three rows, each
+                // nuvec's few-row kernel: weights loaded once for two to four rows, each
                 // with `qmv_fast`'s arithmetic (lanes: two cost about one).
                 drop(args);
-                let partial = u8::from(!n.is_multiple_of(8));
-                let threes = triple_rows(m, bits);
                 let size = out.dtype.size();
                 let Arg::Read(xb, xo) = x.arg() else {
                     unreachable!("an operand is read")
                 };
-                for (first, rows, r) in [(0, threes, 3), (threes, m - threes, 2)] {
-                    if rows == 0 {
-                        continue;
-                    }
+                let mut first = 0;
+                for (rows, r, sps) in row_groups(m, bits) {
+                    let partial = u8::from(!n.is_multiple_of(2 * sps));
+                    let suffix = if sps == 4 {
+                        String::new()
+                    } else {
+                        format!("_s{sps}")
+                    };
                     let rb = ints(rows);
                     let output = buffer.metal_mut().expect("device storage");
                     let args = [
@@ -6939,9 +7092,10 @@ mod metal {
                         Arg::bytes(&nb),
                         Arg::bytes(&rb),
                     ];
-                    let name = format!("nuvec_affine_qmv_rows_{base}_pr{partial}_r{r}");
-                    let grid = [rows.div_ceil(r), n.div_ceil(8), 1];
+                    let name = format!("nuvec_affine_qmv_rows_{base}_pr{partial}_r{r}{suffix}");
+                    let grid = [rows.div_ceil(r), n.div_ceil(2 * sps), 1];
                     self.dispatch_groups(&name, &args, grid, [32, 2, 1])?;
+                    first += rows;
                 }
                 return Ok(());
             }
@@ -8106,6 +8260,28 @@ mod metal {
     mod tests {
         use super::*;
         use crate::Array;
+
+        /// Every row plan covers its rows in order, in groups the kernels are built for.
+        #[test]
+        fn row_groups_cover_the_rows() {
+            for bits in [1, 2, 3, 4, 5, 6, 8] {
+                for m in 2..=32 {
+                    let groups = row_groups(m, bits);
+                    let total: usize = groups.iter().map(|g| g.0).sum();
+                    assert_eq!(total, m, "{bits} bits, {m} rows: {groups:?}");
+                    for &(rows, r, s) in &groups {
+                        assert!(rows > 0 && rows.is_multiple_of(r), "{bits}/{m}: {groups:?}");
+                        let built = match (r, s) {
+                            (2 | 3, 4) => true,
+                            (4, 4) => matches!(bits, 3 | 6),
+                            (3, 2) => bits == 4,
+                            _ => false,
+                        };
+                        assert!(built, "{bits} bits, {m} rows: ({r}, {s}) not built");
+                    }
+                }
+            }
+        }
 
         /// A GPU failure fails the evaluation that encoded into the failed command buffer,
         /// and nothing independent of it.

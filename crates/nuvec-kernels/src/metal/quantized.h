@@ -1904,13 +1904,44 @@ template <typename T, int group_size, int bits, int WK, int BN, int TM>
   }
 }
 
+// `qdot`'s terms for 3 and 6 bits, decoded once for several input rows: `c[j]` is term
+// `j`'s masked code (as `qdot` reads it) and `xi[j]`, `hi[j]` its input value and whether
+// that value is taken times 256 (a code split over two bytes); `qdot_terms` adds them in
+// `qdot`'s order, so a row's sum has `qdot`'s bits.
+template <int bits>
+struct QdotTerms;
+
+template <>
+struct QdotTerms<3> {
+  // Per 3 bytes (8 values): byte, mask, input value, times 256.
+  static constant constexpr int n = 10;
+  static constant constexpr int per = 8;
+  static constant constexpr int bytes = 3;
+  static constant constexpr uchar byte[n] = {0, 0, 0, 1, 1, 1, 1, 2, 2, 2};
+  static constant constexpr uchar mask[n] = {0x07, 0x38, 0xc0, 0x01, 0x0e, 0x70, 0x80, 0x03, 0x1c, 0xe0};
+  static constant constexpr uchar xi[n] = {0, 1, 2, 2, 3, 4, 5, 5, 6, 7};
+  static constant constexpr bool hi[n] = {false, false, false, true, false, false, false, true, false, false};
+};
+
+template <>
+struct QdotTerms<6> {
+  // Per 3 bytes (4 values).
+  static constant constexpr int n = 6;
+  static constant constexpr int per = 4;
+  static constant constexpr int bytes = 3;
+  static constant constexpr uchar byte[n] = {0, 0, 1, 1, 2, 2};
+  static constant constexpr uchar mask[n] = {0x3f, 0xc0, 0x0f, 0xf0, 0x03, 0xfc};
+  static constant constexpr uchar xi[n] = {0, 1, 1, 2, 2, 3};
+  static constant constexpr bool hi[n] = {false, false, true, false, true, false};
+};
+
 // nuvec's own: `qmv_fast` over `R` input rows. Each thread loads a weight row's codes once
 // and applies them to every input row; for 4 bits it unpacks them once with `qdot`'s
 // expression, for the other widths it applies `qdot` itself per row (the codes then come
 // from the thread's cache). `qmv_fast` reloads them per row, which bounds few-row
 // products. Each row's result equals `qmv_fast`'s bit for bit (tested). Rows past `m`
 // repeat the last row and are not stored.
-template <typename T, int group_size, int bits, bool partial_rows, int R>
+template <typename T, int group_size, int bits, bool partial_rows, int R, int RPS = 4>
 [[kernel]] void affine_qmv_rows(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -1926,7 +1957,7 @@ template <typename T, int group_size, int bits, bool partial_rows, int R>
   // As `qmv_fast_impl`.
   constexpr int packs_per_thread = bits <= 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = RPS;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
   constexpr int values_per_thread = pack_factor * packs_per_thread;
@@ -2006,6 +2037,33 @@ template <typename T, int group_size, int bits, bool partial_rows, int R>
                  x_thread[r][4 * i + 1] * q[4 * i + 1] +
                  x_thread[r][4 * i + 2] * q[4 * i + 2] +
                  x_thread[r][4 * i + 3] * q[4 * i + 3]);
+          }
+          result[r][row] += s * accum + sum[r] * b;
+        }
+      } else if constexpr ((bits == 3 || bits == 6) && R <= 3) {
+        // The codes decoded once (`qdot`'s terms), then each row in `qdot`'s order (up to
+        // three rows: four spill).
+        using Q = QdotTerms<bits>;
+        constexpr int packs = values_per_thread / Q::per;
+        auto wl = (const device uint8_t*)(ws + src * in_vec_size_w);
+        U c[packs][Q::n];
+#pragma clang loop unroll(full)
+        for (int i = 0; i < packs; i++) {
+#pragma clang loop unroll(full)
+          for (int j = 0; j < Q::n; j++) {
+            c[i][j] = wl[Q::bytes * i + Q::byte[j]] & Q::mask[j];
+          }
+        }
+#pragma clang loop unroll(full)
+        for (int r = 0; r < R; r++) {
+          U accum = 0;
+#pragma clang loop unroll(full)
+          for (int i = 0; i < packs; i++) {
+#pragma clang loop unroll(full)
+            for (int j = 0; j < Q::n; j++) {
+              const U xv = x_thread[r][Q::per * i + Q::xi[j]];
+              accum += c[i][j] * (Q::hi[j] ? xv * 256.0f : xv);
+            }
           }
           result[r][row] += s * accum + sum[r] * b;
         }

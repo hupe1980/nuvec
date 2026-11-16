@@ -97,7 +97,7 @@ pub use paged::{PagedCache, SeqId, decode_batch};
 pub use pipeline::{Split, Stage, load_model_pipelined, load_model_sharded};
 pub use sample::Sampler;
 pub use speculative::{
-    Auto, Draft, DraftPolicy, Drafter, MtpDrafter, PromptLookup, SpeculativeGeneration,
+    Auto, Candidates, Draft, DraftPolicy, Drafter, MtpDrafter, PromptLookup, SpeculativeGeneration,
     SpeculativeStats, SuffixDecoding, speculative_generate, verify_rows,
 };
 pub use stop::{Stop, Stopped, TextStream};

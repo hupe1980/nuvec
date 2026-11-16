@@ -1913,3 +1913,142 @@ fn global_scales_are_validated_and_carried() {
         });
     }
 }
+
+/// `fast::quantized_attention` over a quantized cache equals attention over the dequantized
+/// cache (one query row: the kernel; several rows and the CPU: mlx-lm's composition), with
+/// grouped heads, sinks, and cache views (capacity beyond the keys, as a KV cache's).
+#[test]
+fn quantized_attention_equals_the_dequantized_attention() {
+    let Some(()) = common::require_gpu() else {
+        return;
+    };
+    let mut rng = Rng::new(17);
+    for device in [Device::gpu(0), Device::cpu()] {
+        set_default_stream(Stream::default_for(device));
+        for (dtype, tol) in [(DType::F32, 2e-5), (DType::F16, 5e-3), (DType::BF16, 3e-2)] {
+            for (d, bits, gs) in [
+                (128, 8, 64),
+                (128, 4, 64),
+                (64, 8, 32),
+                (128, 4, 128),
+                (64, 4, 64),
+                (128, 3, 64),
+                (64, 3, 32),
+                (128, 3, 128),
+            ] {
+                for (hq, hkv, s, l, sinks) in [
+                    (4, 1, 1, 1, false),
+                    (8, 2, 37, 1, true),
+                    (32, 8, 300, 1, false),
+                    (4, 4, 2100, 1, true),
+                    (8, 2, 37, 3, false),
+                    (16, 2, 9000, 1, true),
+                    (8, 1, 777, 1, false),
+                ] {
+                    // The CPU runs the composition: its short cases suffice.
+                    if device == Device::cpu() && s > 300 {
+                        continue;
+                    }
+                    let cap = s + 50;
+                    let k = random(&mut rng, &[1, hkv, cap, d], dtype);
+                    let v = random(&mut rng, &[1, hkv, cap, d], dtype);
+                    let q = random(&mut rng, &[1, hq, l, d], dtype);
+                    let sink = sinks.then(|| random(&mut rng, &[hq], dtype));
+                    let (kq, vq) = (aq(&k, gs, bits), aq(&v, gs, bits));
+                    let view = |t: &Quantized| {
+                        let cut = |a: &Array| a.i((.., .., ..s));
+                        Quantized::affine(
+                            cut(&t.weight),
+                            cut(&t.scales),
+                            cut(t.biases.as_ref().unwrap()),
+                            gs,
+                            bits,
+                        )
+                    };
+                    let (kv, vv) = (view(&kq), view(&vq));
+                    let scale = 1.0 / (d as f32).sqrt();
+                    let got = fast::quantized_attention(&q, &kv, &vv, scale, sink.as_ref());
+                    let dense = |t: &Quantized| t.dequantize(DType::F32);
+                    let (kd, vd) = (dense(&kv), dense(&vv));
+                    let options = fast::AttentionOptions::default();
+                    let sink32 = sink.as_ref().map(|x| x.astype(DType::F32));
+                    let want = fast::scaled_dot_product_attention(
+                        &q.astype(DType::F32),
+                        &kd,
+                        &vd,
+                        scale,
+                        &options.sinks(sink32.as_ref()),
+                    );
+                    let name = format!(
+                        "{device:?} {dtype:?} d{d} b{bits} gs{gs} hq{hq} hkv{hkv} s{s} l{l} sinks {sinks}"
+                    );
+                    assert_close(&name, &got.astype(DType::F32), &want, tol);
+                }
+            }
+        }
+    }
+    set_default_stream(Stream::default_for(Device::gpu(0)));
+}
+
+/// `fast::quantized_attention`'s derivatives (queries, scales, biases, sinks) equal those of
+/// attention over the dequantized cache, on the GPU (the kernel's forward) and the CPU.
+#[test]
+fn quantized_attention_gradients_match_the_dequantized_attention() {
+    let Some(()) = common::require_gpu() else {
+        return;
+    };
+    let mut rng = Rng::new(23);
+    let (hq, hkv, s, d, gs, bits) = (8, 2, 300, 64, 32, 8);
+    let k = random(&mut rng, &[1, hkv, s, d], DType::F32);
+    let v = random(&mut rng, &[1, hkv, s, d], DType::F32);
+    let (kq, vq) = (aq(&k, gs, bits), aq(&v, gs, bits));
+    let (kw, vw) = (kq.weight.clone(), vq.weight.clone());
+    let xs = vec![
+        random(&mut rng, &[1, hq, 1, d], DType::F32),
+        kq.scales.clone(),
+        kq.biases.clone().unwrap(),
+        vq.scales.clone(),
+        vq.biases.clone().unwrap(),
+        random(&mut rng, &[hq], DType::F32),
+    ];
+    let g = random(&mut rng, &[1, hq, 1, d], DType::F32);
+    let scale = 0.125;
+    for device in [Device::gpu(0), Device::cpu()] {
+        set_default_stream(Stream::default_for(device));
+        let fused = |xs: &[Array]| -> Result<Vec<Array>> {
+            let kq = qw(&kw, &xs[1], &xs[2], gs, bits);
+            let vq = qw(&vw, &xs[3], &xs[4], gs, bits);
+            Ok(vec![fast::quantized_attention(
+                &xs[0],
+                &kq,
+                &vq,
+                scale,
+                Some(&xs[5]),
+            )])
+        };
+        let reference = |xs: &[Array]| -> Result<Vec<Array>> {
+            let kd = qw(&kw, &xs[1], &xs[2], gs, bits).dequantize(DType::F32);
+            let vd = qw(&vw, &xs[3], &xs[4], gs, bits).dequantize(DType::F32);
+            let options = fast::AttentionOptions::default();
+            Ok(vec![fast::scaled_dot_product_attention(
+                &xs[0],
+                &kd,
+                &vd,
+                scale,
+                &options.sinks(Some(&xs[5])),
+            )])
+        };
+        let (got_out, got) = vjp_flat(fused, &xs, std::slice::from_ref(&g)).unwrap();
+        let (want_out, want) = vjp_flat(reference, &xs, std::slice::from_ref(&g)).unwrap();
+        assert_close(
+            &format!("{device:?} value"),
+            &got_out[0],
+            &want_out[0],
+            1e-5,
+        );
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_close(&format!("{device:?} gradient {i}"), a, b, 1e-4);
+        }
+    }
+    set_default_stream(Stream::default_for(Device::gpu(0)));
+}

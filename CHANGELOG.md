@@ -6,6 +6,25 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Draft trees (DDTree) for DFlash drafters on attention-only models: the most likely
+  prefixes verified in one pass, the accepted path kept (`DraftPolicy::Tree`).
+- DSpark drafters (`Qwen3DSparkModel`, e.g. `deepseek-ai/dspark_qwen3_8b_block7`) through
+  `DFlashDrafter`, with their confidences (`last_confidence`).
+- `fast::quantized_attention`: decoding over a quantized KV cache in one kernel, 1.56×
+  mlx-lm's decode speed on Qwen3-8B at 38K tokens with an 8-bit cache.
+- `KvQuant::rotate`: Hadamard-rotated keys; 3-bit caches at 1.16× bf16's perplexity
+  (unrotated 1.87×). The `perplexity` example scores a text through a cache format.
+
+### Changed
+
+- `DraftPolicy::Auto` with DFlash and MTP drafters times plain decoding, chains and trees
+  and keeps the fastest.
+- Row-exact products of 3 to 8 rows: groups of four at 3 and 6 bits, a triple at 4 bits,
+  and 3- and 6-bit codes decoded once per weight row (4-bit 3 rows 1.24× → 1.02× MLX).
+- `KvCache::quantize` is `KvCache::to_quantized` (mlx-lm's name; not `Array::quantize`).
+
 ## [0.13.0] - 2026-11-15
 
 ### Added

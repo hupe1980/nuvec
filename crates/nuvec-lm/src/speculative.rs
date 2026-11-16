@@ -1,7 +1,9 @@
 //! Speculative decoding: a drafter proposes the next tokens, one forward pass verifies them
 //! all, and the longest prefix the model agrees with is kept, plus the model's own next
 //! token. Verifying several tokens in one pass costs much less than generating them one by
-//! one, so every accepted draft token saves most of a step.
+//! one, so every accepted draft token saves most of a step. A block drafter's candidates
+//! can be verified as a draft tree (DDTree): each position's top tokens, the most likely
+//! prefixes in one pass with an ancestor mask.
 //!
 //! Verification routes products as MLX's, so greedy output can differ from plain greedy
 //! decoding's in low bits (and, at a near tie, in a token), as mlx-lm's. With
@@ -12,8 +14,8 @@
 //! is batch 1 on the contiguous cache; the [`Batcher`](crate::Batcher) and paged caches
 //! decode without it.
 //!
-//! Drafters: [`DFlashDrafter`](crate::DFlashDrafter) (a block-diffusion drafter over the
-//! model's hidden states), [`PromptLookup`] (n-grams of the context, no model),
+//! Drafters: [`DFlashDrafter`](crate::DFlashDrafter) (DFlash and DSpark block drafters over
+//! the model's hidden states), [`PromptLookup`] (n-grams of the context, no model),
 //! [`MtpDrafter`] (the model's own multi-token-prediction head, Qwen 3.5–3.8) and
 //! [`SuffixDecoding`] (a suffix index over the prompt and earlier outputs).
 
@@ -24,6 +26,11 @@ use crate::model::{KvCache, Model};
 use crate::stop::StopState;
 
 pub use crate::suffix::SuffixDecoding;
+pub use tree::Candidates;
+pub(crate) use tree::top_k;
+
+mod modes;
+mod tree;
 
 /// Draft tokens, `[n]` (uint32): on the device for model drafters, built on the host for
 /// the others.
@@ -101,6 +108,19 @@ pub trait Drafter {
             break_even: 0.5,
         }
     }
+
+    /// The best `k` tokens at each of `depth` positions after `context`, for a draft tree
+    /// ([`DraftPolicy::Auto`], [`DraftPolicy::Tree`]); `None` (the default) drafts a chain.
+    fn candidates(
+        &mut self,
+        model: &Model,
+        context: &[u32],
+        depth: usize,
+        k: usize,
+    ) -> Result<Option<Candidates>> {
+        let _ = (model, context, depth, k);
+        Ok(None)
+    }
 }
 
 /// [`DraftPolicy::Auto`]'s setting for a drafter and model: the draft length, and the
@@ -117,6 +137,16 @@ pub struct Auto {
 impl<D: Drafter + ?Sized> Drafter for &mut D {
     fn draft(&mut self, model: &Model, context: &[u32], max: usize) -> Result<Draft> {
         (**self).draft(model, context, max)
+    }
+
+    fn candidates(
+        &mut self,
+        model: &Model,
+        context: &[u32],
+        depth: usize,
+        k: usize,
+    ) -> Result<Option<Candidates>> {
+        (**self).candidates(model, context, depth, k)
     }
 
     fn observe(&mut self, model: &Model, tokens: &Array, hidden: Option<&Array>) -> Result<()> {
@@ -139,6 +169,16 @@ impl<D: Drafter + ?Sized> Drafter for &mut D {
 impl<D: Drafter + ?Sized> Drafter for Box<D> {
     fn draft(&mut self, model: &Model, context: &[u32], max: usize) -> Result<Draft> {
         (**self).draft(model, context, max)
+    }
+
+    fn candidates(
+        &mut self,
+        model: &Model,
+        context: &[u32],
+        depth: usize,
+        k: usize,
+    ) -> Result<Option<Candidates>> {
+        (**self).candidates(model, context, depth, k)
     }
 
     fn observe(&mut self, model: &Model, tokens: &Array, hidden: Option<&Array>) -> Result<()> {
@@ -298,12 +338,23 @@ impl Drafter for MtpDrafter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum DraftPolicy {
-    /// The drafter's measured length for the model ([`Drafter::auto`]) with a kill
-    /// switch: when the mean of accepted tokens over the last 16 verifications falls below
-    /// the break-even, the next 64 tokens are decoded plainly (pipelined), then drafting
-    /// resumes. So drafting never costs much on text it cannot predict.
+    /// The drafter's measured length for the model ([`Drafter::auto`]), never slower
+    /// than plain decoding by much:
+    ///
+    /// - Model drafters ([`Drafter::needs_hidden`]: DFlash, MTP) time plain decoding,
+    ///   chains and, where they apply, draft trees, and keep the fastest (probing the
+    ///   others now and then, less often the more they lose). Trees apply with a drafter
+    ///   that gives [candidates](Drafter::candidates), an attention-only model and without
+    ///   [`GenerateOptions::row_exact`]: the most likely prefixes of the drafter's
+    ///   positions, as many as maximise the expected tokens per measured time.
+    /// - Other drafters use a kill switch: when the mean of accepted tokens over the last
+    ///   16 verifications falls below the drafter's break-even, the next 64 tokens are
+    ///   decoded plainly (pipelined), then drafting resumes.
     #[default]
     Auto,
+    /// A draft tree of up to this many nodes every step, where [`DraftPolicy::Auto`] would
+    /// draft a tree; a chain of this many otherwise (A/B measurements).
+    Tree(usize),
     /// Up to this many, every step (A/B measurements).
     Fixed(usize),
     /// Up to this many, pausing after rejected drafts: after a draft with nothing
@@ -348,11 +399,12 @@ pub struct SpeculativeStats {
     pub steps: usize,
     /// Verification passes (steps with a draft).
     pub verifies: usize,
-    /// Draft tokens proposed.
+    /// Draft tokens proposed (tree nodes for draft trees).
     pub drafted: usize,
     /// Draft tokens accepted.
     pub accepted: usize,
-    /// Times [`DraftPolicy::Auto`]'s kill switch paused drafting.
+    /// Times [`DraftPolicy::Auto`]'s kill switch paused drafting (drafters without
+    /// hidden states).
     pub pauses: usize,
 }
 
@@ -419,6 +471,13 @@ pub struct SpeculativeGeneration<'a, D: Drafter> {
     keys: Keys,
     /// The prompt's length (`context` starts with it).
     prompt: usize,
+    /// Measured verification times of draft trees per row count.
+    costs: tree::Costs,
+    /// [`DraftPolicy::Auto`]'s timed choice for model drafters: plain, chains or trees.
+    modes: modes::Modes,
+    /// Moving averages of a tree's accepted tokens and of its expected ones (the drafter's
+    /// probabilities), whose ratio calibrates the expectation.
+    calibration: (f64, f64),
     stops: StopState,
     finished: Option<FinishReason>,
     _wired: WiredLimit,
@@ -487,6 +546,9 @@ pub fn speculative_generate<'a, D: Drafter>(
         start += n;
     }
     let keys = Keys::new(options.seed);
+    let modes = modes::Modes::new(
+        policy == DraftPolicy::Auto && !options.row_exact && model.attention_only(),
+    );
     Ok(SpeculativeGeneration {
         model,
         drafter,
@@ -505,6 +567,9 @@ pub fn speculative_generate<'a, D: Drafter>(
         probed: None,
         keys,
         prompt: prompt.len(),
+        costs: tree::Costs::default(),
+        modes,
+        calibration: (1.0, 1.0),
         stops: StopState::default(),
         finished: None,
         _wired: wired,
@@ -516,7 +581,7 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
     fn draft_len(&self) -> usize {
         match self.policy {
             DraftPolicy::Auto => self.auto.len,
-            DraftPolicy::Fixed(n) | DraftPolicy::Adaptive(n) => n,
+            DraftPolicy::Fixed(n) | DraftPolicy::Adaptive(n) | DraftPolicy::Tree(n) => n,
         }
     }
 
@@ -585,8 +650,8 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             self.pause.0 -= 1;
             self.draft_due = false;
         } else if self.drafter.needs_hidden() {
-            // Model drafters always have a draft.
-            self.draft_due = true;
+            // Model drafters always have a draft, unless plain decoding is timed faster.
+            self.draft_due = !(self.timed() && self.modes.mode() == modes::Mode::Plain);
         } else {
             let d = self
                 .drafter
@@ -666,18 +731,195 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
                     _ => (0, 1),
                 };
             }
-            DraftPolicy::Auto => {
+            DraftPolicy::Auto if !self.timed() => {
                 if self.switch.record(accepted, self.auto.break_even) {
                     self.pause.0 = PAUSE;
                     self.stats.pauses += 1;
                 }
             }
-            DraftPolicy::Fixed(_) => {}
+            DraftPolicy::Auto => {}
+            DraftPolicy::Fixed(_) | DraftPolicy::Tree(_) => {}
         }
         self.draft_due = self.pause.0 == 0;
         self.context.extend(new);
         self.pending.extend(new);
         Ok(())
+    }
+
+    /// Whether [`DraftPolicy::Auto`] times plain decoding, chains and trees (model drafters)
+    /// instead of its kill switch.
+    fn timed(&self) -> bool {
+        self.policy == DraftPolicy::Auto && self.drafter.needs_hidden()
+    }
+
+    /// Whether this step drafts a tree: by policy, without `row_exact` (masked keys change
+    /// the attention's reduction order), on attention-only models.
+    fn tree_due(&self) -> bool {
+        matches!(self.policy, DraftPolicy::Auto | DraftPolicy::Tree(_))
+            && !self.options.row_exact
+            && self.model.attention_only()
+    }
+
+    /// The candidates for a tree of at most `nodes` nodes `depth` deep, if the drafter
+    /// gives them.
+    fn tree_draft(&mut self, depth: usize, nodes: usize) -> Result<Option<Vec<tree::Node>>> {
+        let k = nodes.min(16);
+        let start = std::time::Instant::now();
+        let Some(c) = self
+            .drafter
+            .candidates(self.model, &self.context, depth, k)?
+        else {
+            return Ok(None);
+        };
+        let [d, k] = c.tokens.shape_n::<2>()?;
+        eval(&[&c.tokens, &c.logprobs])?;
+        self.costs.record_draft(start.elapsed().as_secs_f64());
+        let tokens = c.tokens.to_vec::<u32>()?;
+        let logprobs = c.logprobs.astype(nuvec::DType::F32).to_vec::<f32>()?;
+        let mut nodes = tree::build(&tokens, &logprobs, d as usize, k as usize, nodes);
+        if self.policy == DraftPolicy::Auto {
+            let calibration = (self.calibration.0 / self.calibration.1).clamp(0.25, 2.0);
+            nodes.truncate(tree::size(&nodes, calibration, &self.costs));
+        }
+        Ok(Some(nodes))
+    }
+
+    /// Each tree row's token from `logits` (`[1, L, vocab]`), row `r` the
+    /// `first + depth[r]`-th generated: the argmax, or a sample of the filtered distribution
+    /// (lossless: every emitted token is a sample given its path).
+    fn tree_choices(&mut self, logits: &Array, depth: &[i32]) -> Result<Array> {
+        let l = depth.len();
+        let rows = logits.reshape([l as i32, -1]);
+        let first = self.generated() + 1;
+        let rows = match first <= self.options.min_tokens {
+            false => rows,
+            true => {
+                let eos = &self.model.config.eos_token_ids;
+                let masked: Vec<Array> = (0..l)
+                    .map(|r| {
+                        let n = first + depth[r] as usize;
+                        self.options.mask(rows.i(r as i32..r as i32 + 1), eos, n)
+                    })
+                    .collect();
+                ops::concatenate(&masked, 0)
+            }
+        };
+        let sampler = self.options.sampler;
+        let chosen = match sampler.temperature {
+            0.0 => rows.argmax(-1),
+            _ => {
+                let logprobs = rows.subtract(rows.logsumexp_keepdims(-1));
+                let key = self.keys.next()?;
+                sampler.sample_with(&logprobs, key.as_ref())?
+            }
+        };
+        Ok(chosen.astype(nuvec::DType::U32))
+    }
+
+    /// One verification of a draft tree: the last token and the nodes through the model with
+    /// the tree's positions and mask; the accepted path and the model's next token become
+    /// pending, and the caches keep the path.
+    fn verify_tree(&mut self, nodes: &[tree::Node]) -> Result<()> {
+        let last = *self.context.last().expect("never empty");
+        let l = nodes.len() + 1;
+        let mut tokens = vec![last];
+        tokens.extend(nodes.iter().map(|n| n.token));
+        let mut depth = vec![0i32];
+        depth.extend(nodes.iter().map(|n| n.depth as i32));
+        // Row i: itself and its ancestors (node j is row j).
+        let mut ancestors = vec![false; l * l];
+        for i in 0..l {
+            let mut a = i;
+            loop {
+                ancestors[i * l + a] = true;
+                if a == 0 {
+                    break;
+                }
+                a = nodes[a - 1].parent;
+            }
+        }
+        let base = self.cache.first().map_or(0, KvCache::offset);
+        let mask = crate::model::TreeMask::new(
+            Array::from_slice(&depth, [l as i32]),
+            Array::from_slice(&ancestors, [l as i32, l as i32]),
+            base,
+        );
+        for cache in &mut self.cache {
+            cache.set_tree(Some(mask.clone()));
+        }
+        let start = std::time::Instant::now();
+        let input = Array::from_slice(&tokens, [1, l as i32]);
+        let (logits, hidden) = forward_for(self.model, &self.drafter, &input, &mut self.cache);
+        for cache in &mut self.cache {
+            cache.set_tree(None);
+        }
+        let chosen = self.tree_choices(&logits, &depth)?;
+        drop(logits);
+        // The hidden states with the choices, so that no graph holds the caches when the
+        // path is written into them (in place).
+        eval(&[&chosen, &hidden])?;
+        self.costs.record(l, start.elapsed().as_secs_f64());
+        let chosen = chosen.to_vec::<u32>()?;
+        // The walk: from the root, into the child holding the model's token.
+        let mut path = vec![0usize];
+        loop {
+            let at = *path.last().expect("the root");
+            let next = (1..l).find(|&j| nodes[j - 1].parent == at && tokens[j] == chosen[at]);
+            match next {
+                Some(j) => path.push(j),
+                None => break,
+            }
+        }
+        let accepted = path.len() - 1;
+        let next = chosen[*path.last().expect("the root")];
+        let index = Array::from_slice(
+            &path.iter().map(|&j| j as i32).collect::<Vec<_>>(),
+            [path.len() as i32],
+        );
+        let hidden = ops::take(&hidden, &index, 1);
+        let rows = self
+            .cache
+            .iter()
+            .map(|c| c.path_rows(base, &path))
+            .collect::<Result<Vec<_>>>()?;
+        eval(&rows.iter().flatten().chain([&hidden]).collect::<Vec<_>>())?;
+        for (cache, rows) in self.cache.iter_mut().zip(rows) {
+            cache.keep_path(base, &path, rows);
+        }
+        let mut new: Vec<u32> = path[1..].iter().map(|&j| tokens[j]).collect();
+        new.push(next);
+        let observed = Array::from_slice(&new, [new.len() as i32]);
+        self.drafter.observe(self.model, &observed, Some(&hidden))?;
+        let expected: f64 = nodes.iter().map(|n| f64::from(n.score).exp()).sum();
+        let ema = |old: f64, new: f64| 0.9 * old + 0.1 * new;
+        self.calibration = (
+            ema(self.calibration.0, accepted as f64),
+            ema(self.calibration.1, expected.max(1e-3)),
+        );
+        self.stats.steps += 1;
+        self.stats.verifies += 1;
+        self.stats.drafted += nodes.len();
+        self.stats.accepted += accepted;
+        if self.policy == DraftPolicy::Auto
+            && !self.timed()
+            && self.switch.record(accepted, self.auto.break_even)
+        {
+            self.pause.0 = PAUSE;
+            self.stats.pauses += 1;
+        }
+        self.draft_due = self.pause.0 == 0;
+        self.context.extend(&new);
+        self.pending.extend(&new);
+        Ok(())
+    }
+
+    /// A step without a draft (pipelined), then its token.
+    fn plain_step(&mut self) -> Result<u32> {
+        let last = Array::from_slice(&[*self.context.last().expect("never empty")], [1]);
+        let n = self.generated() + 1;
+        self.inflight = Some(self.submit(&last, n)?);
+        self.draft_due = false;
+        self.advance()
     }
 
     /// The next token: pending from a verification, read from the pipeline, or from a new
@@ -688,6 +930,7 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         }
         let more = self.produced + 1 < self.options.max_tokens;
         if let Some(y) = self.inflight.take() {
+            let start = std::time::Instant::now();
             // Keep the pipeline going (submit the following step, then read this token)
             // unless a draft is due.
             if !self.draft_due && more {
@@ -697,6 +940,9 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             }
             let t = y.item::<u32>()?;
             self.context.push(t);
+            if self.timed() && self.modes.mode() == modes::Mode::Plain {
+                self.modes.record(1, start.elapsed().as_secs_f64());
+            }
             self.after_plain_token()?;
             return Ok(t);
         }
@@ -706,6 +952,40 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             .min(verify_rows(self.model, self.options.row_exact) - 1)
             .min(left.saturating_sub(1));
         let probed = self.probed.take();
+        let start = std::time::Instant::now();
+        let timed = self.pause.0 == 0 && max > 0 && probed.is_none() && self.timed();
+        if timed && self.modes.mode() == modes::Mode::Plain {
+            return self.plain_step();
+        }
+        let tree_due = match timed {
+            true => self.modes.mode() == modes::Mode::Tree,
+            false => self.tree_due(),
+        };
+        if self.pause.0 == 0 && max > 0 && probed.is_none() && tree_due {
+            // Depth is capped by the tokens left (`max`); a node count is not.
+            let nodes = verify_rows(self.model, false) - 1;
+            let depth = match self.policy {
+                DraftPolicy::Tree(_) => max,
+                _ => self.auto.len.min(max).max(1),
+            };
+            let nodes = match self.policy {
+                DraftPolicy::Tree(n) => n.min(nodes),
+                _ => nodes,
+            };
+            match self.tree_draft(depth, nodes)? {
+                Some(tree) if tree.is_empty() => return self.plain_step(),
+                Some(tree) => {
+                    self.verify_tree(&tree)?;
+                    if timed {
+                        self.modes
+                            .record(self.pending.len(), start.elapsed().as_secs_f64());
+                    }
+                    return Ok(self.pending.pop_front().expect("verification adds a token"));
+                }
+                None if timed => self.modes.without_trees(),
+                None => {}
+            }
+        }
         let draft = match self.pause.0 {
             0 if max > 0 => {
                 let d = match probed {
@@ -720,13 +1000,13 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             _ => Draft::empty(),
         };
         if draft.is_empty() {
-            let last = Array::from_slice(&[*self.context.last().expect("never empty")], [1]);
-            let n = self.generated() + 1;
-            self.inflight = Some(self.submit(&last, n)?);
-            self.draft_due = false;
-            return self.advance();
+            return self.plain_step();
         }
         self.verify(draft)?;
+        if timed {
+            self.modes
+                .record(self.pending.len(), start.elapsed().as_secs_f64());
+        }
         Ok(self.pending.pop_front().expect("verification adds a token"))
     }
 }
@@ -817,5 +1097,139 @@ mod tests {
             min_ngram: 1,
         };
         assert_eq!(single.lookup(&[5, 1, 5, 2, 5], 1), [2]);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tree_verification {
+    use std::path::PathBuf;
+
+    use nuvec::Array;
+
+    use crate::model::{KvCache, Model, TreeMask};
+
+    fn gpu() -> bool {
+        !cfg!(miri) && (&Array::from(1.0f32) + 1.0).eval().is_ok()
+    }
+
+    /// A fixture model and its prompt.
+    fn fixture(name: &str) -> (Model, Vec<u32>) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        let expected = nuvec::io::load_safetensors(dir.join("expected.safetensors"))
+            .unwrap()
+            .tensors;
+        let prompt = expected["prompt"].to_vec::<u32>().unwrap();
+        (crate::load_model(&dir).unwrap(), prompt)
+    }
+
+    /// Within 1e-4 of the largest logit in float32; within bfloat16's rounding otherwise
+    /// (the tree's rows reduce over masked keys, in another order).
+    fn close(a: &Array, b: &Array, what: &str) {
+        let tol = match b.dtype() {
+            nuvec::DType::F32 => 1e-4,
+            _ => 2e-2,
+        };
+        let f32 = |x: &Array| x.astype(nuvec::DType::F32).to_vec::<f32>().unwrap();
+        let (a, b) = (f32(a), f32(b));
+        let top = b.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let diff = a
+            .iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(diff <= tol * top.max(1.0), "{what}: {diff} (largest {top})");
+    }
+
+    /// Each node's logits equal its path verified as a chain; after keeping a path that is
+    /// not the first branch, the next step equals the path decoded as a chain.
+    #[test]
+    fn tree_verification_equals_chains() {
+        if !gpu() {
+            return;
+        }
+        // Root, then: 1 (a) and 2 (b) under it; 3 (c) and 4 (d) under 1; 5 (e) under 2;
+        // 6 (f) under 3.
+        let parents = [0usize, 0, 1, 1, 2, 3];
+        let tokens = [5u32, 9, 17, 23, 31, 40];
+        let path_of = |mut i: usize| {
+            let mut p = vec![];
+            while i > 0 {
+                p.push(i);
+                i = parents[i - 1];
+            }
+            p.push(0);
+            p.reverse();
+            p
+        };
+        // Windows of 4 (gpt-oss, Gemma 4), sinks (gpt-oss), shared keys (Gemma 4).
+        for name in ["qwen3_f32", "llama_bf16", "gpt_oss_f32", "gemma4_e_f32"] {
+            let quant = false;
+            let (model, prompt) = fixture(name);
+            let mut base = model.new_cache();
+            let head = &prompt[..prompt.len() - 1];
+            let root = *prompt.last().unwrap();
+            let _ = model.forward(&Array::from_slice(head, [1, head.len() as i32]), &mut base);
+            let all: Vec<u32> = std::iter::once(root).chain(tokens).collect();
+            let l = all.len();
+            let mut depth = vec![0i32];
+            let mut ancestors = vec![false; l * l];
+            for i in 0..l {
+                if i > 0 {
+                    depth.push(path_of(i).len() as i32 - 1);
+                }
+                for a in path_of(i) {
+                    ancestors[i * l + a] = true;
+                }
+            }
+            let mask = TreeMask::new(
+                Array::from_slice(&depth, [l as i32]),
+                Array::from_slice(&ancestors, [l as i32, l as i32]),
+                base[0].offset(),
+            );
+            let mut tree = base.clone();
+            for c in &mut tree {
+                c.set_tree(Some(mask.clone()));
+            }
+            let logits = model
+                .forward(&Array::from_slice(&all, [1, l as i32]), &mut tree)
+                .reshape([l as i32, -1]);
+            for c in &mut tree {
+                c.set_tree(None);
+            }
+            let chain = |path: &[usize]| {
+                let mut cache: Vec<KvCache> = base.clone();
+                let ids: Vec<u32> = path.iter().map(|&j| all[j]).collect();
+                let out =
+                    model.forward(&Array::from_slice(&ids, [1, ids.len() as i32]), &mut cache);
+                (out.reshape([ids.len() as i32, -1]), cache)
+            };
+            for i in 0..l {
+                let path = path_of(i);
+                let (out, _) = chain(&path);
+                let last = path.len() as i32 - 1;
+                close(
+                    &logits.i(i as i32),
+                    &out.i(last),
+                    &format!("{name} {quant}: node {i}"),
+                );
+            }
+            // Keep root → a → c → f and decode one more token.
+            let path = path_of(6);
+            let offset = base[0].offset();
+            for c in &mut tree {
+                let rows = c.path_rows(offset, &path).unwrap();
+                c.keep_path(offset, &path, rows);
+            }
+            let (_, mut kept) = chain(&path);
+            let next = Array::from_slice(&[11u32], [1, 1]);
+            let a = model.forward(&next, &mut tree);
+            let b = model.forward(&next, &mut kept);
+            close(
+                &a.reshape([-1]),
+                &b.reshape([-1]),
+                &format!("{name} {quant}: after"),
+            );
+        }
     }
 }

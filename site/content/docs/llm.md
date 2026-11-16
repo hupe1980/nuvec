@@ -127,7 +127,20 @@ if let Some(FinishReason::Stop(stopped)) = generation.finish_reason() {
 
 ## Quantized KV caches
 
-`GenerateOptions::kv_quant` quantizes attention caches as mlx-lm's `kv_bits`, `kv_group_size` and `quantized_kv_start` do: `KvQuant { bits: 8, group_size: 64, start: 5000 }` (the default) quantizes each layer's cache once it holds 5,000 positions, then every later write. The attention equals mlx-lm's bit for bit, and decode runs at mlx-lm's speed with the same settings. An 8-bit cache in groups of 64 takes 0.53× the memory of a bfloat16 one, 4 bits 0.28×. Sliding-window layers and attention sinks (gpt-oss, Gemma 4) are quantized too; mlx-lm refuses them. Head dimensions must be multiples of the group size. The paged `Batcher` does not take quantized caches. Prompt caches with quantized layers save and load in mlx-lm's format (`QuantizedKVCache`).
+`GenerateOptions::kv_quant` quantizes attention caches as mlx-lm's `kv_bits`, `kv_group_size` and `quantized_kv_start` do: `KvQuant { bits: 8, group_size: 64, start: 5000 }` (the default) quantizes each layer's cache once it holds 5,000 positions, then every later write. Decoding runs `fast::quantized_attention`, one kernel that reads the codes once and dequantizes them in registers: on Qwen3-8B 4-bit at 38K tokens with an 8-bit cache it decodes 1.56× as fast as mlx-lm, with a 3-bit cache 2.4× (M4 Pro). Prompts and speculative verification run mlx-lm's composition and match it bit for bit; with `row_exact` decoding does too, so verified rows equal decoded ones. An 8-bit cache in groups of 64 takes 0.53× the memory of a bfloat16 one, 4 bits 0.28×. Sliding-window layers and attention sinks (gpt-oss, Gemma 4) are quantized too; mlx-lm refuses them.
+
+`KvQuant { rotate: true, .. }` rotates each head's keys by the Hadamard transform before quantizing them, and the queries to match. Attention is unchanged except for the quantization error, which falls because the rotation spreads the keys' outlier features over the head. On Qwen3-8B 4-bit (8,192 tokens of English, perplexity; the `perplexity` example):
+
+| Cache | Perplexity | Passkey at 19K tokens (3 depths) |
+|---|---:|---:|
+| bfloat16 | 12.65 | 3 of 3 |
+| 8 bits | 12.65 | 3 of 3 |
+| 4 bits | 14.13 | 3 of 3 |
+| 4 bits, rotated keys | 13.10 | 3 of 3 |
+| 3 bits | 23.63 | 0 of 3 |
+| 3 bits, rotated keys | 14.69 | 3 of 3 |
+
+Rotated caches cost no memory; prompt caches with rotated layers are not saved (mlx-lm's format has no rotation). Head dimensions must be multiples of the group size. The paged `Batcher` does not take quantized caches. Prompt caches with quantized layers save and load in mlx-lm's format (`QuantizedKVCache`).
 
 ## How generation is fast
 

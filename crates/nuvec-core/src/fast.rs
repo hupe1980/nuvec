@@ -691,6 +691,33 @@ pub fn scaled_dot_product_attention(
     )
 }
 
+/// Attention of one query row per head over affine-quantized keys and values (mlx-lm's
+/// quantized KV cache: codes `[B, Hkv, S, D·bits/32]`, scales and biases
+/// `[B, Hkv, S, D/group_size]`), without a mask: `softmax(scale · q·kᵀ [, sinks]) · v` for
+/// `q` `[B, Hq, L, D]` with grouped query heads, with per-head `sinks` (`[Hq]`) if given.
+///
+/// On the GPU, one query row (`L = 1`), head sizes 64 and 128, 3, 4 or 8 bits in groups of 32,
+/// 64 or 128 run one kernel that dequantizes the codes in registers (within the float bound
+/// of the dequantized attention, not mlx-lm's bits: its composition rounds the scores to the
+/// queries' dtype); everything else runs mlx-lm's `quantized_scaled_dot_product_attention`
+/// composition.
+#[track_caller]
+pub fn quantized_attention(
+    q: &Array,
+    k: &crate::Quantized,
+    v: &crate::Quantized,
+    scale: f32,
+    sinks: Option<&Array>,
+) -> Array {
+    let ins = operands(
+        &[q, &k.weight, &k.scales, &v.weight, &v.scales],
+        &[k.biases.as_ref(), v.biases.as_ref(), sinks],
+    );
+    Array::sticky("quantized_attention", Location::caller(), &ins, || {
+        imp::quantized_attention(q, k, v, scale, sinks)
+    })
+}
+
 /// A mixture of experts' routing from its router's probabilities `probs` (`[..., E]`): the
 /// indices (uint32) of each row's `k` largest probabilities and those probabilities
 /// (`[..., k]` each), divided by their sum with `normalize` (mlx-lm's `norm_topk_prob`).
