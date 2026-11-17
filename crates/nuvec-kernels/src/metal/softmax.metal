@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 //
-// Softmax over the last axis (single-row and looped kernels), ported from MLX v0.32.4 (mlx/backend/metal/kernels/softmax.h) into `mlx::softmax`.
-// Instantiated with float accumulation for every type (MLX's `precise` variant).
+// Softmax over the last axis (single-row and looped kernels), ported from MLX v0.32.4
+// (mlx/backend/metal/kernels/softmax.h) into `mlx::softmax`. Instantiated as MLX's: each type
+// accumulating in itself, and float16 and bfloat16 also in float (`softmax_precise_*`, MLX's
+// `precise`); the causal variants accumulate in float.
 //
 // Copyright © 2023-2026 Apple Inc. Licensed under the MIT License:
 // https://github.com/ml-explore/mlx/blob/main/LICENSE
@@ -11,11 +13,27 @@
 namespace mlx {
 namespace softmax {
 
+// MLX's bfloat16 SIMD reductions (`bf16_math.h`): through float, rounded back.
+inline bfloat16_t simd_max(bfloat16_t x) {
+  return static_cast<bfloat16_t>(metal::simd_max(static_cast<float>(x)));
+}
+inline bfloat16_t simd_sum(bfloat16_t x) {
+  return static_cast<bfloat16_t>(metal::simd_sum(static_cast<float>(x)));
+}
+using metal::simd_max;
+using metal::simd_sum;
+
 template <typename T>
 inline T softmax_exp(T x) {
   // Softmax doesn't need high precision exponential cause x is gonna be in
   // (-oo, 0] anyway and subsequently it will be divided by sum(exp(x_i)).
   return fast::exp(x);
+}
+
+// MLX's bfloat16 `fast::exp` (`bf16_math.h`): through float, rounded back.
+template <>
+inline bfloat16_t softmax_exp(bfloat16_t x) {
+  return static_cast<bfloat16_t>(fast::exp(static_cast<float>(x)));
 }
 
 // nuvec: with CAUSAL, row `r` (of `tile_rows` per block, the last query of each block
@@ -224,10 +242,14 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS, bool CAU
 
 template [[host_name("nuvec_softmax_block_float32")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<float, float>) mlx::softmax::softmax_single_row<float, float>;
 template [[host_name("nuvec_softmax_looped_float32")]] [[kernel]] decltype(mlx::softmax::softmax_looped<float, float>) mlx::softmax::softmax_looped<float, float>;
-template [[host_name("nuvec_softmax_block_float16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<half, float>) mlx::softmax::softmax_single_row<half, float>;
-template [[host_name("nuvec_softmax_looped_float16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<half, float>) mlx::softmax::softmax_looped<half, float>;
-template [[host_name("nuvec_softmax_block_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<bfloat16_t, float>) mlx::softmax::softmax_single_row<bfloat16_t, float>;
-template [[host_name("nuvec_softmax_looped_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<bfloat16_t, float>) mlx::softmax::softmax_looped<bfloat16_t, float>;
+template [[host_name("nuvec_softmax_block_float16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<half, half>) mlx::softmax::softmax_single_row<half, half>;
+template [[host_name("nuvec_softmax_precise_block_float16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<half, float>) mlx::softmax::softmax_single_row<half, float>;
+template [[host_name("nuvec_softmax_looped_float16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<half, half>) mlx::softmax::softmax_looped<half, half>;
+template [[host_name("nuvec_softmax_precise_looped_float16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<half, float>) mlx::softmax::softmax_looped<half, float>;
+template [[host_name("nuvec_softmax_block_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<bfloat16_t, bfloat16_t>) mlx::softmax::softmax_single_row<bfloat16_t, bfloat16_t>;
+template [[host_name("nuvec_softmax_precise_block_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<bfloat16_t, float>) mlx::softmax::softmax_single_row<bfloat16_t, float>;
+template [[host_name("nuvec_softmax_looped_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<bfloat16_t, bfloat16_t>) mlx::softmax::softmax_looped<bfloat16_t, bfloat16_t>;
+template [[host_name("nuvec_softmax_precise_looped_bfloat16")]] [[kernel]] decltype(mlx::softmax::softmax_looped<bfloat16_t, float>) mlx::softmax::softmax_looped<bfloat16_t, float>;
 template [[host_name("nuvec_causal_softmax_block_float32")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<float, float, SOFTMAX_N_READS, true>) mlx::softmax::softmax_single_row<float, float, SOFTMAX_N_READS, true>;
 template [[host_name("nuvec_causal_softmax_looped_float32")]] [[kernel]] decltype(mlx::softmax::softmax_looped<float, float, SOFTMAX_N_READS, true>) mlx::softmax::softmax_looped<float, float, SOFTMAX_N_READS, true>;
 template [[host_name("nuvec_causal_softmax_block_float16")]] [[kernel]] decltype(mlx::softmax::softmax_single_row<half, float, SOFTMAX_N_READS, true>) mlx::softmax::softmax_single_row<half, float, SOFTMAX_N_READS, true>;

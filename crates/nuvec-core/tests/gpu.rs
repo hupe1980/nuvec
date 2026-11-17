@@ -939,9 +939,27 @@ fn mlx_reduction_kernels_match_the_cpu_on_every_path() {
                     DType::F32 => 1e-4,
                     _ => 0.0,
                 };
+                // Half-precision sums accumulate in their type on the GPU (MLX's bits), in
+                // float32 on the CPU: bounded by the dtype's epsilon times the terms' sum.
+                let magnitude = match (name, dtype) {
+                    ("sum", DType::F16 | DType::BF16) => on(Device::cpu(), || {
+                        x.astype(DType::F32)
+                            .abs()
+                            .sum(axes.clone())
+                            .astype(DType::F64)
+                    })
+                    .to_vec::<f64>()
+                    .unwrap(),
+                    _ => vec![0.0; cpu.len()],
+                };
+                let eps = if dtype == DType::BF16 {
+                    2f64.powi(-8)
+                } else {
+                    2f64.powi(-11)
+                };
                 for (i, (c, g)) in cpu.iter().zip(&gpu).enumerate() {
                     assert!(
-                        (c - g).abs() <= tol * c.abs().max(1.0),
+                        (c - g).abs() <= (tol * c.abs().max(1.0)).max(eps * magnitude[i]),
                         "{name} {dtype} {shape:?} axes {axes:?} {layout}: element {i}: cpu {c} gpu {g}"
                     );
                 }

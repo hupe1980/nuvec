@@ -282,28 +282,22 @@ fn vector_schedule(key: &RouteKey, class: char) -> Option<SmallVec<[Group; 2]>> 
     Some(groups)
 }
 
-/// Whether the uncapped tiled kernel runs for more than 8 queries (MLX's `use_fallback`,
-/// with nuvec's measured head-size-256 rule).
+/// Whether the uncapped tiled kernel runs for more than 8 queries: MLX's `use_fallback`
+/// (head sizes 192 and 256 compose, except causal self-attention of 2,048 queries or more
+/// in half precision), and the tiled kernel wherever the scores would exceed 8 GiB, where
+/// MLX's composition swaps beside a large model (Qwen3.6-35B-A3B over 262K tokens: 44 GB
+/// on a 48 GB Mac). The bound is fixed, so results do not depend on the machine.
 fn tiled_uncapped(key: &RouteKey) -> bool {
     let (lq, lk) = (key.lq, key.lk);
-    let causal = key.mask == MaskKind::Causal;
-    // MLX: the composition is faster for these head sizes, except long causal
-    // self-attention in half precision. On an M4 Pro (`just bench-attention-route`), the
-    // tiled kernel is faster for causal chunks of 1,024 queries or more over up to 4,096
-    // keys (2,048 over 4,096: 19.9 ms against 23.5) and ties for 2,048 queries over 8,192
-    // keys; the composition is faster beyond (1,024 over 8,192: 23.7 ms against 24.9) and
-    // for shorter chunks, up to 8 GiB of scores (2,048 queries over 131K keys: 813 ms
-    // against 841, MLX 809). Above 8 GiB the scores do not fit beside a large model (MLX's
-    // composition swaps: Qwen3.6-35B-A3B over 262K tokens, 44 GB on a 48 GB Mac), so the
-    // tiled kernel runs. The bound is fixed, so results do not depend on the machine.
     let scores = key.b * key.hq * lq * lk * key.dtype.size();
     let huge = scores > 8 << 30;
-    let slow = match key.d {
-        192 => !huge,
-        256 => !(huge || (causal && lq >= 1024 && (lk <= 4096 || (lq >= 2048 && lk <= 8192)))),
-        _ => false,
-    };
-    !slow
+    let self_attention =
+        key.dtype != DType::F32 && key.mask == MaskKind::Causal && lq >= 2048 && lq == lk;
+    match key.d {
+        192 => huge,
+        256 => huge || self_attention,
+        _ => true,
+    }
 }
 
 /// Whether a windowed call takes the tiled kernel where MLX's rule (for the equivalent

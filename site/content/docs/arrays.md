@@ -116,8 +116,8 @@ Rearranging, as MLX: `flip`, `roll`, `tile`, `pad` (constant, edge, reflect or s
   - `bitwise_and`, `bitwise_or`, `bitwise_xor`, `bitwise_invert`, `left_shift`, `right_shift`, and `logical_and`, `logical_or`, `logical_xor`, `logical_not`;
   - `isnan`, `isinf`, `isfinite`, `isposinf`, `isneginf`, `nan_to_num`, `isclose`, `allclose`, `array_equal`.
 
-  `erf` and `expm1` are within one unit in the last place on both devices (MLX's GPU `expm1` and its CPU `erf` are less accurate).
-- Reductions over any axes: `sum`, `prod`, `max`, `min`, `mean`, `argmax`, `argmin`, `all`, `any`, `logsumexp`, `softmax` (half precision computed in float32, MLX's `precise=True`). Axes are an index (`-1`), a list (`[0, 2]`) or `..` for all of them; `sum_keepdims` and the other `*_keepdims` twins keep the reduced axes.
+  On the GPU these give MLX's bits in every float dtype; the CPU meets MLX's tolerance.
+- Reductions over any axes: `sum`, `prod`, `max`, `min`, `mean`, `argmax`, `argmin`, `all`, `any`, `logsumexp`, `softmax` and `softmax_precise` (MLX's `precise=True`). Axes are an index (`-1`), a list (`[0, 2]`) or `..` for all of them; `sum_keepdims` and the other `*_keepdims` twins keep the reduced axes.
 - Sorting and scans with MLX's kernels: `sort`, `argsort`, `partition`, `argpartition`, `topk`, `cumsum`, `cumprod`, `cummax`, `cummin`, `logcumsumexp`.
 - Statistics and search: `median`, `diff`, `count_nonzero`, `minmax`, `searchsorted`, `unique` (a fixed output size, so nothing is evaluated early).
 - Linear algebra: `matmul` (batched, broadcasting), `addmm`, `gather_mm`, `segmented_mm` (one product per segment of the inner axis), `block_masked_mm`, `tensordot`, `inner`, `outer`, `kron`, `vecdot`, `einsum` (MLX's greedy contraction order; `einsum_path` reports it), `trace`, `matrix_norm` (every vector and matrix norm, the SVD-based ones included).

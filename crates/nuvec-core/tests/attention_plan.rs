@@ -128,9 +128,12 @@ fn expected(c: &Case, class: char) -> Route {
             (d == dv && matches!(d, 64 | 72 | 80 | 96 | 128 | 192 | 256)) || (d, dv) == (96, 64);
         let causal_ok = !causal || lq <= lk;
         let huge = c.b * c.hq * lq * lk * c.dtype.size() > 8 << 30;
+        // MLX's `use_fallback`: 192 and 256 compose, except causal half-precision
+        // self-attention of 2,048 queries or more (and nuvec's 8 GiB bound).
+        let fused256 = c.dtype != DType::F32 && causal && lq >= 2048 && lq == lk;
         let slow = match d {
             192 => !huge,
-            256 => !(huge || (causal && lq >= 1024 && lk <= 8192)),
+            256 => !(huge || fused256),
             _ => false,
         };
         return if head && causal_ok && !slow {

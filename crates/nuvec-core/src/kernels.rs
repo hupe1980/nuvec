@@ -1467,9 +1467,8 @@ pub(crate) fn erfinv(a: f32) -> f32 {
     a * p
 }
 
-/// Numerically stable logistic function.
-/// The error function: Norbert Juffa's faithfully rounded approximation (MLX's Metal
-/// `erf.h`), with the same fused multiply-adds and [`expm1f`], on the CPU too.
+/// The CPU's error function: Norbert Juffa's faithfully rounded approximation (MLX's Metal
+/// `erf.h` with the two-step [`expm1f`]; the GPU runs MLX's).
 pub(crate) fn erf(a: f32) -> f32 {
     let t = a.abs();
     let s = a * a;
@@ -1493,8 +1492,8 @@ pub(crate) fn erf(a: f32) -> f32 {
     }
 }
 
-/// `e^a − 1`: Norbert Juffa's `expm1f`, used by [`erf`]: MLX's Metal `expm1f.h` with the
-/// original's two-step reduction by ln 2, which MLX's drops.
+/// The CPU's `e^a − 1`: Norbert Juffa's `expm1f`, used by [`erf`]: MLX's Metal `expm1f.h`
+/// with the original's two-step reduction by ln 2 (MLX's, on the GPU, has one step).
 pub(crate) fn expm1f(a: f32) -> f32 {
     // exp(a) = 2^i · exp(f), i = rint(a / ln 2)
     // Juffa's 1.442695f is log2(e) in float32.
@@ -1536,13 +1535,11 @@ pub(crate) fn expm1f(a: f32) -> f32 {
     r
 }
 
+/// MLX's `Sigmoid`: `y = 1 / (1 + exp(|x|))`, then `x < 0 ? y : 1 - y`.
 pub(crate) fn sigmoid<T: num_like::Float>(x: T) -> T {
-    if x >= T::ZERO {
-        T::ONE / (T::ONE + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (T::ONE + e)
-    }
+    let a = if x < T::ZERO { -x } else { x };
+    let y = T::ONE / (T::ONE + a.exp());
+    if x < T::ZERO { y } else { T::ONE - y }
 }
 
 mod num_like {
@@ -1552,6 +1549,7 @@ mod num_like {
         + PartialOrd
         + std::ops::Neg<Output = Self>
         + std::ops::Add<Output = Self>
+        + std::ops::Sub<Output = Self>
         + std::ops::Div<Output = Self>
     {
         const ZERO: Self;

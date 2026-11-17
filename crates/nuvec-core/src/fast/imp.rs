@@ -189,9 +189,13 @@ pub enum FastOp {
         /// Whether `silu` follows the convolution.
         silu: bool,
     },
-    /// `(x)`: softmax over the last axis, accumulated in float32.
-    Softmax,
-    /// `(x)`: [`FastOp::Softmax`] of causally masked scores: row `r` of the second-to-last
+    /// `(x)`: softmax over the last axis (MLX's `softmax`): accumulated in the input's type,
+    /// or with `precise` in float32.
+    Softmax {
+        /// MLX's `precise`.
+        precise: bool,
+    },
+    /// `(x)`: [`FastOp::Softmax`] (precise) of causally masked scores: row `r` of the second-to-last
     /// axis (a multiple of `rows` long) keeps columns up to `r % rows + L − rows` (`L` the
     /// last axis), the others taken as the dtype's lowest finite value (MLX's blocked
     /// attention mask) and so 0 in the result.
@@ -315,7 +319,7 @@ pub(crate) fn rows_on_gpu(dtype: DType, size: usize, axis: usize) -> bool {
 pub(crate) fn record_or_fallback(op: FastOp, inputs: Vec<Array>) -> Result<Vec<Array>> {
     let x = &inputs[0];
     let gpu = match op {
-        FastOp::Softmax | FastOp::LogSumExp | FastOp::CausalSoftmax { .. } => {
+        FastOp::Softmax { .. } | FastOp::LogSumExp | FastOp::CausalSoftmax { .. } => {
             rows_on_gpu(x.dtype(), x.size(), x.dims().last().copied().unwrap_or(1))
         }
         _ => on_gpu(x.dtype(), x.size()),
@@ -608,8 +612,8 @@ fn rsqrt(x: &Array) -> Result<Array> {
 
 /// `softmax` over the last axis from ordinary operations, in float32 for half types
 /// (float64 stays float64).
-fn softmax_graph(x: &Array) -> Result<Array> {
-    let xf = if matches!(x.dtype(), DType::F32 | DType::F64) {
+fn softmax_graph(x: &Array, precise: bool) -> Result<Array> {
+    let xf = if !precise || matches!(x.dtype(), DType::F32 | DType::F64) {
         x.clone()
     } else {
         astype(x, DType::F32)?
@@ -708,7 +712,8 @@ impl FastOp {
             Self::MoeRoute { .. } => "moe_route",
             Self::WeightedSum => "weighted_sum",
             Self::ConvSlots { .. } => "causal_conv1d_slots",
-            Self::Softmax => "softmax",
+            Self::Softmax { precise: false } => "softmax",
+            Self::Softmax { precise: true } => "softmax_precise",
             Self::CausalSoftmax { .. } => "causal_softmax",
             Self::LogSumExp => "logsumexp",
             Self::CrossEntropy => "cross_entropy",
@@ -724,7 +729,7 @@ impl FastOp {
     /// `(dtype, shape)` per output, after checking the input count.
     pub(crate) fn outputs(&self, inputs: &[Array]) -> Result<Vec<(DType, Vec<usize>)>> {
         let arity = match self {
-            Self::Softmax
+            Self::Softmax { .. }
             | Self::CausalSoftmax { .. }
             | Self::LogSumExp
             | Self::Hadamard { .. }
@@ -784,7 +789,7 @@ impl FastOp {
             | Self::LayerNorm { .. }
             | Self::Rope { .. }
             | Self::NormRope { .. }
-            | Self::Softmax
+            | Self::Softmax { .. }
             | Self::CausalSoftmax { .. } => {
                 vec![like(x)]
             }
@@ -930,7 +935,7 @@ impl FastOp {
             }
             Self::RmsNormVjp { .. } => param(&inputs[1]) && like(&inputs[2]),
             Self::LayerNormVjp { .. } => param(&inputs[1]) && param(&inputs[2]) && like(&inputs[3]),
-            Self::Softmax | Self::LogSumExp => true,
+            Self::Softmax { .. } | Self::LogSumExp => true,
             Self::CausalSoftmax { rows } => {
                 let d = x.dims();
                 let (r, l) = (*rows as usize, d[d.len() - 1]);
@@ -1616,9 +1621,9 @@ impl FastOp {
                 let at = broadcast_to(&reshape(slots, &[-1, 1, 1])?, kept.dims())?;
                 vec![y, crate::indexing::put_along_axis(pool, &at, &kept, 0)?]
             }
-            Self::Softmax => vec![softmax_graph(x)?],
+            Self::Softmax { precise } => vec![softmax_graph(x, *precise)?],
             Self::CausalSoftmax { rows } => {
-                vec![softmax_graph(&causal_masked(x, *rows as usize)?)?]
+                vec![softmax_graph(&causal_masked(x, *rows as usize)?, true)?]
             }
             Self::GatedDelta { steps } => gated_delta_graph(inputs, *steps)?,
             Self::GatedDeltaSlots => {
@@ -1738,7 +1743,7 @@ impl FastOp {
                 out.extend(std::iter::repeat_n(None, inputs.len() - 1));
                 Ok(out)
             }
-            Self::Softmax | Self::CausalSoftmax { .. } => {
+            Self::Softmax { .. } | Self::CausalSoftmax { .. } => {
                 // (Masked entries are 0 in the output, so their cotangent is 0 too.)
                 let s = &outputs[0];
                 let sg = multiply(s, g)?;
@@ -1746,7 +1751,7 @@ impl FastOp {
                 Ok(vec![Some(dx)])
             }
             Self::LogSumExp => {
-                let s = one(Self::Softmax, vec![inputs[0].clone()])?;
+                let s = one(Self::Softmax { precise: true }, vec![inputs[0].clone()])?;
                 Ok(vec![Some(multiply(g, &s)?)])
             }
             Self::CrossEntropy => {
@@ -1931,7 +1936,7 @@ impl FastOp {
         let simple = match self {
             Self::RmsNorm { .. }
             | Self::LayerNorm { .. }
-            | Self::Softmax
+            | Self::Softmax { .. }
             | Self::CausalSoftmax { .. }
             | Self::LogSumExp => rest_unbatched,
             Self::Rope { .. } => rest_unbatched && inputs[1].size() == 1,
@@ -3719,9 +3724,9 @@ fn attention_graph(
         let denom = add(sum(&e, &[-1], true)?, exp(&subtract(&sink, &m)?)?)?;
         astype(&divide(&e, &denom)?, dtype)?
     } else if rows_on_gpu(dtype, scores.size(), scores.dims()[scores.ndim() - 1]) {
-        crate::ops::imp::softmax(&scores, &[-1])?
+        crate::ops::imp::softmax(&scores, &[-1], true)?
     } else {
-        softmax_graph(&scores)?
+        softmax_graph(&scores, true)?
     };
     let out = crate::ops::imp::matmul(&probs, &v)?;
     if rep > 1 {
@@ -4020,10 +4025,11 @@ pub(crate) fn quantized_attention_graph(
                 .astype(scores.dtype())
                 .reshape([1, hkv, rep, 1, 1]);
             let column = crate::ops::broadcast_to(&column, [b, hkv, rep, l, 1]);
-            let p = crate::ops::softmax(&crate::ops::concatenate(&[scores, column], -1), -1);
+            let p =
+                crate::ops::softmax_precise(&crate::ops::concatenate(&[scores, column], -1), -1);
             p.i((.., .., .., .., ..s))
         }
-        false => crate::ops::softmax(&scores, -1),
+        false => crate::ops::softmax_precise(&scores, -1),
     };
     crate::ops::quantized_matmul(&probs, &weights(4), false).reshape([b, hq, l, d])
 }

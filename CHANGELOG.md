@@ -6,6 +6,25 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-17
+
+### Added
+
+- `just parity-tokens MODEL` and the `greedy_parity` example: greedy tokens against mlx-lm's
+  on a cached checkpoint, with the first differing step and both margins.
+- `softmax_precise` (MLX's `precise=True`).
+
+### Changed
+
+- `softmax` is MLX's default: float16 and bfloat16 accumulate in their own type.
+- The GPU's `expm1` and `erf` are MLX's (one-step reduction), no longer faithfully rounded.
+
+### Fixed
+
+- GPU numerics equal MLX's bit for bit over every half-precision value (`sigmoid`,
+  `logaddexp`, contraction in norms, `rope` and convolutions, half-precision sums, head-256
+  attention routing). Qwen3.5-9B's greedy tokens equal mlx-lm's on 22 of 22 prompts (was 4).
+
 ## [0.14.0] - 2026-11-16
 
 ### Added
@@ -779,7 +798,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/hupe1980/nuvec/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/hupe1980/nuvec/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/hupe1980/nuvec/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/hupe1980/nuvec/compare/v0.11.0...v0.12.0

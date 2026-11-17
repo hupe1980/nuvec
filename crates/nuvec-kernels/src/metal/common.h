@@ -112,7 +112,8 @@ NUVEC_INT_OPS(short, uint)
 NUVEC_INT_OPS(int, uint)
 NUVEC_INT_OPS(long, ulong)
 
-// ── Arithmetic: half precision computes in float and rounds once ────────────
+// ── Arithmetic: each operation computes in float and rounds once to its type (MLX's
+// native `half` and `bfloat` arithmetic); compositions round after each step ─────────
 
 // MLX's log1p (`utils.h`; its `Limits<float>::max` is infinity).
 inline float log1p_(float x) {
@@ -126,16 +127,14 @@ inline float log1p_(float x) {
     return x * (precise::log(xp1) / (xp1 - 1.0f));
 }
 
-// expm1f and erf: Norbert Juffa's single-precision approximations (BSD-2-Clause; see
-// THIRD_PARTY_NOTICES), maximum errors 0.997 and 0.995 units in the last place, as MLX's
-// `expm1f.h` and `erf.h` but with the original's two-step reduction by ln 2 (MLX's drops
-// the low part, an error of up to tens of units in the last place).
+// MLX's `expm1f.h` and `erf.h` (Norbert Juffa's single-precision approximations,
+// BSD-2-Clause; see THIRD_PARTY_NOTICES), as MLX ships them: `expm1f` reduces by ln 2 in one
+// step.
 inline float expm1f_(float a) {
     float j = fma(1.442695f, a, 12582912.f);
     j = j - 12582912.0f;
     int i = int(j);
     float f = fma(j, -6.93145752e-1f, a);
-    f = fma(j, -1.42860677e-6f, f);
     float s = f * f;
     if (a == 0.0f) {
         s = a;
@@ -212,14 +211,6 @@ inline float logaddexp_(float x, float y) {
     return (mn == -INFINITY || mx == INFINITY) ? mx : mx + log1p_(precise::exp(mn - mx));
 }
 
-inline float sigmoid_(float x) {
-    if (x >= 0.0f) {
-        return 1.0f / (1.0f + precise::exp(-x));
-    }
-    float e = precise::exp(x);
-    return e / (1.0f + e);
-}
-
 // MLX's inverse error function (Giles' single-precision polynomial).
 inline float erfinv_(float a) {
     float t = precise::log(fma(a, 0.0f - a, 1.0f));
@@ -271,9 +262,7 @@ inline float erfinv_(float a) {
     inline T op_sin(T a) { return T(precise::sin(float(a))); }                                \
     inline T op_cos(T a) { return T(precise::cos(float(a))); }                                \
     inline T op_tanh(T a) { return T(precise::tanh(float(a))); }                              \
-    inline T op_sigmoid(T a) { return T(sigmoid_(float(a))); }                                \
     inline T op_erfinv(T a) { return T(erfinv_(float(a))); }                                  \
-    inline T op_logaddexp(T a, T b) { return T(logaddexp_(float(a), float(b))); }            \
     inline T op_floordiv(T a, T b) { return T(precise::floor(float(op_div(a, b)))); }    \
     inline T op_erf(T a) { return T(erf_(float(a))); }                                        \
     inline T op_expm1(T a) { return T(expm1f_(float(a))); }                                   \
@@ -298,6 +287,55 @@ inline float erfinv_(float a) {
 NUVEC_FLOAT_OPS(half)
 NUVEC_FLOAT_OPS(bfloat)
 NUVEC_FLOAT_OPS(float)
+
+// MLX's Sigmoid: `y = 1 / (1 + exp(|x|))`, then `x < 0 ? y : 1 - y`. MLX's half results are
+// the float evaluation rounded once; its bfloat ones round after each step.
+inline float op_sigmoid(float x) {
+    float y = 1.0f / (1.0f + precise::exp(precise::fabs(x)));
+    return x < 0.0f ? y : 1.0f - y;
+}
+inline half op_sigmoid(half x) { return half(op_sigmoid(float(x))); }
+inline bfloat op_sigmoid(bfloat x) {
+    bfloat y = op_div(bfloat(1), op_add(bfloat(1), op_exp(op_abs(x))));
+    return float(x) < 0.0f ? y : op_sub(bfloat(1), y);
+}
+
+// MLX's LogAddExp in the type: `max + log1p(exp(min - max))`, the difference and `exp` in
+// the type. Its `log1p` is the float one for float and half (so `max + log1p` is a float sum,
+// rounded once to half) and its bfloat one for bfloat (rounded, then added in bfloat).
+inline float op_logaddexp(float x, float y) { return logaddexp_(x, y); }
+inline half op_logaddexp(half x, half y) {
+    if (isnan(float(x)) || isnan(float(y))) {
+        return half(NAN);
+    }
+    half mx = float(x) > float(y) ? x : y;
+    half mn = float(x) < float(y) ? x : y;
+    if (float(mn) == -INFINITY || float(mx) == INFINITY) {
+        return mx;
+    }
+    return half(float(mx) + log1p_(float(op_exp(op_sub(mn, mx)))));
+}
+inline bfloat log1p_bf(bfloat x) {
+    float xp1 = 1.0f + float(x);
+    if (xp1 == INFINITY) {
+        return bfloat(INFINITY);
+    }
+    if (xp1 == 1.0f) {
+        return x;
+    }
+    return bfloat(float(x) * (precise::log(xp1) / (xp1 - 1.0f)));
+}
+inline bfloat op_logaddexp(bfloat x, bfloat y) {
+    if (isnan(float(x)) || isnan(float(y))) {
+        return bfloat(NAN);
+    }
+    bfloat mx = float(x) > float(y) ? x : y;
+    bfloat mn = float(x) < float(y) ? x : y;
+    if (float(mn) == -INFINITY || float(mx) == INFINITY) {
+        return mx;
+    }
+    return op_add(mx, log1p_bf(op_exp(op_sub(mn, mx))));
+}
 
 inline float op_remainder(float a, float b) { return remainder_(a, b); }
 inline bfloat op_remainder(bfloat a, bfloat b) { return bfloat(remainder_(float(a), float(b))); }

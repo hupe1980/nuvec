@@ -96,9 +96,20 @@ struct LogAddExp {
         : (maxval + log1p(metal::exp(minval - maxval)));
   };
 
-  // bfloat16 has no native min/max/exp: computed in float (as MLX's bf16 math).
+  // bfloat16 as MLX's template evaluates it: each step (the difference, `exp` and `log1p`
+  // through float, the sum) rounded to bfloat16.
   bfloat16_t operator()(bfloat16_t x, bfloat16_t y) thread {
-    return bfloat16_t(operator()(float(x), float(y)));
+    if (metal::isnan(float(x)) || metal::isnan(float(y))) {
+      return bfloat16_t(metal::numeric_limits<float>::quiet_NaN());
+    }
+    bfloat16_t maxval = float(x) > float(y) ? x : y;
+    bfloat16_t minval = float(x) < float(y) ? x : y;
+    if (float(minval) == -INFINITY || float(maxval) == INFINITY) {
+      return maxval;
+    }
+    bfloat16_t d = bfloat16_t(float(minval) - float(maxval));
+    bfloat16_t e = bfloat16_t(metal::exp(float(d)));
+    return bfloat16_t(float(maxval) + float(log1p(e)));
   };
 };
 

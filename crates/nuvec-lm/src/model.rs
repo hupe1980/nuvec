@@ -1384,10 +1384,10 @@ fn quantized_attention_composed(
         Some(sinks) => {
             let column = sinks.astype(scores.dtype()).reshape([1, hkv, rep, 1, 1]);
             let column = ops::broadcast_to(&column, [b, hkv, rep, l, 1]);
-            let p = ops::softmax(&ops::concatenate(&[scores, column], -1), -1);
+            let p = ops::softmax_precise(&ops::concatenate(&[scores, column], -1), -1);
             p.i((.., .., .., .., ..s))
         }
-        None => ops::softmax(&scores, -1),
+        None => ops::softmax_precise(&scores, -1),
     };
     probs
         .quantized_matmul(&weights(v), false)
@@ -1599,17 +1599,6 @@ impl Attention {
     }
 }
 
-/// `log(1 + exp(x))`, stably (MLX's `nn.softplus`, `logaddexp(x, 0)`): in float32,
-/// rounded once to `x`'s dtype, as MLX's kernel.
-#[track_caller]
-fn softplus(x: &Array) -> Array {
-    let xf = x.astype(DType::F32);
-    let y = xf
-        .maximum(0.0)
-        .add(xf.abs().negative().exp().add(1.0).log());
-    y.astype(x.dtype())
-}
-
 /// `silu(z) · n` in float32, rounded to `n`'s dtype, uncompiled.
 #[track_caller]
 fn gated_norm_graph(n: &Array, z: &Array) -> Array {
@@ -1635,7 +1624,9 @@ fn gated_norm(x: &Array, z: &Array, norm: &RmsNorm) -> Array {
 #[track_caller]
 fn decay_graph(a: &Array, dt_bias: &Array, a_log: &Array) -> Array {
     let rate = a_log.astype(DType::F32).exp();
-    rate.negative().multiply(softplus(&a.add(dt_bias))).exp()
+    rate.negative()
+        .multiply(nuvec_nn::softplus(&a.add(dt_bias)))
+        .exp()
 }
 
 /// Gated DeltaNet's per-head decay, `exp(−exp(A_log) · softplus(a + dt_bias))` in float32
@@ -1961,7 +1952,7 @@ impl Mamba2 {
         let cm = cm.reshape([b, l, groups, state]);
         // mlx-lm's `compute_dt`: `clip(softplus(dt + dt_bias))` in float32.
         let (lo, hi) = (f32::from_bits(limit.0), f32::from_bits(limit.1));
-        let dt = softplus(&dt.astype(DType::F32).add(self.dt_bias.value()))
+        let dt = nuvec_nn::softplus(&dt.astype(DType::F32).add(self.dt_bias.value()))
             .maximum(f64::from(lo))
             .minimum(f64::from(hi));
         let d = self.d.value().astype(h.dtype());
@@ -2264,7 +2255,7 @@ impl MoeMlp {
         // by probability, renormalised over them if configured, and the experts' outputs
         // weighted and summed in the activations' type (`moe_route` and `weighted_sum`: one
         // kernel each, the same bits).
-        let gates = self.gate.forward(x).softmax(-1);
+        let gates = self.gate.forward(x).softmax_precise(-1);
         let (top, scores) = fast::moe_route(&gates, k, self.norm_topk_prob);
         #[cfg(feature = "diagnostics")]
         ROUTES.with(|r| {
@@ -2319,7 +2310,7 @@ impl GptOssMlp {
         let k = self.experts_per_token;
         let logits = self.router.forward(x);
         let (top, best) = fast::moe_route(&logits, k, false);
-        let weights = best.softmax(-1);
+        let weights = best.softmax_precise(-1);
         let y = self.experts.forward(x, &top);
         fast::weighted_sum(&y, &weights)
     }
@@ -2386,7 +2377,7 @@ impl GraniteMlp {
         let moe = &self.block_sparse_moe;
         let logits = moe.router.layer.forward(x);
         let (top, best) = fast::moe_route(&logits, moe.experts_per_token, false);
-        let weights = best.softmax(-1);
+        let weights = best.softmax_precise(-1);
         let experts = fast::weighted_sum(&moe.switch_mlp.forward(x, &top), &weights);
         let parts = self.shared_mlp.input_linear.forward(x).split(2, -1);
         let shared = self

@@ -227,6 +227,7 @@ mod stub {
             _: Data,
             _: &Output,
             _: Option<usize>,
+            _: bool,
         ) -> Result<Data> {
             unreachable!("nothing is writable without Metal")
         }
@@ -4463,11 +4464,12 @@ mod metal {
             let stride = |p: &Packed<'_>| u32b(usize::from(!p.shape.is_empty()));
             let mut extra = Vec::new();
             match op {
-                FastOp::Softmax | FastOp::LogSumExp => {
-                    let kind = if *op == FastOp::Softmax {
-                        "softmax"
-                    } else {
-                        "logsumexp"
+                FastOp::Softmax { .. } | FastOp::LogSumExp => {
+                    // Float32 accumulates in float32 either way (MLX's names).
+                    let kind = match op {
+                        FastOp::Softmax { precise: true } if dt != DType::F32 => "softmax_precise",
+                        FastOp::Softmax { .. } => "softmax",
+                        _ => "logsumexp",
                     };
                     self.row_softmax(kind, dt, (rows, axis), Some(x.arg()), None, &mut out)?;
                 }
@@ -4947,11 +4949,17 @@ mod metal {
             mut base: Data,
             out: &Output,
             causal: Option<usize>,
+            precise: bool,
         ) -> Result<Data> {
             let axis = out.shape.last().copied().unwrap_or(1);
             let rows = out.size / axis.max(1);
             let buffer = Arc::get_mut(&mut base.buffer).expect("donated data has one handle");
-            self.row_softmax("softmax", out.dtype, (rows, axis), None, causal, buffer)?;
+            // The causal variants are precise (MLX's attention composition).
+            let kind = match precise && causal.is_none() && out.dtype != DType::F32 {
+                true => "softmax_precise",
+                false => "softmax",
+            };
+            self.row_softmax(kind, out.dtype, (rows, axis), None, causal, buffer)?;
             Ok(base)
         }
 
@@ -8189,7 +8197,7 @@ mod metal {
                 large_elementwise(&metas, &outputs[0].shape)
             }
             Primitive::Fast(
-                crate::fast::imp::FastOp::Softmax
+                crate::fast::imp::FastOp::Softmax { .. }
                 | crate::fast::imp::FastOp::LogSumExp
                 | crate::fast::imp::FastOp::CausalSoftmax { .. },
             ) => {

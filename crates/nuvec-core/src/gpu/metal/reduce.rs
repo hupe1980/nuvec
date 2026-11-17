@@ -259,11 +259,9 @@ impl GpuEval {
             self.copy(operand, buffer)?;
             return Ok(true);
         }
+        // Every type accumulates in itself, half precision too (MLX's instantiations).
         let tag = format!("{name}_{}", dtype.name());
-        // Half-precision sums and products accumulate in float32 (MLX: in the input type)
-        // and are rounded once at the end.
-        let widen = matches!(name, "sum" | "prod") && matches!(dtype, DType::F16 | DType::BF16);
-        let acc = if widen { DType::F32 } else { dtype };
+        let acc = dtype;
         let mut p = plan(meta, axes);
         let copy;
         let (meta, offset, input) = if p.kind == PlanType::General {
@@ -287,15 +285,7 @@ impl GpuEval {
                 data.buffer.metal().expect("checked"),
             )
         };
-        let mut wide = if widen {
-            Some(Buffer::try_alloc(out_size * 4)?)
-        } else {
-            None
-        };
-        let out = match &mut wide {
-            Some(w) => w.metal_mut().expect("device storage"),
-            None => buffer.metal_mut().expect("device storage"),
-        };
+        let out = buffer.metal_mut().expect("device storage");
         let second = format!("{name}_{}", acc.name());
         let tags = (tag.as_str(), second.as_str(), acc);
         match p.kind {
@@ -304,18 +294,6 @@ impl GpuEval {
                 self.row_reduce(&tag, meta, axes, &p, (input, offset), out_size, out)?
             }
             _ => self.col_reduce(tags, meta, axes, &p, (input, offset), out_size, out)?,
-        }
-        if let Some(w) = wide {
-            // Round the float32 result into the output (the element-wise cast kernel).
-            let name = format!("nuvec_cast_float32_{}_c", dtype.name());
-            let (zero, flags) = (0i64.to_le_bytes(), 0u32.to_le_bytes());
-            let args = [
-                Arg::read(w.metal().expect("device storage")),
-                Arg::write(buffer.metal_mut().expect("device storage")),
-                Arg::bytes(&zero),
-                Arg::bytes(&flags),
-            ];
-            self.dispatch(&name, &args, out_size)?;
         }
         Ok(true)
     }
@@ -633,10 +611,7 @@ impl GpuEval {
             shape: vec![shape[axis]],
             strides: vec![strides[axis]],
         };
-        let tag = match dtype {
-            DType::F32 => "sum_float32".to_owned(),
-            _ => format!("sum_in_{}", dtype.name()),
-        };
+        let tag = format!("sum_{}", dtype.name());
         let input = (partial.metal().expect("device storage"), 0);
         let size = meta.size / shape[axis];
         self.col_reduce((&tag, &tag, dtype), &meta, &[axis], &p, input, size, out)

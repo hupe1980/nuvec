@@ -3,15 +3,15 @@
 //
 // `moe_route`: per row of `E` probabilities, the `k` largest in the stable ascending order
 // of the sort kernel (`argsort`, whose last `k` are `argpartition`'s), their values and,
-// with `normalize`, those divided by their sum (`row_reduce_small`'s sum: in the
-// accumulator type, in order, rounded once; then the element-wise divide). One
+// with `normalize`, those divided by their sum (`row_reduce_small`'s sum: in the input
+// type, as MLX accumulates, in order; then the element-wise divide). One
 // threadgroup per row, one thread per expert: an expert's position in the sorted row is
 // the number of experts sorting before it.
 //
 // `weighted_sum`: `sum(x * w[..., None], -2)` over `[R, k, D]` as `col_reduce_small` sums
 // it: `min(k, 8)` partial sums of every `min(k, 8)`-th product (each rounded to `T`, as the
-// element-wise multiply), added in order in the accumulator type, rounded once (one
-// column is a row reduction: in order).
+// element-wise multiply), added in order in the input type, as MLX accumulates (one column
+// is a row reduction: in order).
 
 #include "fast.h"
 
@@ -118,5 +118,5 @@ template <typename T, typename U>
   decltype(weighted_sum<type, acc>) weighted_sum<type, acc>;
 
 instantiate_moe(float32, float, float)
-instantiate_moe(float16, half, float)
-instantiate_moe(bfloat16, bfloat16_t, float)
+instantiate_moe(float16, half, half)
+instantiate_moe(bfloat16, bfloat16_t, bfloat16_t)

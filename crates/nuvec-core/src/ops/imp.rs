@@ -257,15 +257,16 @@ pub(crate) fn logsumexp(a: &Array, axes: &[isize], keepdims: bool) -> Result<Arr
 }
 
 /// `exp(a) / sum(exp(a))` over `axes` (all axes if empty), with the maximum subtracted
-/// first (without gradient), as MLX does.
-pub(crate) fn softmax(a: &Array, axes: &[isize]) -> Result<Array> {
+/// first (without gradient), as MLX does: in the input's type, or with `precise` in float32
+/// and rounded once.
+pub(crate) fn softmax(a: &Array, axes: &[isize], precise: bool) -> Result<Array> {
     let a = astype(a, at_least_float(a.dtype()))?;
     if last_axis_only(&a, axes) && rows_on_gpu(&a) {
-        return single(Primitive::Fast(crate::fast::imp::FastOp::Softmax), vec![a]);
+        let op = crate::fast::imp::FastOp::Softmax { precise };
+        return single(Primitive::Fast(op), vec![a]);
     }
-    // Half precision in float32, rounded once, as the kernel (MLX's `precise=True`).
     let wide = match a.dtype() {
-        DType::F16 | DType::BF16 => astype(&a, DType::F32)?,
+        DType::F16 | DType::BF16 if precise => astype(&a, DType::F32)?,
         _ => a.clone(),
     };
     let maxval = stop_gradient(&max(&wide, axes, true)?)?;

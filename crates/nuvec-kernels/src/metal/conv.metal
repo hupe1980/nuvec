@@ -5,11 +5,14 @@
 // offset `k` of output `o` reads the position `q = o·stride + k·kernel_dilation − pad_lo` of
 // the input dilated by `input_dilation`: input element `q / input_dilation` when it divides
 // and lies inside the input, else zero. `flip` reverses the kernel. Products and sums are
-// float32 without contraction (this file is compiled with `-ffp-contract=off`).
+// float32, contracted as MLX compiles its kernels (`common.h` turns contraction off for its
+// own helpers).
 
 #include <metal_stdlib>
 
 #include "common.h"
+
+#pragma clang fp contract(on)
 
 using namespace metal;
 
@@ -52,8 +55,8 @@ static inline int conv_source(constant ConvGeometry& g, const thread int* o, con
 }
 
 // Depthwise (`groups = C_in`, `C_out = m · C_in`): output channel `co` convolves input channel
-// `co / m` with its own kernel, the taps summed in order (zeros included), so the result
-// equals the composition's bit for bit. One thread per output element; channels are the
+// `co / m` with its own kernel, the taps accumulated in order from zero as MLX's
+// `depthwise_conv_1d` (`acc += x · w`, contracted to fused multiply-adds; zeros included). One thread per output element; channels are the
 // fastest grid dimension, so neighbouring threads read contiguously.
 template <typename T>
 [[kernel]] void depthwise_conv(
@@ -80,8 +83,7 @@ template <typename T>
   for (int t = 0; t < taps; ++t) {
     int at = conv_source(g, o, k);
     float xv = at >= 0 ? static_cast<float>(xn[size_t(at) * g.c_in]) : 0.0f;
-    float term = xv * static_cast<float>(wc[t]);
-    sum = t == 0 ? term : sum + term;
+    sum += xv * static_cast<float>(wc[t]);
     for (int i = 2; i >= 0; --i) {
       if (++k[i] < g.ksize[i]) {
         break;
@@ -147,7 +149,7 @@ template <typename T>
 
 // `causal_conv1d_slots` (nuvec's own): for sequence `n` at pool slot `slots[n]`, the window
 // `pool[slot, 0..K − 1, c]` then `x[n, 0..L, c]`, convolved as `depthwise_conv` (taps in
-// order, float32, uncontracted, rounded once) and, with `silu`, `v · sigmoid(v)` as the
+// order, float32 fused multiply-adds, rounded once) and, with `silu`, `v · sigmoid(v)` as the
 // element-wise kernels round it; then the window's last `K − 1` entries written back to
 // the slot. One thread per (channel, sequence) owns its channel's window, so the slot is
 // read before it is written. Slots outside `0..S` read slot `S − 1` clamped and write
@@ -181,13 +183,11 @@ template <typename T>
   for (int t = 0; t < l; ++t) {
     float sum = 0;
     for (int j = 0; j < k; ++j) {
-      float term = static_cast<float>(win[t + j]) * static_cast<float>(wc[j]);
-      sum = j == 0 ? term : sum + term;
+      sum += static_cast<float>(win[t + j]) * static_cast<float>(wc[j]);
     }
     T v = static_cast<T>(sum);
     if (silu) {
-      T g = T(nuvec::sigmoid_(float(v)));
-      v = T(float(v) * float(g));
+      v = nuvec::op_mul(v, nuvec::op_sigmoid(v));
     }
     out[(size_t(n) * l + t) * c + ch] = v;
   }

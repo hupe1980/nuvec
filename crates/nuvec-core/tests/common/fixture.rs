@@ -1159,9 +1159,12 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
             8.0 * eps * e.abs().max(1.0)
         }
         "erfinv" => 8.0 * eps * e.abs().max(f64::MIN_POSITIVE),
-        // MLX's CPU erf is Abramowitz and Stegun's 7.1.26 (1.5e-7, plus its float32
-        // evaluation); nuvec's is faithfully rounded.
-        "erf" => 2.5e-7 + 4.0 * eps * e.abs(),
+        // These cases hold MLX's CPU results; nuvec's GPU computes MLX's GPU bits. MLX's CPU
+        // erf is Abramowitz and Stegun's 7.1.26 (1.5e-7, plus its float32 evaluation); its
+        // GPU `expm1f` (also in `erf` above 0.93) reduces by ln 2 in one step, a relative
+        // error up to about 2e-6 · |x| (2e-4 near 88).
+        "erf" => 2e-6 + 4.0 * eps * e.abs(),
+        "expm1" => (2.5e-4 + 4.0 * eps) * e.abs(),
         // Windows: float32 cosines of MLX's (its zeros are 1e-15-sized).
         "hanning" | "hamming" | "blackman" | "bartlett" => 4.0 * eps,
         // Butterflies: each level's rounding is relative to that level's magnitude, at most
@@ -1274,9 +1277,9 @@ fn tolerance(case: &Case, expected: &Tensor, e: f64) -> f64 {
             let n = case.inputs[0].shape.iter().max().copied().unwrap_or(1) as f64;
             4.0 * (n + 1.0) * eps * e.abs().max(1.0)
         }
-        "exp" | "log" | "sqrt" | "sin" | "cos" | "tanh" | "sigmoid" | "power" | "expm1"
-        | "log1p" | "log2" | "log10" | "tan" | "sinh" | "cosh" | "arccos" | "arccosh"
-        | "arcsin" | "arcsinh" | "arctan" | "arctanh" | "rsqrt" | "arctan2" => {
+        "exp" | "log" | "sqrt" | "sin" | "cos" | "tanh" | "sigmoid" | "power" | "log1p"
+        | "log2" | "log10" | "tan" | "sinh" | "cosh" | "arccos" | "arccosh" | "arcsin"
+        | "arcsinh" | "arctan" | "arctanh" | "rsqrt" | "arctan2" => {
             4.0 * eps * e.abs().max(f64::MIN_POSITIVE)
         }
         // A sum of the larger operand and log1p(exp(·)): absolute error near zero.

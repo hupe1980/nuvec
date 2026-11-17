@@ -167,6 +167,13 @@ test-large:
 bench-parity *args:
     uv run scripts/bench_parity.py {{args}}
 
+# Greedy tokens against mlx-lm's on a cached checkpoint: mlx-lm's reference
+# (`scripts/greedy_reference.py`), then `examples/greedy_parity` (identical prompts, or the
+# first differing step with both engines' margins).
+parity-tokens model="mlx-community/Qwen3-8B-4bit" tokens="256":
+    uv run scripts/greedy_reference.py {{model}} --tokens {{tokens}} --out target/parity/$(basename {{model}}).json
+    cargo run --release -q -p nuvec-lm --example greedy_parity -- --model {{model}} --reference target/parity/$(basename {{model}}).json
+
 # Validates the committed benchmark records (default: everything under site/static/benchmarks).
 bench-validate *paths:
     uv run scripts/validate_parity.py {{paths}}

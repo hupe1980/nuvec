@@ -430,7 +430,8 @@ fn in_place_inputs(
         Primitive::Binary(_) => &[0, 1],
         Primitive::Select => &[1, 2],
         Primitive::Fast(
-            crate::fast::imp::FastOp::Softmax | crate::fast::imp::FastOp::CausalSoftmax { .. },
+            crate::fast::imp::FastOp::Softmax { .. }
+            | crate::fast::imp::FastOp::CausalSoftmax { .. },
         ) => &[0],
         _ => &[],
     };
@@ -604,11 +605,11 @@ fn in_place(
         Primitive::Fast(crate::fast::imp::FastOp::PagedWrite) => {
             gpu.paged_write_in_place(base, &operands(1), out)?
         }
-        Primitive::Fast(crate::fast::imp::FastOp::Softmax) => {
-            gpu.softmax_in_place(base, out, None)?
+        Primitive::Fast(crate::fast::imp::FastOp::Softmax { precise }) => {
+            gpu.softmax_in_place(base, out, None, *precise)?
         }
         Primitive::Fast(crate::fast::imp::FastOp::CausalSoftmax { rows }) => {
-            gpu.softmax_in_place(base, out, Some(*rows as usize))?
+            gpu.softmax_in_place(base, out, Some(*rows as usize), true)?
         }
         Primitive::Fast(op) => gpu.norm_rope_in_place(base, op, &operands(1), out)?,
         Primitive::SliceUpdate { .. } if node.stream.device.kind == DeviceKind::Cpu => {

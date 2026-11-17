@@ -545,7 +545,12 @@ fn fast_op(rng: &mut SplitMix64, float: impl Fn(&mut SplitMix64) -> u32) -> (Fas
         // `PagedAttention`, `PagedWrite` and `ConvSlots` index caches with their inputs'
         // values; their bounds rules (skip and clamp) are tested on hostile values in
         // `tests/fast.rs`.
-        8 => (FastOp::Softmax, 1),
+        8 => (
+            FastOp::Softmax {
+                precise: rng.coin(),
+            },
+            1,
+        ),
         9 => (FastOp::LogSumExp, 1),
         10 => (FastOp::CrossEntropy, 2),
         11 => (FastOp::CrossEntropyVjp, 4),

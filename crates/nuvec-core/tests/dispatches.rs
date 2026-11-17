@@ -68,7 +68,7 @@ fn fused_paged_operations_are_one_dispatch() {
     };
     assert_eq!(n, 1, "paged_write in place");
     // A Qwen 3 MoE layer's glue at one token (128 experts, 8 per token, bfloat16): the
-    // routing and the weighting are one kernel each, where the composition takes 7.
+    // routing and the weighting are one kernel each, where the composition takes 6.
     let probs = ops::ones([1, 1, 128], DType::BF16).softmax(-1);
     let experts = ops::ones([1, 1, 8, 2048], DType::BF16);
     let w = ops::ones([1, 1, 8], DType::BF16);
@@ -79,16 +79,13 @@ fn fused_paged_operations_are_one_dispatch() {
         let scores = probs.take_along_axis(&top, -1);
         scores.divide(scores.sum_keepdims(-1))
     });
-    assert_eq!(
-        n, 5,
-        "routing composed: argsort, take, sum and its rounding, divide"
-    );
+    assert_eq!(n, 4, "routing composed: argsort, take, sum, divide");
     let n = dispatches(&[&experts, &w], || fast::weighted_sum(&experts, &w));
     assert_eq!(n, 1, "weighted_sum");
     let n = dispatches(&[&experts, &w], || {
         experts.multiply(w.expand_dims(-1)).sum(-2)
     });
-    assert_eq!(n, 3, "weighting composed: multiply, sum and its rounding");
+    assert_eq!(n, 2, "weighting composed: multiply, sum");
     // Gemma 4's post-MLP chain (norm, residual add, layer scalar, next norm): one kernel,
     // where the composition takes 4.
     let h = ops::ones([1, 1, 2816], DType::BF16);

@@ -53,7 +53,7 @@ fn table() -> Vec<(&'static str, Op, Op)> {
         mean(1); mean_keepdims(..); logsumexp(-1); logsumexp_keepdims(0); var(..);
         var_keepdims(-1); var_with(0, VarOptions { ddof: 1, keepdims: true }); std(1);
         std_keepdims(..); std_with(.., VarOptions { ddof: 1, keepdims: false });
-        argmax(-1); argmax_keepdims(..); argmin(0); argmin_keepdims(1); softmax(-1);
+        argmax(-1); argmax_keepdims(..); argmin(0); argmin_keepdims(1); softmax(-1); softmax_precise(-1);
         cumsum(-1); cumsum_with(0, ScanOptions { reverse: true, exclusive: true });
         cumprod(1); cumprod_with(.., ScanOptions { reverse: false, exclusive: true });
         cummax(0); cummax_with(-1, ScanOptions { reverse: true, exclusive: false });

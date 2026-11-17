@@ -498,7 +498,7 @@ pub fn argmin_keepdims(a: &Array, axis: impl Axis) -> Array {
     arg_reduce_op(Location::caller(), a, axis.axis_spec(), true, false)
 }
 
-fn softmax_op(at: &'static Location<'static>, a: &Array, spec: AxesSpec) -> Array {
+fn softmax_op(at: &'static Location<'static>, a: &Array, spec: AxesSpec, precise: bool) -> Array {
     Array::sticky("softmax", at, &[a], || {
         let axes = spec.sorted(a.ndim())?;
         if axes.is_empty() {
@@ -508,14 +508,21 @@ fn softmax_op(at: &'static Location<'static>, a: &Array, spec: AxesSpec) -> Arra
             let ex = imp::exp(&imp::subtract(&a, &imp::stop_gradient(&a)?)?)?;
             return imp::divide(&ex, &ex);
         }
-        imp::softmax(a, &isize_axes(&axes))
+        imp::softmax(a, &isize_axes(&axes), precise)
     })
 }
 
 /// `exp(a) / sum(exp(a))` over `axes`; see [`Array::softmax`].
 #[track_caller]
 pub fn softmax(a: &Array, axes: impl Axes) -> Array {
-    softmax_op(Location::caller(), a, axes.axes_spec())
+    softmax_op(Location::caller(), a, axes.axes_spec(), false)
+}
+
+/// [`softmax`] accumulated in float32 (MLX's `precise=True`); see
+/// [`Array::softmax_precise`].
+#[track_caller]
+pub fn softmax_precise(a: &Array, axes: impl Axes) -> Array {
+    softmax_op(Location::caller(), a, axes.axes_spec(), true)
 }
 
 // ── Scans and sorting ───────────────────────────────────────────────────────
@@ -2059,17 +2066,18 @@ methods! {
         fn sigmoid(&self) -> Array;
         /// Element-wise inverse error function, in at least float32.
         fn erfinv(&self) -> Array;
-        /// Element-wise error function, in at least float32 (MLX's approximation, within
-        /// one unit in the last place).
+        /// Element-wise error function, in at least float32 (MLX's approximations: its GPU's
+        /// bits; on the CPU within one unit in the last place).
         ///
         /// ```
         /// use nuvec_core::array;
         ///
         /// let y = array![0.0f32, 1.0].erf().to_vec::<f32>().unwrap();
-        /// assert_eq!(y, [0.0, 0.8427008]);
+        /// assert!(y[0] == 0.0 && (y[1] - 0.842_700_8).abs() < 1e-6);
         /// ```
         fn erf(&self) -> Array;
-        /// Element-wise `e^self − 1`, accurate near 0, in at least float32.
+        /// Element-wise `e^self − 1`, accurate near 0, in at least float32 (MLX's
+        /// approximation).
         fn expm1(&self) -> Array;
         /// Element-wise `ln(1 + self)`, accurate near 0, in at least float32.
         fn log1p(&self) -> Array;
@@ -2333,10 +2341,9 @@ methods! {
         fn argmin(&self, axis: impl Axis) -> Array;
         /// [`Array::argmin`] keeping the reduced axis (every axis for `..`).
         fn argmin_keepdims(&self, axis: impl Axis) -> Array;
-        /// `exp(self) / sum(exp(self))` over `axes`, with the maximum subtracted first.
-        /// Always MLX's `softmax(..., precise=True)`: float16 and bfloat16 are computed in
-        /// float32 and rounded once to the input dtype, on every device and axis, so there is
-        /// no `precise` flag and no need to cast first.
+        /// `exp(self) / sum(exp(self))` over `axes`, with the maximum subtracted first, as
+        /// MLX's `softmax`: float16 and bfloat16 accumulate in their own type
+        /// ([`Array::softmax_precise`] in float32).
         ///
         /// ```
         /// use nuvec_core::array;
@@ -2344,6 +2351,9 @@ methods! {
         /// assert_eq!(array![1.0, 1.0].softmax(-1).to_vec::<f32>().unwrap(), [0.5, 0.5]);
         /// ```
         fn softmax(&self, axes: impl Axes) -> Array;
+        /// [`Array::softmax`] accumulated in float32 and rounded once to the input dtype
+        /// (MLX's `softmax(..., precise=True)`).
+        fn softmax_precise(&self, axes: impl Axes) -> Array;
     }
 
     /// # Scans and sorting
