@@ -251,6 +251,16 @@ fn gpu_elementwise_ops_equal_mlx_exhaustively() {
     if common::require_gpu().is_none() {
         return;
     }
+    // The fixture is MLX on Apple GPUs. A virtual machine's paravirtual device (GitHub's
+    // macOS runners) flushes subnormals and has its own math library, for MLX as for nuvec.
+    let architecture = nuvec_gpu::Device::shared().map(|d| d.info().architecture.clone());
+    if !architecture
+        .as_deref()
+        .is_some_and(|a| a.starts_with("applegpu"))
+    {
+        eprintln!("skipped: {architecture:?} is not an Apple GPU");
+        return;
+    }
     let (checked, failures) = differing("gpu");
     assert!(
         failures.is_empty(),

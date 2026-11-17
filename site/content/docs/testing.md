@@ -18,7 +18,7 @@ nuvec treats MLX as the oracle: tests compare its results with MLX's.
 - gradients (`vjp` and `jvp`) and batching (`vmap`) of every primitive;
 - random-number streams, which must be bit-identical for a key.
 
-`scripts/elementwise_fixtures.py` records MLX's outputs of every element-wise op over every float16 and bfloat16 value (2^20 float32 values), and of the fused norms, rotations, softmax, reductions and scans, as hashes; nuvec's GPU must match them bit for bit.
+`scripts/elementwise_fixtures.py` records MLX's outputs of every element-wise op over every float16 and bfloat16 value (2^20 float32 values), and of the fused norms, rotations, softmax, reductions and scans, as hashes; nuvec's GPU must match them bit for bit on Apple GPUs (a virtual machine's paravirtual device is skipped: it flushes subnormals and has its own math).
 
 Tolerances are derived per operation from the dtype's machine epsilon and the operation's error bound (for example, products scale with the inner dimension and the operands' magnitudes), so a passing test means "as accurate as MLX", not "close enough".
 
