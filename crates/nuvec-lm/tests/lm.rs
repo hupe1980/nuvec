@@ -2355,8 +2355,10 @@ fn encoding_time_grows_linearly() {
         };
         let ratio = best(large) / best(small);
         eprintln!("{name}: 10× the text took {ratio:.1}× as long");
+        // Linear is 10×, quadratic 100×; the bound sits between them (cache effects and
+        // shared CI machines stretch linear runs to about 15×).
         assert!(
-            ratio <= 15.0,
+            ratio <= 30.0,
             "{name}: 10× the text took {ratio:.1}× as long"
         );
     }
