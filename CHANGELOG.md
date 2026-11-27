@@ -6,6 +6,8 @@ All notable changes to nuvec are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-27
+
 ### Added
 
 - `just qualify-mlx` for CPU and Metal fixtures and 16 frozen greedy prompts on two checkpoints.
@@ -816,7 +818,8 @@ The first release: MLX's programming model in pure Rust, with an LLM runtime at 
 - Decode at 0.97–1.04× and prefill at a geometric mean of 1.04× of mlx-lm 0.32.2 across
   seven models on an Apple M4 Pro (`just bench-parity`).
 
-[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/hupe1980/nuvec/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/hupe1980/nuvec/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/hupe1980/nuvec/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/hupe1980/nuvec/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/hupe1980/nuvec/compare/v0.12.0...v0.13.0
