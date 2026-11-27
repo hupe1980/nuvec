@@ -1305,7 +1305,7 @@ fn speculative_decoding_keeps_the_greedy_output() {
             let mut g = speculative_generate(
                 &model,
                 &prompt,
-                exact(options),
+                exact(options.clone()),
                 drafter,
                 DraftPolicy::Fixed(4),
             )
@@ -1317,7 +1317,7 @@ fn speculative_decoding_keeps_the_greedy_output() {
             prompt: prompt.len(),
             tokens: greedy.clone(),
         };
-        let (ids, stats) = run.clone()(Box::new(oracle));
+        let (ids, stats) = run(Box::new(oracle));
         assert_eq!(ids, greedy, "{name}: oracle drafts");
         assert_eq!(
             stats.accepted, stats.drafted,
@@ -1328,9 +1328,130 @@ fn speculative_decoding_keeps_the_greedy_output() {
             prompt: prompt.len(),
             tokens: greedy.iter().map(|t| (t + 1) % 128).collect(),
         };
-        let (ids, stats) = run.clone()(Box::new(wrong));
+        let (ids, stats) = run(Box::new(wrong));
         assert_eq!(ids, greedy, "{name}: wrong drafts");
         assert_eq!((stats.accepted, stats.steps), (0, greedy.len()), "{name}");
+        if name == "qwen3_5_f32" {
+            struct MalformedDraft {
+                tokens: Array,
+                probed: bool,
+            }
+            impl Drafter for MalformedDraft {
+                fn draft(&mut self, _: &Model, _: &[u32], _: usize) -> nuvec::Result<Draft> {
+                    // Force a plain step. The second call probes whether drafting can resume.
+                    Ok(if std::mem::replace(&mut self.probed, true) {
+                        Draft::new(self.tokens.clone())
+                    } else {
+                        Draft::empty()
+                    })
+                }
+            }
+            for tokens in [
+                Array::from_slice(&[1u32, 2], [1, 2]),
+                Array::from_slice(&[] as &[u32], [0, 1]),
+                Array::from(1u32),
+                Array::from_slice(&[] as &[i32], [0]),
+            ] {
+                let mut g = speculative_generate(
+                    &model,
+                    &prompt,
+                    exact(options.clone()),
+                    MalformedDraft {
+                        tokens,
+                        probed: false,
+                    },
+                    DraftPolicy::Fixed(3),
+                )
+                .unwrap();
+                let result = g.by_ref().collect::<nuvec::Result<Vec<_>>>();
+                assert!(matches!(result, Err(nuvec::Error::InvalidArgument(_))));
+                assert_eq!(g.stats().verifies, 0);
+            }
+            // Reject each position of a fixed chain and continue beyond its rollback.
+            for width in [3, 5, 7] {
+                let reference = generate(
+                    &model,
+                    &prompt,
+                    exact(GenerateOptions {
+                        max_tokens: 24,
+                        ..Default::default()
+                    }),
+                )
+                .unwrap()
+                .collect::<nuvec::Result<Vec<_>>>()
+                .unwrap();
+                assert!(reference.len() > width + 2);
+                struct RejectAt {
+                    oracle: Fixed,
+                    index: usize,
+                    rejected: bool,
+                }
+                impl Drafter for RejectAt {
+                    fn draft(
+                        &mut self,
+                        model: &Model,
+                        context: &[u32],
+                        max: usize,
+                    ) -> nuvec::Result<Draft> {
+                        let done = context.len() - self.oracle.prompt;
+                        let mut next: Vec<_> = self
+                            .oracle
+                            .tokens
+                            .iter()
+                            .skip(done)
+                            .take(max)
+                            .copied()
+                            .collect();
+                        if !self.rejected
+                            && let Some(token) = next.get_mut(self.index)
+                        {
+                            *token = (*token + 1) % model.config.vocab_size as u32;
+                            self.rejected = true;
+                        }
+                        Ok(Draft::from_tokens(&next))
+                    }
+                }
+                for index in [0, width / 2, width - 1] {
+                    let mut g = speculative_generate(
+                        &model,
+                        &prompt,
+                        exact(GenerateOptions {
+                            max_tokens: reference.len(),
+                            ..Default::default()
+                        }),
+                        RejectAt {
+                            oracle: Fixed {
+                                prompt: prompt.len(),
+                                tokens: reference.clone(),
+                            },
+                            index,
+                            rejected: false,
+                        },
+                        DraftPolicy::Fixed(width),
+                    )
+                    .unwrap();
+                    g.record_rounds(false);
+                    let ids = g.by_ref().collect::<nuvec::Result<Vec<_>>>().unwrap();
+                    let rounds = g.take_rounds();
+                    assert_eq!(rounds[0].draft.len(), width);
+                    assert_eq!(rounds[0].accepted, index);
+                    for round in rounds {
+                        let end = round.start + round.accepted;
+                        assert_eq!(round.draft[..round.accepted], reference[round.start..end]);
+                        assert_eq!(round.next, reference[end]);
+                        if round.accepted < round.draft.len() {
+                            assert_ne!(round.next, round.draft[round.accepted]);
+                        }
+                    }
+                    assert_eq!(ids, reference, "chain {width}, rejection {index}");
+                    assert!(
+                        g.stats().accepted < g.stats().drafted,
+                        "width {width} rejection {index}: {:?}",
+                        g.stats()
+                    );
+                }
+            }
+        }
         // Right for two tokens, then wrong: partial acceptance, a rollback mid-draft.
         let half = Fixed {
             prompt: prompt.len(),
@@ -1340,7 +1461,7 @@ fn speculative_decoding_keeps_the_greedy_output() {
                 .map(|(i, t)| if i % 4 < 2 { *t } else { (t + 1) % 128 })
                 .collect(),
         };
-        let (ids, stats) = run.clone()(Box::new(half));
+        let (ids, stats) = run(Box::new(half));
         assert_eq!(ids, greedy, "{name}: partly right drafts");
         assert!(
             stats.accepted > 0 && stats.accepted < stats.drafted,

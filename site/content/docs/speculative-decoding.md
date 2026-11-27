@@ -60,6 +60,28 @@ Trees apply to attention-only models (Qwen3, Qwen3-MoE, Llama, gpt-oss, Gemma 4)
 - **`DraftPolicy::Adaptive(n)`**: up to `n` tokens, pausing 1, 2, 4, … 16 steps after a fully rejected draft (prompt lookup's classic back-off).
 - **`DraftPolicy::Fixed(n)`**: up to `n` tokens every step, for measurements.
 
+## Choosing an exact draft width
+
+With the Qwen3.5-9B 4-bit target and its DFlash checkpoint in the local Hugging Face cache, run:
+
+```sh
+just bench-exact-verify --out target/exact-verify/report.json
+```
+
+The report pairs fixed widths of three, five and seven drafts with serial greedy generation on copy, code and prose prompts. Each verification also includes its seed token. The benchmark checks every proposed prefix and the target's next token, including the final partial round. Compare the per-prompt decode rates and their seven-to-three geometric mean. Each fenced eight-row verification is timed against a paired plain decode run. Time to the first token includes preparing the drafter in this benchmark.
+
+On November 27, 2026, on a 48 GB M4 Pro running macOS 27.2.1, seven exact drafts produced **0.729×** the output tokens/s of three across the three prompts (geometric mean). Each exact run emitted the same 128 tokens as serial generation. The fast seven-draft control diverged on the coding prompt. The machine was also running workspace tests. [Raw samples and verification decisions](/nuvec/experiments/exact-verify-m4-pro.json)
+
+| Prompt | Plain tok/s | 3 drafts tok/s | 5 drafts tok/s | 7 drafts tok/s | Eight-row target time / plain step |
+|---|---:|---:|---:|---:|---:|
+| Copy | 47.75 | 70.51 | 62.98 | 54.84 | 2.70× |
+| Code | 43.77 | 60.19 | 49.91 | 40.09 | 2.91× |
+| Prose | 45.79 | 53.85 | 50.95 | 40.31 | 3.20× |
+
+An experimental kernel that shares a weight load across eight rows passed the strided row-independence test and emitted the same 128 tokens on a held-out Python prompt. It reduced median seven-draft throughput from 73.75 to 57.84 tok/s across three paired runs, so the runtime retains the existing kernel. [Held-out prompt and paired observations](/nuvec/experiments/exact-verify-eight-row-trial.json)
+
+To inspect decisions in your own generation, call `generation.record_rounds(false)` before consuming tokens and `generation.take_rounds()` to drain completed rounds. Each round includes its output position, proposed IDs, accepted count and next ID. Call `record_rounds(true)` for stage timing, which synchronizes the draft on the device.
+
 ## Sampling
 
 With a temperature, verifications use the lossless rule: a draft token is accepted with probability `min(1, p / q)` against the sampler's filtered distribution (temperature, top-p, min-p, top-k), and a rejected one is replaced by a sample from the residual. Tokens are distributed exactly as plain sampling's; a seed repeats a run.
@@ -68,7 +90,7 @@ The rule is also available on its own, on the device, for runtimes that bring th
 
 ## Results
 
-DFlash on Apple M4 Pro, code (a CSV-processing function in each model's chat format), 256 greedy tokens, 4-bit drafters, drafts of 7:
+DFlash in fast mode on Apple M4 Pro, code (a CSV-processing function in each model's chat format), 256 greedy tokens, 4-bit drafters, drafts of 7:
 
 | Target + drafter | Plain decoding | DFlash | Drafts accepted |
 |---|---:|---:|---|
@@ -84,7 +106,7 @@ Qwen3-8B with `z-lab/Qwen3-8B-DFlash-b16` against dflash-mlx 0.1.8 (MLX 0.32.4) 
 | MLX (mlx-lm, dflash-mlx) | 52.5 tok/s | 63.4 tok/s (1.21×) | 72% |
 | nuvec | 51.6 tok/s | **111.3 tok/s (2.16×)** | 71% |
 
-Both accept the same share of drafts; nuvec's verification of 8 rows costs about one decode step. With `row_exact`, nuvec decodes the same tokens as plain decoding at plain decoding's speed.
+Both accept the same share of drafts. With fast routing, nuvec's verification of 8 rows costs about one decode step on this Qwen3-8B prompt. With `row_exact`, nuvec decodes the same tokens as plain decoding at plain decoding's speed.
 
 DSpark against DFlash on Qwen3-8B 4-bit, drafts of 7, 4-bit drafters (tok/s):
 

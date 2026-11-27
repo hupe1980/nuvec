@@ -4413,6 +4413,16 @@ mod metal {
             if let FastOp::Hadamard { scale } = *op {
                 return self.hadamard(operands[0], &outputs[0], f32::from_bits(scale));
             }
+            if let FastOp::PagedQuantizedAttention { scale } = *op {
+                let mut out = alloc(&outputs[0])?;
+                self.quantized_attention(
+                    operands,
+                    (f32::from_bits(scale), 64, 8, false),
+                    true,
+                    &mut out,
+                )?;
+                return Ok(vec![Data::new(out)]);
+            }
             if let FastOp::QuantizedAttention {
                 scale,
                 group_size,
@@ -4422,7 +4432,7 @@ mod metal {
             {
                 let mut out = alloc(&outputs[0])?;
                 let options = (f32::from_bits(scale), group_size, bits, sinks);
-                self.quantized_attention(operands, options, &mut out)?;
+                self.quantized_attention(operands, options, false, &mut out)?;
                 return Ok(vec![Data::new(out)]);
             }
             if let FastOp::PagedAttention {
@@ -4671,6 +4681,7 @@ mod metal {
                 | FastOp::BlockMaskedMm { .. }
                 | FastOp::QuantizeDequantize { .. }
                 | FastOp::PagedAttention { .. }
+                | FastOp::PagedQuantizedAttention { .. }
                 | FastOp::QuantizedAttention { .. }
                 | FastOp::PagedWrite
                 | FastOp::MoeRoute { .. }
@@ -4970,17 +4981,27 @@ mod metal {
             &mut self,
             operands: &[Operand<'_>],
             (scale, group_size, bits, sinks): (f32, u32, u32, bool),
+            paged: bool,
             buffer: &mut Buffer,
         ) -> Result<()> {
             // Threads per threadgroup (the kernel's tile of keys).
             const TG: usize = 128;
             let q = self.packed(operands[0], true)?;
             let (b, hq, d) = (q.shape[0], q.shape[1], q.shape[3]);
-            let (hkv, lk) = (operands[1].0.shape[1], operands[1].0.shape[2]);
+            let shape = &operands[1].0.shape;
+            let hkv = shape[1];
+            let lk = if paged {
+                shape[2] * operands[7].0.shape[1]
+            } else {
+                shape[2]
+            };
             let gqa = hq / hkv;
             // Each (batch, key head) a whole stride apart, positions a stride apart, the
             // last axis contiguous.
             let ok = |m: &Output| {
+                if paged {
+                    return false;
+                }
                 m.strides[3] == 1
                     && (m.shape[0] == 1
                         || m.shape[1] == 1
@@ -5044,11 +5065,26 @@ mod metal {
                     Some(s) => args.push(s.arg()),
                     None => args.push(q.arg()),
                 }
+                let (table, lengths, layout);
+                if paged {
+                    table = self.packed(operands[7], true)?;
+                    lengths = self.packed(operands[8], true)?;
+                    layout = [
+                        shape[2].trailing_zeros() as i32,
+                        table.shape[1] as i32,
+                        shape[0] as i32,
+                    ];
+                    args.extend([
+                        table.arg(),
+                        lengths.arg(),
+                        Arg::bytes(bytemuck::bytes_of(&layout)),
+                    ]);
+                }
                 let name = format!(
                     "nuvec_sdpa_vector_q_2pass_1_{dtn}_{d}_b{bits}_gs{group_size}_g{gqa}{}",
                     if sinks.is_some() { "_sinks" } else { "" }
                 );
-                let pipeline = self.pipeline(&name)?;
+                let pipeline = self.pipeline_with(&name, &[(48, paged)])?;
                 self.encode_groups(&pipeline, &args, [hkv, b, blocks], [TG, 1, 1])?;
                 self.counted()?;
             }

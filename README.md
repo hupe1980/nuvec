@@ -203,7 +203,14 @@ Building and testing need no Python: the MLX fixtures are checked in. With [uv](
 | `just bench-parity` | nuvec-lm vs mlx-lm and the previous release: `--tier smoke` (two models, about 10 minutes), the quick tier (one model per architecture, about 45 minutes), `--tier full` (all models and long contexts, hours) |
 | `just bench-gemm` / `bench-quant` / `bench-fast` / `bench-conv` / `bench-special` | matrix products, quantized products, fused kernels, convolutions, Hadamard, einsum and the special products |
 | `just bench-compile`, `just bench-load`, `just mnist` | compiled functions, checkpoint loading, MNIST training |
+| `just qualify-mlx` | check CPU and Metal fixtures against the pinned MLX release and replay 16 frozen greedy prompts on two Qwen checkpoints |
+| `just qualify-mlx --fixture-only` | run the numerical checks without model snapshots |
+| `just bench-exact-verify`, `bench-paged-quantized-kv`, `bench-sparse-mla` | compare exact draft widths, opt-in eight-bit pages, and a single DeepSeek-V3.2 layer |
 | `just fixtures`, `lm-fixtures`, `nn-fixtures`, `io-fixtures` | re-record the reference results |
+
+The unreleased tree qualified MLX 0.32.5 with mlx-lm 0.32.2 on the 48 GiB M4 Pro. All 16 greedy prompts matched the reference. The four-model benchmark passed all 40 performance cells against nuvec v0.15.0. [Qualification results](https://hupe1980.github.io/nuvec/docs/benchmarks/#m4-pro-qualification-results)
+
+The CPU fixture records chunk-level differences for 168 operation/type combinations on the M4 Pro. Half-precision and bfloat16 sigmoid and log-add-exp match all four reference rows. [CPU activation results](https://hupe1980.github.io/nuvec/docs/arrays/#checking-cpu-activation-results)
 
 `NUVEC_PROFILE=1` prints the GPU time per kernel of any run (see [profiling](https://hupe1980.github.io/nuvec/docs/gpu/#profiling)).
 

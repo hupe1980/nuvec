@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "numpy==2.5.4"]
+# dependencies = ["mlx==0.32.5", "numpy==2.5.4"]
 # ///
 """Compares nuvec and MLX on the same machine.
 
@@ -8,11 +8,13 @@ Times identical workloads in MLX (CPU device, pinned version), runs
 `cargo bench -p nuvec-core --bench vs_mlx`, and prints a markdown table with median
 times and the nuvec/MLX ratio (lower is better for nuvec).
 
-Usage: `just bench-mlx` (or `uv run scripts/bench_vs_mlx.py`).
+Use `just bench-mlx` for the full table, or run this script with `--activations-only`
+to measure just the four CPU activation cells (no GPU needed).
 """
 
 from __future__ import annotations
 
+import argparse
 import platform
 import subprocess
 import time
@@ -38,10 +40,21 @@ def bench(reps: int, run) -> float:
     return median_us(samples)
 
 
-def mlx_results(device=mx.cpu, prefix: str = "") -> dict[str, float]:
+def mlx_results(device=mx.cpu, prefix: str = "", *, activations_only: bool = False) -> dict[str, float]:
     mx.set_default_device(device)
     out: dict[str, float] = {}
     one = mx.array(1.0, dtype=mx.float32)
+
+    if not prefix:
+        for tag, dtype in (("f16", mx.float16), ("bf16", mx.bfloat16)):
+            a = mx.arange(-4.0, 4.0, 1.0 / 512).astype(dtype)
+            b = -a
+            mx.eval(a, b)
+            out[f"cpu_sigmoid_{tag}_4096"] = bench(100, lambda a=a: mx.eval(mx.sigmoid(a)))
+            out[f"cpu_logaddexp_{tag}_4096"] = bench(100, lambda a=a, b=b: mx.eval(mx.logaddexp(a, b)))
+
+    if activations_only:
+        return out
 
     def dispatch() -> None:
         x = mx.array(0.0, dtype=mx.float32)
@@ -71,13 +84,14 @@ def mlx_results(device=mx.cpu, prefix: str = "") -> dict[str, float]:
     for size in (256, 1024):
         x, y = mx.ones((size, size)), mx.ones((size, size))
         mx.eval(x, y)
-        out[f"{prefix}matmul_{size}"] = bench(20 if prefix else (10 if size > 512 else 50), lambda: mx.eval(x @ y))
+        out[f"{prefix}matmul_{size}"] = bench(20 if prefix else (10 if size > 512 else 50), lambda x=x, y=y: mx.eval(x @ y))
     return out
 
 
-def nuvec_results() -> dict[str, float]:
+def nuvec_results(activations_only: bool) -> dict[str, float]:
     proc = subprocess.run(
-        ["cargo", "bench", "-q", "-p", "nuvec-core", "--bench", "vs_mlx"],
+        ["cargo", "bench", "-q", "-p", "nuvec-core", "--bench", "vs_mlx",
+         *(["--", "--activations-only"] if activations_only else [])],
         cwd=ROOT, capture_output=True, text=True, check=True,
     )
     results = {}
@@ -91,16 +105,20 @@ def nuvec_results() -> dict[str, float]:
 def machine() -> str:
     try:
         cpu = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
-                             capture_output=True, text=True).stdout.strip()
+                             capture_output=True, text=True, check=False).stdout.strip()
     except OSError:
         cpu = platform.processor()
     return f"{cpu}, {platform.system()} {platform.release()}"
 
 
 def main() -> None:
-    theirs = mlx_results()
-    theirs.update(mlx_results(mx.gpu, "gpu_"))
-    ours = nuvec_results()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--activations-only", action="store_true")
+    args = parser.parse_args()
+    theirs = mlx_results(activations_only=args.activations_only)
+    if not args.activations_only:
+        theirs.update(mlx_results(mx.gpu, "gpu_"))
+    ours = nuvec_results(args.activations_only)
     print(f"Machine: {machine()}")
     print(f"MLX {mx.__version__}; rows without a prefix use the CPU device, `gpu_` rows the GPU.")
     print("nuvec release build. Medians over repeated runs; MLX timings include Python overhead.\n")

@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2"]
+# dependencies = ["mlx==0.32.5", "mlx-lm==0.32.2"]
 # ///
 """Pipeline- or tensor-parallel generation: nuvec against mlx-lm on the same machines.
 

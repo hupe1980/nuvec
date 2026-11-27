@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """Decompositions on the CPU, nuvec (faer) against MLX (Accelerate's LAPACK), float32.
 

@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2"]
+# dependencies = ["mlx==0.32.5", "mlx-lm==0.32.2"]
 # ///
 """Decode attention over a quantized KV cache: one query row over 1K–64K keys (head 128,
 32 query and 8 key heads), bf16 vector attention against mlx-lm's quantized-cache attention

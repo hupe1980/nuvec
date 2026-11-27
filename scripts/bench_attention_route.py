@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """Attention under a score-memory cap at long-prefill chunk shapes: the measurements behind
 nuvec's capped routing rule (`capped_tiled` in the attention planner) and its uncapped
@@ -44,6 +44,12 @@ def nuvec(variant: str) -> dict[tuple, tuple[float, str]]:
     return out
 
 
+def timed_attention(q, k) -> float:
+    t = time.perf_counter()
+    mx.eval(mx.fast.scaled_dot_product_attention(q, k, k, scale=0.0625, mask="causal"))
+    return (time.perf_counter() - t) * 1e3
+
+
 def mlx(cells) -> dict[tuple, float]:
     mx.set_default_device(mx.gpu)
     heads = {256: (16, 2), 128: (32, 8)}
@@ -57,14 +63,9 @@ def mlx(cells) -> dict[tuple, float]:
         k = (mx.zeros((1, hkv, lk, d)) + 0.02).astype(DTYPES[dt])
         mx.eval(q, k)
 
-        def run() -> float:
-            t = time.perf_counter()
-            mx.eval(mx.fast.scaled_dot_product_attention(q, k, k, scale=0.0625, mask="causal"))
-            return (time.perf_counter() - t) * 1e3
-
-        run()
+        timed_attention(q, k)
         reps = 3 if lq * lk > 1 << 26 else 7
-        times = sorted(run() for _ in range(reps))
+        times = sorted(timed_attention(q, k) for _ in range(reps))
         out[(d, lq, lk, dt)] = times[len(times) // 2]
         del q, k
         mx.clear_cache()

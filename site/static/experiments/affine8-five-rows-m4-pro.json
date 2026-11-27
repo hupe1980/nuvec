@@ -1,0 +1,66 @@
+{
+  "case": [
+    "affine8-4096x4096",
+    "bfloat16",
+    5
+  ],
+  "date": "2026-11-27",
+  "chip": "Apple M4 Pro",
+  "macos": "27.2.1",
+  "mlx": "0.32.4",
+  "nuvec_binary_sha256": "3b6d1430219e9d1f49356d3ee7d5e138eb268c1e6f63f40ed2063cb025683c52",
+  "warmup": 200,
+  "bursts": 3,
+  "products_per_burst": 200,
+  "batch_size": 8,
+  "pair_statistic": "best burst per route",
+  "before": {
+    "load": [
+      5.5419921875,
+      5.2109375,
+      23.162109375
+    ],
+    "cpu": "CPU usage: 4.42% user, 2.60% sys, 92.97% idle "
+  },
+  "samples": [
+    {
+      "exact_us": 76.32,
+      "mlx_us": 75.51645499916049,
+      "ratio": 1.010640661043324
+    },
+    {
+      "mlx_us": 75.87437499751104,
+      "exact_us": 76.52,
+      "ratio": 1.0085091310802907
+    },
+    {
+      "exact_us": 75.9,
+      "mlx_us": 76.09853999838379,
+      "ratio": 0.997391014356018
+    },
+    {
+      "mlx_us": 76.68020999972214,
+      "exact_us": 77.11,
+      "ratio": 1.0056049663958853
+    },
+    {
+      "exact_us": 76.73,
+      "mlx_us": 75.8366650006792,
+      "ratio": 1.0117797242179993
+    },
+    {
+      "mlx_us": 77.19770499988954,
+      "exact_us": 75.63,
+      "ratio": 0.9796923367101161
+    }
+  ],
+  "median_paired_ratio": 1.0070570487380879,
+  "after": {
+    "load": [
+      5.25830078125,
+      5.1572265625,
+      23.0380859375
+    ],
+    "cpu": "CPU usage: 3.91% user, 8.26% sys, 87.82% idle "
+  }
+}

@@ -4,6 +4,8 @@
 //! already validated shapes, dtypes and (op, dtype) support, so the per-type rules below
 //! only see supported combinations.
 
+mod activations;
+
 use bytemuck::Pod;
 use nuvec_cpu::{Gemm, MatView, View, map1, map2, map3};
 
@@ -475,6 +477,9 @@ pub(crate) fn select(c: Operand<'_>, a: Operand<'_>, b: Operand<'_>) -> Result<B
 /// Every arm passes a distinct function item (not a `fn` pointer), so each operation is
 /// monomorphised and inlined into the kernel's loop.
 pub(crate) fn unary(op: UnaryOp, a: Operand<'_>) -> Result<Buffer> {
+    if op == UnaryOp::Sigmoid && matches!(a.0.dtype, DType::F16 | DType::BF16) {
+        return activations::sigmoid(a);
+    }
     if (op, a.0.dtype) == (UnaryOp::Abs, DType::Complex64) {
         let mut out = output::<f32>(a.0.size)?;
         map1(
@@ -512,6 +517,9 @@ pub(crate) fn unary(op: UnaryOp, a: Operand<'_>) -> Result<Buffer> {
 /// An element-wise function of two operands of equal shape and dtype. Monomorphised per
 /// operation, as in [`unary`].
 pub(crate) fn binary(op: BinaryOp, a: Operand<'_>, b: Operand<'_>) -> Result<Buffer> {
+    if op == BinaryOp::LogAddExp && matches!(a.0.dtype, DType::F16 | DType::BF16) {
+        return activations::logaddexp(a, b);
+    }
     with_type!(a.0.dtype, T => {
         let (va, vb, shape) = (view::<T>(a), view::<T>(b), &a.0.shape);
         if op.is_comparison() {
@@ -1572,6 +1580,35 @@ mod num_like {
     }
 }
 
+/// MLX CPU's Cephes-derived `simd::exp` (Apple, MIT). It reduces to 2^n times
+/// a polynomial, and saturates beyond ±88 even for bfloat16 subnormal inputs.
+fn mlx_cpu_exp(value: f32) -> f32 {
+    if !(-88.0..=88.0).contains(&value) {
+        return if value.is_nan() {
+            value
+        } else if value > 0.0 {
+            f32::INFINITY
+        } else {
+            0.0
+        };
+    }
+    let scaled = value * std::f32::consts::LOG2_E;
+    let exponent = (scaled + 0.5).floor();
+    let fraction = scaled - exponent;
+    let mut poly = 1.535_336_2e-4_f32;
+    for coefficient in [
+        1.339_887_4e-3,
+        9.618_438e-3,
+        5.550_332_4e-2,
+        2.402_264_8e-1,
+        std::f32::consts::LN_2,
+        1.0,
+    ] {
+        poly = poly.mul_add(fraction, coefficient);
+    }
+    f32::from_bits(((exponent as i32 + 127) as u32) << 23) * poly
+}
+
 macro_rules! half_num {
     ($($t:ty),*) => {$(
         impl Num for $t {
@@ -1587,8 +1624,31 @@ macro_rules! half_num {
             fn neg_(self) -> Self { -self }
             fn abs_(self) -> Self { <$t>::from_f32(self.to_f32().abs()) }
             fn is_nan_(self) -> bool { self.is_nan() }
-            fn float_(self, op: UnaryOp) -> Self { <$t>::from_f32(self.to_f32().float_(op)) }
-            fn logaddexp_(self, o: Self) -> Self { <$t>::from_f32(self.to_f32().logaddexp_(o.to_f32())) }
+            fn float_(self, op: UnaryOp) -> Self {
+                if op == UnaryOp::Sigmoid {
+                    let one = <$t>::ONE;
+                    let x = self.to_f32();
+                    let e = <$t>::from_f32(mlx_cpu_exp(x.abs()));
+                    // MLX's scalar bfloat16 operands promote the float literals in
+                    // sigmoid. Its vector half path rounds the add and divide to half.
+                    if <$t as crate::Element>::DTYPE == DType::BF16 {
+                        let y = 1.0 / (1.0 + e.to_f32());
+                        return <$t>::from_f32(if x < 0.0 { y } else { 1.0 - y });
+                    }
+                    let y = one.div_(one.add_(e));
+                    return if x < 0.0 { y } else { one.sub_(y) };
+                }
+                <$t>::from_f32(self.to_f32().float_(op))
+            }
+            fn logaddexp_(self, o: Self) -> Self {
+                let max = self.max_(o);
+                let min = self.min_(o);
+                if min == <$t>::NEG_INFINITY || max == <$t>::INFINITY {
+                    return max;
+                }
+                let exp = <$t>::from_f32(mlx_cpu_exp(min.sub_(max).to_f32()));
+                max.add_(<$t>::from_f32(exp.to_f32().ln_1p()))
+            }
             // The floor of the rounded quotient (MLX's kernel: `floor(x / y)` in the type).
             fn floordiv_(self, o: Self) -> Self { <$t>::from_f32(self.div_(o).to_f32().floor()) }
             fn pow_(self, o: Self) -> Self { <$t>::from_f32(self.to_f32().powf(o.to_f32())) }

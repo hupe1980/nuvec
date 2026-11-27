@@ -10,10 +10,7 @@ use nuvec_core::{Device, with_stream};
 #[test]
 fn fixture_meta() {
     let (meta, cases) = load();
-    assert!(
-        meta.contains("mlx=0.32.4") && meta.contains("device=cpu"),
-        "{meta}"
-    );
+    assert_eq!(meta, "mlx=0.32.5 device=cpu seed=20261016");
     assert!(cases.len() >= 150, "only {} cases", cases.len());
 }
 
@@ -24,14 +21,20 @@ fn fixture_meta() {
 )]
 fn mlx_fixtures() {
     let (_, cases) = load();
-    let failures: Vec<String> = cases.iter().filter_map(check).collect();
-    assert!(
-        failures.is_empty(),
-        "{} of {} MLX fixture cases failed:\n{}",
-        failures.len(),
-        cases.len(),
-        failures.join("\n")
-    );
+    let mut devices = vec![Device::cpu()];
+    if common::require_gpu().is_some() {
+        devices.push(Device::gpu(0));
+    }
+    for device in devices {
+        let failures: Vec<_> = with_stream(device, || cases.iter().filter_map(check).collect());
+        assert!(
+            failures.is_empty(),
+            "{device}: {} of {} MLX fixture cases failed:\n{}",
+            failures.len(),
+            cases.len(),
+            failures.join("\n")
+        );
+    }
 }
 
 #[test]
@@ -61,10 +64,7 @@ fn comparator_detects_corruption() {
 )]
 fn mlx_gpu_fixtures_bit_for_bit() {
     let (meta, cases) = load_gpu();
-    assert!(
-        meta.contains("mlx=0.32.4") && meta.contains("device=gpu"),
-        "{meta}"
-    );
+    assert_eq!(meta, "mlx=0.32.5 device=gpu seed=20261016");
     let mut devices = vec![];
     if common::require_gpu().is_some() {
         devices.push(Device::gpu(0));
@@ -144,4 +144,68 @@ fn check_within(case: &Case) -> Option<String> {
         ((a.0 - b.0).abs() > atol * scale + rtol * b.0.abs())
             .then(|| format!("{}: element {i}: {} vs MLX {}", case.name, a.0, b.0))
     })
+}
+
+/// Values recorded by the release probes with MLX 0.32.5.
+#[test]
+fn release_quantized_accumulation() {
+    use nuvec_core::{DType, Quant, QuantMode, ops};
+    with_stream(Device::cpu(), || {
+        let x = ops::ones([1, 4096], DType::BF16);
+        for quant in [Quant::affine(32, 4), Quant::new(QuantMode::Mxfp4)] {
+            for transpose in [false, true] {
+                let shape = if transpose { [64, 4096] } else { [4096, 64] };
+                let w = ops::ones(shape, DType::BF16).quantize(quant);
+                let y = x.quantized_matmul(&w, transpose).astype(DType::F32);
+                assert_eq!(y.to_vec::<f32>().unwrap(), [4096.; 64]);
+            }
+        }
+    });
+}
+
+#[test]
+fn release_pad_fill_derivatives() {
+    use nuvec_core::{Array, array, jvp, ops, vjp};
+    for device in [Device::cpu(), Device::gpu(0)] {
+        if device == Device::gpu(0) && common::require_gpu().is_none() {
+            continue;
+        }
+        with_stream(device, || {
+            let pad =
+                |(x, fill): &(Array, Array)| ops::pad(x, &[(1, 2)], ops::PadMode::Constant, fill);
+            let args = (array![1f32, 2.], Array::from(3f32));
+            let (_, tangent) = jvp(pad, &args, &(array![5f32, 7.], Array::from(11f32))).unwrap();
+            assert_eq!(tangent.to_vec::<f32>().unwrap(), [11., 5., 7., 11., 11.]);
+            let (_, (x, fill)) = vjp(pad, &args, &array![1f32, 2., 3., 4., 5.]).unwrap();
+            assert_eq!(x.to_vec::<f32>().unwrap(), [2., 3.]);
+            assert_eq!(fill.item::<f32>().unwrap(), 10.);
+        });
+    }
+}
+
+#[test]
+fn release_gated_delta_preserves_float32_gate() {
+    use nuvec_core::{DType, fast, ops};
+    if common::require_gpu().is_none() {
+        return;
+    }
+    with_stream(Device::gpu(0), || {
+        let q = ops::ones([1, 1, 1, 32], DType::BF16) * 0.03125;
+        let zero = ops::zeros([1, 1, 1, 32], DType::BF16);
+        let gate = ops::full([1, 1, 1], 0.998_765_4_f32);
+        let beta = ops::ones([1, 1, 1], DType::F32);
+        let state = ops::ones([1, 1, 32, 32], DType::F32);
+        let (_, next) = fast::gated_delta(&q, &zero, &zero, &gate, &beta, &state);
+        assert_eq!(next.to_vec::<f32>().unwrap(), [0.998_765_4; 1024]);
+        // The f32 key is 1/8. With an initial state and gate of one,
+        // S k = 4 and each updated cell is exactly 1 - 4/8 on both devices.
+        let key = ops::full([1, 1, 1, 32], 0.125_f32);
+        let (_, next) = fast::gated_delta(&q, &key, &zero, &beta, &beta, &state);
+        assert!(
+            next.to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|&value| value == 0.5)
+        );
+    });
 }

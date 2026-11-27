@@ -2124,3 +2124,81 @@ fn qqmm_matrix_routes_match_the_dequantized_product() {
         }
     }
 }
+
+/// Explicit gathers of dense dequantized rows check the packed kernel's derivatives
+/// and its per-sequence limit. Nonpositive lengths and invalid block ids never
+/// address another pool or enter an unchecked index calculation.
+#[test]
+fn paged_quantized_attention_transforms_and_bounds() -> Result<()> {
+    let mut rng = Rng::new(118);
+    for device in [Device::cpu(), Device::gpu(0)] {
+        if device == Device::gpu(0) && common::require_gpu().is_none() {
+            continue;
+        }
+        set_default_stream(Stream::default_for(device));
+        let (kw, ks, kb) = parts(aq(&random(&mut rng, &[4, 1, 4, 64], DType::F32), 64, 8));
+        let (vw, vs, vb) = parts(aq(&random(&mut rng, &[4, 1, 4, 64], DType::F32), 64, 8));
+        let table = Array::from_slice(&[-2, 3, 2, 9], [2, 2]);
+        let lengths = Array::from_slice(&[6, 29], [2]);
+        let xs = vec![random(&mut rng, &[2, 2, 1, 64], DType::F32), ks, kb, vs, vb];
+        let fused = |xs: &[Array]| -> Result<Vec<Array>> {
+            Ok(vec![fast::paged_quantized_attention(
+                &xs[0],
+                [&kw, &xs[1], &xs[2]],
+                [&vw, &xs[3], &xs[4]],
+                &table,
+                &lengths,
+                0.125,
+            )])
+        };
+        let reference = |xs: &[Array]| -> Result<Vec<Array>> {
+            let k = qw(&kw, &xs[1], &xs[2], 64, 8).dequantize(DType::F32);
+            let v = qw(&vw, &xs[3], &xs[4], 64, 8).dequantize(DType::F32);
+            let output = [(0, [0, 3], 6), (1, [2, 3], 8)].map(|(r, blocks, n)| {
+                let gather = |a: &Array| {
+                    a.take(&Array::from(blocks.to_vec()), 0)
+                        .reshape([1, 1, 8, 64])
+                        .i((.., .., ..n))
+                };
+                fast::scaled_dot_product_attention(
+                    &xs[0].i(r..r + 1),
+                    &gather(&k),
+                    &gather(&v),
+                    0.125,
+                    &Default::default(),
+                )
+            });
+            Ok(vec![ops::concatenate(&output, 0)])
+        };
+        let g = random(&mut rng, xs[0].shape(), DType::F32);
+        let (out, grads) = vjp_flat(fused, &xs, std::slice::from_ref(&g))?;
+        let (want, wgrads) = vjp_flat(reference, &xs, std::slice::from_ref(&g))?;
+        assert_close("paged q8", &out[0], &want[0], 2e-5);
+        for (a, b) in grads.iter().zip(wgrads) {
+            assert_close("paged q8 vjp", a, &b, 1e-4);
+        }
+        let tangents: Vec<_> = xs
+            .iter()
+            .map(|a| random(&mut rng, a.shape(), DType::F32))
+            .collect();
+        let (_, j1) = jvp_flat(fused, &xs, &tangents)?;
+        let (_, j2) = jvp_flat(reference, &xs, &tangents)?;
+        assert_close("paged q8 jvp", &j1[0], &j2[0], 1e-4);
+        let batched: Vec<_> = xs
+            .iter()
+            .map(|a| ops::stack(&[a.clone(), a.clone()], 0))
+            .collect();
+        let vmap = vmap_flat(fused, &[Some(0); 5], &[0])(&batched)?;
+        assert_close("paged q8 vmap", &vmap[0].i(1), &want[0], 2e-5);
+        let zero = fast::paged_quantized_attention(
+            &xs[0],
+            [&kw, &xs[1], &xs[2]],
+            [&vw, &xs[3], &xs[4]],
+            &table,
+            &Array::from(vec![0, -1]),
+            0.125,
+        );
+        assert_eq!(zero.abs().max(..).item::<f32>()?, 0.0);
+    }
+    Ok(())
+}

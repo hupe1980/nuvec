@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "numpy==2.5.4"]
+# dependencies = ["mlx==0.32.5", "numpy==2.5.4"]
 # ///
 """Trains MLX's MNIST example and nuvec's port on the same machine and compares them.
 

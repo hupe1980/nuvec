@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["transformers==5.22.1", "jinja2==3.1.6", "mlx==0.32.4", "mlx-lm==0.32.2", "huggingface_hub"]
+# dependencies = ["transformers==5.22.1", "jinja2==3.1.6", "mlx==0.32.5", "mlx-lm==0.32.2", "huggingface_hub"]
 # ///
 """Chat-template and chat-dataset fixtures for nuvec-lm, recorded from transformers and mlx-lm.
 
@@ -229,10 +229,14 @@ def patch_clock():
 def snapshot(repo, download=False):
     from huggingface_hub import snapshot_download
 
+    # Corpus regeneration discovers revisions. Fixture replays use the recorded snapshot,
+    # which can be cached even on machines without a refs/main for the repository.
+    revision = None if download else next(
+        (entry["commit"] for entry in corpus_repos() if entry["repo"] == repo), None
+    )
     try:
-        return Path(
-            snapshot_download(repo, allow_patterns=TOKENIZER_FILES, local_files_only=not download)
-        )
+        return Path(snapshot_download(repo, revision=revision, allow_patterns=TOKENIZER_FILES,
+                                      local_files_only=not download))
     except Exception as e:  # noqa: BLE001
         print(f"  {repo}: {type(e).__name__}: {e}", file=sys.stderr)
         return None
@@ -431,7 +435,7 @@ def cmd_generate(_args):
     for repo in LOCAL:
         path = snapshot(repo)
         if path is None:
-            continue
+            raise SystemExit(f"Missing the recorded {repo} tokenizer; generate.json was not updated")
         config = json.loads((path / "config.json").read_text())
         tokenizer = load_tokenizer(path, eos_token_ids=config.get("eos_token_id"))
         ids = []

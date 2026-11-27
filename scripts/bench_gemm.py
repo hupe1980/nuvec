@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """GPU GEMM shape matrix: nuvec vs MLX on the same machine.
 

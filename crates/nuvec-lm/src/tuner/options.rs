@@ -479,7 +479,7 @@ hf_dataset:
     }
 
     /// The rates of `{cosine_decay, warmup 3, warmup_init 0.1, arguments [1, 4, 0.2]}`
-    /// equal mlx-lm's `build_schedule` (recorded from mlx-lm 0.32.2 with MLX 0.32.4).
+    /// equal mlx-lm's `build_schedule` (recorded from mlx-lm 0.32.2 with MLX 0.32.5).
     #[test]
     fn schedules_equal_mlx_lm() {
         let c = parse_yaml(

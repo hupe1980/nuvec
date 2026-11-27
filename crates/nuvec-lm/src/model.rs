@@ -18,6 +18,7 @@ use crate::config::{
 };
 
 mod gemma;
+pub(crate) mod paged_quant;
 mod prompt_cache;
 pub use prompt_cache::{load_prompt_cache, save_prompt_cache};
 mod mtp;
@@ -1398,6 +1399,7 @@ fn quantized_attention_composed(
 /// head_dim]` each ([`crate::PagedCache`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PagedLayer {
+    pub(crate) packed: Option<Box<paged_quant::Pages>>,
     pub(crate) keys: Option<Array>,
     pub(crate) values: Option<Array>,
     /// A Gated DeltaNet layer's states, one slot per sequence: the convolution's last
@@ -1448,6 +1450,13 @@ pub(crate) struct GroupStep {
 }
 
 impl PagedLayer {
+    pub(crate) fn arrays(&self) -> impl Iterator<Item = &Array> {
+        [&self.keys, &self.values, &self.conv, &self.recurrent]
+            .into_iter()
+            .flatten()
+            .chain(self.packed.iter().flat_map(|pages| pages.arrays()))
+    }
+
     /// The keys (`[B, kv_heads, 1, head_dim]`) normalised by `k_norm`, rotated at
     /// `positions` and written at `slots` of their pool in one kernel, the values (`[B,
     /// kv_heads, head_dim]`) written at `slots` of theirs; and the pools.
@@ -1487,7 +1496,55 @@ impl Attention {
     /// written into their slots, then attention through the block tables.
     #[track_caller]
     fn forward_paged(&self, x: &Array, layer: &mut PagedLayer, step: &PagedStep) -> Array {
-        self.forward_paged_kv(x, layer, step, None).0
+        let Some(pages) = &mut layer.packed else {
+            return self.forward_paged_kv(x, layer, step, None).0;
+        };
+        let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
+        let (q, gate) = self.paged_query(x, b, l, step);
+        let (k, v) = self.paged_projections(x, b, l);
+        let k = self
+            .rope
+            .norm_rope_at(&k, self.qk_norms().1, &step.positions, None);
+        let format = paged_quant::FORMAT;
+        let group = &step.groups[layer.group];
+        pages.write(
+            layer.pool_size,
+            format.encode(&k),
+            format.encode_values(&v.transpose(HEADS_FIRST)),
+            &group.slots.reshape([b, 1]),
+        );
+        let output = pages.attention(
+            &q,
+            group,
+            (&step.host_lengths, &step.lengths),
+            self.kv_heads,
+            self.scale(q.dtype()),
+        );
+        self.output(&output, gate, [b, l])
+    }
+
+    fn paged_query(&self, x: &Array, b: i32, l: i32, step: &PagedStep) -> (Array, Option<Array>) {
+        let (q, gate) = self.query(x, [b, l]);
+        let q = self.input_scale(q).transpose(HEADS_FIRST);
+        let q = self
+            .rope
+            .norm_rope_at(&q, self.qk_norms().0, &step.positions, None);
+        (q, gate)
+    }
+
+    fn paged_projections(&self, x: &Array, b: i32, l: i32) -> (Array, Array) {
+        let k = self.k_proj().forward(x).reshape([b, l, self.kv_heads, -1]);
+        // K = V: the values are the keys' projection, before its norm and rotation.
+        let v = match &self.v_proj {
+            Some(v) => v.forward(x).reshape([b, l, self.kv_heads, -1]),
+            None => k.clone(),
+        };
+        let v = match self.v_norm {
+            Some(eps) => fast::rms_norm(&v, None, eps),
+            None => v,
+        };
+        let k = self.input_scale(k).transpose(HEADS_FIRST);
+        (k, v)
     }
 
     /// [`Attention::forward_paged`], also giving the pools attended to (and the group of
@@ -1501,26 +1558,12 @@ impl Attention {
         shared: Option<&(Array, Array, usize)>,
     ) -> (Array, (Array, Array, usize)) {
         let [b, l, _] = x.shape_n::<3>().unwrap_or_default();
-        let (q, gate) = self.query(x, [b, l]);
-        let q = self.input_scale(q).transpose(HEADS_FIRST);
-        let q = self
-            .rope
-            .norm_rope_at(&q, self.qk_norms().0, &step.positions, None);
+        let (q, gate) = self.paged_query(x, b, l, step);
         let (keys, values, group) = match shared {
             Some(kv) => kv.clone(),
             None => {
                 let g = &step.groups[layer.group];
-                let k = self.k_proj().forward(x).reshape([b, l, self.kv_heads, -1]);
-                // K = V: the values are the keys' projection, before its norm and rotation.
-                let v = match &self.v_proj {
-                    Some(v) => v.forward(x).reshape([b, l, self.kv_heads, -1]),
-                    None => k.clone(),
-                };
-                let v = match self.v_norm {
-                    Some(eps) => fast::rms_norm(&v, None, eps),
-                    None => v,
-                };
-                let k = self.input_scale(k).transpose(HEADS_FIRST);
+                let (k, v) = self.paged_projections(x, b, l);
                 let (keys, values) = layer.write_kv(
                     (&self.rope, self.qk_norms().1),
                     (&k, &v.reshape([b, self.kv_heads, -1])),
@@ -2882,20 +2925,29 @@ impl Model {
     /// and values of this stage's full-attention layers with their own keys, in the
     /// activations' dtype. Sliding-window layers hold a fixed window per sequence instead.
     pub fn kv_bytes_per_position(&self) -> usize {
+        self.paged_layers()
+            .iter()
+            .zip(self.kv_layer_bytes())
+            .filter_map(|(kind, bytes)| (*kind == PagedKind::Keys(None)).then_some(bytes))
+            .sum()
+    }
+
+    pub(crate) fn kv_layer_bytes(&self) -> Vec<usize> {
         let dtype = match self.stage() {
             Some(stage) => stage.activations(),
             None => self.embed(&Array::from_slice(&[0u32], [1, 1])).dtype(),
         };
-        self.paged_layers()
+        self.model
+            .layers
             .iter()
-            .zip(&self.model.layers)
-            .map(|(kind, b)| match (kind, &b.mixer) {
-                (PagedKind::Keys(None), Mixer::Attention(a)) => {
-                    2 * a.k_proj().outputs() * dtype.size()
-                }
+            .map(|b| match &b.mixer {
+                Mixer::Attention(a) => a
+                    .k_proj
+                    .as_ref()
+                    .map_or(0, |k| 2 * k.outputs() * dtype.size()),
                 _ => 0,
             })
-            .sum()
+            .collect()
     }
 
     /// An empty cache per layer.
@@ -3378,8 +3430,8 @@ impl Model {
         if logits.is_ok() {
             // A pool write that failed without failing the logits fails the step too.
             for layer in layers.iter() {
-                for pool in [&layer.keys, &layer.values, &layer.conv, &layer.recurrent] {
-                    if let Some(e) = pool.as_ref().and_then(Array::error) {
+                for pool in layer.arrays() {
+                    if let Some(e) = pool.error() {
                         logits = Err(e.clone());
                     }
                 }

@@ -718,6 +718,31 @@ pub fn quantized_attention(
     })
 }
 
+/// One decode query per sequence over eight-bit affine group-64 key/value pages.
+/// Keys and values are `[codes, scales, biases]`, each `[blocks, KV heads, block size, packed width]`.
+/// Block tables and live lengths are int32. The block size is a power of two.
+/// Head widths 64 and 128 and GQA ratios 1, 2, 4 and 8 are supported.
+/// As in [`paged_attention`], block indices and live lengths are clamped to storage bounds.
+#[track_caller]
+pub fn paged_quantized_attention(
+    q: &Array,
+    keys: [&Array; 3],
+    values: [&Array; 3],
+    tables: &Array,
+    lengths: &Array,
+    scale: f32,
+) -> Array {
+    let inputs = [
+        q, keys[0], keys[1], keys[2], values[0], values[1], values[2], tables, lengths,
+    ];
+    Array::sticky(
+        "paged_quantized_attention",
+        Location::caller(),
+        &inputs,
+        || imp::paged_quantized_attention(inputs.into_iter().cloned().collect(), scale),
+    )
+}
+
 /// A mixture of experts' routing from its router's probabilities `probs` (`[..., E]`): the
 /// indices (uint32) of each row's `k` largest probabilities and those probabilities
 /// (`[..., k]` each), divided by their sum with `normalize` (mlx-lm's `norm_topk_prob`).

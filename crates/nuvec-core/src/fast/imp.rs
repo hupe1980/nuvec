@@ -158,6 +158,11 @@ pub enum FastOp {
         /// Whether per-head sinks follow.
         sinks: bool,
     },
+    /// Eight-bit affine group-64 KV pages, a per-sequence block table and live lengths.
+    PagedQuantizedAttention {
+        /// `f32::to_bits` of the score scale.
+        scale: u32,
+    },
     /// `(q, k_cache, v_cache, block_tables, lengths[, sinks])`:
     /// [`paged_attention`](crate::fast::paged_attention).
     PagedAttention {
@@ -321,6 +326,11 @@ pub(crate) fn record_or_fallback(op: FastOp, inputs: Vec<Array>) -> Result<Vec<A
     let gpu = match op {
         FastOp::Softmax { .. } | FastOp::LogSumExp | FastOp::CausalSoftmax { .. } => {
             rows_on_gpu(x.dtype(), x.size(), x.dims().last().copied().unwrap_or(1))
+        }
+        // Packed KV codes use the same in-place scatter as floating-point paged caches.
+        FastOp::PagedWrite if x.dtype() == DType::U32 => {
+            default_stream().device.kind == DeviceKind::Gpu
+                && (1..u32::MAX as usize).contains(&x.size())
         }
         _ => on_gpu(x.dtype(), x.size()),
     };
@@ -708,6 +718,7 @@ impl FastOp {
             Self::QuantizeDequantize { .. } => "quantize_dequantize",
             Self::PagedAttention { .. } => "paged_attention",
             Self::QuantizedAttention { .. } => "quantized_attention",
+            Self::PagedQuantizedAttention { .. } => "paged_quantized_attention",
             Self::PagedWrite => "paged_write",
             Self::MoeRoute { .. } => "moe_route",
             Self::WeightedSum => "weighted_sum",
@@ -746,6 +757,7 @@ impl FastOp {
             Self::QuantizeDequantize { .. } => inputs.len().clamp(1, 2),
             Self::PagedAttention { sinks, .. } => 5 + usize::from(*sinks),
             Self::QuantizedAttention { sinks, .. } => 7 + usize::from(*sinks),
+            Self::PagedQuantizedAttention { .. } => 9,
             Self::PagedWrite => 3,
             Self::ConvSlots { .. } => 4,
             Self::AddRmsNorm { .. } | Self::RmsNormVjp { .. } | Self::LayerNorm { .. } => 3,
@@ -803,7 +815,10 @@ impl FastOp {
                 Some(_) => vec![like(x), like(x)],
                 None => vec![like(x)],
             },
-            Self::PagedAttention { .. } | Self::PagedWrite | Self::QuantizedAttention { .. } => {
+            Self::PagedAttention { .. }
+            | Self::PagedQuantizedAttention { .. }
+            | Self::PagedWrite
+            | Self::QuantizedAttention { .. } => {
                 vec![like(x)]
             }
             Self::MoeRoute { k, .. } => {
@@ -911,7 +926,8 @@ impl FastOp {
             p.dtype() == x.dtype() && (p.ndim() == 0 || (p.ndim() == 1 && p.size() == last(x)))
         };
         let like = |a: &Array| a.dtype() == x.dtype() && a.dims() == x.dims();
-        if !kernel_float(x) {
+        let packed_codes = *self == Self::PagedWrite && x.dtype() == DType::U32;
+        if !(kernel_float(x) || packed_codes) {
             return Err(Error::unsupported_dtype(name, x.dtype()));
         }
         let rotation = |dims: usize, x: &Array, freqs: Option<&Array>| {
@@ -1090,6 +1106,7 @@ impl FastOp {
                         .try_fold(1usize, |p, &v| p.checked_mul(v))
                         .is_some_and(fits)
             }
+            Self::PagedQuantizedAttention { .. } => paged_quantized_fits(inputs),
             Self::QuantizedAttention {
                 group_size,
                 bits,
@@ -1579,6 +1596,29 @@ impl FastOp {
                 (*group_size as i32, *bits as i32),
                 *sinks,
             )],
+            Self::PagedQuantizedAttention { scale } => {
+                let dense = |idx: usize| {
+                    crate::Quantized::affine(
+                        inputs[idx].clone(),
+                        inputs[idx + 1].clone(),
+                        inputs[idx + 2].clone(),
+                        64,
+                        8,
+                    )
+                    .dequantize(x.dtype())
+                };
+                vec![paged_attention_graph(
+                    &[
+                        x.clone(),
+                        dense(1),
+                        dense(4),
+                        inputs[7].clone(),
+                        inputs[8].clone(),
+                    ],
+                    float(*scale),
+                    0,
+                )?]
+            }
             Self::PagedAttention { scale, window, .. } => {
                 vec![paged_attention_graph(inputs, float(*scale), *window)?]
             }
@@ -1773,6 +1813,7 @@ impl FastOp {
             | Self::NormRope { .. }
             | Self::PagedAttention { .. }
             | Self::QuantizedAttention { .. }
+            | Self::PagedQuantizedAttention { .. }
             | Self::PagedWrite
             | Self::MoeRoute { .. }
             | Self::WeightedSum
@@ -3799,6 +3840,7 @@ pub(crate) fn gated_delta_slots(
         astype(slots, DType::I32)?,
     ];
     let kernel = on_gpu(q.dtype(), q.size())
+        && q.dtype() == k.dtype()
         && q.dtype() == v.dtype()
         && q.dims()[3].is_multiple_of(32)
         && [g, beta, pool]
@@ -3866,6 +3908,7 @@ fn gated_delta_op(
         state.clone(),
     ];
     let kernel = on_gpu(q.dtype(), q.size())
+        && q.dtype() == k.dtype()
         && q.dtype() == v.dtype()
         && dk % 32 == 0
         && [g, beta, state]
@@ -3935,6 +3978,53 @@ fn gated_delta_graph(inputs: &[Array], steps: bool) -> Result<Vec<Array>> {
         (true, true) => zeros(&[b, 0, hv, dv, dk], state.dtype())?,
     };
     Ok(vec![y, s])
+}
+
+/// Validate the rows and the 32-bit page-index arithmetic of the packed Metal kernel.
+fn paged_quantized_fits(inputs: &[Array]) -> bool {
+    let [q, kw, ks, kb, vw, vs, vb, tables, lengths] = inputs else {
+        return false;
+    };
+    let ([b, hq, 1, d], [pages, hkv, bs, words], [tb, columns]) =
+        (q.dims(), kw.dims(), tables.dims())
+    else {
+        return false;
+    };
+    let capacity = columns.saturating_mul(*bs);
+    matches!(d, 64 | 128)
+        && *pages > 0
+        && *hkv > 0
+        && hq.is_multiple_of(*hkv)
+        && matches!(hq / hkv, 1 | 2 | 4 | 8)
+        && bs.is_power_of_two()
+        && *columns > 0
+        && capacity <= i32::MAX as usize / 2
+        && words * 4 == *d
+        && kw.size() < i32::MAX as usize
+        && q.size() < i32::MAX as usize / 1024
+        && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        && b == tb
+        && lengths.dims() == [*b]
+        && tables.dtype() == DType::I32
+        && lengths.dtype() == DType::I32
+        && kw.dtype() == DType::U32
+        && vw.dtype() == DType::U32
+        && kw.dims() == vw.dims()
+        && [ks, kb, vs, vb]
+            .iter()
+            .all(|a| a.dtype() == q.dtype() && a.dims() == [*pages, *hkv, *bs, d / 64])
+}
+
+pub(crate) fn paged_quantized_attention(inputs: Vec<Array>, scale: f32) -> Result<Array> {
+    if !paged_quantized_fits(&inputs) {
+        return Err(Error::InvalidArgument("paged_quantized_attention: incompatible queries, affine eight-bit page layout, block tables or lengths".into()));
+    }
+    one(
+        FastOp::PagedQuantizedAttention {
+            scale: scale.to_bits(),
+        },
+        inputs,
+    )
 }
 
 /// Whether [`FastOp::QuantizedAttention`]'s kernel takes these inputs: one query row per

@@ -119,7 +119,8 @@ fn check(name: &'static str, input: &Array, weight: &Array, conv: &Conv) -> Resu
         let size = n
             .saturating_sub(1)
             .checked_mul(conv.input_dilation[i])
-            .and_then(|s| isize::try_from(s + usize::from(n > 0)).ok())
+            .and_then(|s| s.checked_add(usize::from(n > 0)))
+            .and_then(|s| isize::try_from(s).ok())
             .and_then(|s| s.checked_add(conv.pad_lo[i])?.checked_add(conv.pad_hi[i]));
         let (Some(span), Some(size)) = (span, size) else {
             return Err(invalid(name, format!("the sizes overflow on axis {i}")));
@@ -170,37 +171,43 @@ pub(crate) fn conv_general(
     name: &'static str,
     input: &Array,
     weight: &Array,
-    conv: &Conv,
+    parameters: &Conv,
 ) -> Result<Array> {
-    // Negative padding slices the input (before its dilation, as MLX), then pads nothing.
-    let d = conv.stride.len();
+    check(name, input, weight, parameters)?;
+    let dtype = promote_types(input.dtype(), weight.dtype());
+    let d = parameters.stride.len();
     let mut input = input.clone();
-    let mut conv = conv.clone();
-    if input.ndim() == d + 2
-        && conv.pad_lo.len() == d
-        && conv.pad_hi.len() == d
-        && conv.pad_lo.iter().chain(&conv.pad_hi).any(|&p| p < 0)
-    {
+    let mut conv = parameters.clone();
+    if conv.pad_lo.iter().chain(&conv.pad_hi).any(|&p| p < 0) {
         let mut args = vec![SliceArg::full(); d + 2];
         for i in 0..d {
-            let (lo, hi) = ((-conv.pad_lo[i]).max(0), (-conv.pad_hi[i]).max(0));
-            let n = input.dims()[1 + i] as isize;
-            args[1 + i] = SliceArg::new(Some(lo.min(n)), Some((n - hi).max(lo.min(n))), 1);
-            conv.pad_lo[i] = conv.pad_lo[i].max(0);
-            conv.pad_hi[i] = conv.pad_hi[i].max(0);
+            let n = input.dims()[i + 1];
+            let dilation = conv.input_dilation[i];
+            let lo = conv.pad_lo[i].min(0).unsigned_abs().div_ceil(dilation);
+            let hi = n.saturating_sub(conv.pad_hi[i].min(0).unsigned_abs().div_ceil(dilation));
+            if hi <= lo {
+                let mut shape = vec![input.dims()[0]];
+                shape.extend(out_dims(input.dims(), weight.dims(), parameters));
+                shape.push(weight.dims()[0]);
+                return zeros(&shape, dtype);
+            }
+            args[i + 1] = SliceArg::new(Some(lo as isize), Some(hi as isize), 1);
+            // A crop between input samples leaves zeros at that edge of the dilated input.
+            if conv.pad_lo[i] < 0 {
+                conv.pad_lo[i] = conv.pad_lo[i].rem_euclid(dilation as isize);
+            }
+            if conv.pad_hi[i] < 0 {
+                conv.pad_hi[i] = conv.pad_hi[i].rem_euclid(dilation as isize);
+            }
         }
         input = slice(&input, &args)?;
     }
-    let conv = &conv;
-    check(name, &input, weight, conv)?;
-    let dtype = promote_types(input.dtype(), weight.dtype());
-    let (pad_lo, pad_hi) = (conv.pad_lo.clone(), conv.pad_hi.clone());
     let op = crate::fast::imp::FastOp::Conv {
-        stride: conv.stride.clone(),
-        pad_lo,
-        pad_hi,
-        kernel_dilation: conv.kernel_dilation.clone(),
-        input_dilation: conv.input_dilation.clone(),
+        stride: conv.stride,
+        pad_lo: conv.pad_lo,
+        pad_hi: conv.pad_hi,
+        kernel_dilation: conv.kernel_dilation,
+        input_dilation: conv.input_dilation,
         groups: conv.groups,
         flip: conv.flip,
     };

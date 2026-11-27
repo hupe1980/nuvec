@@ -38,6 +38,19 @@ fn main() -> Result<()> {
     }
     // Rows without a prefix measure the CPU (the default device is the GPU when present).
     set_default_stream(Stream::default_for(Device::cpu()));
+    for (tag, dtype) in [("f16", DType::F16), ("bf16", DType::BF16)] {
+        let a = evaluated(ops::arange(-4.0, 4.0, 1.0 / 512.0).astype(dtype))?;
+        let b = evaluated(a.negative())?;
+        bench(&format!("cpu_sigmoid_{tag}_4096"), 100, || {
+            a.sigmoid().eval()
+        })?;
+        bench(&format!("cpu_logaddexp_{tag}_4096"), 100, || {
+            a.logaddexp(&b).eval()
+        })?;
+    }
+    if std::env::args().any(|a| a == "--activations-only") {
+        return Ok(());
+    }
     let one = Array::from(1.0f32);
     bench("dispatch_10k", 20, || {
         let mut x = Array::from(0.0f32);

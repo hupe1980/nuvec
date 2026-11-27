@@ -1,0 +1,170 @@
+# MLX 0.32.5, Apple M4 Pro, macOS 27.2.1 build 26B131.
+# dtype op [differing zero-based chunk indices]; no indices = exact.
+float16 abs
+float16 arccos 11
+float16 arccosh 3 7
+float16 arcsin
+float16 arcsinh 5 7 13 15
+float16 arctan 4 12
+float16 arctanh
+float16 ceil
+float16 cos
+float16 cosh
+float16 erf 0 1 2 3 8 9 10 11
+float16 erfinv
+float16 exp
+float16 expm1 8
+float16 floor
+float16 log
+float16 log2 3 4
+float16 log10
+float16 log1p 1 8
+float16 negative
+float16 round
+float16 sigmoid
+float16 sign
+float16 sin 8
+float16 sinh
+float16 square
+float16 sqrt
+float16 rsqrt 0 1 2 3 4 5 6 7
+float16 tan 8
+float16 tanh
+float16 add
+float16 subtract
+float16 multiply
+float16 divide
+float16 floor_divide
+float16 remainder 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float16 logaddexp
+float16 maximum
+float16 minimum
+float16 power 1 2 3 4 6 7 8 9 11 13
+float16 arctan2 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float16 fast:rms_norm 0 1 5 6 7 9
+float16 fast:layer_norm 0 4 5 7 9
+float16 fast:rope 0 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float16 fast:rope_traditional 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float16 fast:softmax 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float16 fast:logsumexp 2 3 4 6 8 10 11 12 13 15
+float16 fast:sum 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float16 fast:mean 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float16 fast:max
+float16 fast:cumsum
+float16 fast:logcumsumexp 11
+float16 fast:hadamard 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float16 fast:conv_depthwise 0 1 2 3 5 6 7 8 9 10 12 15
+float16 fast:sum_columns 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float16 fast:sum_long_columns 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+bfloat16 abs
+bfloat16 arccos
+bfloat16 arccosh
+bfloat16 arcsin
+bfloat16 arcsinh
+bfloat16 arctan
+bfloat16 arctanh
+bfloat16 ceil
+bfloat16 cos
+bfloat16 cosh
+bfloat16 erf 0 1 2 3 8 9 10 11
+bfloat16 erfinv
+bfloat16 exp 4 12
+bfloat16 expm1
+bfloat16 floor
+bfloat16 log
+bfloat16 log2
+bfloat16 log10
+bfloat16 log1p
+bfloat16 negative
+bfloat16 round
+bfloat16 sigmoid
+bfloat16 sign
+bfloat16 sin 8
+bfloat16 sinh
+bfloat16 square
+bfloat16 sqrt
+bfloat16 rsqrt 0 1 2 3 4 5 6 7
+bfloat16 tan
+bfloat16 tanh
+bfloat16 add
+bfloat16 subtract
+bfloat16 multiply
+bfloat16 divide
+bfloat16 floor_divide
+bfloat16 remainder
+bfloat16 logaddexp
+bfloat16 maximum
+bfloat16 minimum
+bfloat16 power
+bfloat16 arctan2
+bfloat16 fast:rms_norm
+bfloat16 fast:layer_norm
+bfloat16 fast:rope
+bfloat16 fast:rope_traditional 0 1 2 3 4 5 6 7 8 9 10 13 14 15
+bfloat16 fast:softmax 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+bfloat16 fast:logsumexp
+bfloat16 fast:sum
+bfloat16 fast:mean
+bfloat16 fast:max
+bfloat16 fast:cumsum
+bfloat16 fast:logcumsumexp 0 2 3 5 7 8 10 11 12 13 15
+bfloat16 fast:hadamard 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+bfloat16 fast:conv_depthwise
+bfloat16 fast:sum_columns
+bfloat16 fast:sum_long_columns
+float32 abs
+float32 arccos 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 arccosh 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 arcsin 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 arcsinh 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 arctan 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 arctanh 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 ceil
+float32 cos
+float32 cosh 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 erf 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 erfinv 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 exp 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 expm1 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 floor
+float32 log 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 log2 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 log10 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 log1p 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 negative
+float32 round
+float32 sigmoid 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 sign
+float32 sin
+float32 sinh 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 square
+float32 sqrt
+float32 rsqrt 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 tan 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 tanh 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 add
+float32 subtract
+float32 multiply
+float32 divide
+float32 floor_divide
+float32 remainder
+float32 logaddexp 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 maximum
+float32 minimum
+float32 power 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 arctan2 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:rms_norm 0 1 2 3 4 6 7 8 9 10 11 12 13 14 15
+float32 fast:layer_norm 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:rope 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:rope_traditional 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:softmax 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:logsumexp 12
+float32 fast:sum 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:mean 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:max
+float32 fast:cumsum
+float32 fast:logcumsumexp 0 1 2 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:hadamard
+float32 fast:conv_depthwise 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:sum_columns 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+float32 fast:sum_long_columns 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15

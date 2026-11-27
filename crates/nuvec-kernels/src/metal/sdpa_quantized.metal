@@ -22,6 +22,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
+constant bool quant_paged [[function_constant(48)]];
+
+// For a packed pool the row index is relative to the first block's key head.
+// Clamp caller-supplied table entries just as dense paged_attention does.
+inline int quant_page_row(int key, const device int* table, int shift, int hkv, int blocks) {
+  const int page = clamp(table[key >> shift], 0, blocks - 1);
+  return (page * hkv << shift) + (key & ((1 << shift) - 1));
+}
+
 // A unit of codes: a 32-bit word (`32 / BITS` codes) at 4 and 8 bits; 3 bytes (8 codes,
 // MLX's 3-bit packing) at 3 bits. Code `c` of a unit is bits `BITS·c …` of its value.
 template <int BITS>
@@ -60,6 +69,9 @@ template <typename T, int D, int BITS, int GS, int G, bool SINKS>
     const constant int64_t* strides [[buffer(11)]],
     const constant float& scale [[buffer(12)]],
     const device T* sinks [[buffer(13)]],
+    const device int* tables [[buffer(14), function_constant(quant_paged)]],
+    const device int* lengths [[buffer(15), function_constant(quant_paged)]],
+    const constant int* layout [[buffer(16), function_constant(quant_paged)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint t [[thread_index_in_threadgroup]],
@@ -89,7 +101,7 @@ template <typename T, int D, int BITS, int GS, int G, bool SINKS>
   const int hkv = tpg.x;
   const int hq = hkv * G;
   const int head0 = batch * hq + kv_head * G;
-  const int kvh = batch * hkv + kv_head;
+  const int kvh = (quant_paged ? 0 : batch * hkv) + kv_head;
 
   for (int i = t; i < G * D; i += TG) {
     q_sh[i / D][i % D] = static_cast<U>(scale) * static_cast<U>(queries[head0 * D + i]);
@@ -109,9 +121,11 @@ template <typename T, int D, int BITS, int GS, int G, bool SINKS>
   const int stripe = int(t) / WORDS;
   const int vgroup = (vword * PACK) / GS;
 
-  const int chunk = (N + blocks - 1) / blocks;
+  const int length = quant_paged ? clamp(lengths[batch], 0, N) : N;
+  const device int* table = quant_paged ? tables + size_t(batch) * layout[1] : nullptr;
+  const int chunk = (length + blocks - 1) / blocks;
   const int s0 = block * chunk;
-  const int s1 = min(N, s0 + chunk);
+  const int s1 = min(length, s0 + chunk);
 
   U m[G];
   U l[G];
@@ -150,7 +164,8 @@ template <typename T, int D, int BITS, int GS, int G, bool SINKS>
       score[j] = 0;
     }
     if (valid) {
-      const device uint8_t* kp = kbase + key * strides[1] * 4;
+      const int row = quant_paged ? quant_page_row(key, table, layout[0], hkv, layout[2]) : key;
+      const device uint8_t* kp = kbase + row * strides[1] * 4;
       for (int g = 0; g < GROUPS; g++) {
         U acc[G];
         for (int j = 0; j < G; j++) {
@@ -166,8 +181,8 @@ template <typename T, int D, int BITS, int GS, int G, bool SINKS>
             }
           }
         }
-        const U sc = static_cast<U>(ksb[key * strides[3] + g]);
-        const U bi = static_cast<U>(kbb[key * strides[3] + g]);
+        const U sc = static_cast<U>(ksb[row * strides[3] + g]);
+        const U bi = static_cast<U>(kbb[row * strides[3] + g]);
         for (int j = 0; j < G; j++) {
           score[j] += sc * acc[j] + bi * qsum_sh[j][g];
         }
@@ -202,7 +217,7 @@ template <typename T, int D, int BITS, int GS, int G, bool SINKS>
     }
     const int n = min(TG, s1 - base);
     for (int k = stripe; k < n; k += STRIPES) {
-      const int kk = base + k;
+      const int kk = quant_paged ? quant_page_row(base + k, table, layout[0], hkv, layout[2]) : base + k;
       const U sc = static_cast<U>(vsb[kk * strides[7]]);
       const U bi = static_cast<U>(vbb[kk * strides[7]]);
       const uint32_t word = Unit<BITS>::load(vbase + kk * strides[5] * 4);

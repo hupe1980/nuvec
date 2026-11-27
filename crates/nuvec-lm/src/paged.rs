@@ -13,6 +13,7 @@
 
 use nuvec::{Array, Result, fast, ops};
 
+use crate::model::paged_quant::Layout;
 use crate::model::{GroupStep, KvCache, Model, PagedKind, PagedLayer, PagedStep};
 
 /// A sequence of a [`PagedCache`].
@@ -50,6 +51,8 @@ struct Sequence {
 #[derive(Debug, Clone)]
 pub struct PagedCache {
     pub(crate) layers: Vec<PagedLayer>,
+    pub(crate) packed: Option<Layout>,
+    capacity_bytes: usize,
     groups: Vec<Group>,
     /// Each layer's group (`None`: no keys and values of its own).
     layer_group: Vec<Option<usize>>,
@@ -84,6 +87,39 @@ impl PagedCache {
     /// for up to `sequences` sequences at a time. The pools are allocated with the first
     /// sequence, in its states' dtypes.
     pub fn new(model: &Model, blocks: usize, block_size: usize, sequences: usize) -> Result<Self> {
+        Self::with_layout(model, blocks, block_size, sequences, None)
+    }
+
+    /// Eight-bit affine pages (group 64) from the first position, for full-attention Qwen3.
+    /// Insert prefilled KV using [`KvCache::to_quantized`] before the first forward.
+    pub fn new_quantized(
+        model: &Model,
+        blocks: usize,
+        block_size: usize,
+        sequences: usize,
+    ) -> Result<Self> {
+        Self::with_layout(
+            model,
+            blocks,
+            block_size,
+            sequences,
+            Some(Layout::for_model(model)?),
+        )
+    }
+
+    /// Configured bytes for KV arrays across all layers, including affine metadata.
+    /// Excludes recurrent states, block tables, scratch, weights and allocator rounding.
+    pub fn kv_capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+
+    pub(crate) fn with_layout(
+        model: &Model,
+        blocks: usize,
+        block_size: usize,
+        sequences: usize,
+        packed: Option<Layout>,
+    ) -> Result<Self> {
         if !block_size.is_power_of_two() || blocks == 0 || sequences == 0 {
             return Err(invalid(
                 "blocks of a power-of-two size, at least one block and one sequence",
@@ -95,6 +131,13 @@ impl PagedCache {
             )));
         }
         let int = |v: usize| i32::try_from(v).map_err(|_| invalid(format!("{v} is too large")));
+        int(sequences)?;
+        let check_slots = |n: usize| {
+            n.checked_mul(block_size)
+                .and_then(|slots| i32::try_from(slots).ok())
+                .ok_or_else(|| invalid("page slots exceed signed 32-bit indexing"))
+        };
+        check_slots(blocks)?;
         let mut groups: Vec<Group> = Vec::new();
         let mut layer_group = Vec::new();
         let kinds = model.paged_layers();
@@ -108,12 +151,15 @@ impl PagedCache {
                 None => {
                     let n = match window {
                         None => blocks,
-                        Some(w) => sequences * ((w.max(1) - 1).div_ceil(block_size) + 2),
+                        Some(w) => sequences
+                            .checked_mul((w.max(1) - 1).div_ceil(block_size) + 2)
+                            .ok_or_else(|| invalid("window pool capacity overflow"))?,
                     };
+                    check_slots(n)?;
                     groups.push(Group {
                         window,
                         blocks: n,
-                        free: (0..n as u32).rev().collect(),
+                        free: Vec::new(),
                     });
                     groups.len() - 1
                 }
@@ -126,10 +172,32 @@ impl PagedCache {
             groups.push(Group {
                 window: None,
                 blocks,
-                free: (0..blocks as u32).rev().collect(),
+                free: Vec::new(),
             });
         }
         let primary = groups.iter().position(|g| g.window.is_none()).unwrap_or(0);
+        let capacity_bytes = if let Some(layout) = packed {
+            layout
+                .bytes_per_position
+                .checked_mul(blocks)
+                .and_then(|b| b.checked_mul(block_size))
+        } else {
+            layer_group
+                .iter()
+                .zip(model.kv_layer_bytes())
+                .filter_map(|(g, bytes)| g.map(|g| (groups[g].blocks, bytes)))
+                .try_fold(0usize, |sum, (blocks, bytes)| {
+                    sum.checked_add(blocks.checked_mul(block_size)?.checked_mul(bytes)?)
+                })
+        }
+        .ok_or_else(|| invalid("KV capacity exceeds address space"))?;
+        for group in &mut groups {
+            group
+                .free
+                .try_reserve_exact(group.blocks)
+                .map_err(|_| invalid("cannot allocate page table"))?;
+            group.free.extend((0..group.blocks as u32).rev());
+        }
         let layers = layer_group
             .iter()
             .map(|g| {
@@ -140,12 +208,15 @@ impl PagedCache {
                     ),
                     state_slots: int(sequences)?,
                     group: g.unwrap_or(0),
+                    packed: packed.map(|_| Box::default()),
                     ..Default::default()
                 })
             })
             .collect::<Result<_>>()?;
         Ok(Self {
             layers,
+            packed,
+            capacity_bytes,
             groups,
             layer_group,
             states: kinds.iter().map(|&k| k == PagedKind::States).collect(),
@@ -254,17 +325,20 @@ impl PagedCache {
         // Checked before anything is allocated.
         let mut rows = None;
         for ((c, g), &states) in cache.iter().zip(&self.layer_group).zip(&self.states) {
-            if c.is_quantized() {
-                return Err(invalid(
-                    "a quantized cache (the paged cache is not quantized)",
-                ));
-            }
-            let batch = match (c.linear_state(), c.keys_values()) {
-                (Some((conv, _)), _) => conv.shape().first().copied(),
-                (None, Some((k, _))) => k.shape().first().copied(),
-                // An empty sequence, or a layer with nothing of its own.
-                (None, None) if len == 0 || !own(g, states) => None,
-                (None, None) => return Err(invalid("a layer without keys, values or states")),
+            let batch = if let Some(layout) = self.packed {
+                layout.import_rows(c, len)?
+            } else {
+                if c.is_quantized() {
+                    return Err(invalid(
+                        "a quantized cache (the paged cache is not quantized)",
+                    ));
+                }
+                match (c.linear_state(), c.keys_values()) {
+                    (Some((conv, _)), _) => conv.shape().first().copied(),
+                    (None, Some((k, _))) => k.shape().first().copied(),
+                    (None, None) if len == 0 || !own(g, states) => None,
+                    (None, None) => return Err(invalid("a layer without keys, values or states")),
+                }
             };
             let batch_fits = match (batch, rows) {
                 (Some(b), Some(r)) => b == r,
@@ -425,6 +499,16 @@ impl PagedCache {
             let Some(slots) = &slots[g] else {
                 continue; // empty sequences: no positions to write
             };
+            if let Some(pages) = &mut layer.packed {
+                let (k, v, _) = c
+                    .quantized_keys_values()
+                    .ok_or_else(|| invalid("missing eight-bit cache"))?;
+                pages.write(layer.pool_size, k, v, slots);
+                if let Some(error) = pages.arrays().find_map(Array::error) {
+                    return Err(error.clone());
+                }
+                continue;
+            }
             let (k, v) = c.keys_values().expect("checked by insert");
             // The kept positions of the cache's (which starts at `c.start()`).
             let from = (firsts[g] - c.start()) as i32;
@@ -566,12 +650,12 @@ impl PagedCache {
         }
     }
 
-    /// The cached arrays (to evaluate them).
+    /// The cached arrays, in layer order. Packed layers yield key codes, scales and biases,
+    /// then value codes, scales and biases.
     pub fn state(&self) -> Vec<Array> {
         self.layers
             .iter()
-            .flat_map(|l| [&l.keys, &l.values, &l.conv, &l.recurrent])
-            .flatten()
+            .flat_map(PagedLayer::arrays)
             .cloned()
             .collect()
     }
@@ -586,6 +670,11 @@ pub fn decode_batch(
     ids: &[SeqId],
     cache: &mut PagedCache,
 ) -> Result<Array> {
+    if let Some(expected) = cache.packed
+        && expected != Layout::for_model(model)?
+    {
+        return Err(invalid("model does not match the eight-bit pool layout"));
+    }
     let reservation = cache.reserve(ids)?;
     match forward_reserved(model, &Array::from(tokens.to_vec()), &reservation, cache) {
         Ok(logits) => {

@@ -345,3 +345,7 @@ template <typename T>
 instantiate_paged(float32, float)
 instantiate_paged(float16, half)
 instantiate_paged(bfloat16, bfloat16_t)
+
+// An eight-bit cache packs four codes in each word.
+template [[host_name("nuvec_paged_write_uint32")]] [[kernel]]
+decltype(paged_write<uint32_t>) paged_write<uint32_t>;

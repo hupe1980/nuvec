@@ -54,19 +54,19 @@ fn fused_paged_operations_are_one_dispatch() {
     });
     assert_eq!(n, 2, "paged_write into a held pool");
     // Owned pools are written in place: one dispatch each.
-    let n = {
-        let owned = ops::zeros([8, h, 4, d], DType::BF16);
-        owned.eval().unwrap();
-        for a in [&prefill, &slots] {
+    for dtype in [DType::BF16, DType::U32] {
+        let owned = ops::zeros([8, h, 4, d], dtype);
+        let rows = rows.astype(dtype);
+        for a in [&owned, &rows, &slots] {
             a.eval().unwrap();
         }
         let before = nuvec_core::__gpu_dispatches();
         let out = fast::paged_write(&owned, &rows, &slots);
         drop(owned);
         out.eval().unwrap();
-        nuvec_core::__gpu_dispatches() - before
-    };
-    assert_eq!(n, 1, "paged_write in place");
+        let n = nuvec_core::__gpu_dispatches() - before;
+        assert_eq!(n, 1, "paged_write in place for {dtype:?}");
+    }
     // A Qwen 3 MoE layer's glue at one token (128 experts, 8 per token, bfloat16): the
     // routing and the weighting are one kernel each, where the composition takes 6.
     let probs = ops::ones([1, 1, 128], DType::BF16).softmax(-1);

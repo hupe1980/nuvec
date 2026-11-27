@@ -87,7 +87,7 @@ memory() {
 tensor() {
     local m launch
     m=$(snapshot Qwen3-0.6B-4bit)
-    launch=(uv run --python 3.13 --with mlx==0.32.4 --with mlx-lm==0.32.2 python -c
+    launch=(uv run --python 3.13 --with mlx==0.32.5 --with mlx-lm==0.32.2 python -c
         "from mlx._distributed_utils.launch import main; main()" --backend ring -n 2 --)
     log "tensor: nuvec"
     xcrun xctrace record --template "Metal System Trace" --all-processes --time-limit 60s \

@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2", "jsonschema==4.23.0"]
+# dependencies = ["mlx==0.32.5", "mlx-lm==0.32.2", "jsonschema==4.23.0"]
 # ///
 """Parity record: nuvec-lm vs mlx-lm over a roster of models, on the same machine and day.
 
@@ -51,7 +51,7 @@ Usage: `just bench-parity [models…] [--tier smoke|quick|full] [--baseline REF 
 [--resume] [--budget SECONDS] [--nuvec-ref REF] [--no-cold] [--no-max-context]
 [--prompt-tokens 2048,32768] [--concurrency 1,4,8]`.
 
-Each child's output is cached under `target/bench-parity/<model>/jobs/`; `--resume` reuses
+Each child's output is cached under `target/bench-parity/session-*/<model>/jobs/`; `--resume` reuses
 it, and `--budget` stops starting children after that many seconds (exit 3), so a long run
 can be continued.
 """
@@ -60,8 +60,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
-import math
 import os
 import platform
 import re
@@ -136,19 +136,24 @@ class OutOfBudget(Exception):
 
 def sh(*cmd: str) -> str:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+        return subprocess.run(cmd, capture_output=True, text=True, check=False).stdout.strip()
     except OSError:
         return ""
 
 
-def snapshot(model: str) -> Path | None:
+def snapshot(model: str, revision: str | None = None) -> Path | None:
     """The cached snapshot directory: the one `refs/main` names, else the newest."""
     hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / "hub"
+    hub = Path(os.environ.get("HF_HUB_CACHE", hub))
     repo = hub / f"models--{model.replace('/', '--')}"
+    if revision is not None:
+        path = repo / "snapshots" / revision
+        return path if (path / "config.json").is_file() else None
     ref = repo / "refs" / "main"
     if ref.exists():
         path = repo / "snapshots" / ref.read_text().strip()
-        return path if (path / "config.json").exists() else None
+        if (path / "config.json").exists():
+            return path
     found = sorted((p.parent for p in (repo / "snapshots").glob("*/config.json")),
                    key=lambda p: p.stat().st_mtime)
     return found[-1] if found else None
@@ -183,9 +188,27 @@ def lines(out: str) -> list[dict]:
     return [json.loads(line) for line in out.splitlines() if line.startswith("{")]
 
 
+def source_identity() -> str:
+    """Identify the actual benchmark sources, including unpublished working-tree edits."""
+    paths = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--others",
+                                     "--exclude-standard", "--", "crates", "Cargo.toml", "Cargo.lock",
+                                     "rust-toolchain.toml", "scripts/bench_parity.py"], cwd=ROOT)
+    digest = hashlib.sha256()
+    for name in sorted(set(paths.split(b"\0")) - {b""}):
+        path = ROOT / os.fsdecode(name)
+        parts = path.relative_to(ROOT).parts
+        if "tests" in parts or "benches" in parts or (path.suffix == ".md"):
+            continue
+        if "examples" in parts and path.name != "bench.rs":
+            continue
+        if path.is_file():
+            digest.update(name + b"\0" + hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
 def workspace_version() -> str:
     text = (ROOT / "Cargo.toml").read_text()
-    return re.search(r'^version = "([^"]+)"', text, re.M).group(1)
+    return re.search(r'^version = "([^"]+)"', text, re.MULTILINE).group(1)
 
 
 def git(*args: str) -> str:
@@ -205,7 +228,7 @@ def environment(nuvec_ref: str | None) -> dict:
     if nuvec_ref:
         commit, dirty = git("rev-parse", nuvec_ref), False
         ver = re.search(r'^version = "([^"]+)"', git("show", f"{nuvec_ref}:Cargo.toml"),
-                        re.M).group(1)
+                        re.MULTILINE).group(1)
     else:
         commit, dirty, ver = git("rev-parse", "HEAD"), bool(tree_changes()), \
             workspace_version()
@@ -221,6 +244,8 @@ def environment(nuvec_ref: str | None) -> dict:
         "power": {"source": "ac" if "AC Power" in batt else
                   "battery" if "Battery Power" in batt else "unknown",
                   "low_power_mode": bool(low_power and low_power.group(1) == "1")},
+        "load_average_at_start": os.getloadavg(),
+        "sdk": sh("xcrun", "--sdk", "macosx", "--show-sdk-version"),
         "swap_used_bytes_at_start": int(float(m.group(1)) * (1 << 20)) if m else 0,
         "nuvec": {"version": ver, "commit": commit, "dirty": dirty},
         "rust": sh("rustc", "-V"),
@@ -269,8 +294,10 @@ def mlx_worker(mode: str, snap: str, rest: list[str]) -> None:
             if limit is None or n <= limit:
                 write(f"ttft-{n}.txt", [long[:n]])
         write("first-token.txt", [base[:16]])
-        write("concurrency.txt",
-              [tokenizer.encode(f"{i + 1}. " + TEXT * 8)[:CONC_PROMPT] for i in range(8)])
+        concurrent = [tokenizer.encode(f"{i + 1}. " + TEXT * 64)[:CONC_PROMPT] for i in range(8)]
+        if any(len(prompt) != CONC_PROMPT for prompt in concurrent):
+            raise ValueError(f"expected {CONC_PROMPT} tokens per concurrency prompt")
+        write("concurrency.txt", concurrent)
         print(json.dumps({"limit": limit}))
         return
 
@@ -363,6 +390,7 @@ class Runner:
     def __init__(self, args, bench: Path, ref_tag: str, base: Path | None = None,
                  base_tag: str = ""):
         self.args = args
+        self.work = WORK
         self.bench = bench
         self.ref_tag = ref_tag  # "" for the working tree, "@<sha>" for --nuvec-ref
         self.base = base  # the baseline release's bench binary (`--baseline`)
@@ -389,7 +417,7 @@ class Runner:
     def path(self, model: str, key: str, engine: str) -> Path:
         tag = {"nuvec": self.ref_tag, "base": self.base_tag}.get(engine, "")
         name = "nuvec" if engine == "base" else engine
-        return WORK / slug(model) / "jobs" / f"{name}{tag}-{key}.json"
+        return self.work / slug(model) / "jobs" / f"{name}{tag}-{key}.json"
 
     def engines(self) -> list[str]:
         """The engines of one comparison, in the order they alternate."""
@@ -497,11 +525,10 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
     entry["snapshot"] = snap.name
     s = str(snap)
     problems: list[str] = []
-    limit = max_positions(snap)
     lengths = sorted(set(prompt_tokens + extras))
     if r.args.no_max_context:
         lengths = [n for n in lengths if n < MAX_CONTEXT]
-    prompts = WORK / slug(model) / "prompts"
+    prompts = r.work / slug(model) / "prompts"
     ids = r.job(model, "ids-" + "-".join(map(str, lengths)), "mlx",
                 ["ids", s, str(prompts), ",".join(map(str, lengths))])
     if ids["error"]:
@@ -643,11 +670,17 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
         for mode, prep in modes:
             o, t = [], []
             purge_failed = False
-            for i in range(LOAD_SAMPLES):
+            baseline_load = []
+            for i in range(LOAD_SAMPLES + (r.extra if mode == "warm" else 0)):
+                if r.base and mode == "warm":
+                    sample = r.job(model, f"load-{mode}-{i}", "base",
+                                   [*text, "--phase", "load", "--first-token-ids", str(first)])
+                    if not sample["error"]:
+                        baseline_load.extend(sample["lines"])
                 for engine, cmd in (("nuvec", [*text, "--phase", "load", "--first-token-ids",
                                                str(first)]),
                                     ("mlx", ["load", s, str(first)])):
-                    if prep and subprocess.run(prep, capture_output=True).returncode != 0:
+                    if prep and subprocess.run(prep, capture_output=True, check=False).returncode != 0:
                         purge_failed = True
                         break
                     res_ = r.job(model, f"load-{mode}-{i}", engine, cmd)
@@ -665,6 +698,9 @@ def run_model(r: Runner, model: str, kind: str, extras: list[int], sections: lis
                                                    side(t, "model_ready_s")[0], "s", False),
                              "first_token_s": pair(side(o, "first_token_s")[0],
                                                    side(t, "first_token_s")[0], "s", False)}
+                if r.base and mode == "warm":
+                    for key, cell in res[mode].items():
+                        attach(cell, side(baseline_load, key)[0], False)
         if r.args.no_cold:
             why = "not run (--no-cold)"
             res["cold"] = {"model_ready_s": pair(None, None, "s", False, reason=why),
@@ -758,7 +794,7 @@ def pairs_of(entry: dict):
             yield "prefill_legacy", row["prefill_tok_s"]
     for row in entry.get("ttft", {}).get("lengths", []):
         yield f"ttft_{row['prompt_tokens']}", row["ttft_s"]
-    for name, cell in entry.get("memory", {}).items():
+    for cell in entry.get("memory", {}).values():
         yield "memory", cell["peak_bytes"]
     for mode, cell in entry.get("load", {}).items():
         yield f"load_{mode}", cell["first_token_s"]
@@ -770,6 +806,8 @@ def pairs_of(entry: dict):
 
 def baseline_cells(entry: dict):
     """(section, cell, Pair) for every cell compared with the baseline release."""
+    for key, cell in entry.get("load", {}).get("warm", {}).items():
+        yield "load", f"warm {key}", cell
     for row in entry.get("decode", []):
         yield "decode", f"decode after {row['repeats']}x", row["tok_s"]
     for row in entry.get("ttft", {}).get("lengths", []):
@@ -864,16 +902,21 @@ def med(p: dict, k: str, digits: int = 1) -> str:
     return f"{p[k]['median']:.{digits}f}" if p.get(k) else "—"
 
 
+def gigabytes(pair: dict, engine: str) -> str:
+    value = pair.get(engine)
+    return f"{value['median'] / 1e9:.2f}" if value else "—"
+
+
 def markdown(record: dict) -> str:
     env = record["environment"]
-    out = [f"{env['chip']}, {env['memory_bytes'] // GIB} GB, macOS {env['macos']['version']}; "
+    out = [(f"{env['chip']}, {env['memory_bytes'] // GIB} GB, macOS {env['macos']['version']}; "
            f"nuvec {env['nuvec']['version']}, mlx {env['mlx']}, mlx-lm {env['mlx_lm']}; "
            f"{record['created'][:10]}. Ratios above 1.00 favour nuvec; ⚠ marks a cell below "
-           f"{GATE}×.", ""]
+           f"{GATE}×."), ""]
     rows = [m for m in record["models"] if "decode" in m]
     if rows:
-        out += ["| model | kind | prompt | prefill nuvec / mlx-lm (tok/s) | ratio "
-                "| decode nuvec / mlx-lm (tok/s) | ratio |", "|---|---|---:|---:|---:|---:|---:|"]
+        out += [("| model | kind | prompt | prefill nuvec / mlx-lm (tok/s) | ratio "
+                "| decode nuvec / mlx-lm (tok/s) | ratio |"), "|---|---|---:|---:|---:|---:|---:|"]
         for m in rows:
             for d, lg in zip(m["decode"], m["ttft"]["legacy"]):
                 t = d["prompt_tokens"]
@@ -898,8 +941,8 @@ def markdown(record: dict) -> str:
         for m in rows:
             for name, c in m["memory"].items():
                 p = c["peak_bytes"]
-                g = lambda k: f"{p[k]['median'] / 1e9:.2f}" if p.get(k) else "—"  # noqa: E731
-                out.append(f"| {slug(m['id'])} | {name} | {g('nuvec')} / {g('mlx_lm')} "
+                ours, theirs = (gigabytes(p, engine) for engine in ("nuvec", "mlx_lm"))
+                out.append(f"| {slug(m['id'])} | {name} | {ours} / {theirs} "
                            f"| {fmt_ratio(p)} |")
         out.append("")
     rows = [m for m in record["models"] if m.get("load")]
@@ -945,10 +988,12 @@ def markdown(record: dict) -> str:
             out += ["", f"| model | cell | nuvec HEAD / {base['ref']} | ratio |",
                     "|---|---|---:|---:|"]
             for m, c, p in cells:
-                g = (lambda k: f"{p[k]['median'] / 1e9:.2f} GB" if p.get(k) else "—") \
-                    if p["nuvec"]["unit"] == "bytes" else (lambda k: med(p, k, 2))
-                out.append(f"| {slug(m['id'])} | {c} | {g('nuvec')} / "
-                           f"{g('baseline')} | {p['vs_baseline']:.2f}×"
+                ours, previous = (
+                    gigabytes(p, engine) + " GB" if p["nuvec"]["unit"] == "bytes"
+                    else med(p, engine, 2) for engine in ("nuvec", "baseline")
+                )
+                out.append(f"| {slug(m['id'])} | {c} | {ours} / "
+                           f"{previous} | {p['vs_baseline']:.2f}×"
                            f"{' ⚠' if p['vs_baseline'] < base['threshold'] else ''} |")
             out.append("")
         out.append(f"Against {base['ref']}: {s['baseline_geomean']['value']:.2f}× "
@@ -998,7 +1043,7 @@ def build(ref: str | None, skip: bool = False) -> tuple[Path, str]:
     binary = WORK / f"bench-{sha[:12]}"
     if not binary.exists():
         if tree.exists():
-            subprocess.run(["git", "-C", str(ROOT), "worktree", "remove", "--force", str(tree)])
+            subprocess.run(["git", "-C", str(ROOT), "worktree", "remove", "--force", str(tree)], check=True)
         subprocess.run(["git", "-C", str(ROOT), "worktree", "add", "--detach", str(tree), sha],
                        check=True, capture_output=True)
         try:
@@ -1007,7 +1052,7 @@ def build(ref: str | None, skip: bool = False) -> tuple[Path, str]:
                            check=True)
             shutil.copy2(WORK / "ref-target/release/examples/bench", binary)
         finally:
-            subprocess.run(["git", "-C", str(ROOT), "worktree", "remove", "--force", str(tree)])
+            subprocess.run(["git", "-C", str(ROOT), "worktree", "remove", "--force", str(tree)], check=True)
     return binary, f"@{sha[:12]}"
 
 
@@ -1061,12 +1106,38 @@ def main() -> int:
     base, base_tag = build(baseline) if baseline else (None, "")
     runner = Runner(args, bench, tag, base, base_tag)
     env = environment(args.nuvec_ref)
+    if not args.nuvec_ref:
+        env["nuvec"]["source_sha256"] = source_identity()
     roster = {m: (k, e) for m, k, e in ROSTER}
     models = args.models or {"smoke": SMOKE_MODELS, "quick": QUICK_MODELS}.get(
         args.tier, [m for m, _, _ in ROSTER])
     prompt_tokens = [int(n) for n in (args.prompt_tokens or tier["prompt_tokens"]).split(",")
                      if n]
     levels = [int(n) for n in (args.concurrency or tier["concurrency"]).split(",") if n]
+    session_path = WORK / "session.json"
+    with bench.open("rb") as binary:
+        env["nuvec"]["binary_sha256"] = hashlib.file_digest(binary, "sha256").hexdigest()
+    identity = {
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "build": env["nuvec"], "baseline": base_tag, "oracle": [env["mlx"], env["mlx_lm"]],
+        "machine": [env["chip"], env["macos"]], "runs": args.runs, "passes": args.passes,
+        "tier": args.tier, "sections": sections, "lengths": prompt_tokens, "levels": levels,
+        "cold": not args.no_cold, "max_context": not args.no_max_context,
+        "snapshots": {model: snap.name if (snap := snapshot(model)) else None for model in models},
+    }
+    WORK.mkdir(parents=True, exist_ok=True)
+    if args.resume:
+        saved = json.loads(session_path.read_text()) if session_path.is_file() else {}
+        folder = saved.get("folder", "")
+        if (saved.get("identity") != identity or not re.fullmatch(r"session-[a-z0-9_]+", folder)
+                or not (WORK / folder).is_dir()):
+            ap.error("cached measurements have a different session identity; start without --resume")
+        runner.work = WORK / folder
+    else:
+        runner.work = Path(tempfile.mkdtemp(prefix="session-", dir=WORK))
+        shutil.copy2(bench, runner.work / "bench")
+        write_atomic(session_path, {"identity": identity, "folder": runner.work.name})
+    runner.bench = runner.work / "bench"
     results = []
     try:
         for model in models:
@@ -1082,7 +1153,7 @@ def main() -> int:
                 redo = run_model(runner, model, kind, extras, [x for x in sections
                                  if x in again], prompt_tokens, levels)
                 runner.extra = 0
-                for key in ("decode", "memory", "concurrency"):
+                for key in ("decode", "memory", "load", "concurrency"):
                     if key in redo:
                         entry[key] = redo[key]
                 for key, value in redo.get("ttft", {}).items():

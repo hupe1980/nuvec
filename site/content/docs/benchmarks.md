@@ -8,6 +8,30 @@ group = "Project"
 
 nuvec's performance target is MLX on the same machine. Every number here comes from `just bench-parity`, which runs both engines on the same Mac in one session and reports losses as well as wins. The records, with every sample: [0.8.0 quick tier](/nuvec/benchmarks/0.8.0/m4-pro-48gb-quick.json) and [0.5.0 full tier](/nuvec/benchmarks/0.5.0/m4-pro-48gb.json), M4 Pro 48 GB (JSON). Each record is validated against its [schema](/nuvec/benchmarks/parity-record-v1.schema.json), and [index.json](/nuvec/benchmarks/index.json) lists all of them.
 
+## Checking MLX parity
+
+Run `just qualify-mlx` on the M4 Pro with local snapshots of Qwen3-8B-4bit and Qwen3.5-9B-4bit. The command uses MLX 0.32.5 and mlx-lm 0.32.2. It verifies the CPU and Metal fixtures, then compares 256 generated tokens on each of eight frozen prompts per checkpoint. The JSON report at `target/qualification/report.json` identifies the first divergent step when a prompt fails. For fixtures alone, run `just qualify-mlx --fixture-only`.
+
+### M4 Pro qualification results
+
+All 168 Metal rows matched the pinned MLX release. On macOS 27.2.1 the CPU profile has 98 exact rows and 70 with recorded numerical differences. All 16 dense and hybrid prompts matched for 4,096 generated tokens in total. [Numerical and per-prompt results](/nuvec/qualification/m4-pro-mlx-0.32.5.json)
+
+All 40 required quick-tier cells passed the 3% regression gate against nuvec v0.15.0. The table gives geometric means of the per-cell median ratios against mlx-lm 0.32.2 using MLX 0.32.5. Ratios above 1 favour nuvec. [Individual ratios and raw samples](/nuvec/benchmarks/qualification/m4-pro-mlx-0.32.5-quick.json)
+
+| Measured workload | Cells | Ratio against mlx-lm |
+|---|---:|---:|
+| Decode, three prompt lengths | 12 | 1.010× throughput |
+| Time to first token, 2,048 prompt tokens | 4 | 0.995× inverse time |
+| Allocator peak, load/decode/prefill | 12 | 1.014× inverse peak bytes |
+| Warm load to first token | 4 | 1.443× inverse time |
+| Four concurrent requests | 4 | 1.035× throughput |
+
+The previous-release comparison uses the best sample from each nuvec build. Its geometric mean across all 40 cells was 1.006×. The record identifies the working-tree sources, executable, four checkpoint revisions and SDK. To check the published file locally, run the validator from the repository root.
+
+```sh
+uv run scripts/validate_parity.py --require-quick v0.15.0 site/static/benchmarks/qualification/m4-pro-mlx-0.32.5-quick.json
+```
+
 ## Method
 
 - **Three tiers.** `--tier smoke` (about 10 minutes): Qwen3-8B and Qwen3-30B-A3B, decode and time to first token, regressions below 0.95×; the check before a release that touches performance. The quick tier (the default, about 45 minutes): one model per architecture (dense, hybrid, mixture of experts, gpt-oss), decode, time to first token at 2,048 tokens, memory, warm load and 4 concurrent requests. `--tier full` adds the whole roster, 32K tokens and longer, cold loads and 1 and 8 requests; it takes hours and runs in pieces (`--budget`, `--resume`). Each record names its tier.

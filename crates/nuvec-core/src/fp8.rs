@@ -1,6 +1,6 @@
 //! The 8- and 4-bit floating-point codes of MLX's microscaling quantization modes: E4M3
 //! (mxfp8 values and nvfp4 scales), E2M1 (mxfp4 and nvfp4 values) and E8M0 (mx scales),
-//! transcribed from MLX v0.32.4's Metal headers (`fp8.h`, `fp4.h`) so that the CPU writes
+//! transcribed from MLX v0.32.5's Metal headers (`fp8.h`, `fp4.h`) so that the CPU writes
 //! the bytes MLX's GPU writes.
 //!
 //! Copyright © 2025-2026 Apple Inc. Licensed under the MIT License:
@@ -13,15 +13,17 @@ pub(crate) const E4M3_MAX: f32 = 448.0;
 /// The largest E2M1 value.
 pub(crate) const E2M1_MAX: f32 = 6.0;
 
-/// `x` as E4M3, rounding to nearest even and saturating at ±448 (NaN and ±Inf included,
-/// as MLX's `fp8_e4m3`).
+/// `x` as E4M3, rounding to nearest even and saturating overflow and infinities at ±448. NaNs use
+/// the signed E4M3 NaN code.
 pub(crate) fn e4m3_from_f32(x: f32) -> u8 {
     const FP8_MAX: u32 = 543 << 21;
     const DENORM_MASK: u32 = 141 << 23;
     let mut bits = x.to_bits();
     let sign = bits & 0x8000_0000;
     bits ^= sign;
-    let code = if bits >= FP8_MAX {
+    let code = if bits > f32::INFINITY.to_bits() {
+        0x7F
+    } else if bits >= FP8_MAX {
         0x7E
     } else if bits < (121 << 23) {
         let sum = f32::from_bits(bits) + f32::from_bits(DENORM_MASK);
@@ -91,12 +93,12 @@ pub(crate) fn e8m0_from_f32(x: f32) -> u8 {
     (n + 127) as u8
 }
 
-/// The value of E8M0 code `code`: `2^(code - 127)`, with `0x00` as 2⁻¹²⁷ and `0xFF` as +Inf.
+/// The value of E8M0 code `code`: `2^(code - 127)`, with `0x00` as 2⁻¹²⁷ and `0xFF` as quiet NaN.
 pub(crate) fn e8m0_to_f32(code: u8) -> f32 {
-    if code == 0 {
-        f32::from_bits(0x40_0000)
-    } else {
-        f32::from_bits(u32::from(code) << 23)
+    match code {
+        0 => f32::from_bits(0x40_0000),
+        0xFF => f32::from_bits(0x7fc0_0000),
+        _ => f32::from_bits(u32::from(code) << 23),
     }
 }
 
@@ -135,7 +137,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot execute half's hardware f16 conversion")]
     fn e4m3_matches_mlx_probes() {
-        // MLX 0.32.4 `mx.to_fp8` on the GPU.
+        // MLX 0.32.5 `mx.to_fp8` on the GPU.
         let values = [
             0.1,
             1.0,
@@ -147,7 +149,8 @@ mod tests {
             -0.0,
             f32::INFINITY,
             f32::NEG_INFINITY,
-            f32::NAN,
+            f32::from_bits(0x7fc0_0000),
+            f32::from_bits(0xffc0_0000),
             2f32.powi(-9),
             2f32.powi(-10),
             0.002_929_687_5,
@@ -157,7 +160,7 @@ mod tests {
             1.1875,
         ];
         let expected = [
-            29, 56, 126, 126, 197, 0, 0, 128, 126, 254, 126, 1, 0, 2, 126, 126, 56, 58,
+            29, 56, 126, 126, 197, 0, 0, 128, 126, 254, 127, 255, 1, 0, 2, 126, 126, 56, 58,
         ];
         let got: Vec<u8> = values.iter().map(|&v| e4m3_from_f32(v)).collect();
         assert_eq!(got, expected);
@@ -166,7 +169,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot execute half's hardware f16 conversion")]
     fn e4m3_codes_round_trip() {
-        // MLX 0.32.4 `mx.from_fp8(codes, mx.float32)`.
+        // MLX 0.32.5 `mx.from_fp8(codes, mx.float32)`.
         for (code, value) in [
             (0, 0.0),
             (1, 0.001_953_125),
@@ -225,7 +228,7 @@ mod tests {
         // 2⁻¹²⁷ (a subnormal), from its bits: Miri perturbs `powi`.
         let tiny = f32::from_bits(0x40_0000);
         assert_eq!(e8m0_to_f32(0), tiny);
-        assert_eq!(e8m0_to_f32(0xFF), f32::INFINITY);
+        assert_eq!(e8m0_to_f32(0xFF).to_bits(), 0x7fc0_0000);
         // 1/6 rounds to 2⁻³ but up to 2⁻² (MLX: a group [-1, 0, …] gets scale code 125).
         assert_eq!(mx_scale_round_up(1.0 / 6.0), 0.25);
         assert_eq!(mx_scale_round_up(0.0), tiny);

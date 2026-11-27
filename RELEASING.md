@@ -23,3 +23,7 @@ Not part of a release; run them when the machine is free and commit the records 
   and on the landing page.
 - `just soak 1` (an hour of server-like work) and `just test-large` (arrays of 2^32 elements
   and more, about 14 GB of GPU memory) after changes to memory, the allocator or indexing.
+
+## Checking the MLX reference
+
+Run `just qualify-mlx` on the reference Mac with the dense and hybrid Qwen snapshots. It uses the project's current pins (MLX 0.32.5 and mlx-lm 0.32.2). For a numerical check without model weights, use `just qualify-mlx --fixture-only`. When updating the pin, regenerate the fixtures and run this same check. Use `just bench-parity` for release performance. [Measurements and commands](https://hupe1980.github.io/nuvec/docs/benchmarks/#m4-pro-qualification-results)

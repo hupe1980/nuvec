@@ -79,6 +79,7 @@ pub mod paged;
 pub mod pipeline;
 pub mod quant;
 pub mod sample;
+pub mod sparse_mla;
 pub mod speculative;
 pub mod stop;
 mod suffix;

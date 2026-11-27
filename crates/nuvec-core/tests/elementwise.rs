@@ -4,6 +4,11 @@
 
 mod common;
 
+#[path = "elementwise/cpu.rs"]
+mod cpu;
+
+use std::collections::BTreeMap;
+
 use nuvec_core::{Array, DType, Device, fast, ops, with_stream};
 
 const FIXTURE: &str = include_str!("fixtures/elementwise.txt");
@@ -18,7 +23,7 @@ fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
 
 /// The output's bits with NaNs canonical, hashed in `chunks` parts as numpy's
 /// `array_split` divides them.
-fn hashes(out: &Array, dtype: DType, chunks: usize) -> Vec<u64> {
+fn canonical_words(out: &Array, dtype: DType) -> Vec<u32> {
     let is_nan = out.not_equal(out).to_vec::<bool>().expect("NaNs");
     let words: Vec<u32> = if dtype == DType::F32 {
         out.view(DType::U32).to_vec::<u32>().expect("bits")
@@ -31,12 +36,16 @@ fn hashes(out: &Array, dtype: DType, chunks: usize) -> Vec<u64> {
         DType::BF16 => 0x7fc0,
         _ => 0x7fc0_0000,
     };
-    let width = if dtype == DType::F32 { 4 } else { 2 };
-    let words: Vec<u32> = words
+    words
         .into_iter()
         .zip(is_nan)
         .map(|(w, n)| if n { nan } else { w })
-        .collect();
+        .collect()
+}
+
+fn hashes(out: &Array, dtype: DType, chunks: usize) -> Vec<u64> {
+    let words = canonical_words(out, dtype);
+    let width = if dtype == DType::F32 { 4 } else { 2 };
     let (size, extra) = (words.len() / chunks, words.len() % chunks);
     let mut at = 0;
     (0..chunks)
@@ -193,56 +202,70 @@ fn binary(op: &str, x: &Array, y: &Array) -> Array {
     }
 }
 
-/// The cases of `device` (`"gpu"` or `"cpu"`) that differ from MLX's.
-fn differing(device: &str) -> (usize, Vec<String>) {
+fn dtype_from_name(name: &str) -> DType {
+    match name {
+        "float16" => DType::F16,
+        "bfloat16" => DType::BF16,
+        "float32" => DType::F32,
+        _ => panic!("unknown fixture dtype {name}"),
+    }
+}
+
+type Differences<'a> = BTreeMap<(&'a str, &'a str), Vec<usize>>;
+
+fn compare_fixture(device: &str) -> Differences<'static> {
     let mut lines = FIXTURE.lines();
-    let meta = lines.next().expect("meta");
-    assert!(meta.contains("mlx=0.32.4"), "{meta}");
-    let chunks: usize = meta
-        .split("chunks=")
-        .nth(1)
-        .and_then(|c| c.trim().parse().ok())
-        .expect("chunks");
+    assert_eq!(lines.next(), Some("# mlx=0.32.5 chunks=16"));
     let on = if device == "gpu" {
         Device::gpu(0)
     } else {
         Device::cpu()
     };
-    let (mut checked, mut failures) = (0, vec![]);
+    let mut rows = BTreeMap::new();
     for line in lines {
         let mut parts = line.split_whitespace();
-        let (dev, dtype, op) = (
-            parts.next().expect("device"),
-            parts.next().expect("dtype"),
-            parts.next().expect("op"),
-        );
+        let dev = parts.next().expect("device");
+        let name = parts.next().expect("dtype");
+        let op = parts.next().expect("op");
         if dev != device {
             continue;
         }
-        let want: Vec<u64> = parts.map(|h| h.parse().expect("hash")).collect();
-        let dtype = match dtype {
-            "float16" => DType::F16,
-            "bfloat16" => DType::BF16,
-            _ => DType::F32,
-        };
+        let want = parts
+            .map(|h| h.parse().expect("hash"))
+            .collect::<Vec<u64>>();
+        assert_eq!(want.len(), 16, "{dev} {name} {op}: hash count");
+        let dtype = dtype_from_name(name);
         let got = with_stream(on, || {
-            let (u, x, y) = inputs(dtype);
             let out = if let Some(f) = op.strip_prefix("fast:") {
                 fused(f, dtype)
-            } else if op_is_binary(op) {
-                binary(op, &x, &y)
             } else {
-                unary(op, &u)
+                let (u, x, y) = inputs(dtype);
+                if op_is_binary(op) {
+                    binary(op, &x, &y)
+                } else {
+                    unary(op, &u)
+                }
             };
-            hashes(&out, dtype, chunks)
+            hashes(&out, dtype, 16)
         });
-        checked += 1;
-        let bad: Vec<usize> = (0..chunks).filter(|&c| got[c] != want[c]).collect();
-        if !bad.is_empty() {
-            failures.push(format!("{device} {dtype:?} {op}: chunks {bad:?} differ"));
-        }
+        let bad = (0..16).filter(|&c| got[c] != want[c]).collect();
+        assert!(
+            rows.insert((name, op), bad).is_none(),
+            "duplicate {dev} {name} {op}"
+        );
     }
-    (checked, failures)
+    assert_eq!(rows.len(), 168, "{device} case count");
+    rows
+}
+
+fn differing(device: &str) -> (usize, Vec<String>) {
+    let rows = compare_fixture(device);
+    let failures = rows
+        .iter()
+        .filter(|(_, chunks)| !chunks.is_empty())
+        .map(|((dtype, op), chunks)| format!("{device} {dtype} {op}: chunks {chunks:?} differ"))
+        .collect();
+    (rows.len(), failures)
 }
 
 #[test]

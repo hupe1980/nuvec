@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "numpy==2.5.4"]
+# dependencies = ["mlx==0.32.5", "numpy==2.5.4"]
 # ///
 """Records MLX outputs as test fixtures for nuvec.
 
@@ -401,7 +401,7 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
     if op == "broadcast_to":
         return mx.broadcast_to(xs[0], nums(p["shape"]))
     if op in ("conv2d", "conv3d"):
-        t = lambda k: tuple(nums(p[k]))  # noqa: E731
+        t = lambda k: tuple(nums(p[k]))
         return getattr(mx, op)(xs[0], xs[1], stride=t("stride"), padding=t("padding"),
                                dilation=t("dilation"), groups=int(p["groups"]))
     if op == "conv_general":
@@ -410,7 +410,7 @@ def apply(op: str, p: dict[str, str], xs: list[mx.array]) -> mx.array:
                                kernel_dilation=nums(p["kd"]), input_dilation=nums(p["id"]),
                                groups=int(p["groups"]), flip=p["flip"] == "1")
     if op.startswith("conv_transpose"):
-        t = (lambda k: int(p[k])) if op.endswith("1d") else (lambda k: tuple(nums(p[k])))  # noqa: E731
+        t = (lambda k: int(p[k])) if op.endswith("1d") else (lambda k: tuple(nums(p[k])))
         return getattr(mx, op)(xs[0], xs[1], stride=t("stride"), padding=t("padding"),
                                dilation=t("dilation"), output_padding=t("output_padding"),
                                groups=int(p["groups"]))
@@ -898,7 +898,7 @@ case("addmm-t", "addmm", [make("float32", (6, 4)), make("float32", (6, 3)), make
      alpha=1.0, beta=1.0, pre="t")
 derivative("vjp", "vjp-addmm", "addmm", [make("float32", (3, 4)), make("float32", (4, 2)), make("float32", (2,))],
            alpha=1.5, beta=0.5)
-# alpha = beta = 1: MLX 0.32.4's AddMM jvp ignores alpha and beta (a bug; its vjp is
+# alpha = beta = 1: MLX 0.32.5's AddMM jvp ignores alpha and beta (a bug; its vjp is
 # correct, and nuvec keeps `alpha (dA B + A dB) + beta dC`, see the decision log).
 derivative("jvp", "jvp-addmm", "addmm", [make("float32", (3, 4)), make("float32", (4, 2)), make("float32", (3, 2))],
            alpha=1.0, beta=1.0)
@@ -1145,7 +1145,7 @@ def api_eval(kind: str, expr: str, xs: list[mx.array], pre: str | None) -> mx.ar
     if kind == "set":
         target, value = expr.split("=", 1)
         y = mx.array(env["x"])
-        exec(f"y{target[1:]} = {value}", env | {"y": y})
+        exec(f"y{target[1:]} = {value}", env | {"y": y})  # noqa: S102 — literal fixture expressions below
         return y
     return eval(expr, env)
 
@@ -1805,17 +1805,22 @@ for mode in ["full", "same", "valid"]:
     case(f"convolve-{mode}", "convolve", [crand("float32", (9,)), crand("float32", (4,))], mode=mode)
     case(f"convolve-{mode}-swap", "convolve", [crand("float32", (3,)), crand("float32", (8,))], mode=mode)
 for name, op, ins, params in [
-    ("conv2d", "conv2d", [crand("float32", (1, 6, 6, 3)), crand("float32", (4, 3, 3, 3))], dict(stride="2,1", padding="1,1", dilation="1,2", groups=1)),
-    ("conv2d-depthwise", "conv2d", [crand("float32", (1, 6, 6, 3)), crand("float32", (3, 3, 3, 1))], dict(stride="1,1", padding="1,1", dilation="1,1", groups=3)),
-    ("conv2d-patch", "conv2d", [crand("float32", (1, 8, 8, 2)), crand("float32", (3, 4, 4, 2))], dict(stride="4,4", padding="0,0", dilation="1,1", groups=1)),
-    ("conv3d", "conv3d", [crand("float32", (1, 4, 4, 4, 2)), crand("float32", (2, 2, 2, 2, 2))], dict(stride="1,1,1", padding="0,1,0", dilation="1,1,1", groups=1)),
-    ("conv_transpose2d", "conv_transpose2d", [crand("float32", (1, 4, 4, 2)), crand("float32", (3, 3, 3, 2))], dict(stride="2,2", padding="1,1", dilation="1,1", output_padding="1,1", groups=1)),
+    ("conv2d", "conv2d", [crand("float32", (1, 6, 6, 3)), crand("float32", (4, 3, 3, 3))], {"stride": "2,1", "padding": "1,1", "dilation": "1,2", "groups": 1}),
+    ("conv2d-depthwise", "conv2d", [crand("float32", (1, 6, 6, 3)), crand("float32", (3, 3, 3, 1))], {"stride": "1,1", "padding": "1,1", "dilation": "1,1", "groups": 3}),
+    ("conv2d-patch", "conv2d", [crand("float32", (1, 8, 8, 2)), crand("float32", (3, 4, 4, 2))], {"stride": "4,4", "padding": "0,0", "dilation": "1,1", "groups": 1}),
+    ("conv3d", "conv3d", [crand("float32", (1, 4, 4, 4, 2)), crand("float32", (2, 2, 2, 2, 2))], {"stride": "1,1,1", "padding": "0,1,0", "dilation": "1,1,1", "groups": 1}),
+    ("conv_transpose2d", "conv_transpose2d", [crand("float32", (1, 4, 4, 2)), crand("float32", (3, 3, 3, 2))], {"stride": "2,2", "padding": "1,1", "dilation": "1,1", "output_padding": "1,1", "groups": 1}),
 ]:
     derivative("vjp", f"vjp-{name}", op, ins, **params)
 
 # Negative padding with input dilation: MLX slices the input before dilating it.
 case("conv_general-crop-input-dilated", "conv_general", [crand("float32", (1, 6, 7, 3)), crand("float32", (4, 2, 3, 3))], stride="1,1", lo="-1,1", hi="0,-1", kd="1,1", id="2,2", groups=1, flip=0)
 case("conv_transpose1d-overpadded", "conv_transpose1d", [crand("float32", (2, 9, 4)), crand("float32", (3, 3, 4))], stride=2, padding=3, dilation=1, output_padding=0, groups=1)
+# Negative padding can leave only the zeros between real input samples.
+case("conv_general-crop-entire-input", "conv_general",
+     [mx.array([[[3.0], [5.0]]]), mx.ones((1, 1, 1))],
+     stride="1", lo="-1", hi="-1", kd="1", id="3", groups=1, flip=0)
+
 
 # einsum's contraction order: the greedy path, and values where it differs
 # from left to right.
@@ -1851,10 +1856,12 @@ seg = mx.array([[0, 3], [3, 10], [2, 2], [5, 9]], dtype=mx.int32)
 case("segmented_mm", "segmented_mm", [make("float32", (5, 10)), make("float32", (10, 6)), seg])
 case("segmented_mm-batched", "segmented_mm", [make("float32", (3, 8)), make("float32", (8, 2)),
                                                mx.array([[[0, 8], [1, 4]], [[4, 8], [0, 0]]], dtype=mx.int32)])
-# (No float16 case: MLX 0.32.4's CPU segmented_mm is wrong in float16; its GPU is right.)
+case("segmented_mm-f16", "segmented_mm",
+     [mx.arange(50).reshape(5, 10).astype(mx.float16) / 17,
+      mx.arange(60).reshape(10, 6).astype(mx.float16) / 19, seg])
 for masks, bs, shape in [("o", 32, (70, 40, 50)), ("lr", 32, (64, 96, 33)), ("olr", 64, (65, 130, 70))]:
     m, k, n = shape
-    blocks = lambda v: (v + bs - 1) // bs  # noqa: E731
+    blocks = lambda v, bs=bs: (v + bs - 1) // bs
     dims = {"o": (blocks(m), blocks(n)), "l": (blocks(m), blocks(k)), "r": (blocks(k), blocks(n))}
     for kind in ["bool", "float32"]:
         ms = [make(kind, dims[c]) for c in masks]
@@ -1871,7 +1878,7 @@ for dt, masks, bs, shape, kind in [("bfloat16", "o", 32, (128, 96, 160), "bool")
                                    ("bfloat16", "lr", 64, (65, 130, 70), "bfloat16"),
                                    ("float32", "olr", 64, (128, 128, 128), "float32")]:
     m, k, n = shape
-    blocks = lambda v: (v + bs - 1) // bs  # noqa: E731
+    blocks = lambda v, bs=bs: (v + bs - 1) // bs
     dims = {"o": (blocks(m), blocks(n)), "l": (blocks(m), blocks(k)), "r": (blocks(k), blocks(n))}
     ms = [make(kind, dims[c]) for c in masks]
     case_gpu(f"block_masked_mm-gpu-{dt}-{masks}-{bs}", "block_masked_mm",
@@ -1900,7 +1907,7 @@ for mode in ["nvfp4", "mxfp8"]:
     xg, wg = make("bfloat16", (32, 64)), make("bfloat16", (32, 64))
     cg = make("bfloat16", (32, 32))
     with mx.stream(mx.gpu):
-        _, grads = mx.vjp(lambda a, b: [mx.qqmm(a, b, mode=mode)], [xg, wg], [cg])
+        _, grads = mx.vjp(lambda a, b, mode=mode: [mx.qqmm(a, b, mode=mode)], [xg, wg], [cg])
         mx.eval(grads)
     gpu_cases.append((f"vjp-qqmm-{mode}", f"vjp|fn=qqmm|mode={mode}|q=0", [xg, wg, cg], list(grads)))
 

@@ -1625,6 +1625,12 @@ mod gpu {
                 vec![3, 2, 3, 2, 1],
                 |x, w| ops::conv3d(x, w, 1, 1, 1, 3),
             ),
+            (
+                "dilated input crop",
+                vec![1, 6, 7, 3],
+                vec![4, 2, 3, 3],
+                |x, w| ops::conv_general(x, w, &o(&[1], &[-1, 1], &[0, -1], &[1], &[2], 1, false)),
+            ),
         ];
         let mut rng = Rng::new(0x94);
         for (name, xs, ws, f) in cases {

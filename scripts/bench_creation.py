@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """Creation ops on the GPU, nuvec against MLX: the creating call alone and creation plus
 evaluation of zeros, ones and full from 4 KB to 256 MB, and 1,000 small creations added

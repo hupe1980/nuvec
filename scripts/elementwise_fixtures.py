@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "numpy"]
+# dependencies = ["mlx==0.32.5", "numpy"]
 # ///
 """Element-wise fixtures from MLX: every half-precision value, 2^20 float32 patterns.
 
@@ -20,6 +20,9 @@ Hadamard transform and a depthwise convolution.
 `crates/nuvec-core/tests/elementwise.rs` checks nuvec against it.
 """
 
+import argparse
+import json
+import platform
 from pathlib import Path
 
 import mlx.core as mx
@@ -55,10 +58,10 @@ def fnv(data: bytes) -> int:
     return h
 
 
-def hashes(out: mx.array, dtype: str) -> list[int]:
+def result_words(out: mx.array, dtype: str) -> np.ndarray:
     bits = np.array(mx.contiguous(out).view(WORD[dtype])).reshape(-1).copy()
     bits[np.array(mx.isnan(out)).reshape(-1)] = NAN[dtype]
-    return [fnv(c.tobytes()) for c in np.array_split(bits, CHUNKS)]
+    return bits
 
 
 def inputs(dtype: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -111,25 +114,47 @@ def fast(op: str, dt, stream) -> mx.array:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--metadata", type=Path)
+    parser.add_argument("--device", choices=("cpu", "gpu"))
+    parser.add_argument("--dtype", choices=tuple(WORD))
+    parser.add_argument("--op", choices=[*UNARY, *BINARY, *("fast:" + op for op in FAST)])
+    parser.add_argument("--words", type=Path, help="save canonical output words for one case")
+    args = parser.parse_args()
+    if (args.device or args.dtype or args.op) and args.out is None:
+        parser.error("filtered fixtures require --out")
+    if args.words and not (args.device and args.dtype and args.op):
+        parser.error("--words requires --device, --dtype and --op")
+    destination = args.out or OUT
     lines = [f"# mlx={mx.__version__} chunks={CHUNKS}"]
-    for device in ["gpu", "cpu"]:
+    for device in [args.device] if args.device else ["gpu", "cpu"]:
         stream = mx.gpu if device == "gpu" else mx.cpu
-        for dtype in ["float16", "bfloat16", "float32"]:
+        for dtype in [args.dtype] if args.dtype else WORD:
             dt = getattr(mx, dtype)
             u, xs, ys = inputs(dtype)
-            x = mx.array(u).view(dt)
-            for op in UNARY:
-                out = getattr(mx, op)(x, stream=stream)
-                lines.append(" ".join([device, dtype, op, *map(str, hashes(out, dtype))]))
-            a, b = mx.array(xs).view(dt), mx.array(ys).view(dt)
-            for op in BINARY:
-                out = getattr(mx, op)(a, b, stream=stream)
-                lines.append(" ".join([device, dtype, op, *map(str, hashes(out, dtype))]))
-            for op in FAST:
-                out = fast(op, dt, stream)
-                lines.append(" ".join([device, dtype, "fast:" + op, *map(str, hashes(out, dtype))]))
-    OUT.write_text("\n".join(lines) + "\n")
-    print(f"wrote {OUT} ({len(lines) - 1} cases)")
+            x, a, b = (mx.array(v).view(dt) for v in (u, xs, ys))
+            for op in [args.op] if args.op else [*UNARY, *BINARY, *("fast:" + f for f in FAST)]:
+                if op.startswith("fast:"):
+                    out = fast(op[5:], dt, stream)
+                elif op in BINARY:
+                    out = getattr(mx, op)(a, b, stream=stream)
+                else:
+                    out = getattr(mx, op)(x, stream=stream)
+                bits = result_words(out, dtype)
+                if args.words:
+                    args.words.write_bytes(bits.tobytes())
+                chunks = [str(fnv(c.tobytes())) for c in np.array_split(bits, CHUNKS)]
+                lines.append(" ".join([device, dtype, op, *chunks]))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(lines) + "\n")
+    if args.metadata:
+        info = mx.device_info()
+        args.metadata.write_text(json.dumps({
+            "mlx": mx.__version__, "macos": platform.mac_ver()[0],
+            "chip": info.get("device_name"), "architecture": info.get("architecture"),
+        }, indent=2) + "\n")
+    print(f"wrote {destination} ({len(lines) - 1} cases)")
 
 
 if __name__ == "__main__":

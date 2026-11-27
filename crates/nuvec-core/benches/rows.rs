@@ -2,7 +2,8 @@
 //! routing and MLX by `scripts/bench_rows.py` (`just bench-rows`). Prints
 //! `name<TAB>dtype<TAB>B<TAB>us` per case: time per product in sustained `async_eval`
 //! bursts after a warm-up (best of three). `BENCH_EXACT=1` builds and evaluates under
-//! `with_row_exact` (lanes that must equal their solo runs).
+//! `with_row_exact` (lanes that must equal their solo runs). Set `BENCH_ROWS` to measure one
+//! row count in isolation.
 
 use std::time::Instant;
 
@@ -143,13 +144,26 @@ fn main() -> Result<()> {
 }
 
 fn run(filter: &str) -> Result<()> {
+    let rows = match std::env::var("BENCH_ROWS") {
+        Ok(value) => {
+            let b = value
+                .parse::<usize>()
+                .ok()
+                .filter(|b| (1..=16).contains(b))
+                .ok_or_else(|| {
+                    nuvec_core::Error::InvalidArgument("BENCH_ROWS must be 1–16".into())
+                })?;
+            b..=b
+        }
+        Err(_) => 1..=16,
+    };
     for &(name, dtype) in CASES.iter().filter(|(n, _)| n.contains(filter)) {
         let label = match dtype {
             DType::F16 => "float16",
             DType::BF16 => "bfloat16",
             _ => "float32",
         };
-        for b in 1..=16usize {
+        for b in rows.clone() {
             let op = make(name, dtype, b)?;
             let reps = 200;
             let burst = |count: usize| -> Result<f64> {

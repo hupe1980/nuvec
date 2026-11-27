@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """MLX's quantized GEMV at aligned and unaligned K: K that is
 not a multiple of 512 (4-bit) takes MLX's generic `qmv`, not `qmv_fast`. Prints µs per call

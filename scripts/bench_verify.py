@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """Verify attention (speculative decoding): 1, 2, 4 and 8 causal query rows over a key
 cache, nuvec against MLX on the same machine. Prints microseconds per call (32 calls

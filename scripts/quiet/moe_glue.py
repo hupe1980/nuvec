@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """The upper bound of fusing MoE decode glue, on MLX with
 Qwen3-30B-A3B's shapes: 48 layers, 128 experts, top-8, D = 2048, I = 768, 4-bit experts.

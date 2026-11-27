@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2"]
+# dependencies = ["mlx==0.32.5", "mlx-lm==0.32.2"]
 # ///
 """LoRA training, nuvec-lm against `mlx_lm.lora`: the same synthetic dataset (200 rows of
 `--words` words, about 500 tokens by default; `text` rows, or with `--data-format chat` a

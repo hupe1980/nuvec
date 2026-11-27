@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """GPU fused operations (normalisation, RoPE, softmax, log-sum-exp, cross entropy) and
 element-wise functions: nuvec

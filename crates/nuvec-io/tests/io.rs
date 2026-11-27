@@ -1,4 +1,4 @@
-//! safetensors and npy against files written by MLX 0.32.4 and NumPy
+//! safetensors and npy against files written by MLX 0.32.5 and NumPy
 //! (`scripts/io_fixtures.py`), and round trips through nuvec's writers.
 
 use std::path::PathBuf;

@@ -2,6 +2,16 @@
  "schema": "nuvec-parity-index",
  "releases": [
   {
+   "version": "unreleased",
+   "records": [
+    {
+     "machine": "m4-pro-48gb",
+     "path": "qualification/m4-pro-mlx-0.32.5-quick.json",
+     "kind": "qualification-quick"
+    }
+   ]
+  },
+  {
    "version": "0.8.0",
    "records": [
     {

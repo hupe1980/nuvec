@@ -230,7 +230,8 @@ fn attention_gradients_equal_finite_differences() {
     ignore = "hundreds of evaluations: too slow under Miri, and covered natively"
 )]
 fn binary_gradients_with_broadcasting() {
-    let cases: [(&str, F); 7] = [
+    let cases: [(&str, F); 8] = [
+        ("logaddexp", |x| x[0].logaddexp(&x[1])),
         ("add", |x| x[0].add(&x[1])),
         ("subtract", |x| x[0].subtract(&x[1])),
         ("multiply", |x| x[0].multiply(&x[1])),
@@ -352,7 +353,7 @@ fn matmul_gradients() {
         -1.0,
         1.0,
     );
-    // beta scales c's derivative in both modes (MLX 0.32.4's jvp drops it, a bug there).
+    // beta scales c's derivative in both modes (MLX 0.32.5's jvp drops it, a bug there).
     check(
         "addmm",
         |x| x[2].addmm(&x[0], &x[1], 1.5, -0.5),

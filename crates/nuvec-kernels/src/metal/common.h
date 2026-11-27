@@ -128,13 +128,13 @@ inline float log1p_(float x) {
 }
 
 // MLX's `expm1f.h` and `erf.h` (Norbert Juffa's single-precision approximations,
-// BSD-2-Clause; see THIRD_PARTY_NOTICES), as MLX ships them: `expm1f` reduces by ln 2 in one
-// step.
+// BSD-2-Clause; see THIRD_PARTY_NOTICES), with the split ln(2) reduction from MLX 0.32.5.
 inline float expm1f_(float a) {
     float j = fma(1.442695f, a, 12582912.f);
     j = j - 12582912.0f;
     int i = int(j);
     float f = fma(j, -6.93145752e-1f, a);
+    f = fma(j, -1.42860677e-6f, f);
     float s = f * f;
     if (a == 0.0f) {
         s = a;

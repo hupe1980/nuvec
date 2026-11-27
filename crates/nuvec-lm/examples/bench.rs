@@ -28,6 +28,7 @@
 //! - `--phase memory-load|memory-decode|memory-prefill:N --ids-file F`: one phase in this
 //!   process, then the peak memory (allocator plus mapped files) and its parts.
 //! - `--phase load --first-token-ids F`: seconds to a loaded model and to the first token.
+//! - `--paged-kv8` selects eight-bit pages for batch timing. `--timing-only` skips the solo replay.
 //! - `--batch N --ids-file F`: the first `N` lines served together by a `Batcher`
 //!   (128 tokens each, end-of-sequence ignored), compared with each prompt alone.
 //!
@@ -127,7 +128,11 @@ fn main() -> nuvec::Result<()> {
 
     // The time to the first token, then the tokens after it, the time they took and the
     // count (the first included).
-    let drafts = std::cell::Cell::new((0, 0));
+    let drafts = std::cell::Cell::new(nuvec_lm::SpeculativeStats::default());
+    let emit_ids = args.iter().any(|a| a == "--emit-ids");
+    let profile = args.iter().any(|a| a == "--time-stages");
+    let rounds = std::cell::RefCell::new(Vec::new());
+    let output_ids = std::cell::RefCell::new(Vec::new());
     let run = |ids: &[u32], options: GenerateOptions| -> nuvec::Result<(f64, f64, usize)> {
         let start = Instant::now();
         let mut speculative = None;
@@ -161,7 +166,10 @@ fn main() -> nuvec::Result<()> {
                 "tree" => DraftPolicy::Tree(draft),
                 p => fail(&format!("--policy {p}: auto, adaptive, fixed or tree")),
             };
-            let g = speculative_generate(&model, ids, options, d, policy)?;
+            let mut g = speculative_generate(&model, ids, options, d, policy)?;
+            if emit_ids || profile {
+                g.record_rounds(profile);
+            }
             speculative.insert(g)
         } else {
             plain.insert(generate(&model, ids, options)?)
@@ -170,15 +178,20 @@ fn main() -> nuvec::Result<()> {
         let first_seconds = start.elapsed().as_secs_f64();
         let decode_start = Instant::now();
         let mut count = 0;
+        output_ids.borrow_mut().clear();
         // Both end at an end-of-sequence token (not yielded).
         for id in first.into_iter().map(Ok).chain(generation) {
-            id?;
+            let token = id?;
+            if emit_ids {
+                output_ids.borrow_mut().push(token);
+            }
             count += 1;
         }
         let decode_seconds = decode_start.elapsed().as_secs_f64();
-        if let Some(g) = &speculative {
+        if let Some(g) = &mut speculative {
+            rounds.replace(g.take_rounds());
             let stats = g.stats();
-            drafts.set((stats.drafted, stats.accepted));
+            drafts.set(stats);
             if stats.pauses > 0 {
                 eprintln!("kill switch: {} pauses", stats.pauses);
             }
@@ -317,6 +330,9 @@ fn main() -> nuvec::Result<()> {
         let n: usize = n.parse().unwrap_or_else(|_| fail("--batch: not a number"));
         let path = value("--ids-file").unwrap_or_else(|| fail("--ids-file"));
         let prompts: Vec<Vec<u32>> = read_ids(&path).into_iter().take(n).collect();
+        if n == 0 {
+            fail("--batch must be positive");
+        }
         if prompts.len() < n {
             fail(&format!("{path}: fewer than {n} prompts"));
         }
@@ -324,15 +340,24 @@ fn main() -> nuvec::Result<()> {
         let longest = prompts.iter().map(Vec::len).max().unwrap_or(0);
         let block_size = 16;
         let blocks = n * (longest + options.max_tokens).div_ceil(block_size) + n;
-        let mut batcher = Batcher::new(
-            &model,
-            BatcherOptions {
-                blocks: Some(blocks),
-                block_size,
-                max_batch: n,
-                ..Default::default()
-            },
-        )?;
+        let config = BatcherOptions {
+            blocks: Some(blocks),
+            block_size,
+            max_batch: n,
+            ..Default::default()
+        };
+        let kv8 = args.iter().any(|s| s == "--paged-kv8");
+        let mut batcher = if kv8 {
+            Batcher::new_quantized(&model, config)?
+        } else {
+            Batcher::new(&model, config)?
+        };
+        let kv_capacity_bytes = batcher.kv_capacity_bytes();
+        nuvec::memory::reset_peak_memory();
+        let mut prefill_peak = 0;
+        let mut first_token_s = 0.0;
+        let mut itl = Vec::new();
+        let mut last_token = vec![None::<Instant>; n];
         nuvec::metal::profile::reset();
         let start = Instant::now();
         let mut outputs = vec![Vec::new(); n];
@@ -342,6 +367,7 @@ fn main() -> nuvec::Result<()> {
         }
         let mut finished = 0;
         let mut first_tokens = 0;
+        let mut decode_tokens = 0;
         let mut decode_start = start;
         while finished < n {
             for event in batcher.step()? {
@@ -351,36 +377,74 @@ fn main() -> nuvec::Result<()> {
                             .iter()
                             .position(|&r| r == id)
                             .expect("a submitted request");
+                        if first_tokens == n {
+                            decode_tokens += 1;
+                        }
+                        let now = Instant::now();
+                        if let Some(last) = last_token[i].replace(now) {
+                            itl.push(now.duration_since(last).as_secs_f64());
+                        }
                         if outputs[i].is_empty() {
+                            if first_tokens == 0 {
+                                first_token_s = start.elapsed().as_secs_f64();
+                            }
                             first_tokens += 1;
                             if first_tokens == n {
                                 decode_start = Instant::now();
+                                prefill_peak = nuvec::memory::stats().peak_with_mapped;
+                                nuvec::memory::reset_peak_memory();
                             }
                         }
                         outputs[i].push(token);
                     }
-                    Event::Finished { .. } => finished += 1,
+                    Event::Finished { id, reason } => {
+                        if reason != nuvec_lm::FinishReason::Length {
+                            fail(&format!("batch request {id} ended early: {reason:?}"));
+                        }
+                        finished += 1;
+                    }
                 }
             }
         }
         let wall = start.elapsed().as_secs_f64();
         let decode_wall = decode_start.elapsed().as_secs_f64();
+        let decode_peak = nuvec::memory::stats().peak_with_mapped;
         drop(batcher);
         if nuvec::metal::profile::enabled() {
             print_profile(&format!("{n} requests"));
         }
-        let total: usize = outputs.iter().map(Vec::len).sum();
-        let mut matches = true;
-        for (prompt, out) in prompts.iter().zip(&outputs) {
-            let solo: Vec<u32> =
-                generate(&model, prompt, options.clone())?.collect::<nuvec::Result<_>>()?;
-            matches &= &solo == out;
+        if outputs
+            .iter()
+            .any(|tokens| tokens.len() != options.max_tokens)
+        {
+            fail("incomplete batch output");
         }
+        let total: usize = outputs.iter().map(Vec::len).sum();
+        let matches = if kv8 || args.iter().any(|s| s == "--timing-only") {
+            None // The dense solo generator uses a different first-position quantization schedule.
+        } else {
+            let mut matches = true;
+            for (prompt, out) in prompts.iter().zip(&outputs) {
+                let solo = generate(&model, prompt, options.clone())?
+                    .collect::<nuvec::Result<Vec<_>>>()?;
+                matches &= &solo == out;
+            }
+            Some(matches)
+        };
+        itl.sort_by(f64::total_cmp);
+        let optional =
+            |value: Option<&f64>| value.map_or_else(|| "null".to_owned(), ToString::to_string);
+        let matches = matches.map_or("null", |yes| if yes { "true" } else { "false" });
+        let format = if kv8 { "affine8-g64" } else { "dense" };
         println!(
             "{{\"level\": {n}, \"total_tokens\": {total}, \"wall_s\": {wall:.4}, \
-             \"decode_wall_s\": {decode_wall:.4}, \"decode_tokens\": {}, \
-             \"matches_solo\": {matches}}}",
-            total - n
+             \"decode_wall_s\": {decode_wall:.4}, \"decode_tokens\": {}, \"matches_solo\": {matches}, \
+             \"kv_format\": \"{format}\", \"kv_capacity_bytes\": {kv_capacity_bytes}, \
+             \"prefill_peak_bytes\": {prefill_peak}, \"decode_peak_bytes\": {decode_peak}, \
+             \"first_token_s\": {first_token_s}, \"itl_p50_s\": {}, \"itl_p95_s\": {}}}",
+            decode_tokens,
+            optional(itl.get(itl.len() / 2)),
+            optional(itl.get(95 * itl.len() / 100))
         );
         return Ok(());
     }
@@ -424,14 +488,32 @@ fn main() -> nuvec::Result<()> {
             // The one peak metric: allocator memory plus mapped weights (MLX's
             // `get_peak_memory` counts its copied weights).
             let peak = nuvec::memory::stats().peak_with_mapped;
+            let stats = drafts.get();
+            let details = if emit_ids || profile {
+                let trace = rounds.borrow().iter().map(|r| {
+                    let elapsed = r.target_time.map_or_else(|| "null".to_owned(), |t| t.as_secs_f64().to_string());
+                    format!("{{\"start\":{},\"draft\":{:?},\"accepted\":{},\"next\":{},\"target_s\":{elapsed}}}",
+                            r.start, r.draft, r.accepted, r.next)
+                }).collect::<Vec<_>>().join(",");
+                format!(
+                    ", \"ids\": {:?}, \"verifies\": {}, \"max_verify_rows\": {}, \"draft_s\": {}, \"verify_s\": {}, \"rounds\": [{trace}]",
+                    output_ids.borrow(),
+                    stats.verifies,
+                    stats.max_verify_rows,
+                    stats.draft_time.as_secs_f64(),
+                    stats.verify_time.as_secs_f64()
+                )
+            } else {
+                String::new()
+            };
             println!(
                 "{{\"repeats\": {r}, \"prompt_tokens\": {}, \"prefill\": {prefill:.2}, \
                  \"ttft_s\": {first:.4}, \"decode\": {decode:.2}, \"decode_s\": \
                  {decode_seconds:.4}, \"tokens\": {tokens}, \"peak_bytes\": {peak}, \
-                 \"drafted\": {}, \"accepted\": {}}}",
+                 \"drafted\": {}, \"accepted\": {}{details}}}",
                 ids.len(),
-                drafts.get().0,
-                drafts.get().1
+                stats.drafted,
+                stats.accepted
             );
         }
         if nuvec::metal::profile::enabled() {

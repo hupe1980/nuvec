@@ -60,6 +60,16 @@ impl Draft {
         Self { tokens }
     }
 
+    fn checked(self) -> Result<Self> {
+        let tokens = self.tokens.check()?;
+        if tokens.ndim() != 1 || tokens.dtype() != nuvec::DType::U32 {
+            return Err(nuvec::Error::InvalidArgument(
+                "draft tokens must be a uint32 vector".into(),
+            ));
+        }
+        Ok(Self { tokens })
+    }
+
     /// The number of draft tokens.
     pub fn len(&self) -> usize {
         self.tokens.shape().first().map_or(0, |&n| n as usize)
@@ -391,6 +401,22 @@ impl KillSwitch {
     }
 }
 
+/// A linear draft and the decision taken at its first differing token.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct VerifyRound {
+    /// Zero-based output index of the first proposed token, excluding the prompt.
+    pub start: usize,
+    /// Proposed token IDs, in order, excluding the input seed.
+    pub draft: Vec<u32>,
+    /// Number of accepted draft tokens. The target emits these and then `next`.
+    pub accepted: usize,
+    /// Token chosen by the target after the accepted prefix.
+    pub next: u32,
+    /// Elapsed time from the fenced draft to the evaluated target decision.
+    pub target_time: Option<std::time::Duration>,
+}
+
 /// Counts of a speculative generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -399,6 +425,12 @@ pub struct SpeculativeStats {
     pub steps: usize,
     /// Verification passes (steps with a draft).
     pub verifies: usize,
+    /// Largest linear verification, including its seed token.
+    pub max_verify_rows: usize,
+    /// Time spent producing linear drafts with stage timing enabled.
+    pub draft_time: std::time::Duration,
+    /// Time spent verifying linear drafts with stage timing enabled.
+    pub verify_time: std::time::Duration,
     /// Draft tokens proposed (tree nodes for draft trees).
     pub drafted: usize,
     /// Draft tokens accepted.
@@ -456,6 +488,8 @@ pub struct SpeculativeGeneration<'a, D: Drafter> {
     pending: std::collections::VecDeque<u32>,
     produced: usize,
     stats: SpeculativeStats,
+    time_stages: bool,
+    rounds: Option<Vec<VerifyRound>>,
     /// Steps left without drafting, and the next pause after a rejected draft.
     pause: (usize, usize),
     /// Without a draft, steps are pipelined as in [`crate::generate`]: the next token,
@@ -561,6 +595,8 @@ pub fn speculative_generate<'a, D: Drafter>(
         pending: Default::default(),
         produced: 0,
         stats: SpeculativeStats::default(),
+        time_stages: false,
+        rounds: None,
         pause: (0, 1),
         inflight: None,
         draft_due: false,
@@ -596,6 +632,19 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
     /// The counts so far.
     pub fn stats(&self) -> SpeculativeStats {
         self.stats
+    }
+
+    /// Record linear verification decisions. With `time_stages`, fence drafts before
+    /// timing the target. Use an unfenced run to measure end-to-end throughput.
+    pub fn record_rounds(&mut self, time_stages: bool) {
+        self.rounds.get_or_insert_with(Vec::new);
+        self.time_stages = time_stages;
+    }
+
+    /// Drain the decisions recorded since the previous call. Periodically drain long
+    /// generations to bound the memory used for tracing.
+    pub fn take_rounds(&mut self) -> Vec<VerifyRound> {
+        self.rounds.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Why the generation ended, once it has (the iterator returned its last item).
@@ -655,7 +704,8 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         } else {
             let d = self
                 .drafter
-                .draft(self.model, &self.context, self.draft_len())?;
+                .draft(self.model, &self.context, self.draft_len())?
+                .checked()?;
             self.draft_due = !d.is_empty();
             self.probed = self.draft_due.then_some(d);
         }
@@ -664,7 +714,7 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
 
     /// One verification step: the last token and the draft through the model; the
     /// accepted draft tokens and the model's next token become pending.
-    fn verify(&mut self, draft: Draft) -> Result<()> {
+    fn verify(&mut self, draft: Draft, start: Option<std::time::Instant>) -> Result<()> {
         let last = *self.context.last().expect("never empty");
         let k = draft.len();
         let input = ops::concatenate(&[Array::from_slice(&[last], [1]), draft.tokens.clone()], 0)
@@ -709,6 +759,10 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         // One host read: the decision and the draft.
         eval(&[&decision, &draft.tokens])?;
         let (accepted, next, _) = nuvec::speculative::read(&decision)?;
+        let target_time = start.map(|t| t.elapsed());
+        if let Some(time) = target_time {
+            self.stats.verify_time += time;
+        }
         let draft_v = draft.tokens.to_vec::<u32>()?;
         for cache in &mut self.cache {
             cache.trim(k - accepted)?;
@@ -722,6 +776,7 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         self.drafter.observe(self.model, &tokens, hidden.as_ref())?;
         self.stats.steps += 1;
         self.stats.verifies += 1;
+        self.stats.max_verify_rows = self.stats.max_verify_rows.max(k + 1);
         self.stats.drafted += k;
         self.stats.accepted += accepted;
         match self.policy {
@@ -741,6 +796,15 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             DraftPolicy::Fixed(_) | DraftPolicy::Tree(_) => {}
         }
         self.draft_due = self.pause.0 == 0;
+        if let Some(rounds) = &mut self.rounds {
+            rounds.push(VerifyRound {
+                start: first - 1,
+                draft: draft_v,
+                accepted,
+                next,
+                target_time,
+            });
+        }
         self.context.extend(new);
         self.pending.extend(new);
         Ok(())
@@ -990,7 +1054,10 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
             0 if max > 0 => {
                 let d = match probed {
                     Some(d) => d,
-                    None => self.drafter.draft(self.model, &self.context, max)?,
+                    None => self
+                        .drafter
+                        .draft(self.model, &self.context, max)?
+                        .checked()?,
                 };
                 match d.len() > max {
                     true => Draft::new(d.tokens.i(0..max as i32)),
@@ -1002,7 +1069,14 @@ impl<D: Drafter> SpeculativeGeneration<'_, D> {
         if draft.is_empty() {
             return self.plain_step();
         }
-        self.verify(draft)?;
+        let verify_start = if self.time_stages {
+            eval(&[&draft.tokens])?;
+            self.stats.draft_time += start.elapsed();
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        self.verify(draft, verify_start)?;
         if timed {
             self.modes
                 .record(self.pending.len(), start.elapsed().as_secs_f64());

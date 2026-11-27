@@ -1,0 +1,31 @@
+{
+  "seed": 1307,
+  "config": {
+    "hidden_size": 16,
+    "num_attention_heads": 2,
+    "q_lora_rank": 8,
+    "kv_lora_rank": 8,
+    "qk_nope_head_dim": 6,
+    "qk_rope_head_dim": 4,
+    "v_head_dim": 6,
+    "index_n_heads": 4,
+    "index_head_dim": 8,
+    "index_topk": 3,
+    "max_position_embeddings": 32,
+    "rope_scaling": {
+      "type": "yarn",
+      "factor": 4.0,
+      "original_max_position_embeddings": 16,
+      "beta_fast": 8,
+      "beta_slow": 1,
+      "mscale": 1.0,
+      "mscale_all_dim": 1.0
+    }
+  },
+  "mlx": "0.32.5",
+  "mlx_lm": "0.32.2",
+  "sha256": {
+    "f32": "fde9f1eca66caa0d2c52a28883aac4452371abaac2a7398f60808a2d42aacc80",
+    "bf16": "7ae7c5cd501cec550948f68a3f15d6d15691e8971825e558158cbaaf610fb1be"
+  }
+}

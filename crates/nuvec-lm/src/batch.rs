@@ -42,6 +42,7 @@ use nuvec::{Array, Error, Result, async_eval, eval, ops};
 pub use crate::generate::FinishReason;
 use crate::generate::{GenerateOptions, Keys, judge, prefill_rows};
 use crate::model::Model;
+use crate::model::paged_quant::{self, Layout};
 use crate::paged::{PagedCache, Reservation, SeqId, forward_reserved};
 use crate::stop::StopState;
 
@@ -176,23 +177,29 @@ impl BatcherOptions {
     }
 
     /// The block count: `blocks`, or sized from memory (see [`Self::blocks`]).
-    fn block_count(&self, model: &Model) -> usize {
+    fn block_count(&self, bytes_per_position: usize) -> Result<usize> {
         if let Some(blocks) = self.blocks {
-            return blocks;
+            return Ok(blocks);
         }
-        let per_block = (model.kv_bytes_per_position() * self.block_size).max(1);
+        let bad = || Error::InvalidArgument("batcher: capacity overflow".into());
+        let per_block = bytes_per_position
+            .checked_mul(self.block_size)
+            .ok_or_else(bad)?
+            .max(1);
+        let cap = self
+            .max_batch
+            .checked_mul(MAX_DEFAULT_POSITIONS)
+            .ok_or_else(bad)?
+            / self.block_size;
         let blocks = match nuvec::metal::device_info() {
             Some(info) => {
                 let free = (info.recommended_working_set as usize)
                     .saturating_sub(nuvec::memory::active_memory());
                 (free as f64 * self.memory_fraction) as usize / per_block
             }
-            None => self.max_batch * 4096 / self.block_size,
+            None => self.max_batch.checked_mul(4096).ok_or_else(bad)? / self.block_size,
         };
-        blocks.clamp(
-            self.max_batch,
-            self.max_batch * MAX_DEFAULT_POSITIONS / self.block_size,
-        )
+        Ok(blocks.clamp(self.max_batch, cap.max(self.max_batch)))
     }
 }
 
@@ -243,12 +250,36 @@ impl<'a> Batcher<'a> {
     /// A batcher for `model` as `options` say ([`BatcherOptions`]); the options are
     /// checked first.
     pub fn new(model: &'a Model, options: BatcherOptions) -> Result<Self> {
+        Self::with_layout(model, options, None)
+    }
+
+    /// A batcher with eight-bit affine KV pages from the first cached position.
+    /// Currently supports single-device, full-attention Qwen3. All requests inherit this format.
+    pub fn new_quantized(model: &'a Model, options: BatcherOptions) -> Result<Self> {
+        Self::with_layout(model, options, Some(Layout::for_model(model)?))
+    }
+
+    /// Configured KV array bytes, including compression metadata.
+    pub fn kv_capacity_bytes(&self) -> usize {
+        self.cache.kv_capacity_bytes()
+    }
+
+    fn with_layout(
+        model: &'a Model,
+        options: BatcherOptions,
+        packed: Option<Layout>,
+    ) -> Result<Self> {
         options.validate()?;
-        let blocks = options.block_count(model);
+        let blocks = match options.blocks {
+            Some(n) => n,
+            None => options.block_count(
+                packed.map_or_else(|| model.kv_bytes_per_position(), |p| p.bytes_per_position),
+            )?,
+        };
         let max_batch = options.max_batch;
         Ok(Self {
             model,
-            cache: PagedCache::new(model, blocks, options.block_size, max_batch)?,
+            cache: PagedCache::with_layout(model, blocks, options.block_size, max_batch, packed)?,
             max_batch,
             waiting: VecDeque::new(),
             running: Vec::new(),
@@ -275,9 +306,7 @@ impl<'a> Batcher<'a> {
         }
         options.validate()?;
         if options.kv_quant.is_some() {
-            return invalid(
-                "the paged cache is not quantized (`kv_quant` is for `generate`)".into(),
-            );
+            return invalid("the paged cache format is fixed at batcher construction".into());
         }
         if !self.fits(prompt.len()) {
             return invalid(format!(
@@ -489,6 +518,11 @@ impl<'a> Batcher<'a> {
             .map(|r| &r.tokens[..r.tokens.len() - 1])
             .collect();
         let mut kv = self.model.new_cache();
+        if self.cache.packed.is_some() {
+            for layer in &mut kv {
+                layer.to_quantized(paged_quant::FORMAT)?;
+            }
+        }
         prefill_rows(
             self.model,
             &mut kv,

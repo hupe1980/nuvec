@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """`all_sum`: nuvec vs MLX on the same machines. By default over the TCP ring with 2 and 4
 ranks on loopback; with `--hostfile` on several Macs through `mlx.launch` (`--backend ring`,

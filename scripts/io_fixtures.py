@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "numpy==2.5.4"]
+# dependencies = ["mlx==0.32.5", "numpy==2.5.4"]
 # ///
 """Writes files with MLX and NumPy for nuvec-io's tests (`crates/nuvec-io/tests/fixtures`).
 

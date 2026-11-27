@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """`mlx.core`'s and `mlx.core.linalg`'s functions without a nuvec counterpart.
 
@@ -22,16 +22,18 @@ import mlx.core as mx
 ROOT = Path(__file__).resolve().parent.parent
 
 # Elsewhere in nuvec, or not array operations.
-RUNTIME = set("""
-clear_cache clear_streams compile disable_compile enable_compile device_count device_info
-default_device default_stream get_active_memory get_array_buffer_size get_cache_memory
-get_memory_limit get_peak_memory get_printoptions is_available new_stream
-new_thread_local_stream new_thread_unsafe_stream printoptions reset_peak_memory
-set_cache_limit set_default_device set_default_stream set_memory_limit set_printoptions
-set_wired_limit stream synchronize load save save_gguf save_safetensors savez
-savez_compressed from_dlpack asarray export_function export_to_dot exporter import_function
-eval async_eval checkpoint custom_function grad value_and_grad jvp vjp vmap
-""".split())
+RUNTIME = {
+    "clear_cache", "clear_streams", "compile", "disable_compile", "enable_compile",
+    "device_count", "device_info", "default_device", "default_stream", "get_active_memory",
+    "get_array_buffer_size", "get_cache_memory", "get_memory_limit", "get_peak_memory",
+    "get_printoptions", "is_available", "new_stream", "new_thread_local_stream",
+    "new_thread_unsafe_stream", "printoptions", "reset_peak_memory", "set_cache_limit",
+    "set_default_device", "set_default_stream", "set_memory_limit", "set_printoptions",
+    "set_wired_limit", "stream", "synchronize", "load", "save", "save_gguf", "save_safetensors",
+    "savez", "savez_compressed", "from_dlpack", "asarray", "export_function", "export_to_dot",
+    "exporter", "import_function", "eval", "async_eval", "checkpoint", "custom_function",
+    "grad", "value_and_grad", "jvp", "vjp", "vmap",
+}
 # Out of scope: listed, not required.
 LATER: set[str] = set()
 # MLX names nuvec spells otherwise.
@@ -48,9 +50,9 @@ def nuvec_names() -> set[str]:
         text = f.read_text()
         names |= set(re.findall(r"pub fn ([a-z0-9_]+)", text))
         for macro in ("binary_ops!", "binary_fn!", "unary_fn!", "reductions!", "scans!"):
-            for block in re.findall(re.escape(macro) + r" \{(.*?)\n\}", text, re.S):
+            for block in re.findall(re.escape(macro) + r" \{(.*?)\n\}", text, re.DOTALL):
                 names |= set(re.findall(r"(\w+)(?:, \w+)? =>", block))
-        for block in re.findall(r"unary_ops!\((.*?)\);", text, re.S):
+        for block in re.findall(r"unary_ops!\((.*?)\);", text, re.DOTALL):
             names |= set(re.findall(r"(\w+)", block))
     return names
 

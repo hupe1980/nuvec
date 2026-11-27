@@ -2610,7 +2610,8 @@ methods! {
         /// ```
         fn view(&self, dtype: DType) -> Array;
         /// The floats as E4M3 bytes (uint8; MLX's `to_fp8`): rounded to nearest even,
-        /// saturating at ±448. There is no fp8 dtype; [`Array::from_fp8`] restores floats.
+        /// saturating overflow and infinities at ±448 and encoding NaNs as E4M3 NaNs.
+        /// There is no fp8 dtype; [`Array::from_fp8`] restores floats.
         ///
         /// ```
         /// use nuvec_core::{DType, array};

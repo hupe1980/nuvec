@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2", "dflash-mlx==0.1.8"]
+# dependencies = ["mlx==0.32.5", "mlx-lm==0.32.2", "dflash-mlx==0.1.8"]
 # ///
 """DFlash speculative decoding against MLX on the same machine: Qwen3-8B 4-bit with
 z-lab/Qwen3-8B-DFlash-b16 (4-bit drafter, group 64), the GSM8K "Natalia" problem in Qwen3's

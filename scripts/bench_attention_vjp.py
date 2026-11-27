@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """Attention forward and backward on the GPU, nuvec against MLX: `value_and_grad` of
 `sum(attention(q, k, v) * w)` for q, k and v (B 4, 16 query heads, 8 key heads, L 512 /

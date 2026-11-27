@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """Few-row products (B = 1..16 rows: dense, affine quantized, gathered) on the GPU: nuvec's
 default routing and its row-exact mode (`with_row_exact`, lanes that must equal their solo
@@ -13,6 +13,8 @@ row and against MLX, and the largest row count up to which every case keeps at l
 of 0.3.0 (the candidate for `ROW_INDEPENDENT_ROWS`).
 
 Usage: `just bench-rows [filter]`, `BASE=../nuvec-0.3.0 just bench-rows`.
+Use `BENCH_ROWS=5 just bench-rows affine8` for a single row count. The exact/B1
+column requires a one-row control and is unavailable when selecting a different count.
 """
 
 from __future__ import annotations
@@ -91,26 +93,27 @@ def mlx_op(name: str, dt, b: int):
     return lambda: mx.gather_mm(x, w, rhs_indices=idx, sorted_indices=True)
 
 
+def burst(op, count: int) -> float:
+    t = time.perf_counter()
+    pending = []
+    for _ in range(count):
+        pending.append(op())
+        if len(pending) == 8:
+            mx.async_eval(pending)
+            pending = []
+    mx.eval(pending)
+    mx.eval(op())
+    return (time.perf_counter() - t) / count
+
+
 def mlx(keys) -> dict[tuple[str, str, int], float]:
     mx.set_default_device(mx.gpu)
     out = {}
     for name, dt, b in keys:
         op = mlx_op(name, DTYPES[dt], b)
 
-        def burst(count: int) -> float:
-            t = time.perf_counter()
-            pending = []
-            for _ in range(count):
-                pending.append(op())
-                if len(pending) == 8:
-                    mx.async_eval(pending)
-                    pending = []
-            mx.eval(pending)
-            mx.eval(op())
-            return (time.perf_counter() - t) / count
-
-        burst(200)
-        out[(name, dt, b)] = min(burst(200) for _ in range(3)) * 1e6
+        burst(op, 200)
+        out[(name, dt, b)] = min(burst(op, 200) for _ in range(3)) * 1e6
     return out
 
 

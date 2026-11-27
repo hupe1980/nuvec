@@ -1,6 +1,6 @@
 //! `nuvec-nn` behaviour: derived modules, introspection, freezing, train/eval mode, loading
 //! and saving weights, optimizers' path-keyed state and the layers against
-//! values recorded from MLX 0.32.4.
+//! values recorded from MLX 0.32.5.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -231,7 +231,7 @@ fn optimizers_equal_mlx() {
     }
 }
 
-/// Three Adafactor steps on a `[3, 4]` matrix (factored) and a vector, against MLX 0.32.4's
+/// Three Adafactor steps on a `[3, 4]` matrix (factored) and a vector, against MLX 0.32.5's
 /// `optimizers.Adafactor` (values recorded on its CPU stream).
 #[test]
 fn adafactor_equals_mlx() {

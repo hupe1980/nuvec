@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2"]
+# dependencies = ["mlx==0.32.5", "mlx-lm==0.32.2"]
 # ///
 """Requantizes a cached MLX 4-bit (affine) checkpoint to a floating-point mode, for
 benchmarks of the mxfp4, mxfp8 and nvfp4 kernels on real model shapes when the original

@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2"]
+# dependencies = ["mlx==0.32.5", "mlx-lm==0.32.2"]
 # ///
 """mlx-lm's greedy tokens for `examples/greedy_parity.rs`.
 
@@ -13,6 +13,7 @@ step. Models come from the local Hugging Face cache.
 """
 
 import argparse
+import hashlib
 import json
 import platform
 import sys
@@ -48,11 +49,13 @@ def prompts(tokenizer, lengths):
     before, after = frame(tokenizer)
     out, offset = [], 0
     for length in lengths:
-        # At least one token of text when the template is longer than the length.
-        n = max(length - len(before) - len(after), 1)
+        # For a prompt shorter than the chat template, use raw document tokens.
+        # This keeps the requested length without truncating the template's control tokens.
+        prefix, suffix = (before, after) if length > len(before) + len(after) else ([], [])
+        n = length - len(prefix) - len(suffix)
         if offset + n > len(ids):
             offset = 0
-        out.append(before + ids[offset : offset + n] + after)
+        out.append(prefix + ids[offset : offset + n] + suffix)
         offset += n
     return out
 
@@ -76,10 +79,20 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--tokens", type=int, default=256)
     parser.add_argument("--lengths", default=",".join(map(str, LENGTHS)))
+    parser.add_argument("--prompts-from", type=Path, help="use the exact prompt IDs in a frozen corpus")
     args = parser.parse_args()
+    if args.tokens < 1:
+        parser.error("--tokens must be positive")
     model, tokenizer = load(args.model)
     cases = []
-    for prompt in prompts(tokenizer, [int(n) for n in args.lengths.split(",")]):
+    lengths = [int(n) for n in args.lengths.split(",")]
+    if args.prompts_from:
+        selected = [case["prompt"] for case in json.loads(args.prompts_from.read_text())["cases"]]
+    else:
+        selected = prompts(tokenizer, lengths)
+    if [len(case) for case in selected] != lengths or min(lengths) < 1:
+        parser.error("prompt IDs do not match the requested nonempty lengths")
+    for prompt in selected:
         tokens, top2 = run(model, prompt, args.tokens)
         cases.append({"prompt": prompt, "tokens": tokens, "top2": top2})
         print(f"{len(prompt)} prompt tokens", file=sys.stderr)
@@ -88,6 +101,8 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps({
         "model": args.model,
+        "snapshot": Path(args.model).resolve().name if Path(args.model).is_dir() else None,
+        "prompt_sha256": hashlib.sha256(json.dumps(selected, separators=(",", ":")).encode()).hexdigest(),
         "mlx": mx.__version__,
         "mlx_lm": mlx_lm.__version__,
         "prefill_step_size": 2048,

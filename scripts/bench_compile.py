@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4"]
+# dependencies = ["mlx==0.32.5"]
 # ///
 """Compiled element-wise functions (GELU, SwiGLU gating, an Adam step): nuvec vs MLX on
 the same machine, uncompiled and compiled.

@@ -15,8 +15,8 @@ TOOLS=$ROOT/scripts/quiet
 TEXT="The lighthouse keeper climbed the spiral stairs every evening, counting the steps and listening to the sea against the rocks below. "
 MST=${MST:-Metal System Trace}
 # A persistent environment (an ephemeral `uv run` interpreter is gone once it returns).
-VENV=$ROOT/target/quiet/mlx-venv
-[ -x "$VENV/bin/python" ] || { uv venv -q "$VENV" && uv pip install -q --python "$VENV/bin/python" mlx==0.32.4 mlx-lm==0.32.2; }
+VENV=$ROOT/target/quiet/mlx-0.32.5-venv
+[ -x "$VENV/bin/python" ] || { uv venv -q "$VENV" && uv pip install -q --python "$VENV/bin/python" mlx==0.32.5 mlx-lm==0.32.2; }
 PY=$VENV/bin/python
 snap() { local d=~/.cache/huggingface/hub/models--${1//\//--}; echo "$d/snapshots/$(cat "$d/refs/main")"; }
 log() { echo "[$(date +%H:%M:%S)] decode: $*" | tee -a "$OUT/decode.log"; }

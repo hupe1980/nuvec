@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2"]
+# dependencies = ["mlx==0.32.5", "mlx-lm==0.32.2"]
 # ///
 """The first token of a short prompt, part by part, as mlx-lm's `generate_step` makes it:
 the prompt but its last token (one chunk, evaluated with the cache), the cache clear, then the

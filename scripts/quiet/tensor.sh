@@ -36,7 +36,7 @@ caffeinate -dimsu -w $$ &
 cargo build -q --release -p nuvec-lm --example bench --example pipeline_generate || exit 1
 M06=$(snapshot Qwen3-0.6B-4bit)
 M8=$(snapshot Qwen3-8B-4bit)
-LAUNCH=(uv run -q --python 3.13 --with mlx==0.32.4 --with mlx-lm==0.32.2 python -c
+LAUNCH=(uv run -q --python 3.13 --with mlx==0.32.5 --with mlx-lm==0.32.2 python -c
     "from mlx._distributed_utils.launch import main; main()" --backend ring -n 2 --)
 
 log "decode"

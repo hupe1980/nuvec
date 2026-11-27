@@ -392,3 +392,19 @@ release version:
 # GPU tests fail instead of skipping without a Metal device (`NUVEC_REQUIRE_GPU=1`).
 ci:
     NUVEC_REQUIRE_GPU=1 just fmt-check lint test doc miri deny metallib-check metal-check nax-check internal-paths layering api-hygiene no-hand-visits notices docs-rs docs-claims portable-check
+
+# Compare the current MLX reference with nuvec on a physical Apple GPU.
+qualify-mlx *args:
+    uv run --python 3.13 scripts/qualify_mlx.py {{args}}
+
+# Benchmark sparse latent attention against its dense reference.
+bench-sparse-mla *args:
+    uv run scripts/bench_sparse_mla.py {{args}}
+
+# Compare exact DFlash widths using the same prompts, tokens and checkpoint revisions.
+bench-exact-verify *args:
+    python3 scripts/bench_exact_verify.py {{args}}
+
+# Exercise quantized paged KV capacity, memory and throughput against dense pages.
+bench-paged-quantized-kv *args:
+    uv run scripts/bench_paged_quantized_kv.py {{args}}

@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2", "tokenizers==0.22.1"]
+# dependencies = ["mlx==0.32.5", "mlx-lm==0.32.2", "tokenizers==0.22.1"]
 # ///
 """Records tiny random models of each Llama-family variant with mlx-lm, and their outputs,
 as test fixtures for nuvec-lm.
@@ -293,6 +293,7 @@ AWQ_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
 def packed_models() -> None:
     import numpy as np
 
+    mx.random.seed(20261025)
     rng = np.random.default_rng(20261025)
 
     def mlx_pack(q, bits):  # q [out, in] -> uint32 [out, in * bits / 32]
@@ -320,6 +321,13 @@ def packed_models() -> None:
         nn.quantize(model, group_size=gs, bits=bits,
                     class_predicate=lambda p, m: isinstance(m, nn.Linear) and ".layers." in f".{p}")
         flat = dict(tree_flatten(model.parameters()))
+        # Keep the checkpoint's floating-point inputs fixed when refreshing its oracle.
+        out = OUT / name
+        checkpoint = out / "model.safetensors"
+        existing = mx.load(str(checkpoint)) if checkpoint.is_file() else None
+        if existing is not None:
+            flat.update({k: v for k, v in existing.items()
+                         if k in flat and not k.endswith((".scales", ".biases"))})
         hf = {k: v for k, v in flat.items() if not k.endswith((".scales", ".biases"))}
         for prefix in sorted({k[:-len(".scales")] for k in flat if k.endswith(".scales")}):
             out_f, packed_in = flat[prefix + ".weight"].shape
@@ -351,10 +359,15 @@ def packed_models() -> None:
             qc |= {"quant_method": "gptq", "sym": False, "desc_act": False,
                    "checkpoint_format": "gptq_v2" if method == "gptq_v2" else "gptq"}
         config["quantization_config"] = qc
-        out = OUT / name
         out.mkdir(parents=True, exist_ok=True)
         (out / "config.json").write_text(json.dumps(config, indent=2))
-        mx.save_safetensors(str(out / "model.safetensors"), hf)
+        if existing is None:
+            mx.save_safetensors(str(checkpoint), hf)
+        else:
+            assert hf.keys() == existing.keys() and all(
+                hf[k].dtype == v.dtype and mx.array_equal(hf[k], v).item()
+                for k, v in existing.items()
+            ), f"{name}: regenerated packing differs from the fixture inputs"
         prompt = mx.array(PROMPT, dtype=mx.uint32)
         logits = model(prompt[None]).astype(mx.float32)
         if method == "awq":

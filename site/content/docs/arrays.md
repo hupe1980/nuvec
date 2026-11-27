@@ -70,6 +70,19 @@ assert_eq!((&x * 2.0).dtype(), DType::F32); // a float scalar makes integers flo
 assert_eq!((&h * 2.0).dtype(), DType::F16); // but never widens a float type
 ```
 
+### Checking CPU activation results
+
+On Apple M4 Pro running macOS 27.2.1 build 26B131, CPU `sigmoid` and `logaddexp` match the MLX 0.32.5 CPU corpus in both float16 and bfloat16, with default features and with `accelerate`. The corpus exercises all 65,536 unary input words and 1,048,576 deterministic binary pairs per dtype. A separate MLX 0.32.5 fixture covers views including broadcast inputs and scalar tails. The comparison canonicalizes NaNs and preserves signed zeros.
+
+To inspect an individual CPU difference, run the offline oracle with the original shape. For example, `uv run --python 3.13 scripts/cpu_activation_fixtures.py --witness float32 expm1` prints the first differing index, input and result words. To replay the profile's full 168-row CPU ledger, run the following command on that host.
+
+```sh
+NUVEC_REQUIRE_CPU_PROFILE=1 cargo test --locked --release -p nuvec-core \
+  --test elementwise cpu::qualified_cpu_ledger -- --exact
+```
+
+A large CPU call can initialize a table of rounded values for that operation and dtype. Calls with fewer than 512 elements compute directly. Using both operations can retain up to 192 KiB per dtype. On the M4 Pro, the first calls on 4,096 values took 108–191 µs across the four operation/dtype combinations. Warm calls took 2.2–12.2 µs with default features. These are shared-host medians. Reproduce the warm measurements with `uv run --python 3.13 scripts/bench_vs_mlx.py --activations-only`. [Raw activation benchmarks](/nuvec/experiments/cpu-activations-m4-pro.json)
+
 ## Views
 
 `reshape`, `transpose` (and `.t()`), indexing with `i`, `broadcast_to`, `expand_dims` and `squeeze` return **views** that share their input's memory whenever the layout allows. Kernels accept arbitrary strides, so views are never copied just to be read.
@@ -165,7 +178,7 @@ The kernels are pure Rust (`faer`). With the feature `accelerate`, Apple targets
 
 ## Convolutions
 
-The convolutions take MLX's layout and arguments: the input is channels last (`[N, spatial…, C_in]`) and the weight `[C_out, kernel…, C_in / groups]`. An argument per spatial axis is one value for every axis (`1`) or one each (`[2, 1]`). `conv_general` adds asymmetric and negative padding (a crop of the input), input dilation and flipped kernels (`ConvOptions`); the transposed convolutions are flipped convolutions of the input dilated by the stride, as in MLX.
+The convolutions take MLX's layout and arguments: the input is channels last (`[N, spatial…, C_in]`) and the weight `[C_out, kernel…, C_in / groups]`. An argument per spatial axis is one value for every axis (`1`) or one each (`[2, 1]`). `conv_general` adds asymmetric and negative padding (a crop measured in positions of the dilated input), input dilation and flipped kernels (`ConvOptions`); the transposed convolutions are flipped convolutions of the input dilated by the stride, as in MLX.
 
 ```rust
 # use nuvec::prelude::*;

@@ -35,7 +35,7 @@ sweep f16 "" 128,128,32 128,64,32 64,128,32 128,128,16 64,64,32
 sweep f32 "NUVEC_CUDA_TF32=1" 64,64,32 64,128,32 128,64,32 128,128,16 64,64,16
 sweep f32 "" 64,64,32 64,128,32 128,64,32 128,128,16 64,64,16
 echo "== MLX benchmark"
-python3 -m venv /root/mlx >/dev/null && timeout 600 /root/mlx/bin/pip install -q 'mlx[cuda13]==0.32.4' 2>&1 | tail -2
+python3 -m venv /root/mlx >/dev/null && timeout 600 /root/mlx/bin/pip install -q 'mlx[cuda13]==0.32.5' 2>&1 | tail -2
 timeout 900 /root/mlx/bin/python scripts/bench_cuda.py 2>&1 | grep Gemm
 echo "== MLX, TF32 off"
 MLX_ENABLE_TF32=0 timeout 600 /root/mlx/bin/python scripts/bench_cuda.py 2>&1 | grep -E 'Gemm.*float32'

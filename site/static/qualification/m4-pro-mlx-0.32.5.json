@@ -1,0 +1,109 @@
+{
+ "mlx": "0.32.5",
+ "mlx_lm": "0.32.2",
+ "machine": {
+  "mlx": "0.32.5",
+  "macos": "27.2.1",
+  "chip": "Apple M4 Pro",
+  "architecture": "applegpu_g16s"
+ },
+ "fixture_rows": 336,
+ "fixture_sha256": "c4cdad1fbdc33d20885b2ac30a264e41ac25e067dc6f6c9f6e02afaec3a4bd6d",
+ "greedy": [
+  {
+   "model": "mlx-community/Qwen3-8B-4bit",
+   "snapshot": "545dc4251c05440727734bcd94334791f6ab0192",
+   "corpus_sha256": "17073088f1ef268d8ac33ca45348032ed7a8828730e814eee75d0897c1fdc9ee",
+   "cases": [
+    {
+     "prompt_tokens": 24,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 200,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 1000,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 1537,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 2048,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 3500,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 4350,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 8192,
+     "matched_tokens": 256,
+     "status": "pass"
+    }
+   ]
+  },
+  {
+   "model": "mlx-community/Qwen3.5-9B-4bit",
+   "snapshot": "8b2b98c00a6b4d291155e4890773ca8f769aee53",
+   "corpus_sha256": "782141e76386fdc20f686263bdb141dd0e06fa4fdb692da42804baf31df7c3bd",
+   "cases": [
+    {
+     "prompt_tokens": 24,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 200,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 1000,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 1537,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 2048,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 3500,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 4350,
+     "matched_tokens": 256,
+     "status": "pass"
+    },
+    {
+     "prompt_tokens": 8192,
+     "matched_tokens": 256,
+     "status": "pass"
+    }
+   ]
+  }
+ ],
+ "status": "passed"
+}

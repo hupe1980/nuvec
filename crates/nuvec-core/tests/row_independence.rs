@@ -682,7 +682,7 @@ mod built_inside {
         }
         for quant in quants() {
             for (k, n) in [(512, 512), (1024, 256), (4096, 64)] {
-                for rows in [2, 3, 4, 8] {
+                for rows in [2, 3, 4, 6, 8] {
                     for seed in 0..20 {
                         let w = normal(&[n, k], seed);
                         let wq = w.quantize(quant);
@@ -697,6 +697,20 @@ mod built_inside {
                     }
                 }
             }
+        }
+    }
+
+    /// Verify the three deployed chain widths when rows come from a non-contiguous view.
+    #[test]
+    fn exact_chains_read_strided_inputs() {
+        if !gpu() {
+            return;
+        }
+        let wq = normal(&[256, 512], 13).quantize(Quant::affine(64, 4));
+        for rows in [4, 6, 8] {
+            let x = normal(&[512, rows], 17).t();
+            let y = with_row_exact(|| x.quantized_matmul(&wq, true));
+            exact_rows("strided exact chain", &y, &x, &wq);
         }
     }
 

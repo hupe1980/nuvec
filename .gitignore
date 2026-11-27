@@ -45,6 +45,7 @@ rustc-ice-*.txt
 /specs/
 /.specify/
 /.claude/
+/.agents/skills/speckit-*/
 /.github/skills/speckit-*/
 /CLAUDE.md
 

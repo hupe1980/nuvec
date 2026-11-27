@@ -11,7 +11,7 @@ use super::fixture::{Case, Tensor, from_array, parse, to_array, values};
 /// The API fixtures.
 pub fn load_api() -> Vec<Case> {
     let (meta, cases) = parse(include_bytes!("../fixtures/mlx_api.bin"));
-    assert!(meta.contains("mlx=0.32.4"), "{meta}");
+    assert_eq!(meta, "mlx=0.32.5 device=cpu seed=20261016");
     cases
 }
 

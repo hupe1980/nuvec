@@ -1,0 +1,215 @@
+{
+  "profile": "Apple M4 Pro / 26B131",
+  "base": "v0.15.0",
+  "candidate": "working tree",
+  "repetitions_per_process": 100,
+  "warmups": 3,
+  "process_order": "rotate [base, default, accelerate] by i % 3 for i=0..6",
+  "unit": "microseconds",
+  "warm_medians": {
+    "base": {
+      "cpu_sigmoid_f16_4096": [
+        18.3,
+        18.4,
+        18.2,
+        6.7,
+        6.2,
+        6.4,
+        6.2
+      ],
+      "cpu_logaddexp_f16_4096": [
+        16.0,
+        49.5,
+        16.8,
+        14.8,
+        14.7,
+        15.0,
+        14.9
+      ],
+      "cpu_sigmoid_bf16_4096": [
+        9.3,
+        9.5,
+        9.3,
+        9.5,
+        8.4,
+        8.6,
+        8.6
+      ],
+      "cpu_logaddexp_bf16_4096": [
+        19.4,
+        19.2,
+        19.3,
+        19.2,
+        17.8,
+        24.3,
+        18.4
+      ]
+    },
+    "default": {
+      "cpu_sigmoid_f16_4096": [
+        6.0,
+        6.0,
+        6.1,
+        2.3,
+        2.2,
+        2.2,
+        2.3
+      ],
+      "cpu_logaddexp_f16_4096": [
+        13.7,
+        13.6,
+        13.8,
+        5.6,
+        5.5,
+        5.3,
+        5.5
+      ],
+      "cpu_sigmoid_bf16_4096": [
+        5.7,
+        5.6,
+        5.7,
+        2.2,
+        2.2,
+        2.1,
+        2.1
+      ],
+      "cpu_logaddexp_bf16_4096": [
+        42.4,
+        42.4,
+        42.6,
+        12.2,
+        12.1,
+        11.2,
+        11.4
+      ]
+    },
+    "accelerate": {
+      "cpu_sigmoid_f16_4096": [
+        6.2,
+        6.0,
+        2.5,
+        2.4,
+        2.2,
+        2.4,
+        2.3
+      ],
+      "cpu_logaddexp_f16_4096": [
+        13.9,
+        13.8,
+        6.0,
+        5.8,
+        5.3,
+        5.4,
+        5.8
+      ],
+      "cpu_sigmoid_bf16_4096": [
+        5.7,
+        5.8,
+        2.8,
+        2.3,
+        2.2,
+        2.1,
+        2.3
+      ],
+      "cpu_logaddexp_bf16_4096": [
+        42.5,
+        42.5,
+        14.5,
+        12.1,
+        11.1,
+        11.1,
+        12.0
+      ]
+    }
+  },
+  "cold": {
+    "base": {
+      "cpu_sigmoid_f16_4096": [
+        46.7,
+        31.9,
+        18.1,
+        34.5,
+        32.4
+      ],
+      "cpu_logaddexp_f16_4096": [
+        126.8,
+        63.0,
+        34.0,
+        66.5,
+        66.8
+      ],
+      "cpu_sigmoid_bf16_4096": [
+        31.4,
+        32.0,
+        11.3,
+        32.5,
+        32.5
+      ],
+      "cpu_logaddexp_bf16_4096": [
+        93.0,
+        71.5,
+        27.8,
+        69.3,
+        68.7
+      ]
+    },
+    "default": {
+      "cpu_sigmoid_f16_4096": [
+        195.2,
+        142.0,
+        141.6,
+        149.4,
+        439.8
+      ],
+      "cpu_logaddexp_f16_4096": [
+        137.5,
+        102.2,
+        100.3,
+        107.5,
+        318.3
+      ],
+      "cpu_sigmoid_bf16_4096": [
+        197.5,
+        181.5,
+        181.0,
+        191.2,
+        748.4
+      ],
+      "cpu_logaddexp_bf16_4096": [
+        179.9,
+        139.7,
+        142.3,
+        146.4,
+        650.0
+      ]
+    }
+  },
+  "date": "2026-11-27",
+  "host_conditions": "Shared Apple M4 Pro with concurrent workspace checks.",
+  "candidate_files_sha256": {
+    "crates/nuvec-core/src/kernels.rs": "9ec28076f1fb1db9abd607a717557d1c5a1e3c40e815e0789ed02d47bcae3096",
+    "crates/nuvec-core/src/kernels/activations.rs": "a98b7aa4a02d72ee665356e7c9d56e5f87c4cf7f047dc1a4c382748d117436ac",
+    "crates/nuvec-core/benches/vs_mlx.rs": "1543ee9a6276e90d39ab051358d3153553a9113f75a4aa56b407455fe0884f7b"
+  },
+  "cold_protocol": "Five fresh processes per build. Evaluate the input arrays, then measure the first eval of each operation and dtype. Includes scratch allocation and table initialization.",
+  "mlx_0.32.5_python_medians": [
+    {
+      "cpu_sigmoid_f16_4096": 14.999999621068127,
+      "cpu_logaddexp_f16_4096": 19.875000361935236,
+      "cpu_sigmoid_bf16_4096": 18.707998606259935,
+      "cpu_logaddexp_bf16_4096": 51.500001063686796
+    },
+    {
+      "cpu_sigmoid_f16_4096": 16.12499909242615,
+      "cpu_logaddexp_f16_4096": 23.499998860643245,
+      "cpu_sigmoid_bf16_4096": 17.29199902911205,
+      "cpu_logaddexp_bf16_4096": 49.49999856762588
+    },
+    {
+      "cpu_sigmoid_f16_4096": 15.6660007633036,
+      "cpu_logaddexp_f16_4096": 21.707999621867202,
+      "cpu_sigmoid_bf16_4096": 18.834000002243556,
+      "cpu_logaddexp_bf16_4096": 49.04200068267528
+    }
+  ]
+}

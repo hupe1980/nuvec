@@ -1,4 +1,4 @@
-//! `nuvec-nn` against `mlx.nn` and `mlx.optimizers` 0.32.4: inputs and expected outputs
+//! `nuvec-nn` against `mlx.nn` and `mlx.optimizers` 0.32.5: inputs and expected outputs
 //! recorded by `scripts/nn_fixtures.py` (`just nn-fixtures`) on MLX's CPU device.
 
 use std::collections::BTreeMap;
@@ -450,7 +450,7 @@ fn names(m: &impl Module) -> Vec<String> {
     m.parameters().into_iter().map(|(n, _)| n).collect()
 }
 
-/// Every layer's parameter names equal MLX 0.32.4's `tree_flatten` names.
+/// Every layer's parameter names equal MLX 0.32.5's `tree_flatten` names.
 #[test]
 fn parameter_names_equal_mlx() {
     random::seed(0);
