@@ -9,11 +9,12 @@ method (sustained throughput: products submitted back to back with `async_eval` 
 warm-up, best of three bursts of about 0.1 s), then prints TFLOP/s, the nuvec/MLX time
 ratio and its geometric mean per dtype.
 
-Usage: `just bench-gemm`.
+Usage: `just bench-gemm [SHAPE ...]`. Use `--help` to list the available shapes.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 import platform
 import subprocess
@@ -30,6 +31,10 @@ SHAPES = [
     ("sq2048", 1, 2048, 2048, 2048, False),
     ("sq4096", 1, 4096, 4096, 4096, False),
     ("nt2048", 1, 2048, 2048, 2048, True),
+    ("qk14", 4, 14, 16, 14, True),
+    ("skinny9", 1, 9, 1024, 4096, True),
+    ("skinny14", 1, 14, 4096, 4096, True),
+    ("skinny15", 1, 15, 1024, 4096, True),
     ("skinny16", 1, 16, 4096, 4096, True),
     ("tallk", 1, 256, 8192, 256, False),
     ("wide", 1, 4096, 512, 4096, False),
@@ -48,38 +53,41 @@ SHAPES = [
 DTYPES = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 
 
-def mlx_results() -> dict[tuple[str, str], float]:
+def burst(a: mx.array, b: mx.array, count: int) -> float:
+    t = time.perf_counter()
+    last = None
+    for _ in range(count):
+        last = a @ b
+        mx.async_eval(last)
+    mx.eval(last)
+    return (time.perf_counter() - t) / count
+
+
+def mlx_results(shapes) -> dict[tuple[str, str], float]:
     mx.set_default_device(mx.gpu)
     out = {}
     for label, dtype in DTYPES.items():
-        for name, batch, m, k, n, bt in SHAPES:
+        for name, batch, m, k, n, bt in shapes:
             a_shape = (batch, m, k) if batch > 1 else (m, k)
-            b_shape = (batch, k, n) if batch > 1 else ((n, k) if bt else (k, n))
+            b_shape = (n, k) if bt else (k, n)
+            if batch > 1:
+                b_shape = (batch, *b_shape)
             a = mx.random.uniform(-1, 1, a_shape).astype(dtype)
             b = mx.random.uniform(-1, 1, b_shape).astype(dtype)
             mx.eval(a, b)
-            if bt and batch == 1:
-                b = b.T
+            if bt:
+                b = b.swapaxes(-1, -2)
             flops = 2 * batch * m * n * k
             reps = min(max(2_000_000_000_000 // 10 // max(flops, 1), 20), 2000)
 
-            def burst(count: int) -> float:
-                t = time.perf_counter()
-                last = None
-                for _ in range(count):
-                    last = a @ b
-                    mx.async_eval(last)
-                mx.eval(last)
-                return (time.perf_counter() - t) / count
-
-            burst(reps)  # warm-up: GPU clocks ramp up
-            out[(name, label)] = min(burst(reps) for _ in range(3)) * 1e6
+            burst(a, b, reps)  # warm-up: GPU clocks ramp up
+            out[(name, label)] = min(burst(a, b, reps) for _ in range(3)) * 1e6
     return out
 
 
-def nuvec_results() -> dict[tuple[str, str], float]:
-    proc = subprocess.run(["cargo", "bench", "-q", "-p", "nuvec-core", "--bench", "gemm"],
-                          cwd=ROOT, capture_output=True, text=True, check=True)
+def nuvec_results(names) -> dict[tuple[str, str], float]:
+    proc = subprocess.run(["cargo", "bench", "-q", "-p", "nuvec-core", "--bench", "gemm", "--", *names],
+                          cwd=ROOT, stdout=subprocess.PIPE, text=True, check=True)
     out = {}
     for line in proc.stdout.splitlines():
         name, label, us = line.split("\t")
@@ -88,24 +96,33 @@ def nuvec_results() -> dict[tuple[str, str], float]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Benchmark Metal matrix products against MLX.")
+    names = [shape[0] for shape in SHAPES]
+    parser.add_argument("shapes", nargs="*", metavar="SHAPE", help=", ".join(names))
+    selected = parser.parse_args().shapes
+    for name in selected:
+        if name not in names:
+            parser.error(f"unknown shape {name!r} (see --help for available shapes)")
+    shapes = [shape for shape in SHAPES if not selected or shape[0] in selected]
     # Throughput drifts over minutes (thermals, background load): alternate the two
     # programs twice and keep each side's best time per case.
-    runs = [(nuvec_results(), mlx_results()) for _ in range(2)]
+    runs = [(nuvec_results(selected), mlx_results(shapes)) for _ in range(2)]
     ours = {key: min(r[0][key] for r in runs) for key in runs[0][0]}
     theirs = {key: min(r[1][key] for r in runs) for key in runs[0][1]}
     print(f"GPU GEMM, {platform.machine()} {platform.mac_ver()[0]}; MLX {mx.__version__}; "
           "sustained throughput (async_eval bursts; best of 3 bursts x 2 alternating runs)")
-    print("| shape | dtype | nuvec TFLOP/s | MLX TFLOP/s | nuvec / MLX time |")
-    print("|---|---|---:|---:|---:|")
+    print("| shape | dtype | nuvec µs | MLX µs | nuvec TFLOP/s | MLX TFLOP/s | nuvec / MLX time |")
+    print("|---|---|---:|---:|---:|---:|---:|")
     for label in DTYPES:
         ratios = []
-        for name, batch, m, k, n, _ in SHAPES:
+        for name, batch, m, k, n, _ in shapes:
             flops = 2 * batch * m * n * k
             o, t = ours[(name, label)], theirs[(name, label)]
             ratios.append(o / t)
-            print(f"| {name} | {label} | {flops / o / 1e6:.2f} | {flops / t / 1e6:.2f} | {o / t:.2f}× |")
+            print(f"| {name} | {label} | {o:.2f} | {t:.2f} | {flops / o / 1e6:.2f} | "
+                  f"{flops / t / 1e6:.2f} | {o / t:.2f}× |")
         gm = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
-        print(f"| **geomean** | {label} | | | **{gm:.2f}×** |")
+        print(f"| **geomean** | {label} | | | | | **{gm:.2f}×** |")
 
 
 if __name__ == "__main__":

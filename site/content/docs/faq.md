@@ -8,7 +8,7 @@ group = "Project"
 
 ## Is nuvec a binding to MLX?
 
-No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ library. It reaches Metal through Apple's system frameworks and compiles its own kernels, many of them ported from MLX with their attribution kept.
+nuvec implements lazy arrays and transforms in Rust. It reaches Metal through Apple’s system frameworks and compiles its own kernels, including kernels ported from MLX.
 
 ## How does it compare with mlx-rs?
 
@@ -24,7 +24,7 @@ nuvec follows MLX, JAX and NumPy, where gradients come from transforming functio
 
 ## How fast is it?
 
-On par with MLX. On an Apple M4 Pro, nuvec-lm decodes at 1.01× mlx-lm's speed (geometric mean over dense, hybrid, mixture-of-experts, gpt-oss and Gemma 4 models), reaches the first token as fast, and loads 1.5–1.8× faster. The [benchmarks](@/docs/benchmarks.md) page has the dated records.
+Across four checkpoints on a 48 GB M4 Pro, nuvec-lm averaged 1.01× the decode throughput of mlx-lm 0.32.2. Warm load to first token was 1.44× faster. [Benchmarks](@/docs/benchmarks.md)
 
 ## Which Macs are supported?
 
@@ -36,15 +36,7 @@ No; nuvec is a Rust library. The `nuvec` name on PyPI is reserved.
 
 ## Can I train models?
 
-Yes:
-
-- autodiff covers every operation; models are structs with `#[derive(Module)]` whose gradients have the model's type;
-- `nuvec-nn` has layers, dropout, LoRA and optimizers (with parameter groups); quantized layers support QLoRA-style fine-tuning;
-- nuvec-lm fine-tunes loaded models as `mlx_lm.lora` (LoRA, DoRA or full, on text, chat or completion data with `--mask-prompt`; the `lora` example) and reads and writes mlx-lm's adapter directories;
-- nuvec-lm renders a checkpoint's chat template as transformers does (`nuvec_lm::chat`);
-- a whole training step compiles with `compile_mut`.
-
-The repository trains MLX's MNIST example and matches MLX's accuracy.
+Use `nuvec-nn` to define layers and optimizers and `compile_mut` to compile a training step. For a loaded language model, the `lora` example supports LoRA, DoRA and full fine-tuning on text, chat or completion data. [Fine-tuning](@/docs/llm.md#fine-tuning)
 
 ## Is the API stable?
 

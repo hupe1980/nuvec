@@ -64,9 +64,9 @@ NVFP4 takes an optional float32 global scale, as MLX's `global_scale`: `ops::qua
 
 ## Products on the GPU
 
-Products use MLX's kernels, chosen by shape as MLX chooses them: matrix-vector kernels for few rows, as in decode; tiled kernels for many rows; split-K when the output is small but the inner dimension long. From 2 rows, MLX's multi-vector kernel reads each weight group once for several rows, and affine 4- and 8-bit products of 3 to 16 rows over large matrices (N · K ≥ 2²¹) run MLX's simdgroup-matrix kernel `qmv_mma` (from MLX `main`; 4 rows from M4 on and on M1/M2 Ultra, not on M3 Ultra and newer), and MXFP4, MXFP8 and NVFP4 products of 6 to 16 rows (N · K ≥ 2²²) its floating-point variant, so a row's low bits can depend on how many rows share a product, as in MLX.
+The GPU chooses kernels by shape and hardware. Few-row products can reuse a weight group across rows. Larger products use tiled matrix multiplication, with split-K when the inner dimension is long and the output small. Batch size can affect rounding.
 
-For speculative verification and batches of independent sequences, enable `GenerateOptions::row_exact` or build the product under `nuvec::with_row_exact`. With up to eight rows, each result equals its single-row product bit for bit. Affine products can share a weight load across four rows. In November 2026 M4 Pro measurements against MLX 0.32.4, 3-bit products with two to eight rows took 0.85–1.12× MLX's time, 4-bit products took 0.82–1.07×, and 6-bit products took 0.98–1.34×. The 8-bit, five-row 4096×4096 product took 1.007× MLX's time in a six-pair repeat. Use `BENCH_ROWS=5 just bench-rows affine8` to measure that cell on your Mac. [Eight-bit measurements](/nuvec/experiments/affine8-five-rows-m4-pro.json)
+For speculative verification and batches of independent sequences, enable `GenerateOptions::row_exact` or build the product under `nuvec::with_row_exact`. With up to eight rows, each result equals its single-row product bit for bit. Use `BENCH_ROWS=5 just bench-rows affine8` to time a five-row product on your Mac. [Eight-bit measurements](/nuvec/experiments/affine8-five-rows-m4-pro.json)
 
 ## Mixture of experts
 

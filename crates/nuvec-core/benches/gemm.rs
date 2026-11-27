@@ -15,6 +15,10 @@ const SHAPES: &[(&str, usize, usize, usize, usize, bool)] = &[
     ("sq2048", 1, 2048, 2048, 2048, false),
     ("sq4096", 1, 4096, 4096, 4096, false),
     ("nt2048", 1, 2048, 2048, 2048, true),
+    ("qk14", 4, 14, 16, 14, true),
+    ("skinny9", 1, 9, 1024, 4096, true),
+    ("skinny14", 1, 14, 4096, 4096, true),
+    ("skinny15", 1, 15, 1024, 4096, true),
     ("skinny16", 1, 16, 4096, 4096, true),
     ("tallk", 1, 256, 8192, 256, false),
     ("wide", 1, 4096, 512, 4096, false),
@@ -36,6 +40,17 @@ fn main() -> Result<()> {
     if !std::env::args().any(|a| a == "--bench") {
         return Ok(());
     }
+    let selected: Vec<_> = std::env::args()
+        .skip(1)
+        .filter(|s| s != "--bench")
+        .collect();
+    for name in &selected {
+        if !SHAPES.iter().any(|s| s.0 == name) {
+            return Err(nuvec_core::Error::InvalidArgument(format!(
+                "unknown GEMM shape {name:?}"
+            )));
+        }
+    }
     set_default_stream(Stream::default_for(Device::gpu(0)));
     for (dtype, label) in [
         (DType::F32, "float32"),
@@ -43,20 +58,24 @@ fn main() -> Result<()> {
         (DType::BF16, "bfloat16"),
     ] {
         for &(name, batch, m, k, n, bt) in SHAPES {
+            if !selected.is_empty() && !selected.iter().any(|s| s == name) {
+                continue;
+            }
             let a_shape: Vec<usize> = if batch > 1 {
                 vec![batch, m, k]
             } else {
                 vec![m, k]
             };
-            let b_shape: Vec<usize> = match (batch > 1, bt) {
-                (true, _) => vec![batch, k, n],
-                (false, true) => vec![n, k],
-                (false, false) => vec![k, n],
+            let (rows, cols) = if bt { (n, k) } else { (k, n) };
+            let b_shape = if batch > 1 {
+                vec![batch, rows, cols]
+            } else {
+                vec![rows, cols]
             };
             let a = random::uniform(-1.0, 1.0, &a_shape[..], DType::F32, None).astype(dtype);
             let b = random::uniform(-1.0, 1.0, &b_shape[..], DType::F32, None).astype(dtype);
             nuvec_core::eval(&[a.clone(), b.clone()])?;
-            let b = if bt && batch == 1 { b.t() } else { b };
+            let b = if bt { b.swapaxes(-1, -2) } else { b };
             let flops = 2 * batch * m * n * k;
             // About 0.1 s of work per measurement (at least 20 products).
             let reps = (2_000_000_000_000 / 10 / flops.max(1)).clamp(20, 2000);

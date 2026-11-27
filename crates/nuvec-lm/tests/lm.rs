@@ -68,10 +68,12 @@ fn check_prefills(name: &str, tol: f32, prefill_steps: &[usize]) {
     assert_eq!(got.shape(), shape, "{name}: logits shape");
     let scale = logits.iter().fold(1.0f32, |m, x| m.max(x.abs()));
     for (i, (g, e)) in got.to_vec::<f32>().unwrap().iter().zip(&logits).enumerate() {
-        assert!(
-            (g - e).abs() <= tol * scale,
-            "{name}: logit {i}: {g} vs mlx-lm {e}"
-        );
+        let matches = if tol == 0.0 {
+            g.to_bits() == e.to_bits()
+        } else {
+            (g - e).abs() <= tol * scale
+        };
+        assert!(matches, "{name}: logit {i}: {g} vs mlx-lm {e}");
     }
     for &prefill_step in prefill_steps {
         let options = GenerateOptions {
@@ -126,14 +128,28 @@ fn fp_quantized_models_match_mlx_lm() {
 /// AutoAWQ and GPTQ (v1 4-bit, v2 8-bit with an identity `g_idx`) checkpoints, converted at
 /// load, give the logits and greedy tokens of the same codes, zeros and scales in MLX's
 /// affine layout under mlx-lm (which loads the AWQ files to the same logits itself).
-#[test]
-fn awq_and_gptq_checkpoints_match_mlx_lm() {
-    // Bit for bit on the GPU the logits were recorded on (an M4 Pro); other generations
-    // round their kernels' sums differently (up to 0.25% of the largest logit on an M1,
-    // 0.6% on the CPU).
-    let tol = if recorded_gpu() { 1e-6 } else { 1e-2 };
-    for name in ["qwen3_awq", "llama_gptq", "qwen3_gptq8_v2"] {
+mod packed_checkpoints {
+    use super::{check, recorded_gpu};
+
+    fn check_packed(name: &str) {
+        // Other GPU generations round some sums differently from the recording M4 Pro.
+        let tol = if recorded_gpu() { 0.0 } else { 1e-2 };
         check(name, tol);
+    }
+
+    #[test]
+    fn qwen3_awq() {
+        check_packed("qwen3_awq");
+    }
+
+    #[test]
+    fn llama_gptq_v1() {
+        check_packed("llama_gptq");
+    }
+
+    #[test]
+    fn qwen3_gptq_v2() {
+        check_packed("qwen3_gptq8_v2");
     }
 }
 

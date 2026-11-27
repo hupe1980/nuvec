@@ -30,12 +30,12 @@
         {
           "@type": "Question",
           "name": "Is nuvec a binding to MLX?",
-          "acceptedAnswer": { "@type": "Answer", "text": "No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ library. It reaches Metal through Apple's system frameworks and compiles its own Metal kernels, several of them ported from MLX." }
+          "acceptedAnswer": { "@type": "Answer", "text": "nuvec implements lazy arrays and transforms in Rust and compiles its own Metal kernels, including kernels ported from MLX." }
         },
         {
           "@type": "Question",
           "name": "How fast is nuvec compared to MLX?",
-          "acceptedAnswer": { "@type": "Answer", "text": "On par. On an Apple M4 Pro, nuvec-lm decodes at 1.01× mlx-lm's speed (geometric mean), reaches the first token as fast, and loads 1.5–1.8× faster." }
+          "acceptedAnswer": { "@type": "Answer", "text": "Across four checkpoints on a 48 GB M4 Pro, nuvec-lm averaged 1.01× the decode throughput of mlx-lm 0.32.2. Warm load to first token was 1.44× faster." }
         },
         {
           "@type": "Question",
@@ -56,7 +56,7 @@
     <div>
       <p class="eyebrow">Pure Rust · Apple Silicon · Metal</p>
       <h1>MLX for Rust,<br><span class="gradient">written in Rust.</span></h1>
-      <p class="lead">Lazy arrays (tensors) on unified memory, <code>grad</code>, <code>vmap</code> and <code>compile</code> that compose, MLX's Metal kernels ported and tested against MLX, and an LLM runtime that matches mlx-lm — with no C++ and no bindings.</p>
+      <p class="lead">Build with lazy arrays on unified memory, differentiate Rust functions and run language models on the Apple GPU.</p>
       <div class="cta">
         <a class="button primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
         <a class="button ghost" href="{{ config.extra.repo }}" rel="noopener">★ Star on GitHub</a>
@@ -82,16 +82,16 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
 
 <section class="stats" aria-label="Key numbers">
   <div class="wrap stats-grid">
-    <div><strong>1.01×</strong><span>mlx-lm decode speed<br>(geometric mean, 12 models)</span></div>
+    <div><strong>1.01×</strong><span>mlx-lm decode speed<br>(four checkpoints, M4 Pro)</span></div>
     <div><strong>256K</strong><span>prompt tokens prefilled on 48 GB<br>(Qwen3.6-35B-A3B)</span></div>
-    <div><strong>2.16×</strong><span>decode with DFlash drafts,<br>1.75× dflash-mlx (Qwen3-8B)</span></div>
-    <div><strong>0</strong><span>C/C++ dependencies<br>or MLX bindings</span></div>
+    <div><strong>1.44×</strong><span>faster warm load to first token<br>vs mlx-lm, four checkpoints</span></div>
+    <div><strong>0</strong><span>MLX bindings<br>required to build</span></div>
   </div>
 </section>
 
 <section class="section">
   <div class="wrap">
-    <h2 class="section-title">Everything MLX gives you, in idiomatic Rust</h2>
+    <h2 class="section-title">Arrays, training and inference</h2>
     <p class="section-lead">MLX's programming model, built on Rust's ownership, typed errors and thread safety.</p>
     <div class="cards">
       <article class="card">
@@ -107,12 +107,12 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
       <article class="card">
         <div class="icon" aria-hidden="true">🔥</div>
         <h3>MLX's Metal kernels</h3>
-        <p>Tiled GEMM with split-K, GEMV, 1- to 6-bit and 8-bit affine and MXFP4, MXFP8 and NVFP4 quantized products, flash-style attention, RMSNorm, RoPE, convolutions, sort, scan and mixture-of-experts gather kernels — or your own kernel from source.</p>
+        <p>Use tiled matrix products, quantized weights and fused attention, or supply your own Metal kernel.</p>
       </article>
       <article class="card">
         <div class="icon" aria-hidden="true">🤖</div>
         <h3>An LLM runtime included</h3>
-        <p>Llama, Mistral, Qwen 2/3/3.5, gpt-oss, Gemma 4, Granite 4 and LFM2 — dense, hybrid (Gated DeltaNet, Mamba-2, short convolutions) or mixture-of-experts — from mlx-community or Hugging Face checkpoints, with samplers, stop strings, speculative decoding (DFlash and DSpark, draft trees, MTP), batched serving, and pipeline or tensor parallelism across Macs.</p>
+        <p>Stream tokens from Hugging Face checkpoints, batch requests or use a drafter for speculative decoding. Split large models across Macs.</p>
       </article>
       <article class="card">
         <div class="icon" aria-hidden="true">💾</div>
@@ -130,7 +130,7 @@ grad(f)(&amp;x)?.to_vec::&lt;f32&gt;()?;     <span class="c">// [2, 4, 6]</span>
 
 <section class="section alt">
   <div class="wrap">
-    <h2 class="section-title">Read like NumPy, run like MLX</h2>
+    <h2 class="section-title">Using nuvec</h2>
     <div class="tabs">
       <input type="radio" name="tab" id="tab-arrays" checked>
       <label for="tab-arrays">Arrays</label>
@@ -185,16 +185,16 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
 <section class="section">
   <div class="wrap two-col">
     <div>
-      <h2 class="section-title">As fast as MLX. Measured, not claimed.</h2>
-      <p>Every number comes from <code>just bench-parity</code>: nuvec-lm and mlx-lm on the same Mac and checkpoints in one session, medians of alternating runs, with the previous release alongside to catch regressions.</p>
-      <p class="muted small">Apple M4 Pro · nuvec 0.8.0 · mlx-lm 0.32.2 · 2026-11-09 · greedy · decode after a 961-token prompt.</p>
+      <h2 class="section-title">Decode throughput on Apple M4 Pro</h2>
+      <p>Both engines decode the same token IDs in alternating runs. Each bar compares median output tokens per second.</p>
+      <p class="muted small">48 GB · mlx-lm 0.32.2 · 27 Nov 2026 · greedy decode after 961 prompt tokens (921 for gpt-oss).</p>
       <a class="link-arrow" href="{{ get_url(path='@/docs/benchmarks.md') }}">Full tables and method</a>
     </div>
     <div class="bars" role="table" aria-label="Decode speed relative to mlx-lm">
-      <div class="bar-row" role="row"><span role="cell">Qwen3-8B</span><span class="bar" role="cell" style="--v:1.02"><b>1.02×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">Qwen3-8B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
       <div class="bar-row" role="row"><span role="cell">Qwen3.5-9B</span><span class="bar" role="cell" style="--v:1.00"><b>1.00×</b></span></div>
       <div class="bar-row" role="row"><span role="cell">Qwen3-30B-A3B</span><span class="bar" role="cell" style="--v:1.02"><b>1.02×</b></span></div>
-      <div class="bar-row" role="row"><span role="cell">gpt-oss-20b</span><span class="bar" role="cell" style="--v:0.99"><b>0.99×</b></span></div>
+      <div class="bar-row" role="row"><span role="cell">gpt-oss-20b</span><span class="bar" role="cell" style="--v:1.02"><b>1.02×</b></span></div>
       <div class="bar-axis" aria-hidden="true"><span>mlx-lm = 1.00×</span></div>
     </div>
   </div>
@@ -231,8 +231,8 @@ println!(<span class="s">"{:?}"</span>, p.to_vec::&lt;f32&gt;()?);  <span class=
 <section class="section alt">
   <div class="wrap faq-short">
     <h2 class="section-title">Questions</h2>
-    <details><summary>Is nuvec a binding to MLX?</summary><p>No. nuvec is written in Rust from the ground up and links no MLX or other C/C++ library. It reaches Metal through Apple's system frameworks and compiles its own Metal kernels, several of them ported from MLX.</p></details>
-    <details><summary>How fast is it compared to MLX?</summary><p>On par. On an Apple M4 Pro, nuvec-lm decodes at 1.01× mlx-lm's speed (geometric mean), reaches the first token as fast, and loads 1.5–1.8× faster. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
+    <details><summary>Is nuvec a binding to MLX?</summary><p>nuvec implements lazy arrays and transforms in Rust and compiles its own Metal kernels, including kernels ported from MLX.</p></details>
+    <details><summary>How fast is it compared to MLX?</summary><p>Across four checkpoints on a 48 GB M4 Pro, nuvec-lm averaged 1.01× the decode throughput of mlx-lm 0.32.2. Warm load to first token was 1.44× faster. See <a href="{{ get_url(path='@/docs/benchmarks.md') }}">benchmarks</a>.</p></details>
     <details><summary>Which hardware does it support?</summary><p>Macs with Apple Silicon (M1 or later) on macOS 15 or newer. The core and CPU crates also build and run on Linux.</p></details>
     <a class="link-arrow" href="{{ get_url(path='@/docs/faq.md') }}">All questions</a>
   </div>

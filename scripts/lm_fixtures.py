@@ -18,8 +18,8 @@ Runs on MLX's GPU, as nuvec's tests do.
 by mlx-lm's `linear_to_lora_layers`, with random `lora_b`), with the adapted models' logits in
 evaluation mode (`expected.safetensors`).
 
-Usage: `just lm-fixtures` (or `uv run scripts/lm_fixtures.py`; `--only chained_sampler,eos`
-records just those).
+Usage: `just lm-fixtures` records the standard suite. Use `just lm-fixtures --only packed`
+to rebuild the three seeded AWQ and GPTQ fixtures, or `--help` for other groups.
 
 `--only hybrids` records Granite 4 and LFM2 models; `--only lfm2_moe` records LFM2-MoE models; `--only kv_quant` records mlx-lm's quantized KV caches (generation and a prompt cache) on the
 head-32 models.
@@ -33,31 +33,40 @@ log-probabilities at every step (teacher-forced, one forward pass) in
 
 from __future__ import annotations
 
+import argparse
 import json
-import sys
 from pathlib import Path
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 from mlx.utils import tree_flatten, tree_unflatten
 from mlx_lm.generate import generate_step
-from mlx_lm.models import (gemma4, gemma4_text, gpt_oss, llama, qwen2, qwen3, qwen3_5,
-                           qwen3_5_moe, qwen3_moe)
+from mlx_lm.models import (
+    gemma4,
+    gemma4_text,
+    gpt_oss,
+    llama,
+    qwen2,
+    qwen3,
+    qwen3_5,
+    qwen3_5_moe,
+    qwen3_moe,
+)
 from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
 
 OUT = Path(__file__).resolve().parent.parent / "crates/nuvec-lm/tests/fixtures"
 PROMPT = [3, 17, 92, 5, 64, 33, 101, 8, 77, 2, 45, 120, 9, 56]
 
-BASE = dict(hidden_size=64, num_hidden_layers=2, intermediate_size=128, num_attention_heads=4,
-            num_key_value_heads=2, rms_norm_eps=1e-6, vocab_size=128,
-            max_position_embeddings=512)
-QWEN35 = dict(model_type="qwen3_5_text", hidden_size=64, num_hidden_layers=4,
-              intermediate_size=128, num_attention_heads=4, num_key_value_heads=2,
-              head_dim=32, rms_norm_eps=1e-6, vocab_size=128, max_position_embeddings=512,
-              linear_num_key_heads=2, linear_num_value_heads=4, linear_value_head_dim=16,
-              linear_conv_kernel_dim=4, full_attention_interval=4, attn_output_gate=True,
-              rope_parameters=dict(rope_type="default", rope_theta=1e7,
-                                   partial_rotary_factor=0.25, mrope_section=[2, 1, 1]))
+BASE = {"hidden_size": 64, "num_hidden_layers": 2, "intermediate_size": 128, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 128,
+        "max_position_embeddings": 512}
+QWEN35 = {"model_type": "qwen3_5_text", "hidden_size": 64, "num_hidden_layers": 4,
+          "intermediate_size": 128, "num_attention_heads": 4, "num_key_value_heads": 2,
+          "head_dim": 32, "rms_norm_eps": 1e-6, "vocab_size": 128, "max_position_embeddings": 512,
+          "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_value_head_dim": 16,
+          "linear_conv_kernel_dim": 4, "full_attention_interval": 4, "attn_output_gate": True,
+          "rope_parameters": {"rope_type": "default", "rope_theta": 1e7,
+                                   "partial_rotary_factor": 0.25, "mrope_section": [2, 1, 1]}}
 QWEN35_MOE = dict(QWEN35, model_type="qwen3_5_moe_text", linear_key_head_dim=32,
                   num_experts=16, num_experts_per_tok=8, moe_intermediate_size=32,
                   shared_expert_intermediate_size=64)
@@ -80,28 +89,28 @@ CASES = {
     "qwen2_q4": (qwen2, dict(BASE, model_type="qwen2", rope_theta=1e6,
                              tie_word_embeddings=True), mx.float16, (32, 4)),
     # Qwen 3.5 in float32 (tight tolerances).
-    "qwen3_5_f32": (qwen3_5, dict(model_type="qwen3_5", tie_word_embeddings=False,
-                                  text_config=dict(QWEN35, linear_key_head_dim=32)),
+    "qwen3_5_f32": (qwen3_5, {"model_type": "qwen3_5", "tie_word_embeddings": False,
+                              "text_config": dict(QWEN35, linear_key_head_dim=32)},
                     None, None),
     # Qwen 3.5: Gated DeltaNet and gated attention layers (3:1), partial RoPE, bfloat16,
     # 32-feature keys (the generic kernel).
-    "qwen3_5_bf16": (qwen3_5, dict(model_type="qwen3_5", tie_word_embeddings=False,
-                                   text_config=dict(QWEN35, linear_key_head_dim=32)),
+    "qwen3_5_bf16": (qwen3_5, {"model_type": "qwen3_5", "tie_word_embeddings": False,
+                               "text_config": dict(QWEN35, linear_key_head_dim=32)},
                      mx.bfloat16, None),
     # Qwen 3.5 MoE: 16 experts, 8 per token (the prompt's 112 pairs take the sorted path),
     # a gated shared expert; float32.
-    "qwen3_5_moe_f32": (qwen3_5_moe, dict(model_type="qwen3_5_moe", tie_word_embeddings=False,
-                                          text_config=dict(QWEN35_MOE)), None, None),
+    "qwen3_5_moe_f32": (qwen3_5_moe, {"model_type": "qwen3_5_moe", "tie_word_embeddings": False,
+                                      "text_config": dict(QWEN35_MOE)}, None, None),
     # Qwen 3.5 MoE with 4-bit experts and 8-bit routers (as mlx-community's checkpoints).
-    "qwen3_5_moe_q4": (qwen3_5_moe, dict(model_type="qwen3_5_moe", tie_word_embeddings=False,
-                                         text_config=dict(QWEN35_MOE)), mx.bfloat16, (32, 4)),
+    "qwen3_5_moe_q4": (qwen3_5_moe, {"model_type": "qwen3_5_moe", "tie_word_embeddings": False,
+                                     "text_config": dict(QWEN35_MOE)}, mx.bfloat16, (32, 4)),
     # Qwen 3 MoE, renormalised top-k weights, float32.
     "qwen3_moe_f32": (qwen3_moe, dict(QWEN3_MOE, norm_topk_prob=True), None, None),
     # Qwen 3 MoE with the probabilities as weights, 4-bit experts and 8-bit routers.
     "qwen3_moe_q4": (qwen3_moe, dict(QWEN3_MOE, norm_topk_prob=False), mx.bfloat16, (32, 4)),
     # Qwen 3.5 with 128-feature keys (the packed kernel), 4-bit weights.
-    "qwen3_5_q4": (qwen3_5, dict(model_type="qwen3_5", tie_word_embeddings=False,
-                                 text_config=dict(QWEN35, linear_key_head_dim=128)),
+    "qwen3_5_q4": (qwen3_5, {"model_type": "qwen3_5", "tie_word_embeddings": False,
+                             "text_config": dict(QWEN35, linear_key_head_dim=128)},
                    mx.bfloat16, (32, 4)),
 }
 
@@ -112,29 +121,25 @@ CACHED = ["mlx-community/Qwen3.8-27B-4bit", "mlx-community/Meta-Llama-3.1-8B-Ins
 CACHED_PROMPT = "The history of the lighthouse begins with the fires that sailors lit on hills"
 
 
-def cached() -> None:
+def cached(repos: list[str]) -> None:
     import os
 
+    from bench_parity import snapshot, weight_bytes
     from mlx_lm import load
 
-    hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / "hub"
-    only = sys.argv[sys.argv.index("--cached") + 1:]
-    for repo in CACHED:
-        if only and repo not in only:
-            continue
-        cache = hub / f"models--{repo.replace('/', '--')}"
-        if not cache.exists():
+    for repo in repos:
+        checkpoint = snapshot(repo)
+        if checkpoint is None or not (weights := weight_bytes(checkpoint)):
             print(f"skipped (not cached): {repo}")
             continue
         # One model at a time, and only one that fits: its weights at most half the
         # machine's memory (the rest for activations, MLX's cache and the system).
-        weights = sum(f.stat().st_size for f in cache.glob("snapshots/*/*.safetensors"))
         ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         if weights > ram // 2:
             print(f"skipped (needs {weights / 2**30:.1f} GiB, over half of "
                   f"{ram / 2**30:.0f} GiB): {repo}")
             continue
-        model, tokenizer = load(repo)
+        model, tokenizer = load(checkpoint)
         prompt = tokenizer.encode(CACHED_PROMPT)
         greedy = []
         for token, _ in generate_step(mx.array(prompt), model, max_tokens=32):
@@ -146,7 +151,7 @@ def cached() -> None:
         out = OUT / "cached"
         out.mkdir(parents=True, exist_ok=True)
         ids = mx.array(greedy)
-        mx.save_safetensors(str(out / f"{repo.split('/')[1]}.safetensors"), {
+        mx.save_safetensors(str(out / f"{repo.rsplit('/', 1)[-1]}.safetensors"), {
             "prompt": mx.array(prompt, dtype=mx.uint32),
             "greedy": ids.astype(mx.uint32),
             "greedy_logprob": mx.take_along_axis(logprobs, ids[:, None], axis=-1)[:, 0],
@@ -159,21 +164,32 @@ def cached() -> None:
 
 
 def main() -> None:
-    if "--cached" in sys.argv:
-        cached()
+    groups = {
+        "chained_sampler": chained_sampler, "eos": eos, "samplers": samplers,
+        "adapters": adapters, "fp": fp_models, "packed": packed_models,
+        "ops": ops_fixtures, "gpt_oss": gpt_oss_models, "gemma4": gemma4_models,
+        "o200k": o200k_splits, "spm": spm_tokenizers, "mtp": mtp_heads,
+        "ssm": ssm, "prompt_cache": prompt_caches, "kv_quant": kv_quant,
+        "hybrids": hybrids, "lfm2_moe": lfm2_moe_models,
+    }
+    parser = argparse.ArgumentParser(description="Record reference fixtures with mlx-lm.",
+                                     allow_abbrev=False)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--only", metavar="GROUP[,GROUP...]",
+                      help="record selected groups: " + ", ".join(sorted(groups)))
+    mode.add_argument("--cached", nargs="*", metavar="REPO",
+                      help="record cached checkpoints (defaults to the built-in list)")
+    args = parser.parse_args()
+    if args.cached is not None:
+        cached(args.cached or CACHED)
         return
-    # `--only chained_sampler,eos` records just those (the models are kept as they are).
-    only = None
-    if "--only" in sys.argv:
-        only = sys.argv[sys.argv.index("--only") + 1].split(",")
-    if only is not None:
-        for name in only:
-            {"chained_sampler": chained_sampler, "eos": eos, "samplers": samplers,
-             "adapters": adapters, "fp": fp_models, "packed": packed_models,
-             "ops": ops_fixtures, "gpt_oss": gpt_oss_models, "gemma4": gemma4_models,
-             "o200k": o200k_splits, "spm": spm_tokenizers, "mtp": mtp_heads,
-             "ssm": ssm, "prompt_cache": prompt_caches, "kv_quant": kv_quant,
-             "hybrids": hybrids, "lfm2_moe": lfm2_moe_models}[name]()
+    if args.only is not None:
+        selected = [name.strip() for name in args.only.split(",")]
+        for name in selected:
+            if name not in groups:
+                parser.error(f"unknown fixture group {name!r} (see --help for available groups)")
+        for name in selected:
+            groups[name]()
         return
     mx.random.seed(20261018)
     for name, (family, args, dtype, quant) in CASES.items():
@@ -187,10 +203,10 @@ def main() -> None:
             group_size, bits = quant
             config["quantization"] = {"group_size": group_size, "bits": bits}
 
-            def predicate(path, module):
+            def predicate(path, module, config=config, group_size=group_size):
                 if not hasattr(module, "to_quantized"):
                     return False
-                if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
+                if path.endswith(("mlp.gate", "shared_expert_gate")):
                     config["quantization"][path] = {"group_size": group_size, "bits": 8}
                     return {"group_size": group_size, "bits": 8}
                 return True
@@ -236,8 +252,8 @@ FP_CASES = {
                                 tie_word_embeddings=False), "mxfp8", False, False),
     "qwen3_moe_mxfp4": (qwen3_moe, dict(QWEN3_MOE, norm_topk_prob=True), "mxfp4", True, False),
     "qwen3_moe_nvfp4_gs": (qwen3_moe, dict(QWEN3_MOE, norm_topk_prob=True), "nvfp4", True, True),
-    "qwen3_5_moe_nvfp4": (qwen3_5_moe, dict(model_type="qwen3_5_moe", tie_word_embeddings=False,
-                                            text_config=dict(QWEN35_MOE)), "nvfp4", True, False),
+    "qwen3_5_moe_nvfp4": (qwen3_5_moe, {"model_type": "qwen3_5_moe", "tie_word_embeddings": False,
+                                        "text_config": dict(QWEN35_MOE)}, "nvfp4", True, False),
     "llama_mxfp8": (llama, dict(BASE, model_type="llama", rope_theta=500000.0,
                                 tie_word_embeddings=True), "mxfp8", False, False),
 }
@@ -252,8 +268,8 @@ def fp_models() -> None:
         model.update(tree_map_random(model.parameters()))
         model.set_dtype(mx.bfloat16)
 
-        def predicate(path, module):
-            if routers and (path.endswith("mlp.gate") or path.endswith("shared_expert_gate")):
+        def predicate(path, module, routers=routers):
+            if routers and (path.endswith(("mlp.gate", "shared_expert_gate"))):
                 return {"group_size": 64, "bits": 8, "mode": "affine"}
             return True
 
@@ -321,13 +337,8 @@ def packed_models() -> None:
         nn.quantize(model, group_size=gs, bits=bits,
                     class_predicate=lambda p, m: isinstance(m, nn.Linear) and ".layers." in f".{p}")
         flat = dict(tree_flatten(model.parameters()))
-        # Keep the checkpoint's floating-point inputs fixed when refreshing its oracle.
         out = OUT / name
         checkpoint = out / "model.safetensors"
-        existing = mx.load(str(checkpoint)) if checkpoint.is_file() else None
-        if existing is not None:
-            flat.update({k: v for k, v in existing.items()
-                         if k in flat and not k.endswith((".scales", ".biases"))})
         hf = {k: v for k, v in flat.items() if not k.endswith((".scales", ".biases"))}
         for prefix in sorted({k[:-len(".scales")] for k in flat if k.endswith(".scales")}):
             out_f, packed_in = flat[prefix + ".weight"].shape
@@ -335,7 +346,7 @@ def packed_models() -> None:
             q = rng.integers(0, 1 << bits, (out_f, in_f))
             zero = rng.integers(1 if method == "gptq" else 0, 1 << bits, (out_f, groups))
             scale = (rng.random((out_f, groups)) * 0.02 + 0.005).astype(np.float16)
-            bias = mx.array((-zero.astype(np.float32) * scale.astype(np.float32))).astype(mx.float16)
+            bias = mx.array(-zero.astype(np.float32) * scale.astype(np.float32)).astype(mx.float16)
             flat[prefix + ".weight"] = mx.array(mlx_pack(q, bits))
             flat[prefix + ".scales"] = mx.array(scale)
             flat[prefix + ".biases"] = bias
@@ -361,13 +372,7 @@ def packed_models() -> None:
         config["quantization_config"] = qc
         out.mkdir(parents=True, exist_ok=True)
         (out / "config.json").write_text(json.dumps(config, indent=2))
-        if existing is None:
-            mx.save_safetensors(str(checkpoint), hf)
-        else:
-            assert hf.keys() == existing.keys() and all(
-                hf[k].dtype == v.dtype and mx.array_equal(hf[k], v).item()
-                for k, v in existing.items()
-            ), f"{name}: regenerated packing differs from the fixture inputs"
+        mx.save_safetensors(str(checkpoint), hf)
         prompt = mx.array(PROMPT, dtype=mx.uint32)
         logits = model(prompt[None]).astype(mx.float32)
         if method == "awq":
@@ -455,10 +460,10 @@ def ssm() -> None:
              ("prompt", 1, 8, 2, 16, 64, mx.float32, mx.float32, 300),
              ("prompt_bf16", 1, 8, 2, 16, 64, mx.bfloat16, mx.float32, 37)]
     for name, n, h, gr, dh, ds, dt, st, t in cases:
-        ins = dict(x=rand(n, t, h, dh, dtype=dt), a_log=rand(h, scale=0.5),
-                   b=rand(n, t, gr, ds, dtype=dt), c=rand(n, t, gr, ds, dtype=dt),
-                   d=rand(h, dtype=dt), dt=rand(n, t, h, dtype=dt), dt_bias=rand(h),
-                   state=rand(n, h, dh, ds, scale=0.5, dtype=st))
+        ins = {"x": rand(n, t, h, dh, dtype=dt), "a_log": rand(h, scale=0.5),
+               "b": rand(n, t, gr, ds, dtype=dt), "c": rand(n, t, gr, ds, dtype=dt),
+               "d": rand(h, dtype=dt), "dt": rand(n, t, h, dtype=dt), "dt_bias": rand(h),
+               "state": rand(n, h, dh, ds, scale=0.5, dtype=st)}
         y, state = ssm_ops.ssm_update(ins["x"], ins["a_log"], ins["b"], ins["c"], ins["d"],
                                       ins["dt"], ins["dt_bias"], ins["state"])
         ins["dt_after"] = ssm_ops.compute_dt(ins["dt"], ins["dt_bias"], (0.001, 100.0))
@@ -493,22 +498,22 @@ def prompt_caches() -> None:
         print(f"{name}: prompt cache of {len(cache)} layers")
 
 
-GRANITE4 = dict(model_type="granitemoehybrid", vocab_size=128, hidden_size=64,
-                intermediate_size=32, num_hidden_layers=4, max_position_embeddings=512,
-                num_attention_heads=2, num_key_value_heads=1, attention_bias=False,
-                embedding_multiplier=1.5, attention_multiplier=0.25, logits_scaling=2.0,
-                residual_multiplier=0.5, rms_norm_eps=1e-6,
-                layer_types=["mamba", "mamba", "attention", "mamba"],
-                num_local_experts=8, num_experts_per_tok=2, shared_intermediate_size=64,
-                mamba_n_heads=4, mamba_d_head=16, mamba_proj_bias=False, mamba_d_state=32,
-                mamba_d_conv=4, mamba_n_groups=1, mamba_conv_bias=True,
-                position_embedding_type="rope", tie_word_embeddings=True,
-                rope_parameters={"rope_theta": 10000.0})
-LFM2 = dict(model_type="lfm2", vocab_size=128, hidden_size=64, num_hidden_layers=4,
-            num_attention_heads=2, num_key_value_heads=1, max_position_embeddings=512,
-            norm_eps=1e-5, conv_bias=False, conv_L_cache=3, block_dim=64,
-            block_multiple_of=16, block_ffn_dim_multiplier=1.0, block_auto_adjust_ff_dim=True,
-            block_ff_dim=96, full_attn_idxs=[1, 3], rope_theta=1e6)
+GRANITE4 = {"model_type": "granitemoehybrid", "vocab_size": 128, "hidden_size": 64,
+            "intermediate_size": 32, "num_hidden_layers": 4, "max_position_embeddings": 512,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "attention_bias": False,
+            "embedding_multiplier": 1.5, "attention_multiplier": 0.25, "logits_scaling": 2.0,
+            "residual_multiplier": 0.5, "rms_norm_eps": 1e-6,
+            "layer_types": ["mamba", "mamba", "attention", "mamba"],
+            "num_local_experts": 8, "num_experts_per_tok": 2, "shared_intermediate_size": 64,
+            "mamba_n_heads": 4, "mamba_d_head": 16, "mamba_proj_bias": False, "mamba_d_state": 32,
+            "mamba_d_conv": 4, "mamba_n_groups": 1, "mamba_conv_bias": True,
+            "position_embedding_type": "rope", "tie_word_embeddings": True,
+            "rope_parameters": {"rope_theta": 10000.0}}
+LFM2 = {"model_type": "lfm2", "vocab_size": 128, "hidden_size": 64, "num_hidden_layers": 4,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "max_position_embeddings": 512,
+        "norm_eps": 1e-5, "conv_bias": False, "conv_L_cache": 3, "block_dim": 64,
+        "block_multiple_of": 16, "block_ffn_dim_multiplier": 1.0, "block_auto_adjust_ff_dim": True,
+        "block_ff_dim": 96, "full_attn_idxs": [1, 3], "rope_theta": 1e6}
 
 
 def hybrids() -> None:
@@ -546,7 +551,7 @@ def hybrids() -> None:
     def hf(weights):
         out = {}
         for k, v in weights.items():
-            if k.endswith("conv1d.weight") or k.endswith("conv.conv.weight"):
+            if k.endswith(("conv1d.weight", "conv.conv.weight")):
                 out[k] = v.transpose(0, 2, 1)
             elif ".switch_mlp.gate_proj." in k:
                 up = weights[k.replace("gate_proj", "up_proj")]
@@ -585,12 +590,12 @@ def hybrids() -> None:
                                 {"token": nxt, "logits": logits})
 
 
-LFM2_MOE = dict(model_type="lfm2_moe", vocab_size=128, hidden_size=64, intermediate_size=96,
-                moe_intermediate_size=32, num_hidden_layers=4, num_experts=8,
-                num_experts_per_tok=2, norm_topk_prob=True, num_attention_heads=2,
-                num_key_value_heads=1, max_position_embeddings=512, use_expert_bias=True,
-                num_dense_layers=1, norm_eps=1e-5, conv_bias=False, conv_L_cache=3,
-                rope_theta=1e6, routed_scaling_factor=1.5, full_attn_idxs=[1, 3])
+LFM2_MOE = {"model_type": "lfm2_moe", "vocab_size": 128, "hidden_size": 64, "intermediate_size": 96,
+            "moe_intermediate_size": 32, "num_hidden_layers": 4, "num_experts": 8,
+            "num_experts_per_tok": 2, "norm_topk_prob": True, "num_attention_heads": 2,
+            "num_key_value_heads": 1, "max_position_embeddings": 512, "use_expert_bias": True,
+            "num_dense_layers": 1, "norm_eps": 1e-5, "conv_bias": False, "conv_L_cache": 3,
+            "rope_theta": 1e6, "routed_scaling_factor": 1.5, "full_attn_idxs": [1, 3]}
 
 
 def lfm2_moe_models() -> None:
@@ -741,13 +746,13 @@ def kv_quant() -> None:
 # layouts: the MXFP4 originals (`*_blocks`/`*_scales`, `quant_method: mxfp4`, which mlx-lm's
 # own loader must give the same logits) and transformers' full-precision experts
 # (`gate_up_proj` `[E, D, 2I]` interleaved on the last axis, `down_proj` `[E, I, D]`).
-GPT_OSS = dict(model_type="gpt_oss", hidden_size=64, num_hidden_layers=2, intermediate_size=64,
-               num_attention_heads=4, num_key_value_heads=2, head_dim=16, vocab_size=128,
-               rms_norm_eps=1e-5, num_local_experts=8, num_experts_per_tok=2, sliding_window=4,
-               rope_theta=150000.0, layer_types=["sliding_attention", "full_attention"],
-               rope_scaling={"rope_type": "yarn", "factor": 4.0,
+GPT_OSS = {"model_type": "gpt_oss", "hidden_size": 64, "num_hidden_layers": 2, "intermediate_size": 64,
+           "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "vocab_size": 128,
+           "rms_norm_eps": 1e-5, "num_local_experts": 8, "num_experts_per_tok": 2, "sliding_window": 4,
+           "rope_theta": 150000.0, "layer_types": ["sliding_attention", "full_attention"],
+           "rope_scaling": {"rope_type": "yarn", "factor": 4.0,
                              "original_max_position_embeddings": 8, "beta_fast": 32.0,
-                             "beta_slow": 1.0}, tie_word_embeddings=False)
+                             "beta_slow": 1.0}, "tie_word_embeddings": False}
 
 
 def record(model, out: Path, config: dict, weights: dict) -> mx.array:
@@ -877,12 +882,12 @@ def gpt_oss_variants(seed: int) -> None:
 # mixture-of-experts branch (8 experts, top 2) beside the MLP, 4-bit with 8-bit routers
 # (`gemma4_moe_q4`), and the same experts in Hugging Face's layout (fused
 # `experts.gate_up_proj`, `model.language_model.` names, a vision tower to drop).
-GEMMA4 = dict(model_type="gemma4_text", hidden_size=64, num_hidden_layers=6, intermediate_size=64,
-              num_attention_heads=4, num_key_value_heads=2, head_dim=16, global_head_dim=32,
-              rms_norm_eps=1e-6, vocab_size=128, vocab_size_per_layer_input=128,
-              hidden_size_per_layer_input=8, num_kv_shared_layers=2, sliding_window=4,
-              layer_types=["sliding_attention", "sliding_attention", "full_attention"] * 2,
-              final_logit_softcapping=30.0, use_double_wide_mlp=True, tie_word_embeddings=True)
+GEMMA4 = {"model_type": "gemma4_text", "hidden_size": 64, "num_hidden_layers": 6, "intermediate_size": 64,
+          "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "global_head_dim": 32,
+          "rms_norm_eps": 1e-6, "vocab_size": 128, "vocab_size_per_layer_input": 128,
+          "hidden_size_per_layer_input": 8, "num_kv_shared_layers": 2, "sliding_window": 4,
+          "layer_types": ["sliding_attention", "sliding_attention", "full_attention"] * 2,
+          "final_logit_softcapping": 30.0, "use_double_wide_mlp": True, "tie_word_embeddings": True}
 GEMMA4_KV = dict(GEMMA4, num_hidden_layers=4, attention_k_eq_v=True, num_global_key_value_heads=1,
                  hidden_size_per_layer_input=0, num_kv_shared_layers=0,
                  layer_types=["sliding_attention", "full_attention"] * 2)
@@ -919,8 +924,8 @@ def gemma4_models() -> None:
     def build(args, dtype, seed, wrapper=False):
         mx.random.seed(seed)
         if wrapper:
-            cfg = dict(model_type="gemma4", vocab_size=args["vocab_size"],
-                       text_config={k: v for k, v in args.items() if k != "model_type"})
+            cfg = {"model_type": "gemma4", "vocab_size": args["vocab_size"],
+                   "text_config": {k: v for k, v in args.items() if k != "model_type"}}
             model = gemma4.Model(gemma4.ModelArgs.from_dict(cfg))
         else:
             cfg = dict(args)
@@ -962,8 +967,8 @@ def gemma4_models() -> None:
                 p = f"model.language_model.layers.{i}.experts."
                 hf[p + "gate_up_proj"] = mx.concatenate([g.gate_proj.weight, g.up_proj.weight], -2)
                 hf[p + "down_proj"] = g.down_proj.weight
-            hcfg = dict(model_type="gemma4", vocab_size=cfg["vocab_size"],
-                        text_config={k: v for k, v in cfg.items() if k != "model_type"})
+            hcfg = {"model_type": "gemma4", "vocab_size": cfg["vocab_size"],
+                    "text_config": {k: v for k, v in cfg.items() if k != "model_type"}}
             out = OUT / "gemma4_moe_hf"
             logits = record(model, out, hcfg, hf)
             loaded, _ = load_model(out)

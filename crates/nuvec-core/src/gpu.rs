@@ -616,6 +616,22 @@ mod metal {
         _pad: i32,
     }
 
+    /// Scalar arguments shared with the wide GEMV Metal kernel.
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct WideGemvParams {
+        m: i32,
+        n: i32,
+        k: i32,
+        matrix_ld: i32,
+        vector_ld: i32,
+        batch_ndim: i32,
+        bias_ld: i64,
+        bias_fd: i64,
+        alpha: f32,
+        beta: f32,
+    }
+
     /// `GEMMSpiltKParams` (MLX steel).
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -716,6 +732,17 @@ mod metal {
                 GemmBuffer::Copy(b) => Arg::Read(b.metal().expect("device storage"), 0),
             }
         }
+    }
+
+    /// Whether consecutive batch matrices begin `matrix_stride` elements apart.
+    fn batch_strides_follow(shape: &[usize], strides: &[isize], mut matrix_stride: isize) -> bool {
+        for (&d, &s) in shape.iter().zip(strides).rev() {
+            if d > 1 && s != matrix_stride {
+                return false;
+            }
+            matrix_stride = matrix_stride.saturating_mul(d as isize);
+        }
+        true
     }
 
     /// How the few-row kernel takes `m ≥ 2` row-exact rows: groups of `(rows, r, s)` — `rows`
@@ -2712,6 +2739,46 @@ mod metal {
             }
             let ga = self.gemmand(a, m, k)?;
             let gb = self.gemmand(b, k, n)?;
+            // The small-M transposed product uses MLX's vector dot/reduction order.
+            // The 1–8 row contract has already selected its independent kernels above.
+            let aligned = |g: &Gemmand<'_>| {
+                g.offset.is_multiple_of(8)
+                    && g.ld % 4 == 0
+                    && batch_shape
+                        .iter()
+                        .zip(&g.batch_strides)
+                        .all(|(&d, s)| d == 1 || s % 4 == 0)
+            };
+            // MLX folds contiguous batches that share a matrix into M. Two batches of
+            // nine or more rows already exceed the wide route after folding.
+            let folds_batch = || {
+                batch > 1
+                    && ga.ld as usize == k
+                    && batch_strides_follow(batch_shape, &ga.batch_strides, (m * k) as isize)
+                    && batch_strides_follow(batch_shape, &gb.batch_strides, 0)
+                    && c.is_none_or(|((cm, _), _, _)| {
+                        batch_strides_follow(
+                            batch_shape,
+                            &cm.strides[..nd - 2],
+                            m as isize * cm.strides[nd - 2],
+                        )
+                    })
+            };
+            if m <= 15
+                && matches!(out.dtype, DType::F16 | DType::BF16)
+                && k.is_multiple_of(4)
+                && !ga.transposed
+                && gb.transposed
+                && aligned(&ga)
+                && aligned(&gb)
+                && !folds_batch()
+                && self
+                    .device()
+                    .and_then(|d| d.info().generation)
+                    .is_some_and(|g| g >= 15)
+            {
+                return self.gemv_wide(&ga, &gb, c, (m, n, k), out, buffer);
+            }
             let class = self
                 .device()
                 .and_then(|d| d.info().architecture.chars().last())
@@ -3162,6 +3229,77 @@ mod metal {
                 &args,
                 [out_len.div_ceil(per_group), 1, batch],
                 [32, bn, bm],
+            )?;
+            self.counted()
+        }
+
+        /// MLX's wide GEMV for aligned float16/bfloat16 rows and transposed weights.
+        fn gemv_wide(
+            &mut self,
+            vec: &Gemmand<'_>,
+            mat: &Gemmand<'_>,
+            c: Option<(Operand<'_>, f32, f32)>,
+            (m, n, k): (usize, usize, usize),
+            out: &Output,
+            buffer: &mut Buffer,
+        ) -> Result<()> {
+            let passes = m.div_ceil(5);
+            let vectors = m.div_ceil(passes);
+            let lanes = if n <= 64 { 32 } else { 16 };
+            let nd = out.shape.len();
+            let batch_shape = &out.shape[..nd - 2];
+            let name = format!("nuvec_gemv_wide_{}_nv{vectors}_kl{lanes}", out.dtype.name());
+            let pipeline =
+                self.pipeline_with(&name, &[(0, batch_shape.len() > 1), (1, c.is_some())])?;
+            let unused = [0u8; 8];
+            let (bias, alpha, beta, ld, fd, bias_strides) = match c {
+                Some(((cm, cd), alpha, beta)) => (
+                    Arg::Read(
+                        cd.buffer.metal().expect("device storage"),
+                        cd.offset as usize * cm.dtype.size(),
+                    ),
+                    alpha,
+                    beta,
+                    cm.strides[nd - 2] as i64,
+                    cm.strides[nd - 1] as i64,
+                    &cm.strides[..nd - 2],
+                ),
+                None => (Arg::bytes(&unused), 1.0, 0.0, 0, 0, &[][..]),
+            };
+            let shape = shape_bytes(batch_shape);
+            let vector_strides = strides_bytes(&vec.batch_strides);
+            let matrix_strides = strides_bytes(&mat.batch_strides);
+            let bias_strides = strides_bytes(bias_strides);
+            let params = WideGemvParams {
+                m: m as i32,
+                n: n as i32,
+                k: k as i32,
+                matrix_ld: mat.ld,
+                vector_ld: vec.ld,
+                batch_ndim: batch_shape.len() as i32,
+                bias_ld: ld,
+                bias_fd: fd,
+                alpha,
+                beta,
+            };
+            let args = [
+                mat.arg(),
+                vec.arg(),
+                Arg::write(buffer.metal_mut().expect("device storage")),
+                Arg::bytes(bytemuck::bytes_of(&params)),
+                Arg::bytes(&shape),
+                Arg::bytes(&vector_strides),
+                Arg::bytes(&matrix_strides),
+                bias,
+                Arg::bytes(&bias_strides),
+            ];
+            let args = if c.is_some() { &args[..] } else { &args[..7] };
+            let grid_x = if n >= 65536 { 1 } else { passes };
+            self.encode_groups(
+                &pipeline,
+                args,
+                [grid_x, n.div_ceil(4), batch_shape.iter().product()],
+                [32, lanes / 8, 1],
             )?;
             self.counted()
         }

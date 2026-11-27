@@ -98,3 +98,13 @@ NUVEC_GEMV_ROWS_BLOCKS(float32, float)
 NUVEC_GEMV_GATHER_BLOCKS(float16, half)
 NUVEC_GEMV_GATHER_BLOCKS(bfloat16, bfloat16_t)
 NUVEC_GEMV_GATHER_BLOCKS(float32, float)
+
+// MLX's wide small-M route above the eight-row independent range.
+#define NUVEC_WIDE(iname, T, nv, kl)                                              \
+    template [[host_name("nuvec_gemv_wide_" #iname "_nv" #nv "_kl" #kl)]] [[kernel]] \
+    decltype(mlx::matvec::gemv_wide<T, nv, kl>) mlx::matvec::gemv_wide<T, nv, kl>;
+#define NUVEC_WIDE_DTYPE(iname, T) \
+    NUVEC_WIDE(iname, T, 4, 16) NUVEC_WIDE(iname, T, 4, 32) \
+    NUVEC_WIDE(iname, T, 5, 16) NUVEC_WIDE(iname, T, 5, 32)
+NUVEC_WIDE_DTYPE(float16, half)
+NUVEC_WIDE_DTYPE(bfloat16, bfloat16_t)

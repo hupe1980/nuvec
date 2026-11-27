@@ -57,11 +57,11 @@ metal-check:
     MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu
     NUVEC_METALLIB=off MTL_DEBUG_LAYER=1 cargo test -p nuvec-gpu --test runtime
     # Runtime-compiled kernels give the precompiled results (MLX fixtures, bit-exact fused ops).
-    NUVEC_METALLIB=off cargo test -p nuvec-core --test gpu --test fast --test mlx
+    NUVEC_METALLIB=off cargo test -p nuvec-core --test gpu --test back_pressure --test fast --test mlx
     # Out-of-bounds GPU reads and writes do not panic: shader validation turns them into
     # errors (paged and indexing kernels, random primitives).
     MTL_SHADER_VALIDATION=1 cargo test -p nuvec-core --test fast --test primitive_fuzz
-    MTL_DEBUG_LAYER=1 cargo test -p nuvec-core --test gpu --test fast --test donation --test determinism
+    MTL_DEBUG_LAYER=1 cargo test -p nuvec-core --test gpu --test back_pressure --test fast --test donation --test determinism
     # Determinism across processes with runtime-compiled kernels (and the hash for
     # `just determinism-xbuild`).
     NUVEC_METALLIB=off cargo test -p nuvec-core --test determinism
@@ -82,9 +82,10 @@ site-serve:
 fixtures:
     uv run scripts/mlx_fixtures.py
 
-# Re-records the nuvec-lm fixtures (tiny models and their outputs) with mlx-lm (needs uv).
-lm-fixtures:
-    uv run scripts/lm_fixtures.py
+# Record nuvec-lm fixtures with mlx-lm. Use --only packed for AWQ and GPTQ.
+[positional-arguments]
+lm-fixtures *args:
+    uv run scripts/lm_fixtures.py "$@"
 
 # Re-records the nuvec-nn fixtures from MLX (needs uv).
 nn-fixtures:
@@ -99,8 +100,9 @@ bench-mlx:
     uv run scripts/bench_vs_mlx.py
 
 # GPU GEMM shape matrix: nuvec vs MLX (TFLOP/s).
-bench-gemm:
-    uv run scripts/bench_gemm.py
+[positional-arguments]
+bench-gemm *shapes:
+    uv run scripts/bench_gemm.py "$@"
 
 # Metal 4 TensorOps run on every Apple GPU of macOS 26.2, so the NAX kernels can be forced on.
 # NAX kernels forced on: equal to the CPU and SIMD kernels, they are the ones that run, minos ≤ 15.

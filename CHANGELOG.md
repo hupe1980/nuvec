@@ -8,18 +8,19 @@ All notable changes to nuvec are documented here. The format follows
 
 ### Added
 
-- A single-command MLX parity check for CPU and Metal fixtures and 16 frozen greedy prompts on two checkpoints.
+- `just qualify-mlx` for CPU and Metal fixtures and 16 frozen greedy prompts on two checkpoints.
 - Opt-in affine eight-bit paged KV for full-attention Qwen3 and a single-sequence DeepSeek-V3.2 attention layer with resumable sessions.
 
 ### Changed
 
-- The element-wise fixture, greedy reference generator and release benchmark now target MLX 0.32.5 with mlx-lm 0.32.2. The M4 Pro qualification passed the full 40-cell quick tier against v0.15.0.
+- Numerical fixtures and release benchmarks use MLX 0.32.5 and mlx-lm 0.32.2.
 
 ### Fixed
 
+- Metal matches MLX's reduction order for eligible 9–15-row transposed FP16 and BF16 products on M3 and newer. This fixes prompt-logit differences in AutoAWQ and GPTQ checkpoints. On M4 Pro, two short FP16 projections ran 1.6–2.7× faster, while the 14 × 4096 × 4096 product took 20% longer.
 - Convolution applies negative padding to the dilated input, including overpadded transposed convolutions.
 - CPU and Metal low-precision quantization preserve E4M3 NaNs and decode the E8M0 scale byte `0xff` as NaN.
-- CPU sigmoid and log-add-exp now match MLX's recorded f16 and bf16 results on the profiled M4 Pro. The suite checks all 168 CPU rows against their recorded chunk differences.
+- CPU sigmoid and log-add-exp now match MLX's recorded f16 and bf16 results on the profiled M4 Pro.
 - Metal gated-delta updates with mixed query and key dtypes now use the compositional implementation.
 - Benchmark comparisons reject mismatched cells. Quick-tier validation checks raw samples and the previous-release ratio. Concurrency fixtures verify the advertised prompt length.
 

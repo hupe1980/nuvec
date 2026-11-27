@@ -1,0 +1,233 @@
+{
+  "device": "Apple M4 Pro",
+  "macos": "27.2.1",
+  "macos_build": "26B131",
+  "mlx": "0.32.5",
+  "baseline_nuvec_commit": "2defccdf9feb33cf75f32c1545346449cbc7ca3a",
+  "command": "just bench-gemm qk14 skinny9 skinny14 skinny15",
+  "method": "Release builds on the same host. Each sample is the best of three sustained async_eval bursts after a warmup. Two passes ran in opposite engine order. Times are microseconds per product. Shapes are batch, M, K, N with a transposed right operand. Small host-bound timings vary between bursts.",
+  "order": [
+    [
+      "before",
+      "nuvec",
+      "mlx"
+    ],
+    [
+      "mlx",
+      "nuvec",
+      "before"
+    ]
+  ],
+  "cells": [
+    {
+      "shape": "qk14",
+      "dimensions": [
+        4,
+        14,
+        16,
+        14
+      ],
+      "dtype": "float16",
+      "us_per_product": {
+        "before": [
+          11.3,
+          10.54
+        ],
+        "nuvec": [
+          15.63,
+          21.4
+        ],
+        "mlx": [
+          17.9,
+          18.04
+        ]
+      }
+    },
+    {
+      "shape": "skinny9",
+      "dimensions": [
+        1,
+        9,
+        1024,
+        4096
+      ],
+      "dtype": "float16",
+      "us_per_product": {
+        "before": [
+          88.8,
+          88.08
+        ],
+        "nuvec": [
+          33.2,
+          33.34
+        ],
+        "mlx": [
+          36.81,
+          36.71
+        ]
+      }
+    },
+    {
+      "shape": "skinny14",
+      "dimensions": [
+        1,
+        14,
+        4096,
+        4096
+      ],
+      "dtype": "float16",
+      "us_per_product": {
+        "before": [
+          184.39,
+          180.92
+        ],
+        "nuvec": [
+          217.06,
+          218.29
+        ],
+        "mlx": [
+          195.86,
+          196.69
+        ]
+      }
+    },
+    {
+      "shape": "skinny15",
+      "dimensions": [
+        1,
+        15,
+        1024,
+        4096
+      ],
+      "dtype": "float16",
+      "us_per_product": {
+        "before": [
+          89.05,
+          88.53
+        ],
+        "nuvec": [
+          56.5,
+          56.65
+        ],
+        "mlx": [
+          53.33,
+          53.5
+        ]
+      }
+    },
+    {
+      "shape": "qk14",
+      "dimensions": [
+        4,
+        14,
+        16,
+        14
+      ],
+      "dtype": "bfloat16",
+      "us_per_product": {
+        "before": [
+          12.56,
+          11.77
+        ],
+        "nuvec": [
+          10.29,
+          10.95
+        ],
+        "mlx": [
+          20.53,
+          44.05
+        ]
+      }
+    },
+    {
+      "shape": "skinny9",
+      "dimensions": [
+        1,
+        9,
+        1024,
+        4096
+      ],
+      "dtype": "bfloat16",
+      "us_per_product": {
+        "before": [
+          88.96,
+          88.13
+        ],
+        "nuvec": [
+          32.89,
+          32.85
+        ],
+        "mlx": [
+          39.17,
+          43.87
+        ]
+      }
+    },
+    {
+      "shape": "skinny14",
+      "dimensions": [
+        1,
+        14,
+        4096,
+        4096
+      ],
+      "dtype": "bfloat16",
+      "us_per_product": {
+        "before": [
+          183.07,
+          179.84
+        ],
+        "nuvec": [
+          217.2,
+          219.84
+        ],
+        "mlx": [
+          198.34,
+          205.95
+        ]
+      }
+    },
+    {
+      "shape": "skinny15",
+      "dimensions": [
+        1,
+        15,
+        1024,
+        4096
+      ],
+      "dtype": "bfloat16",
+      "us_per_product": {
+        "before": [
+          89.16,
+          88.47
+        ],
+        "nuvec": [
+          56.36,
+          56.5
+        ],
+        "mlx": [
+          54.98,
+          54.96
+        ]
+      }
+    }
+  ],
+  "accuracy_sample": {
+    "shape": "skinny14",
+    "rng": "NumPy default_rng(1707), standard_normal float32, FP16 case then BF16 case",
+    "outputs_per_dtype": 57344,
+    "aligned_differences_before": {
+      "float16": 285,
+      "bfloat16": 16
+    },
+    "aligned_differences_current": {
+      "float16": 0,
+      "bfloat16": 0
+    },
+    "four_byte_offset_differences_current": {
+      "float16": 0,
+      "bfloat16": 0
+    },
+    "reference": "MLX 0.32.5 Metal on identical data with the same physical alignment in each engine."
+  }
+}

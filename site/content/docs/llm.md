@@ -157,18 +157,7 @@ For long-running batches, `Batcher::new_quantized(&model, options)` selects eigh
 
 For bf16 activations the packed KV arrays require 68 bytes per 64 components, compared with 128 bytes in dense storage. `batcher.kv_capacity_bytes()` reports the configured array payload across its layers. Weights, temporaries and allocator overhead also contribute to whole-run peak. Quantization can change tokens. `row_exact` compares the same quantized format and prompt chunk schedule. With `PagedCache::new_quantized`, insert an empty sequence or import a cache with matching codes, scales and biases. Call `KvCache::to_quantized` before the first forward for the same quantization schedule.
 
-Four requests on Qwen3-8B 4-bit, starting at 8,192, 8,177, 8,161 and 8,145 positions, gave these five-run medians on a 48 GiB M4 Pro. Decode counts 252 tokens after all four requests emitted their first token. Each process generated 64 tokens per request. The phase peaks include mapped weights.
-
-| Cache format | Decode tokens/s | Configured KV | Prefill peak | Decode peak | Median inter-token latency |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Dense bf16 | 92.55 | 4.54 GiB | 8.98 GiB | 8.84 GiB | 43.32 ms |
-| Eight-bit affine | 99.70 | 2.41 GiB | 7.01 GiB | 6.71 GiB | 40.35 ms |
-
-The benefit depended on context and concurrency. In single-repeat controls, one 8K request reached 40.93 tokens/s with eight-bit pages and 41.90 dense. At roughly 512 positions, four requests reached 148.67 vs 157.41 tokens/s and eight reached 268.18 vs 297.33. A serial mlx-lm reference using one contiguous eight-bit cache per request delivered 36.96 tokens/s on the four long prompts. [Raw timings, token streams and quality results](/nuvec/experiments/paged-kv-m4-pro.json)
-
-On the fixed Qwen3-8B 4-bit checkpoint, scoring 32,768 tokens from each of two repository corpora in 512-token chunks gave perplexities of 6.9875 dense and 6.9961 eight-bit for documentation, and 2.6603 dense and 2.6597 eight-bit for Rust. These measurements use contiguous caches initialized in each format before prefill and score the same token histories. On the same checkpoint, four eight-bit paged histories of 48, 33, 17 and 1 input tokens matched all 128 greedy IDs from their independent contiguous eight-bit references in `row_exact` mode.
-
-To measure your workload, run `just bench-paged-quantized-kv` with a cached Qwen3-8B 4-bit checkpoint. The default compares four roughly 8K-token prompts in dense and compressed batches against the previous dense release. The JSON lines include the model revision, elapsed time until every request has emitted its first token, inter-token latency, aggregate decode throughput and peak memory for each phase. Use `--quality` to score 32,768 tokens each from a fixed text corpus and a fixed code corpus, or `--mlx-only` for serial mlx-lm decode with the same eight-bit format.
+For four Qwen3-8B requests with roughly 8K prompt tokens each, eight-bit pages reduced configured KV capacity from 4.54 to 2.41 GiB on the M4 Pro. Shorter contexts can be slower with quantized pages. Measure your workload with `just bench-paged-quantized-kv` and use `--quality` to compare perplexity on the fixed text and code corpora. [Raw timings and quality results](/nuvec/experiments/paged-kv-m4-pro.json)
 
 `PagedCache` holds the keys and values of many sequences in fixed-size blocks; `decode_batch` advances several of them, each at its own length, in one forward pass. Prefill each sequence as usual, then move it into the paged cache:
 
@@ -344,7 +333,7 @@ fn attend(hidden: &Array) -> Result<Array> {
 
 The session retains one compressed latent, a positional key and an index key per position. At checkpoint dimensions these occupy 1,408 logical bytes per position per layer in bfloat16. `append_with_selection` exposes the selected absolute positions for an oracle comparison. The full checkpoint's experts and language-model head are outside this layer's API.
 
-The production-dimension bfloat16 layer met its 1.02× time target in all six M4 Pro cells, covering 1K, 4K and 16K prefixes with one or 64 appended queries. At a 16,384-token prefix with 64 appended queries, nuvec took 18.28 ms, mlx-lm 0.32.2 took 102.13 ms and the pinned upstream revision took 18.50 ms. Their allocator peaks were 892.7, 2,126.8 and 1,246.3 MiB respectively. [Raw paired samples](/nuvec/experiments/sparse-mla-m4-pro.json)
+Run `just bench-sparse-mla` to compare one layer on 1K, 4K and 16K prefixes with one or 64 appended queries. [Paired timings and peak memory](/nuvec/experiments/sparse-mla-m4-pro.json)
 
 ## Command line
 

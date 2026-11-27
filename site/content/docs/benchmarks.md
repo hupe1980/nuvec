@@ -1,12 +1,12 @@
 +++
 title = "Benchmarks"
-description = "nuvec-lm against mlx-lm on the same Mac: decode, time to first token up to 256K tokens, peak memory, load time and concurrency for twelve models from 0.6B to 35B parameters, with the machine-readable record."
+description = "Measure model throughput, latency, memory and Metal kernel timings against MLX on the same Mac."
 weight = 120
 [extra]
 group = "Project"
 +++
 
-nuvec's performance target is MLX on the same machine. Every number here comes from `just bench-parity`, which runs both engines on the same Mac in one session and reports losses as well as wins. The records, with every sample: [0.8.0 quick tier](/nuvec/benchmarks/0.8.0/m4-pro-48gb-quick.json) and [0.5.0 full tier](/nuvec/benchmarks/0.5.0/m4-pro-48gb.json), M4 Pro 48 GB (JSON). Each record is validated against its [schema](/nuvec/benchmarks/parity-record-v1.schema.json), and [index.json](/nuvec/benchmarks/index.json) lists all of them.
+Run `just bench-parity --tier smoke` with the Qwen3-8B and Qwen3-30B-A3B checkpoints in your Hugging Face cache. The quick tier adds a hybrid model and gpt-oss. Both engines run on the same Mac with the same token IDs. Each record includes checkpoint revisions, software versions and individual samples.
 
 ## Checking MLX parity
 
@@ -26,91 +26,21 @@ All 40 required quick-tier cells passed the 3% regression gate against nuvec v0.
 | Warm load to first token | 4 | 1.443× inverse time |
 | Four concurrent requests | 4 | 1.035× throughput |
 
-The previous-release comparison uses the best sample from each nuvec build. Its geometric mean across all 40 cells was 1.006×. The record identifies the working-tree sources, executable, four checkpoint revisions and SDK. To check the published file locally, run the validator from the repository root.
-
-```sh
-uv run scripts/validate_parity.py --require-quick v0.15.0 site/static/benchmarks/qualification/m4-pro-mlx-0.32.5-quick.json
-```
-
 ## Method
 
-- **Three tiers.** `--tier smoke` (about 10 minutes): Qwen3-8B and Qwen3-30B-A3B, decode and time to first token, regressions below 0.95×; the check before a release that touches performance. The quick tier (the default, about 45 minutes): one model per architecture (dense, hybrid, mixture of experts, gpt-oss), decode, time to first token at 2,048 tokens, memory, warm load and 4 concurrent requests. `--tier full` adds the whole roster, 32K tokens and longer, cold loads and 1 and 8 requests; it takes hours and runs in pieces (`--budget`, `--resume`). Each record names its tier.
-- **Regressions.** The previous release runs as a third engine in the same session, and every cell compares the current tree with it, best sample against best sample. A cell more than 3% slower (or larger) is measured again with a fresh pass of every engine; if it stays below, the record lists it under `summary.regressions` and the command fails.
-- **Same work.** Both engines get the same mlx-community checkpoint and the same token ids, written once from mlx-lm's tokenizer. Decoding is greedy, and the end-of-sequence token is ignored, so every run generates its 128 tokens.
-- **Fresh processes.** Every measurement runs in its own child process, and the engines alternate (nuvec, the previous release, mlx-lm, and again). Cells show medians; the record keeps every sample.
-- **Ratios** are oriented so that above 1.00× favours nuvec: speeds are nuvec / mlx-lm, and times and memory are mlx-lm / nuvec. ⚠️ marks a speed or time cell below the 0.98× gate (run-to-run spread is about ±2%). The goal is 1.0×.
-- **Prefill** is prompt tokens over the time to the first token. **Decode** is the tokens after the first over the time they took. The prefill geometric mean leaves out the 25-token rows, which mostly measure the first token.
-- **Peak memory** is `MemoryStats::peak_with_mapped` for nuvec (the allocator high-water mark plus mapped files, counted whole) and `mx.get_peak_memory()` for mlx-lm (which includes the weights it copied). Each phase runs in a fresh process. The record also keeps nuvec's allocator peak, active and mapped bytes, and the OS peak resident size of both processes.
-- **Load** is the time from the start of `load` to a ready model and to the first token of a 16-token prompt: one priming run, then three samples. Cold load needs `sudo -n /usr/sbin/purge` without a password (add a sudoers rule for `/usr/sbin/purge`); without it, cold cells stay empty.
-- **Speculative decoding** decodes the 25-token prompt with nuvec's drafters (prompt lookup on every model; MTP heads on Qwen 3.5–3.8 when `scripts/extract_mtp.py` has extracted their weights) against mlx-lm's plain decode of the same prompt. mlx-lm has no MTP drafter for these models, so these cells are not gated.
-- **Concurrency** serves 1, 4 or 8 prompts of 512 tokens together and generates 128 tokens each: nuvec's `Batcher` against mlx-lm's `BatchGenerator`. "Same tokens as alone" checks nuvec's batched output against each request generated by itself.
+Decode measures output tokens per second after prefill. Time to first token includes prefill. Warm load measures loading from the filesystem cache through the first generated token. The memory comparison includes mapped weights alongside the GPU allocator peak.
 
-## Results: 0.8.0 (quick tier)
+Ratios against mlx-lm use median samples. The previous-release gate compares each nuvec build's best sample, then repeats any cell below the threshold. The smoke threshold is 0.95× and the quick-tier threshold is 0.97×. See the JSON for individual cells and confirmed regressions. [Benchmark archive](/nuvec/benchmarks/index.json)
 
-Apple M4 Pro, 48 GB, macOS 26.6.2; nuvec 0.8.0, mlx 0.32.4, mlx-lm 0.32.2; 2026-11-09.
+## Short matrix products on Metal
 
-The geometric means are **decode 1.01×, time to first token 1.00× at 2,048 tokens, peak memory 1.01×, warm load 1.50×, and concurrent serving 1.02× at 4 requests.** No cell is below the 0.98× gate. Qwen3.5-9B's MTP head decodes at 1.37× mlx-lm's plain decode, prompt lookup at 1.04× (geometric mean).
+Run `just bench-gemm qk14 skinny9 skinny14 skinny15` for short transposed projections. Use `--help` to list shapes. These FP16 timings on the M4 Pro use the best of two alternating samples. The baseline is nuvec commit `2defccd`. [FP16 and BF16 samples](/nuvec/experiments/wide-gemv-m4-pro.json)
 
-| model | kind | decode (25 / 961 / 3,841 tokens) | TTFT 2K | peak memory | warm load | 4 requests |
-|---|---|---:|---:|---:|---:|---:|
-| Qwen3-8B | dense | 1.02× / 1.02× / 1.01× | 1.00× | 1.03× | 1.33× | 1.02× |
-| Qwen3.5-9B | hybrid | 1.00× / 1.00× / 1.00× | 1.00× | 1.01× | 1.84× | 1.02× |
-| Qwen3-30B-A3B | moe | 1.02× / 1.02× / 1.02× | 1.01× | 1.01× | 1.33× | 1.01× |
-| gpt-oss-20b MXFP4 | moe | 1.00× / 0.99× / 1.00× | 0.99× | 1.01× | 1.58× | 1.01× |
-
-Peak memory is the geometric mean over a model's phases (load, decode, prefill at 2,048 tokens); gpt-oss-20b's prompts are 24, 921 and 3,681 tokens (its tokenizer).
-
-## Results: 0.5.0 (full tier)
-
-Apple M4 Pro, 48 GB, macOS 26.6.2; nuvec 0.5.0, mlx 0.32.4, mlx-lm 0.32.2; 2026-10-31, with 16 GB of swap in use at the start. nuvec / mlx-lm, above 1.00× favours nuvec; ⚠️ marks cells below the 0.98× gate.
-
-The geometric means are **decode 1.01×, prefill 1.01×, time to first token 1.02× at 2,048 and 32,768 tokens (0.98× at 65,536, Qwen3.6-35B-A3B), warm load 1.80×, peak memory 1.02×, and concurrent serving 1.01× / 1.00× / 1.00× at 1 / 4 / 8 requests.** At 261,952 tokens nuvec prefills Qwen3.6-35B-A3B in 1,224 s; mlx-lm ran out of GPU memory.
-
-| model | kind | decode (25 / 961 / 3,841 tokens) | prefill (961 / 3,841) | TTFT 2K / 32K | peak memory | warm load |
-|---|---|---:|---:|---:|---:|---:|
-| Qwen3-0.6B | dense | 1.10× / 1.10× / 1.06× | 1.05× / 1.03× | 1.01× / 1.01× | 1.00× | 2.71× |
-| Llama-3.2-3B | dense | 0.99× / 1.00× / 1.00× | 1.01× / 1.00× | 1.00× / 1.01× | 1.09× | 2.39× |
-| Llama-3.1-8B | dense | 1.01× / 1.00× / 1.00× | 1.01× / 1.00× | 1.00× / 1.00× | 1.03× | 1.66× |
-| Qwen3-8B | dense | 1.00× / 1.01× / 1.01× | 1.01× / 1.00× | 1.00× / 1.01× | 1.03× | 1.31× |
-| Qwen3.5-9B | hybrid | 1.00× / 1.00× / 1.00× | 1.00× / 1.00× | 1.00× / 0.99× | 1.01× | 1.83× |
-| Qwen3.8-27B | hybrid | 1.00× / 1.01× / 1.05× | 1.00× / 1.01× | 1.01× / 1.00× | 0.98× | 1.25× |
-| Qwen3-30B-A3B | moe | 1.00× / 1.00× / 1.00× | 1.00× / 1.00× | 0.99× / 1.00× | 1.01× | 1.20× |
-| Qwen3.6-35B-A3B | hybrid-moe | 0.99× / 1.00× / 1.00× | 0.99× / 0.99× | 1.01× / 0.98× | 1.00× | 1.46× |
-| gpt-oss-20b MXFP4 | moe | 0.99× / 0.99× / 0.98× | 1.02× / 1.04× | 1.04× / 1.03× | 1.02× | 1.47× |
-| gpt-oss-20b 8-bit | moe | 1.01× / 1.01× / 1.00× | 1.01× / 1.02× | 1.02× / 1.02× | 1.01× | 3.60× |
-| Gemma 4 E4B | dense | 0.98× / 1.00× / 1.00× | 1.03× / 1.07× | 1.07× / 1.07× | 1.06× | 2.55× |
-| Gemma 4 26B-A4B | moe | 1.01× / 1.01× / 1.01× | 1.01× / 1.08× | 1.06× / 1.08× | 1.01× | 1.49× |
-
-Peak memory is the geometric mean over a model's phases (load, decode, prefill at 2,048 and 32,768 tokens); warm load is the time to the first token.
-
-### Concurrency
-
-Aggregate throughput of nuvec's `Batcher` against mlx-lm's `BatchGenerator`, 512-token prompts, 128 tokens each:
-
-| model | 1 request | 4 requests | 8 requests |
+| Projection (M × K × N) | Baseline | Wide GEMV | MLX 0.32.5 |
 |---|---:|---:|---:|
-| Qwen3-0.6B | 1.06× | 0.98× ⚠️ | 0.99× |
-| Llama-3.2-3B | 1.00× | 1.00× | 1.00× |
-| Llama-3.1-8B | 1.01× | 1.01× | 1.00× |
-| Qwen3-8B | 1.00× | 1.01× | 1.01× |
-| Qwen3.5-9B | 1.00× | 1.00× | 1.01× |
-| Qwen3.8-27B | 1.01× | 1.00× | 1.01× |
-| Qwen3-30B-A3B | 1.00× | 0.98× | 1.01× |
-| Qwen3.6-35B-A3B | 0.99× | 0.98× ⚠️ | 0.99× |
-| gpt-oss-20b MXFP4 | 1.00× | 1.00× | 1.00× |
-| gpt-oss-20b 8-bit | 1.03× | 1.08× | 1.01× |
-| Gemma 4 E4B | 1.02× | 1.02× | 1.01× |
-| Gemma 4 26B-A4B | 1.02× | 0.99× | 1.00× |
-
-Products route as MLX's, so a request's batched tokens may differ in their low bits from its tokens alone, as mlx-lm's do; `GenerateOptions::row_exact` serves a request its solo tokens.
-
-## Kernels
-
-`just bench-gemm`, `bench-quant`, `bench-fast` and `bench-compile` run the same kernels in nuvec and MLX: sustained asynchronous bursts after a warm-up, best of three, programs alternating. They report nuvec/MLX time (lower is better).
-
-`just bench-kv-attention` times one decode query's attention over 1K–64K keys with bf16, 8-bit and 4-bit caches, nuvec's `fast::quantized_attention` against mlx-lm's composition. On an M4 Pro at 32K keys nuvec takes 0.71× MLX's time at 8 bits and 0.81× at 4 bits; at 64K, 0.65× and 0.79×. `KV_BITS=8 just bench-lm` compares whole decoding with quantized caches.
-
-`just bench-verify` times speculative verification's attention, 1 to 8 causal rows over 4K to 32K keys, in nuvec and MLX, and each against one row. The per-row arithmetic that keeps each row's bits equal to serial decoding sets the cost, not reading the cache: rows that share one read of it take as long. On an M4 Pro, 8 rows take 3.6–6.8× one row's time and 0.47–1.02× MLX 0.32.4's.
+| 9 × 1024 × 4096 | 88.08 µs | 33.20 µs | 36.71 µs |
+| 14 × 4096 × 4096 | 180.92 µs | 217.06 µs | 195.86 µs |
+| 15 × 1024 × 4096 | 88.53 µs | 56.50 µs | 53.33 µs |
 
 ## Run them yourself
 

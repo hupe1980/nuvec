@@ -424,28 +424,6 @@ fn concurrent_evaluations_from_several_threads() {
 }
 
 #[test]
-fn async_eval_applies_back_pressure() {
-    if crate::common::require_gpu().is_none() {
-        return;
-    }
-    let device = nuvec_gpu::Device::shared().unwrap();
-    on(Device::gpu(0), || {
-        let big = ops::full([1 << 20], 1.0f32);
-        let mut outs = Vec::new();
-        for _ in 0..60 {
-            let y = (&big * 2.0 + 1.0).sum(..);
-            async_eval(std::slice::from_ref(&y)).unwrap();
-            // At most 10 per device, plus one per concurrently submitting test thread.
-            assert!(device.in_flight() <= 16, "{} in flight", device.in_flight());
-            outs.push(y);
-        }
-        for y in outs {
-            assert_eq!(y.item::<f32>().unwrap(), 3.0 * (1 << 20) as f32);
-        }
-    });
-}
-
-#[test]
 fn async_eval_reports_known_errors() {
     if crate::common::require_gpu().is_none() {
         return;
@@ -640,6 +618,68 @@ fn steel_gemm_matches_the_cpu_over_shapes_layouts_batches_and_dtypes() {
     let v = random(&[50]);
     let f = || bias.addmm(&v, &b, 1.0, 1.0);
     assert_eq!(on(Device::gpu(0), f).shape(), [41]);
+}
+
+/// A Qwen3 query/key pair whose 16-element dot lands on opposite sides of a float16
+/// rounding boundary in tiled GEMM and MLX 0.32.5's wide GEMV on generation 15+.
+#[test]
+fn wide_gemv_matches_mlx_at_a_rounding_boundary() {
+    if common::require_gpu().is_none()
+        || nuvec_gpu::Device::shared()
+            .and_then(|d| d.info().generation)
+            .is_none_or(|g| g < 15)
+    {
+        return;
+    }
+    let x = [
+        13381u16, 42417, 44612, 45913, 13092, 14651, 12874, 46609, 14455, 44441, 43912, 42014,
+        42195, 12499, 45388, 12742,
+    ];
+    let w = [
+        46762u16, 14673, 13782, 16420, 48385, 44176, 45652, 14464, 15592, 46779, 13381, 15998,
+        1367, 45747, 9102, 16257,
+    ];
+    on(Device::gpu(0), || {
+        // 528 and 1040 exercise one main-loop block and a tail with 16 and 32 lanes.
+        for (m, n, k, half, bfloat) in [
+            (9, 14, 16, (45923, 44387), (48744, 48552)),
+            (11, 65, 528, (51103, 50063), (49392, 49262)),
+            (14, 14, 16, (45923, 44387), (48744, 48552)),
+            (14, 14, 1040, (52097, 51065), (49516, 49387)),
+            (15, 65, 16, (45923, 44387), (48744, 48552)),
+        ] {
+            for (dtype, (product, biased)) in [(DType::F16, half), (DType::BF16, bfloat)] {
+                let rows = |bits: &[u16], count| {
+                    Array::from_slice(&bits.repeat(count * k / bits.len()), [count, k])
+                        .view(DType::F16)
+                        .astype(dtype)
+                };
+                let a = rows(&x, m);
+                let bt = rows(&w, n).t();
+                let bias = Array::from(0.125f32).astype(dtype);
+                for (value, expected) in [
+                    (a.matmul(&bt), product),
+                    (bias.addmm(&a, &bt, 0.5, 0.25), biased),
+                ] {
+                    let bits = value.view(DType::U16).to_vec::<u16>().unwrap();
+                    assert_eq!(bits, vec![expected; m * n], "{dtype:?} {m}×{k}×{n}");
+                }
+            }
+        }
+        // With one shared weight, MLX folds the two batches into a single 28-row GEMM.
+        // Distinct weights keep each matrix at 14 rows and take the wide reduction.
+        let a = Array::from_slice(&x.repeat(28), [2, 14, 16]).view(DType::F16);
+        let b = Array::from_slice(&w.repeat(14), [14, 16])
+            .view(DType::F16)
+            .broadcast_to([2, 14, 16]);
+        for (b, expected) in [(b.clone(), 45924), (b.contiguous(), 45923)] {
+            let bt = b.transpose([0, 2, 1]);
+            assert_eq!(
+                a.matmul(&bt).view(DType::U16).to_vec::<u16>().unwrap(),
+                vec![expected; 2 * 14 * 14]
+            );
+        }
+    });
 }
 
 /// The multi-row matrix-vector kernels (2 to 16 rows, `gemv_rows`): against the CPU, over

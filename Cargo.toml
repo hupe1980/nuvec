@@ -71,7 +71,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 half = { version = "2.7", features = ["bytemuck"] }
 smallvec = { version = "1", features = ["union", "const_generics"] }
-# The derive macros (nuvec-macros); already in the graph through `thiserror`.
+# Derive macros for nuvec-macros.
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "visit"] }
@@ -83,7 +83,6 @@ missing_docs = "warn"
 unreachable_pub = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 
-# Constitution I: every `unsafe` block carries a `// SAFETY:` justification.
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "deny"
